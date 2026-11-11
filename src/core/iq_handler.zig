@@ -24,6 +24,7 @@ const muc_handler = @import("muc_handler.zig");
 const fanout = @import("fanout.zig");
 const room_registry_mod = @import("room_registry");
 const actor_message = @import("message.zig");
+const delivery_queue = @import("delivery_queue");
 
 const log = std.log.scoped(.xmppd);
 
@@ -40,6 +41,29 @@ noinline fn noteJidOverflow(comptime fmt: []const u8, args: anytype) void {
     @branchHint(.cold);
     router.countJidOverflow();
     log.warn(fmt, args);
+}
+
+/// Record one cross-worker delivery drop on the cold path (S14).
+noinline fn noteCrossWorkerDrop(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    _ = delivery_queue.cross_worker_drops.fetchAdd(1, .monotonic);
+    log.warn(fmt, args);
+}
+
+/// Queue a built stanza to a session. A refused send lands on the cold
+/// path: it is logged, and a full write buffer flags the session for
+/// overflow teardown (R1), the same classification dispatchStanza uses.
+fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
+    session.queueSendStanza(stanza) catch |err| {
+        noteQueueDrop(session, err, what);
+    };
+}
+
+/// Classify and log one refused queueSendStanza on the cold path (R5).
+noinline fn noteQueueDrop(session: *Session, err: anyerror, comptime what: []const u8) void {
+    @branchHint(.cold);
+    if (err == error.WriteBufferFull) session.sm_overflow = true;
+    log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
 }
 
 // Types from server.zig — imported via the parent module's compilation unit.
@@ -296,13 +320,21 @@ pub fn handleIqChild(session: *Session, elem: xml.Element) void {
             // Write the opening <vCard xmlns='vcard-temp'> tag
             var fbs = std.io.fixedBufferStream(&session.vcard_buf);
             const w = fbs.writer();
-            w.writeAll("<vCard xmlns='vcard-temp'") catch return;
-            if (elem.self_closing) {
-                w.writeAll("/>") catch return;
+            const open_ok = stanza: {
+                w.writeAll("<vCard xmlns='vcard-temp'") catch break :stanza false;
+                if (elem.self_closing) {
+                    w.writeAll("/>") catch break :stanza false;
+                } else {
+                    w.writeByte('>') catch break :stanza false;
+                }
+                break :stanza true;
+            };
+            if (!open_ok) {
                 session.vcard_collecting = false;
-            } else {
-                w.writeByte('>') catch return;
+                noteDrop("vCard open tag exceeds {d} bytes; collection skipped", .{session.vcard_buf.len});
+                return;
             }
+            if (elem.self_closing) session.vcard_collecting = false;
             session.vcard_buf_len = fbs.pos;
         }
     } else if (std.mem.eql(u8, elem.local_name, "username") and
@@ -534,17 +566,29 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
             if (std.mem.eql(u8, child_ns, xml.ns.disco_items) and std.mem.eql(u8, iq_type, "get")) {
                 var fbs = std.io.fixedBufferStream(&session.write_scratch);
                 const w = fbs.writer();
-                writeIqHeader(server, w, session, "result", iq_id);
-                w.writeAll("><query xmlns='http://jabber.org/protocol/disco#items'/></iq>") catch return;
-                session.queueSendStanza(fbs.getWritten()) catch return;
+                const reply_xml = stanza: {
+                    writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+                    w.writeAll("><query xmlns='http://jabber.org/protocol/disco#items'/></iq>") catch break :stanza null;
+                    break :stanza fbs.getWritten();
+                } orelse {
+                    noteJidOverflow("disco#items reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+                    return;
+                };
+                queueStanzaOrDrop(session, reply_xml, "disco#items reply");
                 return;
             }
             if (std.mem.eql(u8, child_ns, xml.ns.disco_info) and std.mem.eql(u8, iq_type, "get")) {
                 var fbs = std.io.fixedBufferStream(&session.write_scratch);
                 const w = fbs.writer();
-                writeIqHeader(server, w, session, "error", iq_id);
-                w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
-                session.queueSendStanza(fbs.getWritten()) catch return;
+                const reply_xml = stanza: {
+                    writeIqHeader(server, w, session, "error", iq_id) catch break :stanza null;
+                    w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch break :stanza null;
+                    break :stanza fbs.getWritten();
+                } orelse {
+                    noteJidOverflow("disco#info error reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+                    return;
+                };
+                queueStanzaOrDrop(session, reply_xml, "disco#info error reply");
                 return;
             }
             if (std.mem.eql(u8, child_ns, xml.ns.vcard_temp) and std.mem.eql(u8, iq_type, "get")) {
@@ -606,20 +650,26 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         }
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        writeIqHeader(server, w, session, "result", iq_id);
-        if (disco_node.len > 0) {
-            w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info' node='") catch return;
-            xml.escapeWrite(w, disco_node) catch return;
-            w.writeAll("'>") catch return;
-        } else {
-            w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
-        }
-        // XEP-0163 §6.1: the service also answers as a PEP pubsub service.
-        w.writeAll("<identity category='pubsub' type='pep'/>") catch return;
-        w.writeAll("<identity category='server' type='im' name='xmppd'/>") catch return;
-        caps_mod.writeDiscoFeatures(w) catch return;
-        w.writeAll("</query></iq>") catch return;
-        session.queueSendStanza(fbs.getWritten()) catch return;
+        const reply_xml = stanza: {
+            writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+            if (disco_node.len > 0) {
+                w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info' node='") catch break :stanza null;
+                xml.escapeWrite(w, disco_node) catch break :stanza null;
+                w.writeAll("'>") catch break :stanza null;
+            } else {
+                w.writeAll("><query xmlns='http://jabber.org/protocol/disco#info'>") catch break :stanza null;
+            }
+            // XEP-0163 §6.1: the service also answers as a PEP pubsub service.
+            w.writeAll("<identity category='pubsub' type='pep'/>") catch break :stanza null;
+            w.writeAll("<identity category='server' type='im' name='xmppd'/>") catch break :stanza null;
+            caps_mod.writeDiscoFeatures(w) catch break :stanza null;
+            w.writeAll("</query></iq>") catch break :stanza null;
+            break :stanza fbs.getWritten();
+        } orelse {
+            noteJidOverflow("disco#info reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+            return;
+        };
+        queueStanzaOrDrop(session, reply_xml, "disco#info reply");
         return;
     }
 
@@ -627,16 +677,22 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
     if (std.mem.eql(u8, child_ns, xml.ns.disco_items) and std.mem.eql(u8, iq_type, "get")) {
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        writeIqHeader(server, w, session, "result", iq_id);
-        w.writeAll("><query xmlns='http://jabber.org/protocol/disco#items'>") catch return;
-        // Advertise MUC service if configured
-        if (server.muc_host) |muc_host| {
-            w.writeAll("<item jid='") catch return;
-            xml.escapeWrite(w, muc_host) catch return;
-            w.writeAll("' name='Chat Rooms'/>") catch return;
-        }
-        w.writeAll("</query></iq>") catch return;
-        session.queueSendStanza(fbs.getWritten()) catch return;
+        const reply_xml = stanza: {
+            writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+            w.writeAll("><query xmlns='http://jabber.org/protocol/disco#items'>") catch break :stanza null;
+            // Advertise MUC service if configured
+            if (server.muc_host) |muc_host| {
+                w.writeAll("<item jid='") catch break :stanza null;
+                xml.escapeWrite(w, muc_host) catch break :stanza null;
+                w.writeAll("' name='Chat Rooms'/>") catch break :stanza null;
+            }
+            w.writeAll("</query></iq>") catch break :stanza null;
+            break :stanza fbs.getWritten();
+        } orelse {
+            noteJidOverflow("disco#items reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+            return;
+        };
+        queueStanzaOrDrop(session, reply_xml, "disco#items reply");
         return;
     }
 
@@ -644,9 +700,15 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
     if (std.mem.eql(u8, child_ns, xml.ns.ping) and std.mem.eql(u8, iq_type, "get")) {
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        writeIqHeader(server, w, session, "result", iq_id);
-        w.writeAll("/>") catch return;
-        session.queueSendStanza(fbs.getWritten()) catch return;
+        const reply_xml = stanza: {
+            writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+            w.writeAll("/>") catch break :stanza null;
+            break :stanza fbs.getWritten();
+        } orelse {
+            noteJidOverflow("ping result to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+            return;
+        };
+        queueStanzaOrDrop(session, reply_xml, "ping result");
         return;
     }
 
@@ -656,9 +718,15 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
     {
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        writeIqHeader(server, w, session, "result", iq_id);
-        w.writeAll("/>") catch return;
-        session.queueSendStanza(fbs.getWritten()) catch return;
+        const reply_xml = stanza: {
+            writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+            w.writeAll("/>") catch break :stanza null;
+            break :stanza fbs.getWritten();
+        } orelse {
+            noteJidOverflow("session result to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+            return;
+        };
+        queueStanzaOrDrop(session, reply_xml, "session result");
         return;
     }
 
@@ -677,15 +745,21 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
     if (std.mem.eql(u8, child_ns, xml.ns.version) and std.mem.eql(u8, iq_type, "get")) {
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        writeIqHeader(server, w, session, "result", iq_id);
-        w.writeAll("><query xmlns='jabber:iq:version'>") catch return;
-        w.writeAll("<name>xmppd</name>") catch return;
-        w.writeAll("<version>") catch return;
-        xml.escapeWrite(w, build_options.version) catch return;
-        w.writeAll("</version>") catch return;
-        w.writeAll("<os>FreeBSD</os>") catch return;
-        w.writeAll("</query></iq>") catch return;
-        session.queueSendStanza(fbs.getWritten()) catch return;
+        const reply_xml = stanza: {
+            writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+            w.writeAll("><query xmlns='jabber:iq:version'>") catch break :stanza null;
+            w.writeAll("<name>xmppd</name>") catch break :stanza null;
+            w.writeAll("<version>") catch break :stanza null;
+            xml.escapeWrite(w, build_options.version) catch break :stanza null;
+            w.writeAll("</version>") catch break :stanza null;
+            w.writeAll("<os>FreeBSD</os>") catch break :stanza null;
+            w.writeAll("</query></iq>") catch break :stanza null;
+            break :stanza fbs.getWritten();
+        } orelse {
+            noteJidOverflow("version reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+            return;
+        };
+        queueStanzaOrDrop(session, reply_xml, "version reply");
         return;
     }
 
@@ -710,9 +784,15 @@ pub fn dispatchIq(server: *Server, session: *Session, changes: *ChangeList) void
         // Send empty result
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        writeIqHeader(server, w, session, "result", iq_id);
-        w.writeAll("/>") catch return;
-        session.queueSendStanza(fbs.getWritten()) catch return;
+        const reply_xml = stanza: {
+            writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+            w.writeAll("/>") catch break :stanza null;
+            break :stanza fbs.getWritten();
+        } orelse {
+            noteJidOverflow("carbons result to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+            return;
+        };
+        queueStanzaOrDrop(session, reply_xml, "carbons result");
         return;
     }
 
@@ -802,9 +882,15 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
         // No roster configured — return empty roster
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        writeIqHeader(server, w, session, "result", iq_id);
-        w.writeAll("><query xmlns='jabber:iq:roster'/></iq>") catch return;
-        session.queueSendStanza(fbs.getWritten()) catch return;
+        const reply_xml = stanza: {
+            writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+            w.writeAll("><query xmlns='jabber:iq:roster'/></iq>") catch break :stanza null;
+            break :stanza fbs.getWritten();
+        } orelse {
+            noteJidOverflow("roster result to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+            return;
+        };
+        queueStanzaOrDrop(session, reply_xml, "roster result");
         return;
     };
 
@@ -818,42 +904,54 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
         return;
     };
 
-    // Build roster response using prefix iteration
-    var fbs = std.io.fixedBufferStream(&session.write_scratch);
-    const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("><query xmlns='jabber:iq:roster'>") catch return;
-
     // Get all roster items via the store's domain API
-    const items = roster.getAllItems(server.allocator, bare_jid) catch return;
+    const items = roster.getAllItems(server.allocator, bare_jid) catch {
+        noteDrop("connection {d} roster fetch failed; IQ answered with error", .{session.conn.id});
+        sendIqError(server, session, iq_id, "internal-server-error");
+        return;
+    };
     defer GenericRosterStore.freeAllItems(server.allocator, items);
 
-    for (items) |item| {
-        w.writeAll("<item jid='") catch return;
-        xml.escapeWrite(w, item.contact_jid) catch return;
-        w.writeByte('\'') catch return;
-        if (item.entry.name.len > 0) {
-            w.writeAll(" name='") catch return;
-            xml.escapeWrite(w, item.entry.name) catch return;
-            w.writeByte('\'') catch return;
-        }
-        w.writeAll(" subscription='") catch return;
-        w.writeAll(item.entry.subscription.toString()) catch return;
-        w.writeByte('\'') catch return;
-        if (item.entry.ask) {
-            w.writeAll(" ask='subscribe'") catch return;
-        }
-        if (item.entry.group_count > 0) {
-            w.writeByte('>') catch return;
-            writeGroupElements(w, item.entry.groups, item.entry.group_count);
-            w.writeAll("</item>") catch return;
-        } else {
-            w.writeAll("/>") catch return;
-        }
-    }
+    // Build roster response. A reply that cannot fit every item is not
+    // sent half-written: the requester gets a resource-constraint error.
+    var fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = fbs.writer();
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+        w.writeAll("><query xmlns='jabber:iq:roster'>") catch break :stanza null;
 
-    w.writeAll("</query></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+        for (items) |item| {
+            w.writeAll("<item jid='") catch break :stanza null;
+            xml.escapeWrite(w, item.contact_jid) catch break :stanza null;
+            w.writeByte('\'') catch break :stanza null;
+            if (item.entry.name.len > 0) {
+                w.writeAll(" name='") catch break :stanza null;
+                xml.escapeWrite(w, item.entry.name) catch break :stanza null;
+                w.writeByte('\'') catch break :stanza null;
+            }
+            w.writeAll(" subscription='") catch break :stanza null;
+            w.writeAll(item.entry.subscription.toString()) catch break :stanza null;
+            w.writeByte('\'') catch break :stanza null;
+            if (item.entry.ask) {
+                w.writeAll(" ask='subscribe'") catch break :stanza null;
+            }
+            if (item.entry.group_count > 0) {
+                w.writeByte('>') catch break :stanza null;
+                writeGroupElements(w, item.entry.groups, item.entry.group_count) catch break :stanza null;
+                w.writeAll("</item>") catch break :stanza null;
+            } else {
+                w.writeAll("/>") catch break :stanza null;
+            }
+        }
+
+        w.writeAll("</query></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("roster reply to connection {d} exceeds {d} bytes; answering resource-constraint", .{ session.conn.id, session.write_scratch.len });
+        sendIqError(server, session, iq_id, "resource-constraint");
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "roster reply");
 }
 
 /// Handle IQ roster set — add/update/remove a roster item.
@@ -948,7 +1046,9 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
             return;
         }
 
-        roster.removeItem(bare_jid, item_jid) catch {};
+        roster.removeItem(bare_jid, item_jid) catch |err| {
+            noteDrop("roster remove '{s}' for '{s}' failed: {s}", .{ item_jid, bare_jid, @errorName(err) });
+        };
         server.invalidateSubCache(bare_jid);
         result_sub = .remove;
 
@@ -1067,9 +1167,15 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     // Ack with result
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("/>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+        w.writeAll("/>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("roster-set result to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "roster-set result");
 
     // RFC 6121 §2.1.6: Send roster push to all interested resources.
     pushRosterItem(server, bound.local, bound.domain, item_jid, session.iq_roster_item_name, result_sub, result_ask, changes);
@@ -1134,22 +1240,28 @@ fn handlePasswordChange(server: *Server, session: *Session, iq_id: []const u8) v
 fn handleRegisterGet(server: *Server, session: *Session, iq_id: []const u8) void {
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("><query xmlns='jabber:iq:register'>") catch return;
-    w.writeAll("<instructions>Choose a username and password to register.</instructions>") catch return;
-    w.writeAll("<username/>") catch return;
-    w.writeAll("<password/>") catch return;
-    // XEP-0004 data form mirroring the legacy fields, plus the optional
-    // invite field (T165) — marked optional because whether an invite is
-    // required is the auth daemon's configuration, unknown to core.
-    w.writeAll("<x xmlns='jabber:x:data' type='form'>") catch return;
-    w.writeAll("<instructions>Choose a username and password to register.</instructions>") catch return;
-    w.writeAll("<field var='username' type='text-single' label='Username'><required/></field>") catch return;
-    w.writeAll("<field var='password' type='text-private' label='Password'><required/></field>") catch return;
-    w.writeAll("<field var='invite' type='text-single' label='Invite code (if required)'/>") catch return;
-    w.writeAll("</x>") catch return;
-    w.writeAll("</query></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+        w.writeAll("><query xmlns='jabber:iq:register'>") catch break :stanza null;
+        w.writeAll("<instructions>Choose a username and password to register.</instructions>") catch break :stanza null;
+        w.writeAll("<username/>") catch break :stanza null;
+        w.writeAll("<password/>") catch break :stanza null;
+        // XEP-0004 data form mirroring the legacy fields, plus the optional
+        // invite field (T165) — marked optional because whether an invite is
+        // required is the auth daemon's configuration, unknown to core.
+        w.writeAll("<x xmlns='jabber:x:data' type='form'>") catch break :stanza null;
+        w.writeAll("<instructions>Choose a username and password to register.</instructions>") catch break :stanza null;
+        w.writeAll("<field var='username' type='text-single' label='Username'><required/></field>") catch break :stanza null;
+        w.writeAll("<field var='password' type='text-private' label='Password'><required/></field>") catch break :stanza null;
+        w.writeAll("<field var='invite' type='text-single' label='Invite code (if required)'/>") catch break :stanza null;
+        w.writeAll("</x>") catch break :stanza null;
+        w.writeAll("</query></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("register form reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "register form reply");
 }
 
 /// Handle registration submission (XEP-0077 §3.1, pre-auth).
@@ -1288,11 +1400,11 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
 
     // Send each result message
     for (response.messages) |msg| {
-        session.queueSendStanza(msg.xml) catch continue;
+        queueStanzaOrDrop(session, msg.xml, "MAM result message");
     }
 
     // Send the fin IQ
-    session.queueSendStanza(response.fin_iq) catch return;
+    queueStanzaOrDrop(session, response.fin_iq, "MAM fin iq");
 }
 
 /// Handle MAM query for a MUC room (XEP-0313 + XEP-0045).
@@ -1303,10 +1415,15 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
     // Build the room bare JID as archive owner
     var room_buf: [320]u8 = undefined;
     var room_fbs = std.io.fixedBufferStream(&room_buf);
-    room_fbs.writer().writeAll(room_local) catch return;
-    room_fbs.writer().writeByte('@') catch return;
-    room_fbs.writer().writeAll(muc_host) catch return;
-    const room_jid = room_fbs.getWritten();
+    const room_jid = jid: {
+        room_fbs.writer().writeAll(room_local) catch break :jid null;
+        room_fbs.writer().writeByte('@') catch break :jid null;
+        room_fbs.writer().writeAll(muc_host) catch break :jid null;
+        break :jid room_fbs.getWritten();
+    } orelse {
+        noteJidOverflow("room JID for MAM query from connection {d} exceeds {d} bytes; query dropped", .{ session.conn.id, room_buf.len });
+        return;
+    };
 
     // F6: fold a local 'with' JID once so the by_contact index key matches
     // the spelling messages were archived under, on this worker or the
@@ -1389,11 +1506,11 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
 
     // Send each result message
     for (response.messages) |msg| {
-        session.queueSendStanza(msg.xml) catch continue;
+        queueStanzaOrDrop(session, msg.xml, "MAM room result message");
     }
 
     // Send the fin IQ
-    session.queueSendStanza(response.fin_iq) catch return;
+    queueStanzaOrDrop(session, response.fin_iq, "MAM room fin iq");
 }
 
 /// Parse a subset of ISO 8601 timestamps (YYYY-MM-DDThh:mm:ssZ) to unix epoch.
@@ -1443,11 +1560,17 @@ fn isLeapYear(year: u16) bool {
 fn sendLastActivityResult(server: *Server, session: *Session, iq_id: []const u8, seconds: u64) void {
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("><query xmlns='jabber:iq:last' seconds='") catch return;
-    w.print("{d}", .{seconds}) catch return;
-    w.writeAll("'/></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+        w.writeAll("><query xmlns='jabber:iq:last' seconds='") catch break :stanza null;
+        w.print("{d}", .{seconds}) catch break :stanza null;
+        w.writeAll("'/></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("last-activity result to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "last-activity result");
 }
 
 /// Server-directed queries (uptime, XEP-0012 §2.2) and self queries (the
@@ -1530,31 +1653,31 @@ fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, 
 /// Write IQ opening tag with type, from, to (client full JID), and id.
 /// Per RFC 6120 §8.1.2.1, the 'from' in a response MUST be the JID to which
 /// the original stanza was sent (i.e., the 'to' from the request).
-pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []const u8, iq_id: []const u8) void {
-    w.writeAll("<iq type='") catch return;
-    xml.escapeWrite(w, iq_type) catch return;
-    w.writeByte('\'') catch return;
+pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []const u8, iq_id: []const u8) !void {
+    try w.writeAll("<iq type='");
+    try xml.escapeWrite(w, iq_type);
+    try w.writeByte('\'');
     // from = iq_to if set (echo back request's 'to'), otherwise server host
     const from = if (session.iq_to.len > 0) session.iq_to else server.server_host;
-    w.writeAll(" from='") catch return;
-    xml.escapeWrite(w, from) catch return;
-    w.writeByte('\'') catch return;
+    try w.writeAll(" from='");
+    try xml.escapeWrite(w, from);
+    try w.writeByte('\'');
     // to = client's full JID
     if (session.stream.bound_jid) |bound| {
-        w.writeAll(" to='") catch return;
-        xml.escapeWrite(w, bound.local) catch return;
-        w.writeByte('@') catch return;
-        xml.escapeWrite(w, bound.domain) catch return;
+        try w.writeAll(" to='");
+        try xml.escapeWrite(w, bound.local);
+        try w.writeByte('@');
+        try xml.escapeWrite(w, bound.domain);
         if (bound.resource.len > 0) {
-            w.writeByte('/') catch return;
-            xml.escapeWrite(w, bound.resource) catch return;
+            try w.writeByte('/');
+            try xml.escapeWrite(w, bound.resource);
         }
-        w.writeByte('\'') catch return;
+        try w.writeByte('\'');
     }
     if (iq_id.len > 0) {
-        w.writeAll(" id='") catch return;
-        xml.escapeWrite(w, iq_id) catch return;
-        w.writeByte('\'') catch return;
+        try w.writeAll(" id='");
+        try xml.escapeWrite(w, iq_id);
+        try w.writeByte('\'');
     }
 }
 
@@ -1574,7 +1697,10 @@ fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
 
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
+    writeIqHeader(server, w, session, "result", iq_id) catch {
+        noteJidOverflow("vCard reply header to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
 
     if (server.vcard) |vcard| {
         const xml_data = vcard.get(server.allocator, bare_jid) catch null;
@@ -1582,23 +1708,36 @@ fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
             defer server.allocator.free(data);
             // Assemble the complete stanza so SM tracking buffers the whole
             // thing (S15) — a split send would leave a truncated replay entry.
-            var stanza = std.ArrayListUnmanaged(u8){};
+            var stanza: std.ArrayList(u8) = .empty;
             defer stanza.deinit(server.allocator);
             const sw = stanza.writer(server.allocator);
-            sw.writeAll(fbs.getWritten()) catch return;
-            sw.writeByte('>') catch return;
-            sw.writeAll(data) catch return;
-            sw.writeAll("</iq>") catch return;
-            session.queueSendStanza(stanza.items) catch return;
+            const assembled = blk: {
+                sw.writeAll(fbs.getWritten()) catch break :blk false;
+                sw.writeByte('>') catch break :blk false;
+                sw.writeAll(data) catch break :blk false;
+                sw.writeAll("</iq>") catch break :blk false;
+                break :blk true;
+            };
+            if (!assembled) {
+                noteDrop("connection {d} vCard reply assembly failed; dropped", .{session.conn.id});
+                return;
+            }
+            queueStanzaOrDrop(session, stanza.items, "vCard reply");
             return;
         }
     }
 
     // No stored vCard — return Gravatar fallback
-    w.writeAll("><vCard xmlns='vcard-temp'><PHOTO><EXTVAL>https://www.gravatar.com/avatar/") catch return;
-    writeGravatarHash(w, bare_jid);
-    w.writeAll("?d=mp&amp;s=96</EXTVAL></PHOTO></vCard></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        w.writeAll("><vCard xmlns='vcard-temp'><PHOTO><EXTVAL>https://www.gravatar.com/avatar/") catch break :stanza null;
+        writeGravatarHash(w, bare_jid) catch break :stanza null;
+        w.writeAll("?d=mp&amp;s=96</EXTVAL></PHOTO></vCard></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("vCard fallback reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "vCard fallback reply");
 }
 
 /// Handle vCard-temp GET for a specific bare JID (another user).
@@ -1632,15 +1771,25 @@ fn handleVcardGetFor(server: *Server, session: *Session, iq_id: []const u8, targ
             defer server.allocator.free(data);
             // User has a vCard — assemble the complete stanza so SM tracking
             // buffers the whole thing (S15), then send once.
-            writeIqHeader(server, w, session, "result", iq_id);
-            var stanza = std.ArrayListUnmanaged(u8){};
+            writeIqHeader(server, w, session, "result", iq_id) catch {
+                noteJidOverflow("vCard reply header to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+                return;
+            };
+            var stanza: std.ArrayList(u8) = .empty;
             defer stanza.deinit(server.allocator);
             const sw = stanza.writer(server.allocator);
-            sw.writeAll(fbs.getWritten()) catch return;
-            sw.writeByte('>') catch return;
-            sw.writeAll(data) catch return;
-            sw.writeAll("</iq>") catch return;
-            session.queueSendStanza(stanza.items) catch return;
+            const assembled = blk: {
+                sw.writeAll(fbs.getWritten()) catch break :blk false;
+                sw.writeByte('>') catch break :blk false;
+                sw.writeAll(data) catch break :blk false;
+                sw.writeAll("</iq>") catch break :blk false;
+                break :blk true;
+            };
+            if (!assembled) {
+                noteDrop("connection {d} vCard reply assembly failed; dropped", .{session.conn.id});
+                return;
+            }
+            queueStanzaOrDrop(session, stanza.items, "vCard reply");
             return;
         }
     }
@@ -1681,9 +1830,15 @@ fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
     // Ack with empty result
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("/>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+        w.writeAll("/>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("vCard-set result to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "vCard-set result");
 }
 
 /// Handle XEP-0163 PEP publish — store an item in a PEP node.
@@ -1732,13 +1887,19 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
     // Ack with pubsub result including the item ID
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><publish node='") catch return;
-    xml.escapeWrite(w, node) catch return;
-    w.writeAll("'><item id='") catch return;
-    xml.escapeWrite(w, item_id) catch return;
-    w.writeAll("'/></publish></pubsub></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+        w.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><publish node='") catch break :stanza null;
+        xml.escapeWrite(w, node) catch break :stanza null;
+        w.writeAll("'><item id='") catch break :stanza null;
+        xml.escapeWrite(w, item_id) catch break :stanza null;
+        w.writeAll("'/></publish></pubsub></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("PEP publish result to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "PEP publish result");
 
     // XEP-0163 §4.3: Send PEP event notification to presence subscribers
     sendPepNotification(server, session, bare_jid, node, item_id, payload, changes);
@@ -1751,20 +1912,26 @@ fn handlePepNodeConfig(server: *Server, session: *Session, iq_id: []const u8) vo
 
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub#owner'><configure") catch return;
-    if (node.len > 0) {
-        w.writeAll(" node='") catch return;
-        xml.escapeWrite(w, node) catch return;
-        w.writeByte('\'') catch return;
-    }
-    w.writeAll("><x xmlns='jabber:x:data' type='form'>") catch return;
-    w.writeAll("<field var='FORM_TYPE' type='hidden'><value>http://jabber.org/protocol/pubsub#node_config</value></field>") catch return;
-    w.writeAll("<field var='pubsub#persist_items' type='boolean'><value>1</value></field>") catch return;
-    w.writeAll("<field var='pubsub#access_model' type='list-single'><value>presence</value></field>") catch return;
-    w.writeAll("<field var='pubsub#max_items' type='text-single'><value>1</value></field>") catch return;
-    w.writeAll("</x></configure></pubsub></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+        w.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub#owner'><configure") catch break :stanza null;
+        if (node.len > 0) {
+            w.writeAll(" node='") catch break :stanza null;
+            xml.escapeWrite(w, node) catch break :stanza null;
+            w.writeByte('\'') catch break :stanza null;
+        }
+        w.writeAll("><x xmlns='jabber:x:data' type='form'>") catch break :stanza null;
+        w.writeAll("<field var='FORM_TYPE' type='hidden'><value>http://jabber.org/protocol/pubsub#node_config</value></field>") catch break :stanza null;
+        w.writeAll("<field var='pubsub#persist_items' type='boolean'><value>1</value></field>") catch break :stanza null;
+        w.writeAll("<field var='pubsub#access_model' type='list-single'><value>presence</value></field>") catch break :stanza null;
+        w.writeAll("<field var='pubsub#max_items' type='text-single'><value>1</value></field>") catch break :stanza null;
+        w.writeAll("</x></configure></pubsub></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("PEP node config reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "PEP node config reply");
 }
 
 /// Handle XEP-0163 PEP items retrieval — get items from a PEP node.
@@ -1831,18 +1998,24 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
         defer server.allocator.free(payload.?);
 
         // Build response — use dynamic buffer since PEP payloads (avatars) can be large
-        var resp = std.ArrayListUnmanaged(u8){};
+        var resp: std.ArrayList(u8) = .empty;
         defer resp.deinit(server.allocator);
         const rw = resp.writer(server.allocator);
-        writePepIqHeader(rw, bare_jid, session, "result", iq_id) catch return;
-        rw.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='") catch return;
-        xml.escapeWrite(rw, node) catch return;
-        rw.writeAll("'><item id='") catch return;
-        xml.escapeWrite(rw, requested_id) catch return;
-        rw.writeAll("'>") catch return;
-        rw.writeAll(payload.?) catch return;
-        rw.writeAll("</item></items></pubsub></iq>") catch return;
-        session.queueSendStanza(resp.items) catch return;
+        const reply_xml = stanza: {
+            writePepIqHeader(rw, bare_jid, session, "result", iq_id) catch break :stanza null;
+            rw.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='") catch break :stanza null;
+            xml.escapeWrite(rw, node) catch break :stanza null;
+            rw.writeAll("'><item id='") catch break :stanza null;
+            xml.escapeWrite(rw, requested_id) catch break :stanza null;
+            rw.writeAll("'>") catch break :stanza null;
+            rw.writeAll(payload.?) catch break :stanza null;
+            rw.writeAll("</item></items></pubsub></iq>") catch break :stanza null;
+            break :stanza resp.items;
+        } orelse {
+            noteDrop("connection {d} PEP item reply assembly failed; dropped", .{session.conn.id});
+            return;
+        };
+        queueStanzaOrDrop(session, reply_xml, "PEP item reply");
     } else {
         // All items retrieval
         const items = ps.getItems(server.allocator, bare_jid, node) catch {
@@ -1858,22 +2031,28 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
         }
 
         // Build response — use dynamic buffer since PEP payloads can be large
-        var resp = std.ArrayListUnmanaged(u8){};
+        var resp: std.ArrayList(u8) = .empty;
         defer resp.deinit(server.allocator);
         const rw = resp.writer(server.allocator);
-        writePepIqHeader(rw, bare_jid, session, "result", iq_id) catch return;
-        rw.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='") catch return;
-        xml.escapeWrite(rw, node) catch return;
-        rw.writeAll("'>") catch return;
-        for (items) |item| {
-            rw.writeAll("<item id='") catch return;
-            xml.escapeWrite(rw, item.id) catch return;
-            rw.writeAll("'>") catch return;
-            rw.writeAll(item.payload) catch return;
-            rw.writeAll("</item>") catch return;
-        }
-        rw.writeAll("</items></pubsub></iq>") catch return;
-        session.queueSendStanza(resp.items) catch return;
+        const reply_xml = stanza: {
+            writePepIqHeader(rw, bare_jid, session, "result", iq_id) catch break :stanza null;
+            rw.writeAll("><pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='") catch break :stanza null;
+            xml.escapeWrite(rw, node) catch break :stanza null;
+            rw.writeAll("'>") catch break :stanza null;
+            for (items) |item| {
+                rw.writeAll("<item id='") catch break :stanza null;
+                xml.escapeWrite(rw, item.id) catch break :stanza null;
+                rw.writeAll("'>") catch break :stanza null;
+                rw.writeAll(item.payload) catch break :stanza null;
+                rw.writeAll("</item>") catch break :stanza null;
+            }
+            rw.writeAll("</items></pubsub></iq>") catch break :stanza null;
+            break :stanza resp.items;
+        } orelse {
+            noteDrop("connection {d} PEP items reply assembly failed; dropped", .{session.conn.id});
+            return;
+        };
+        queueStanzaOrDrop(session, reply_xml, "PEP items reply");
     }
 }
 
@@ -1934,14 +2113,19 @@ fn sendPepNotification(
     defer notif_lease.release();
     var nfbs = std.io.fixedBufferStream(notif_lease.buf);
     const nw = nfbs.writer();
-    nw.writeAll(body_mid) catch return;
-    xml.escapeWrite(nw, node) catch return;
-    nw.writeAll(body_item_open) catch return;
-    xml.escapeWrite(nw, item_id) catch return;
-    nw.writeAll(body_item_mid) catch return;
-    nw.writeAll(payload) catch return;
-    nw.writeAll(body_suffix) catch return;
-    const body_after_to = nfbs.getWritten();
+    const body_after_to = suffix: {
+        nw.writeAll(body_mid) catch break :suffix null;
+        xml.escapeWrite(nw, node) catch break :suffix null;
+        nw.writeAll(body_item_open) catch break :suffix null;
+        xml.escapeWrite(nw, item_id) catch break :suffix null;
+        nw.writeAll(body_item_mid) catch break :suffix null;
+        nw.writeAll(payload) catch break :suffix null;
+        nw.writeAll(body_suffix) catch break :suffix null;
+        break :suffix nfbs.getWritten();
+    } orelse {
+        noteDrop("PEP notification body for node '{s}' exceeds {d} bytes; fanout skipped", .{ node, notif_lease.buf.len });
+        return;
+    };
 
     // Deliver to the publisher's own resources (self-notification per XEP-0163 §4.3)
     const bound = session.stream.bound_jid orelse return;
@@ -1963,33 +2147,45 @@ fn sendPepNotification(
 
                 var mfbs = std.io.fixedBufferStream(self_msg_lease.buf);
                 const mw = mfbs.writer();
-                mw.writeAll(body_prefix_1) catch continue;
-                xml.escapeWrite(mw, publisher_bare) catch continue;
-                mw.writeAll(body_prefix_2) catch continue;
-                xml.escapeWrite(mw, bound.local) catch continue;
-                mw.writeByte('@') catch continue;
-                xml.escapeWrite(mw, bound.domain) catch continue;
-                mw.writeByte('/') catch continue;
-                xml.escapeWrite(mw, entry.resource()) catch continue;
-                mw.writeAll(body_after_to) catch continue;
-
-                fanout.deliverToSession(target, mfbs.getWritten(), entry.local_session_id, changes);
+                const notif_xml = stanza: {
+                    mw.writeAll(body_prefix_1) catch break :stanza null;
+                    xml.escapeWrite(mw, publisher_bare) catch break :stanza null;
+                    mw.writeAll(body_prefix_2) catch break :stanza null;
+                    xml.escapeWrite(mw, bound.local) catch break :stanza null;
+                    mw.writeByte('@') catch break :stanza null;
+                    xml.escapeWrite(mw, bound.domain) catch break :stanza null;
+                    mw.writeByte('/') catch break :stanza null;
+                    xml.escapeWrite(mw, entry.resource()) catch break :stanza null;
+                    mw.writeAll(body_after_to) catch break :stanza null;
+                    break :stanza mfbs.getWritten();
+                } orelse {
+                    noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ bound.local, bound.domain, entry.resource(), self_msg_lease.buf.len });
+                    continue;
+                };
+                fanout.deliverToSession(target, notif_xml, entry.local_session_id, changes);
             } else {
                 // Cross-thread: build full stanza and deliver via MPSC
                 if (server.delivery_system) |ds| {
                     var mfbs = std.io.fixedBufferStream(self_msg_lease.buf);
                     const mw = mfbs.writer();
-                    mw.writeAll(body_prefix_1) catch continue;
-                    xml.escapeWrite(mw, publisher_bare) catch continue;
-                    mw.writeAll(body_prefix_2) catch continue;
-                    xml.escapeWrite(mw, bound.local) catch continue;
-                    mw.writeByte('@') catch continue;
-                    xml.escapeWrite(mw, bound.domain) catch continue;
-                    mw.writeByte('/') catch continue;
-                    xml.escapeWrite(mw, entry.resource()) catch continue;
-                    mw.writeAll(body_after_to) catch continue;
-
-                    ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, mfbs.getWritten()) catch {};
+                    const notif_xml = stanza: {
+                        mw.writeAll(body_prefix_1) catch break :stanza null;
+                        xml.escapeWrite(mw, publisher_bare) catch break :stanza null;
+                        mw.writeAll(body_prefix_2) catch break :stanza null;
+                        xml.escapeWrite(mw, bound.local) catch break :stanza null;
+                        mw.writeByte('@') catch break :stanza null;
+                        xml.escapeWrite(mw, bound.domain) catch break :stanza null;
+                        mw.writeByte('/') catch break :stanza null;
+                        xml.escapeWrite(mw, entry.resource()) catch break :stanza null;
+                        mw.writeAll(body_after_to) catch break :stanza null;
+                        break :stanza mfbs.getWritten();
+                    } orelse {
+                        noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ bound.local, bound.domain, entry.resource(), self_msg_lease.buf.len });
+                        continue;
+                    };
+                    ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, notif_xml) catch |err| {
+                        noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.local_session_id, @errorName(err) });
+                    };
                 }
             }
         }
@@ -2007,7 +2203,10 @@ fn sendPepNotification(
     const pep_hash = server_mod.sub_cache_mod.hashBareJid(publisher_bare);
     const pep_now = std.time.timestamp();
     const pep_sub_count = server.sub_cache.lookupSubscribers(pep_hash, pep_now, pep_sub_buf, &pep_sub_ptrs) orelse blk: {
-        const count = roster.getPresenceSubscribersFixed(publisher_bare, pep_sub_buf, &pep_sub_ptrs) catch return;
+        const count = roster.getPresenceSubscribersFixed(publisher_bare, pep_sub_buf, &pep_sub_ptrs) catch {
+            noteDrop("presence-subscriber lookup for '{s}' failed; PEP notification skipped", .{publisher_bare});
+            return;
+        };
         server.sub_cache.storeSubscribers(pep_hash, pep_now, pep_sub_ptrs[0..count]);
         break :blk count;
     };
@@ -2041,32 +2240,44 @@ fn sendPepNotification(
 
                 var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
                 const mw = mfbs.writer();
-                mw.writeAll(body_prefix_1) catch continue;
-                xml.escapeWrite(mw, publisher_bare) catch continue;
-                mw.writeAll(body_prefix_2) catch continue;
-                xml.escapeWrite(mw, sub_local) catch continue;
-                mw.writeByte('@') catch continue;
-                xml.escapeWrite(mw, sub_domain) catch continue;
-                mw.writeByte('/') catch continue;
-                xml.escapeWrite(mw, entry.resource()) catch continue;
-                mw.writeAll(body_after_to) catch continue;
-
-                fanout.deliverToSession(target, mfbs.getWritten(), entry.local_session_id, changes);
+                const notif_xml = stanza: {
+                    mw.writeAll(body_prefix_1) catch break :stanza null;
+                    xml.escapeWrite(mw, publisher_bare) catch break :stanza null;
+                    mw.writeAll(body_prefix_2) catch break :stanza null;
+                    xml.escapeWrite(mw, sub_local) catch break :stanza null;
+                    mw.writeByte('@') catch break :stanza null;
+                    xml.escapeWrite(mw, sub_domain) catch break :stanza null;
+                    mw.writeByte('/') catch break :stanza null;
+                    xml.escapeWrite(mw, entry.resource()) catch break :stanza null;
+                    mw.writeAll(body_after_to) catch break :stanza null;
+                    break :stanza mfbs.getWritten();
+                } orelse {
+                    noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ sub_local, sub_domain, entry.resource(), sub_msg_lease.buf.len });
+                    continue;
+                };
+                fanout.deliverToSession(target, notif_xml, entry.local_session_id, changes);
             } else {
                 if (server.delivery_system) |ds| {
                     var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
                     const mw = mfbs.writer();
-                    mw.writeAll(body_prefix_1) catch continue;
-                    xml.escapeWrite(mw, publisher_bare) catch continue;
-                    mw.writeAll(body_prefix_2) catch continue;
-                    xml.escapeWrite(mw, sub_local) catch continue;
-                    mw.writeByte('@') catch continue;
-                    xml.escapeWrite(mw, sub_domain) catch continue;
-                    mw.writeByte('/') catch continue;
-                    xml.escapeWrite(mw, entry.resource()) catch continue;
-                    mw.writeAll(body_after_to) catch continue;
-
-                    ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, mfbs.getWritten()) catch {};
+                    const notif_xml = stanza: {
+                        mw.writeAll(body_prefix_1) catch break :stanza null;
+                        xml.escapeWrite(mw, publisher_bare) catch break :stanza null;
+                        mw.writeAll(body_prefix_2) catch break :stanza null;
+                        xml.escapeWrite(mw, sub_local) catch break :stanza null;
+                        mw.writeByte('@') catch break :stanza null;
+                        xml.escapeWrite(mw, sub_domain) catch break :stanza null;
+                        mw.writeByte('/') catch break :stanza null;
+                        xml.escapeWrite(mw, entry.resource()) catch break :stanza null;
+                        mw.writeAll(body_after_to) catch break :stanza null;
+                        break :stanza mfbs.getWritten();
+                    } orelse {
+                        noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ sub_local, sub_domain, entry.resource(), sub_msg_lease.buf.len });
+                        continue;
+                    };
+                    ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, notif_xml) catch |err| {
+                        noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.local_session_id, @errorName(err) });
+                    };
                 }
             }
         }
@@ -2098,17 +2309,26 @@ fn handleBlocklistGet(server: *Server, session: *Session, iq_id: []const u8, cha
         server.allocator.free(items);
     }
 
+    // A blocklist reply that cannot fit every item is not sent
+    // half-written: the requester gets a resource-constraint error.
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("><blocklist xmlns='urn:xmpp:blocking'>") catch return;
-    for (items) |jid| {
-        w.writeAll("<item jid='") catch return;
-        xml.escapeWrite(w, jid) catch return;
-        w.writeAll("'/>") catch return;
-    }
-    w.writeAll("</blocklist></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+        w.writeAll("><blocklist xmlns='urn:xmpp:blocking'>") catch break :stanza null;
+        for (items) |jid| {
+            w.writeAll("<item jid='") catch break :stanza null;
+            xml.escapeWrite(w, jid) catch break :stanza null;
+            w.writeAll("'/>") catch break :stanza null;
+        }
+        w.writeAll("</blocklist></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("blocklist reply to connection {d} exceeds {d} bytes; answering resource-constraint", .{ session.conn.id, session.write_scratch.len });
+        sendIqError(server, session, iq_id, "resource-constraint");
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "blocklist reply");
 }
 
 /// Handle XEP-0191 <block/> set — add JIDs to user's block list.
@@ -2155,9 +2375,15 @@ fn handleBlock(server: *Server, session: *Session, iq_id: []const u8, changes: *
     // Ack with empty result
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("/>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+        w.writeAll("/>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("block result to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "block result");
 
     // Push block list update to all resources of the blocking user (XEP-0191 §3.3)
     pushBlockPush(server, session, bound.local, bound.domain, "block", item_jid, changes);
@@ -2181,7 +2407,9 @@ fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes:
     var item_jid = session.iq_roster_item_jid;
     if (item_jid.len == 0) {
         // Empty <unblock/> means unblock all
-        bs.removeAll(server.allocator, bare_jid) catch {};
+        bs.removeAll(server.allocator, bare_jid) catch |err| {
+            noteDrop("blocklist clear for '{s}' failed: {s}", .{ bare_jid, @errorName(err) });
+        };
         log.info("connection {d} unblocked all", .{session.conn.id});
     } else {
         // F6: fold a local blocked JID once so the unblock key and the push
@@ -2205,9 +2433,15 @@ fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes:
     // Ack with empty result
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "result", iq_id);
-    w.writeAll("/>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "result", iq_id) catch break :stanza null;
+        w.writeAll("/>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("unblock result to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "unblock result");
 
     // Push unblock update to all resources
     pushBlockPush(server, session, bound.local, bound.domain, "unblock", item_jid, changes);
@@ -2300,29 +2534,41 @@ fn pubsubUnsupportedFeature(verb: []const u8) ?[]const u8 {
 fn sendPubsubUnsupported(server: *Server, session: *Session, iq_id: []const u8, feature: []const u8) void {
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "error", iq_id);
-    w.writeAll("><error type='cancel'><feature-not-implemented xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>") catch return;
-    w.writeAll("<unsupported xmlns='http://jabber.org/protocol/pubsub#errors' feature='") catch return;
-    w.writeAll(feature) catch return;
-    w.writeAll("'/></error></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "error", iq_id) catch break :stanza null;
+        w.writeAll("><error type='cancel'><feature-not-implemented xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>") catch break :stanza null;
+        w.writeAll("<unsupported xmlns='http://jabber.org/protocol/pubsub#errors' feature='") catch break :stanza null;
+        w.writeAll(feature) catch break :stanza null;
+        w.writeAll("'/></error></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("pubsub unsupported error to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "pubsub unsupported error");
 }
 
 pub fn sendIqErrorWithType(server: *Server, session: *Session, iq_id: []const u8, err_type: []const u8, condition: []const u8) void {
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    writeIqHeader(server, w, session, "error", iq_id);
-    w.writeAll("><error type='") catch return;
-    w.writeAll(err_type) catch return;
-    w.writeAll("'><") catch return;
-    w.writeAll(condition) catch return;
-    w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const reply_xml = stanza: {
+        writeIqHeader(server, w, session, "error", iq_id) catch break :stanza null;
+        w.writeAll("><error type='") catch break :stanza null;
+        w.writeAll(err_type) catch break :stanza null;
+        w.writeAll("'><") catch break :stanza null;
+        w.writeAll(condition) catch break :stanza null;
+        w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("IQ error reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, reply_xml, "IQ error reply");
 }
 
 /// Write <group>text</group> elements from serialized groups data.
 /// Format: [len_be(2) | text] * group_count.
-fn writeGroupElements(w: anytype, groups_data: []const u8, group_count: u8) void {
+fn writeGroupElements(w: anytype, groups_data: []const u8, group_count: u8) !void {
     var offset: usize = 0;
     var i: u8 = 0;
     while (i < group_count) : (i += 1) {
@@ -2332,9 +2578,9 @@ fn writeGroupElements(w: anytype, groups_data: []const u8, group_count: u8) void
         if (offset + glen > groups_data.len) break;
         const gtext = groups_data[offset .. offset + glen];
         offset += glen;
-        w.writeAll("<group>") catch continue;
-        xml.escapeWrite(w, gtext) catch continue;
-        w.writeAll("</group>") catch continue;
+        try w.writeAll("<group>");
+        try xml.escapeWrite(w, gtext);
+        try w.writeAll("</group>");
     }
 }
 
@@ -2386,28 +2632,33 @@ pub fn pushRosterItem(
     var pfbs = std.io.fixedBufferStream(&push_buf);
     const pw = pfbs.writer();
     // We'll prepend per-target header, so build item portion first
-    pw.writeAll("<item jid='") catch return;
-    xml.escapeWrite(pw, item_jid) catch return;
-    pw.writeByte('\'') catch return;
-    if (effective_name.len > 0) {
-        pw.writeAll(" name='") catch return;
-        xml.escapeWrite(pw, effective_name) catch return;
-        pw.writeByte('\'') catch return;
-    }
-    pw.writeAll(" subscription='") catch return;
-    pw.writeAll(subscription.toString()) catch return;
-    pw.writeByte('\'') catch return;
-    if (ask) {
-        pw.writeAll(" ask='subscribe'") catch return;
-    }
-    if (group_count > 0) {
-        pw.writeByte('>') catch return;
-        writeGroupElements(pw, groups_data, group_count);
-        pw.writeAll("</item>") catch return;
-    } else {
-        pw.writeAll("/>") catch return;
-    }
-    const item_xml = pfbs.getWritten();
+    const item_xml = stanza: {
+        pw.writeAll("<item jid='") catch break :stanza null;
+        xml.escapeWrite(pw, item_jid) catch break :stanza null;
+        pw.writeByte('\'') catch break :stanza null;
+        if (effective_name.len > 0) {
+            pw.writeAll(" name='") catch break :stanza null;
+            xml.escapeWrite(pw, effective_name) catch break :stanza null;
+            pw.writeByte('\'') catch break :stanza null;
+        }
+        pw.writeAll(" subscription='") catch break :stanza null;
+        pw.writeAll(subscription.toString()) catch break :stanza null;
+        pw.writeByte('\'') catch break :stanza null;
+        if (ask) {
+            pw.writeAll(" ask='subscribe'") catch break :stanza null;
+        }
+        if (group_count > 0) {
+            pw.writeByte('>') catch break :stanza null;
+            writeGroupElements(pw, groups_data, group_count) catch break :stanza null;
+            pw.writeAll("</item>") catch break :stanza null;
+        } else {
+            pw.writeAll("/>") catch break :stanza null;
+        }
+        break :stanza pfbs.getWritten();
+    } orelse {
+        noteJidOverflow("roster-push item '{s}' exceeds {d} bytes; push skipped", .{ item_jid, push_buf.len });
+        return;
+    };
 
     for (entries[0..count]) |entry| {
         // Build full push IQ per target (different 'to' and 'id')
@@ -2417,32 +2668,39 @@ pub fn pushRosterItem(
         var id_buf: [32]u8 = undefined;
         const push_id = server.generateStanzaId(&id_buf);
 
-        fw.writeAll("<iq type='set' to='") catch continue;
-        xml.escapeWrite(fw, user_local) catch continue;
-        fw.writeByte('@') catch continue;
-        xml.escapeWrite(fw, user_domain) catch continue;
-        fw.writeByte('/') catch continue;
-        xml.escapeWrite(fw, entry.resource()) catch continue;
-        fw.writeAll("' id='") catch continue;
-        xml.escapeWrite(fw, push_id) catch continue;
-        fw.writeAll("'><query xmlns='jabber:iq:roster'>") catch continue;
-        fw.writeAll(item_xml) catch continue;
-        fw.writeAll("</query></iq>") catch continue;
-        const full_xml = ffbs.getWritten();
+        const full_xml = stanza: {
+            fw.writeAll("<iq type='set' to='") catch break :stanza null;
+            xml.escapeWrite(fw, user_local) catch break :stanza null;
+            fw.writeByte('@') catch break :stanza null;
+            xml.escapeWrite(fw, user_domain) catch break :stanza null;
+            fw.writeByte('/') catch break :stanza null;
+            xml.escapeWrite(fw, entry.resource()) catch break :stanza null;
+            fw.writeAll("' id='") catch break :stanza null;
+            xml.escapeWrite(fw, push_id) catch break :stanza null;
+            fw.writeAll("'><query xmlns='jabber:iq:roster'>") catch break :stanza null;
+            fw.writeAll(item_xml) catch break :stanza null;
+            fw.writeAll("</query></iq>") catch break :stanza null;
+            break :stanza ffbs.getWritten();
+        } orelse {
+            noteJidOverflow("roster push to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ user_local, user_domain, entry.resource(), full_buf.len });
+            continue;
+        };
 
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
             if (!target.roster_interested) continue;
             fanout.deliverToSession(target, full_xml, entry.local_session_id, changes);
         } else if (server.delivery_system) |ds| {
-            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, full_xml) catch {};
+            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, full_xml) catch |err| {
+                noteCrossWorkerDrop("roster push to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.local_session_id, @errorName(err) });
+            };
         }
     }
 }
 
 /// Write the MD5 hex hash of a bare JID for Gravatar URL construction.
 /// Gravatar uses MD5(lowercase(email)) — bare JIDs are already email-like.
-fn writeGravatarHash(writer: anytype, bare_jid: []const u8) void {
+fn writeGravatarHash(writer: anytype, bare_jid: []const u8) !void {
     var lower_buf: [router.BARE_JID_MAX]u8 = undefined;
     const len = @min(bare_jid.len, lower_buf.len);
     for (bare_jid[0..len], 0..) |c, i| {
@@ -2451,7 +2709,7 @@ fn writeGravatarHash(writer: anytype, bare_jid: []const u8) void {
     var digest: [16]u8 = undefined;
     std.crypto.hash.Md5.hash(lower_buf[0..len], &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    writer.writeAll(&hex) catch {};
+    try writer.writeAll(&hex);
 }
 
 // ============================================================================
@@ -2808,4 +3066,105 @@ test "F6: cross-worker MUC MAM forwards the prepared 'with'" {
     handleMucMamQuery(&server, session, room_local, "conference.localhost", "mamx", &changes);
     _ = ds.getQueue(1).drain({}, f6Drain);
     try std.testing.expectEqualStrings("naplestb@localhost", f6_with_seen[0..f6_with_len]);
+}
+
+test "R5: an unaddressable IQ error reply is counted, never a truncated stanza" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+
+    // A bound localpart wider than the 4 KiB scratch: the header cannot be
+    // written, so no reply can even be addressed. The drop must be counted
+    // (R5); a silently truncated stanza would leave bytes pending.
+    var big: [4096]u8 = undefined;
+    @memset(&big, 'b');
+    session.stream.bound_jid = .{ .local = &big, .domain = "localhost", .resource = "res" };
+
+    const drops_before = router.jid_overflow_drops.load(.monotonic);
+    sendIqErrorWithType(&server, session, "e1", "cancel", "internal-server-error");
+    try std.testing.expectEqual(drops_before + 1, router.jid_overflow_drops.load(.monotonic));
+    try std.testing.expect(!session.conn.hasPendingWrite());
+}
+
+test "R5: a roster push to a full remote queue is counted" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var sm = session_map_mod.SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+    var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    server.worker_id = 0;
+
+    _ = try sm.bind(1, 7, "bob", "localhost", "mobile");
+
+    const queue = delivery_sys.getQueue(1);
+    for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(1, 1, "fill");
+
+    const drops_before = delivery_queue.cross_worker_drops.load(.monotonic);
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    pushRosterItem(&server, "bob", "localhost", "carol@example.com", "Carol", .both, false, &changes);
+    try std.testing.expectEqual(drops_before + 1, delivery_queue.cross_worker_drops.load(.monotonic));
+}
+
+test "R5: an unbuildable PEP self-notification is counted, never silent" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(path);
+    var db = try server_mod.OpBackendType.open(path, .{});
+    defer db.close();
+    var roster = GenericRosterStore.init(&db);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.roster = &roster;
+    server.worker_id = 0;
+    var sm = session_map_mod.SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+    var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+
+    // The publisher's other resource lives on worker 1; the cross-worker
+    // build is what overflows.
+    _ = try sm.bind(1, 7, "alice", "localhost", "desk");
+    sm.setPresenceAvailable("alice", "localhost", "desk", true);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    defer allocator.destroy(session);
+    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+
+    // A publisher JID wider than the 20 KiB bank: every per-resource
+    // notification is unbuildable and the skip must be counted (R5).
+    var big: [Server.BYTE_BANK_SIZE]u8 = undefined;
+    @memset(&big, 'p');
+
+    const drops_before = router.jid_overflow_drops.load(.monotonic);
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+    sendPepNotification(&server, session, &big, "urn:xmpp:microblog:0", "i1", "<entry/>", &changes);
+    try std.testing.expectEqual(drops_before + 1, router.jid_overflow_drops.load(.monotonic));
 }

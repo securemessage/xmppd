@@ -55,6 +55,22 @@ noinline fn noteCrossWorkerDrop(comptime fmt: []const u8, args: anytype) void {
     log.warn(fmt, args);
 }
 
+/// Queue a built stanza to a session. A refused send lands on the cold
+/// path: it is logged, and a full write buffer flags the session for
+/// overflow teardown (R1), the same classification dispatchStanza uses.
+fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
+    session.queueSendStanza(stanza) catch |err| {
+        noteQueueDrop(session, err, what);
+    };
+}
+
+/// Classify and log one refused queueSendStanza on the cold path (R5).
+noinline fn noteQueueDrop(session: *Session, err: anyerror, comptime what: []const u8) void {
+    @branchHint(.cold);
+    if (err == error.WriteBufferFull) session.sm_overflow = true;
+    log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
+}
+
 pub const BARE_JID_MAX = jid_bounds.BARE_JID_MAX;
 pub const FULL_JID_MAX = jid_bounds.FULL_JID_MAX;
 pub const JID_STANZA_MAX = jid_bounds.JID_STANZA_MAX;
@@ -350,7 +366,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     const archive_stanza_id: []const u8 = if (is_archivable) server.generateStanzaId(&sid_buf) else "";
 
     // Build augmented inner_xml with stanza-id appended (for delivery to recipients)
-    var aug_lease = server.leaseByteScratch() orelse return;
+    var aug_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; stanza for {s} dropped before routing", .{to_str});
+        return;
+    };
     defer aug_lease.release();
     var aug_fbs = std.io.fixedBufferStream(aug_lease.buf);
     const delivery_inner_xml: []const u8 = if (archive_stanza_id.len > 0) blk: {
@@ -422,7 +441,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // and consumed (copied by the writer queue, or stored) before the
     // delivery form is built below, and the offline-store branch returns
     // before the delivery loop runs, so the lifetimes never overlap.
-    var out_lease = server.leaseByteScratch() orelse return;
+    var out_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; stanza for {s} dropped after routing", .{to_str});
+        return;
+    };
     defer out_lease.release();
     const out_buf = out_lease.buf;
 
@@ -812,41 +834,50 @@ pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to
         .none => return,
     };
 
-    var stanza_lease = server.leaseByteScratch() orelse return;
+    var stanza_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; S2S stanza for {s} dropped", .{to_str});
+        return;
+    };
     defer stanza_lease.release();
     var stanza_fbs = std.io.fixedBufferStream(stanza_lease.buf);
     const sw = stanza_fbs.writer();
 
-    sw.writeByte('<') catch return;
-    sw.writeAll(tag_name) catch return;
-    sw.writeAll(" from='") catch return;
-    xml.escapeWrite(sw, from_str) catch return;
-    sw.writeAll("' to='") catch return;
-    xml.escapeWrite(sw, to_str) catch return;
-    sw.writeByte('\'') catch return;
-    if (type_str.len > 0) {
-        if (!(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
-            sw.writeAll(" type='") catch return;
-            xml.escapeWrite(sw, type_str) catch return;
-            sw.writeByte('\'') catch return;
+    // The stanza embeds both endpoint JIDs; when it does not fit the scratch
+    // bank nothing can be forwarded, so the drop is only counted (R5).
+    const stanza_xml = stanza: {
+        sw.writeByte('<') catch break :stanza null;
+        sw.writeAll(tag_name) catch break :stanza null;
+        sw.writeAll(" from='") catch break :stanza null;
+        xml.escapeWrite(sw, from_str) catch break :stanza null;
+        sw.writeAll("' to='") catch break :stanza null;
+        xml.escapeWrite(sw, to_str) catch break :stanza null;
+        sw.writeByte('\'') catch break :stanza null;
+        if (type_str.len > 0) {
+            if (!(session.stanza_kind == .message and std.mem.eql(u8, type_str, "normal"))) {
+                sw.writeAll(" type='") catch break :stanza null;
+                xml.escapeWrite(sw, type_str) catch break :stanza null;
+                sw.writeByte('\'') catch break :stanza null;
+            }
         }
-    }
-    if (id_str.len > 0) {
-        sw.writeAll(" id='") catch return;
-        xml.escapeWrite(sw, id_str) catch return;
-        sw.writeByte('\'') catch return;
-    }
-    if (inner_xml.len == 0) {
-        sw.writeAll("/>") catch return;
-    } else {
-        sw.writeByte('>') catch return;
-        sw.writeAll(inner_xml) catch return;
-        sw.writeAll("</") catch return;
-        sw.writeAll(tag_name) catch return;
-        sw.writeByte('>') catch return;
-    }
-
-    const stanza_xml = stanza_fbs.getWritten();
+        if (id_str.len > 0) {
+            sw.writeAll(" id='") catch break :stanza null;
+            xml.escapeWrite(sw, id_str) catch break :stanza null;
+            sw.writeByte('\'') catch break :stanza null;
+        }
+        if (inner_xml.len == 0) {
+            sw.writeAll("/>") catch break :stanza null;
+        } else {
+            sw.writeByte('>') catch break :stanza null;
+            sw.writeAll(inner_xml) catch break :stanza null;
+            sw.writeAll("</") catch break :stanza null;
+            sw.writeAll(tag_name) catch break :stanza null;
+            sw.writeByte('>') catch break :stanza null;
+        }
+        break :stanza stanza_fbs.getWritten();
+    } orelse {
+        noteJidOverflow("S2S stanza for {s} exceeds {d} bytes; not forwarded", .{ to_str, stanza_lease.buf.len });
+        return;
+    };
 
     server.s2s_ipc.send(.{ .s2s_deliver = .{
         .from_jid = from_str,
@@ -948,7 +979,10 @@ fn sendCarbons(
     // Reuse one serialization buffer across resources: each carbon is fully
     // consumed by queueSend or the MPSC delivery before the next iteration.
     // The pool lease keeps per-recipient serialization storage off the stack.
-    var carbon_lease = server.leaseByteScratch() orelse return;
+    var carbon_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; {s} carbons for {s}@{s} skipped", .{ carbon_type, user_local, user_domain });
+        return;
+    };
     defer carbon_lease.release();
     const cbuf = carbon_lease.buf;
 
@@ -974,105 +1008,118 @@ fn sendCarbons(
             var cfbs = std.io.fixedBufferStream(cbuf);
             const cw = cfbs.writer();
 
-            cw.writeAll("<message from='") catch continue;
-            xml.escapeWrite(cw, user_local) catch continue;
-            cw.writeByte('@') catch continue;
-            xml.escapeWrite(cw, user_domain) catch continue;
-            cw.writeAll("' to='") catch continue;
-            xml.escapeWrite(cw, user_local) catch continue;
-            cw.writeByte('@') catch continue;
-            xml.escapeWrite(cw, user_domain) catch continue;
-            cw.writeByte('/') catch continue;
-            xml.escapeWrite(cw, entry.resource()) catch continue;
-            cw.writeAll("' type='chat'>") catch continue;
+            const carbon_data = stanza: {
+                cw.writeAll("<message from='") catch break :stanza null;
+                xml.escapeWrite(cw, user_local) catch break :stanza null;
+                cw.writeByte('@') catch break :stanza null;
+                xml.escapeWrite(cw, user_domain) catch break :stanza null;
+                cw.writeAll("' to='") catch break :stanza null;
+                xml.escapeWrite(cw, user_local) catch break :stanza null;
+                cw.writeByte('@') catch break :stanza null;
+                xml.escapeWrite(cw, user_domain) catch break :stanza null;
+                cw.writeByte('/') catch break :stanza null;
+                xml.escapeWrite(cw, entry.resource()) catch break :stanza null;
+                cw.writeAll("' type='chat'>") catch break :stanza null;
 
-            cw.writeByte('<') catch continue;
-            cw.writeAll(carbon_type) catch continue;
-            cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch continue;
+                cw.writeByte('<') catch break :stanza null;
+                cw.writeAll(carbon_type) catch break :stanza null;
+                cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch break :stanza null;
 
-            cw.writeAll("<message from='") catch continue;
-            xml.escapeWrite(cw, from_str) catch continue;
-            cw.writeAll("' to='") catch continue;
-            xml.escapeWrite(cw, to_str) catch continue;
-            cw.writeByte('\'') catch continue;
-            if (type_str.len > 0) {
-                cw.writeAll(" type='") catch continue;
-                xml.escapeWrite(cw, type_str) catch continue;
-                cw.writeByte('\'') catch continue;
-            }
-            if (id_str.len > 0) {
-                cw.writeAll(" id='") catch continue;
-                xml.escapeWrite(cw, id_str) catch continue;
-                cw.writeByte('\'') catch continue;
-            }
-            if (delivery_inner_xml.len == 0) {
-                cw.writeAll("/>") catch continue;
-            } else {
-                cw.writeByte('>') catch continue;
-                cw.writeAll(delivery_inner_xml) catch continue;
-                cw.writeAll("</message>") catch continue;
-            }
+                cw.writeAll("<message from='") catch break :stanza null;
+                xml.escapeWrite(cw, from_str) catch break :stanza null;
+                cw.writeAll("' to='") catch break :stanza null;
+                xml.escapeWrite(cw, to_str) catch break :stanza null;
+                cw.writeByte('\'') catch break :stanza null;
+                if (type_str.len > 0) {
+                    cw.writeAll(" type='") catch break :stanza null;
+                    xml.escapeWrite(cw, type_str) catch break :stanza null;
+                    cw.writeByte('\'') catch break :stanza null;
+                }
+                if (id_str.len > 0) {
+                    cw.writeAll(" id='") catch break :stanza null;
+                    xml.escapeWrite(cw, id_str) catch break :stanza null;
+                    cw.writeByte('\'') catch break :stanza null;
+                }
+                if (delivery_inner_xml.len == 0) {
+                    cw.writeAll("/>") catch break :stanza null;
+                } else {
+                    cw.writeByte('>') catch break :stanza null;
+                    cw.writeAll(delivery_inner_xml) catch break :stanza null;
+                    cw.writeAll("</message>") catch break :stanza null;
+                }
 
-            cw.writeAll("</forwarded></") catch continue;
-            cw.writeAll(carbon_type) catch continue;
-            cw.writeAll("></message>") catch continue;
-
-            const carbon_data = cfbs.getWritten();
+                cw.writeAll("</forwarded></") catch break :stanza null;
+                cw.writeAll(carbon_type) catch break :stanza null;
+                cw.writeAll("></message>") catch break :stanza null;
+                break :stanza cfbs.getWritten();
+            } orelse {
+                noteDrop("{s} carbon for session {d} exceeds {d} bytes; skipped", .{ carbon_type, entry.local_session_id, cbuf.len });
+                continue;
+            };
             fanout.deliverToSession(target, carbon_data, entry.local_session_id, changes);
         } else {
             // T89: Cross-thread carbon delivery via MPSC
-            const ds = server.delivery_system orelse continue;
+            const ds = server.delivery_system orelse {
+                noteCrossWorkerDrop("{s} carbon for worker {d} session {d} not deliverable: no delivery system", .{ carbon_type, entry.worker_id, entry.local_session_id });
+                continue;
+            };
 
             var cfbs = std.io.fixedBufferStream(cbuf);
             const cw = cfbs.writer();
 
-            cw.writeAll("<message from='") catch continue;
-            xml.escapeWrite(cw, user_local) catch continue;
-            cw.writeByte('@') catch continue;
-            xml.escapeWrite(cw, user_domain) catch continue;
-            cw.writeAll("' to='") catch continue;
-            xml.escapeWrite(cw, user_local) catch continue;
-            cw.writeByte('@') catch continue;
-            xml.escapeWrite(cw, user_domain) catch continue;
-            cw.writeByte('/') catch continue;
-            xml.escapeWrite(cw, entry.resource()) catch continue;
-            cw.writeAll("' type='chat'>") catch continue;
+            const carbon_xml = stanza: {
+                cw.writeAll("<message from='") catch break :stanza null;
+                xml.escapeWrite(cw, user_local) catch break :stanza null;
+                cw.writeByte('@') catch break :stanza null;
+                xml.escapeWrite(cw, user_domain) catch break :stanza null;
+                cw.writeAll("' to='") catch break :stanza null;
+                xml.escapeWrite(cw, user_local) catch break :stanza null;
+                cw.writeByte('@') catch break :stanza null;
+                xml.escapeWrite(cw, user_domain) catch break :stanza null;
+                cw.writeByte('/') catch break :stanza null;
+                xml.escapeWrite(cw, entry.resource()) catch break :stanza null;
+                cw.writeAll("' type='chat'>") catch break :stanza null;
 
-            cw.writeByte('<') catch continue;
-            cw.writeAll(carbon_type) catch continue;
-            cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch continue;
+                cw.writeByte('<') catch break :stanza null;
+                cw.writeAll(carbon_type) catch break :stanza null;
+                cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch break :stanza null;
 
-            cw.writeAll("<message from='") catch continue;
-            xml.escapeWrite(cw, from_str) catch continue;
-            cw.writeAll("' to='") catch continue;
-            xml.escapeWrite(cw, to_str) catch continue;
-            cw.writeByte('\'') catch continue;
-            if (type_str.len > 0) {
-                cw.writeAll(" type='") catch continue;
-                xml.escapeWrite(cw, type_str) catch continue;
-                cw.writeByte('\'') catch continue;
-            }
-            if (id_str.len > 0) {
-                cw.writeAll(" id='") catch continue;
-                xml.escapeWrite(cw, id_str) catch continue;
-                cw.writeByte('\'') catch continue;
-            }
-            if (delivery_inner_xml.len == 0) {
-                cw.writeAll("/>") catch continue;
-            } else {
-                cw.writeByte('>') catch continue;
-                cw.writeAll(delivery_inner_xml) catch continue;
-                cw.writeAll("</message>") catch continue;
-            }
+                cw.writeAll("<message from='") catch break :stanza null;
+                xml.escapeWrite(cw, from_str) catch break :stanza null;
+                cw.writeAll("' to='") catch break :stanza null;
+                xml.escapeWrite(cw, to_str) catch break :stanza null;
+                cw.writeByte('\'') catch break :stanza null;
+                if (type_str.len > 0) {
+                    cw.writeAll(" type='") catch break :stanza null;
+                    xml.escapeWrite(cw, type_str) catch break :stanza null;
+                    cw.writeByte('\'') catch break :stanza null;
+                }
+                if (id_str.len > 0) {
+                    cw.writeAll(" id='") catch break :stanza null;
+                    xml.escapeWrite(cw, id_str) catch break :stanza null;
+                    cw.writeByte('\'') catch break :stanza null;
+                }
+                if (delivery_inner_xml.len == 0) {
+                    cw.writeAll("/>") catch break :stanza null;
+                } else {
+                    cw.writeByte('>') catch break :stanza null;
+                    cw.writeAll(delivery_inner_xml) catch break :stanza null;
+                    cw.writeAll("</message>") catch break :stanza null;
+                }
 
-            cw.writeAll("</forwarded></") catch continue;
-            cw.writeAll(carbon_type) catch continue;
-            cw.writeAll("></message>") catch continue;
+                cw.writeAll("</forwarded></") catch break :stanza null;
+                cw.writeAll(carbon_type) catch break :stanza null;
+                cw.writeAll("></message>") catch break :stanza null;
+                break :stanza cfbs.getWritten();
+            } orelse {
+                noteCrossWorkerDrop("{s} carbon for worker {d} session {d} exceeds {d} bytes; skipped", .{ carbon_type, entry.worker_id, entry.local_session_id, cbuf.len });
+                continue;
+            };
 
             // The slot carries the carbon class so the receiving worker can
             // apply carbons_enabled and the live-only rules; this worker
             // cannot see them on the remote Session.
-            ds.deliverDelivery(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten(), 0, 0, .carbon) catch |err| {
+            ds.deliverDelivery(entry.worker_id, entry.local_session_id, entry.generation, carbon_xml, 0, 0, .carbon) catch |err| {
                 noteCrossWorkerDrop("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
             };
         }
@@ -1091,23 +1138,29 @@ pub fn sendNotAuthorized(session: *Session, id_str: []const u8, to_str: []const 
 
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
-    w.writeByte('<') catch return;
-    w.writeAll(tag_name) catch return;
-    w.writeAll(" type='error'") catch return;
-    if (id_str.len > 0) {
-        w.writeAll(" id='") catch return;
-        xml.escapeWrite(w, id_str) catch return;
-        w.writeByte('\'') catch return;
-    }
-    if (to_str.len > 0) {
-        w.writeAll(" from='") catch return;
-        xml.escapeWrite(w, to_str) catch return;
-        w.writeByte('\'') catch return;
-    }
-    w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
-    w.writeAll(tag_name) catch return;
-    w.writeByte('>') catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    const err_xml = stanza: {
+        w.writeByte('<') catch break :stanza null;
+        w.writeAll(tag_name) catch break :stanza null;
+        w.writeAll(" type='error'") catch break :stanza null;
+        if (id_str.len > 0) {
+            w.writeAll(" id='") catch break :stanza null;
+            xml.escapeWrite(w, id_str) catch break :stanza null;
+            w.writeByte('\'') catch break :stanza null;
+        }
+        if (to_str.len > 0) {
+            w.writeAll(" from='") catch break :stanza null;
+            xml.escapeWrite(w, to_str) catch break :stanza null;
+            w.writeByte('\'') catch break :stanza null;
+        }
+        w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch break :stanza null;
+        w.writeAll(tag_name) catch break :stanza null;
+        w.writeByte('>') catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("not-authorized error for '{s}' exceeds {d} bytes; not sent", .{ to_str, session.write_scratch.len });
+        return;
+    };
+    queueStanzaOrDrop(session, err_xml, "not-authorized error");
 }
 
 /// Send a service-unavailable error for a stanza that can't be delivered.
@@ -1120,7 +1173,7 @@ pub fn sendServiceUnavailable(session: *Session, id_str: []const u8, to_str: []c
     };
 
     if (writeServiceUnavailable(&session.write_scratch, tag_name, id_str, to_str, from_str, true)) |bounce| {
-        session.queueSendStanza(bounce) catch return;
+        queueStanzaOrDrop(session, bounce, "service-unavailable error");
         return;
     }
     // Both JIDs escape wider than the scratch buffer. Echoing them is optional
@@ -1128,8 +1181,12 @@ pub fn sendServiceUnavailable(session: *Session, id_str: []const u8, to_str: []c
     // sender's own connection, which already knows who it is and who it wrote
     // to. Omitted, not truncated, so the result is still a valid stanza.
     if (writeServiceUnavailable(&session.write_scratch, tag_name, id_str, to_str, from_str, false)) |bounce| {
-        session.queueSendStanza(bounce) catch return;
+        queueStanzaOrDrop(session, bounce, "service-unavailable error");
+        return;
     }
+    // Even the JID-free form does not fit: the error can never reach the
+    // sender, so the drop is only counted (R5).
+    noteJidOverflow("service-unavailable error for '{s}' exceeds {d} bytes; not sent", .{ to_str, session.write_scratch.len });
 }
 
 fn writeServiceUnavailable(

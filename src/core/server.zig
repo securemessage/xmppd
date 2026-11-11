@@ -104,6 +104,29 @@ noinline fn noteDrop(comptime fmt: []const u8, args: anytype) void {
     log.warn(fmt, args);
 }
 
+/// Record one over-long-JID skip on the cold path (S4).
+noinline fn noteJidOverflow(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    router.countJidOverflow();
+    log.warn(fmt, args);
+}
+
+/// Queue a built stanza to a session. A refused send lands on the cold
+/// path: it is logged, and a full write buffer flags the session for
+/// overflow teardown (R1), the same classification dispatchStanza uses.
+fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
+    session.queueSendStanza(stanza) catch |err| {
+        noteQueueDrop(session, err, what);
+    };
+}
+
+/// Classify and log one refused queueSendStanza on the cold path (R5).
+noinline fn noteQueueDrop(session: *Session, err: anyerror, comptime what: []const u8) void {
+    @branchHint(.cold);
+    if (err == error.WriteBufferFull) session.sm_overflow = true;
+    log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
+}
+
 /// Per-thread scratch for the pre-bind account compare's localpart
 /// preparation; the prepared name is copied into acc_buf before use.
 threadlocal var prebind_precis_scratch: precis.Scratch = undefined;
@@ -1944,23 +1967,29 @@ pub const Server = struct {
         const tag_name: []const u8 = if (std.mem.eql(u8, elem.local_name, "iq")) "iq" else "message";
         var fbs = std.io.fixedBufferStream(&session.write_scratch);
         const w = fbs.writer();
-        w.writeByte('<') catch return;
-        w.writeAll(tag_name) catch return;
-        w.writeAll(" type='error'") catch return;
-        if (to_attr.len > 0) {
-            w.writeAll(" from='") catch return;
-            xml.escapeWrite(w, to_attr) catch return;
-            w.writeByte('\'') catch return;
-        }
-        if (id_attr.len > 0) {
-            w.writeAll(" id='") catch return;
-            xml.escapeWrite(w, id_attr) catch return;
-            w.writeByte('\'') catch return;
-        }
-        w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch return;
-        w.writeAll(tag_name) catch return;
-        w.writeByte('>') catch return;
-        session.queueSendStanza(fbs.getWritten()) catch return;
+        const reply_xml = stanza: {
+            w.writeByte('<') catch break :stanza null;
+            w.writeAll(tag_name) catch break :stanza null;
+            w.writeAll(" type='error'") catch break :stanza null;
+            if (to_attr.len > 0) {
+                w.writeAll(" from='") catch break :stanza null;
+                xml.escapeWrite(w, to_attr) catch break :stanza null;
+                w.writeByte('\'') catch break :stanza null;
+            }
+            if (id_attr.len > 0) {
+                w.writeAll(" id='") catch break :stanza null;
+                xml.escapeWrite(w, id_attr) catch break :stanza null;
+                w.writeByte('\'') catch break :stanza null;
+            }
+            w.writeAll("><error type='auth'><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></") catch break :stanza null;
+            w.writeAll(tag_name) catch break :stanza null;
+            w.writeByte('>') catch break :stanza null;
+            break :stanza fbs.getWritten();
+        } orelse {
+            noteJidOverflow("pre-bind stanza error to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+            return;
+        };
+        queueStanzaOrDrop(session, reply_xml, "pre-bind stanza error");
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
@@ -2037,20 +2066,30 @@ pub const Server = struct {
             const jid = session.stream.bound_jid orelse session.stream.authenticated_jid orelse return;
             var fbs = std.io.fixedBufferStream(&full_buf);
             const w = fbs.writer();
-            w.writeAll(jid.local) catch return;
-            w.writeByte('@') catch return;
-            w.writeAll(jid.domain) catch return;
-            if (jid.resource.len > 0) {
-                w.writeByte('/') catch return;
-                w.writeAll(jid.resource) catch return;
+            const built = stanza: {
+                w.writeAll(jid.local) catch break :stanza false;
+                w.writeByte('@') catch break :stanza false;
+                w.writeAll(jid.domain) catch break :stanza false;
+                if (jid.resource.len > 0) {
+                    w.writeByte('/') catch break :stanza false;
+                    w.writeAll(jid.resource) catch break :stanza false;
+                }
+                break :stanza true;
+            };
+            if (!built) {
+                noteJidOverflow("jid-malformed reply target for connection {d} exceeds {d} bytes; not sent", .{ session.conn.id, router.FULL_JID_MAX });
+                return;
             }
             reply_to = fbs.getWritten();
         }
         const stanza = writeJidMalformedReply(&session.write_scratch, elem.local_name, to_attr, reply_to, id_attr) orelse
             // An offending JID that escapes wider than the buffer still gets
             // its answer; the 'from' echo is optional.
-            writeJidMalformedReply(&session.write_scratch, elem.local_name, "", reply_to, id_attr) orelse return;
-        session.queueSendStanza(stanza) catch return;
+            writeJidMalformedReply(&session.write_scratch, elem.local_name, "", reply_to, id_attr) orelse {
+            noteJidOverflow("jid-malformed reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+            return;
+        };
+        queueStanzaOrDrop(session, stanza, "jid-malformed reply");
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
@@ -2911,10 +2950,19 @@ pub const Server = struct {
                 // Base64-encode the challenge and send as <challenge>
                 var fbs = std.io.fixedBufferStream(&session.write_scratch);
                 const w = fbs.writer();
-                w.writeAll("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch return;
-                b64EncodeWrite(w, m.challenge) catch return;
-                w.writeAll("</challenge>") catch return;
-                session.conn.queueSend(fbs.getWritten()) catch return;
+                const challenge_xml = stanza: {
+                    w.writeAll("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch break :stanza null;
+                    b64EncodeWrite(w, m.challenge) catch break :stanza null;
+                    w.writeAll("</challenge>") catch break :stanza null;
+                    break :stanza fbs.getWritten();
+                } orelse {
+                    noteDrop("SASL challenge to connection {d} exceeds {d} bytes; dropped", .{ conn_id, session.write_scratch.len });
+                    return;
+                };
+                session.conn.queueSend(challenge_xml) catch |err| {
+                    noteQueueDrop(session, err, "SASL challenge");
+                    return;
+                };
                 session.auth_state = .none;
 
                 if (session.conn.hasPendingWrite()) {
@@ -2959,10 +3007,19 @@ pub const Server = struct {
                             var vc_buf: [1024]u8 = undefined;
                             var vc_fbs = std.io.fixedBufferStream(&vc_buf);
                             const vw = vc_fbs.writer();
-                            vw.writeAll("<vCard xmlns='vcard-temp'><PHOTO><EXTVAL>") catch {};
-                            xml.escapeWrite(vw, m.photo_url) catch {};
-                            vw.writeAll("</EXTVAL></PHOTO></vCard>") catch {};
-                            vcard.set(bare_jid, vc_fbs.getWritten()) catch {};
+                            const vcard_xml = stanza: {
+                                vw.writeAll("<vCard xmlns='vcard-temp'><PHOTO><EXTVAL>") catch break :stanza null;
+                                xml.escapeWrite(vw, m.photo_url) catch break :stanza null;
+                                vw.writeAll("</EXTVAL></PHOTO></vCard>") catch break :stanza null;
+                                break :stanza vc_fbs.getWritten();
+                            } orelse {
+                                noteDrop("OIDC photo vCard for '{s}' exceeds {d} bytes; import skipped", .{ stable_username, vc_buf.len });
+                                break :vcard_import;
+                            };
+                            vcard.set(bare_jid, vcard_xml) catch |err| {
+                                noteDrop("OIDC photo vCard for '{s}' could not be stored: {s}", .{ stable_username, @errorName(err) });
+                                break :vcard_import;
+                            };
                             log.info("OIDC photo imported for '{s}'", .{stable_username});
                         }
                     }
@@ -3005,16 +3062,25 @@ pub const Server = struct {
 
                 var fbs = std.io.fixedBufferStream(&session.write_scratch);
                 const w = fbs.writer();
-                if (m.success) {
-                    iq_handler.writeIqHeader(self, w, session, "result", iq_id);
-                    w.writeAll("/>") catch return;
-                } else {
-                    iq_handler.writeIqHeader(self, w, session, "error", iq_id);
-                    w.writeAll("><error type='cancel'><") catch return;
-                    w.writeAll(m.reason) catch return;
-                    w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
-                }
-                session.conn.queueSend(fbs.getWritten()) catch return;
+                const reply_xml = stanza: {
+                    if (m.success) {
+                        iq_handler.writeIqHeader(self, w, session, "result", iq_id) catch break :stanza null;
+                        w.writeAll("/>") catch break :stanza null;
+                    } else {
+                        iq_handler.writeIqHeader(self, w, session, "error", iq_id) catch break :stanza null;
+                        w.writeAll("><error type='cancel'><") catch break :stanza null;
+                        w.writeAll(m.reason) catch break :stanza null;
+                        w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch break :stanza null;
+                    }
+                    break :stanza fbs.getWritten();
+                } orelse {
+                    noteJidOverflow("register result to connection {d} exceeds {d} bytes; dropped", .{ conn_id, session.write_scratch.len });
+                    return;
+                };
+                session.conn.queueSend(reply_xml) catch |err| {
+                    noteQueueDrop(session, err, "register result");
+                    return;
+                };
 
                 if (session.conn.hasPendingWrite()) {
                     changes.addWrite(session.conn.fd, conn_id) catch {};
@@ -3026,16 +3092,22 @@ pub const Server = struct {
 
                 var fbs = std.io.fixedBufferStream(&session.write_scratch);
                 const w = fbs.writer();
-                if (m.success) {
-                    iq_handler.writeIqHeader(self, w, session, "result", iq_id);
-                    w.writeAll("/>") catch return;
-                } else {
-                    iq_handler.writeIqHeader(self, w, session, "error", iq_id);
-                    w.writeAll("><error type='modify'><") catch return;
-                    w.writeAll(m.reason) catch return;
-                    w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
-                }
-                session.queueSendStanza(fbs.getWritten()) catch return;
+                const reply_xml = stanza: {
+                    if (m.success) {
+                        iq_handler.writeIqHeader(self, w, session, "result", iq_id) catch break :stanza null;
+                        w.writeAll("/>") catch break :stanza null;
+                    } else {
+                        iq_handler.writeIqHeader(self, w, session, "error", iq_id) catch break :stanza null;
+                        w.writeAll("><error type='modify'><") catch break :stanza null;
+                        w.writeAll(m.reason) catch break :stanza null;
+                        w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch break :stanza null;
+                    }
+                    break :stanza fbs.getWritten();
+                } orelse {
+                    noteJidOverflow("password-change result to connection {d} exceeds {d} bytes; dropped", .{ conn_id, session.write_scratch.len });
+                    return;
+                };
+                queueStanzaOrDrop(session, reply_xml, "password-change result");
 
                 if (session.conn.hasPendingWrite()) {
                     changes.addWrite(session.conn.fd, conn_id) catch {};
@@ -3056,9 +3128,15 @@ pub const Server = struct {
                     // Send IQ result then close the stream
                     var fbs = std.io.fixedBufferStream(&session.write_scratch);
                     const w = fbs.writer();
-                    iq_handler.writeIqHeader(self, w, session, "result", iq_id);
-                    w.writeAll("/>") catch return;
-                    session.queueSendStanza(fbs.getWritten()) catch return;
+                    const reply_xml = stanza: {
+                        iq_handler.writeIqHeader(self, w, session, "result", iq_id) catch break :stanza null;
+                        w.writeAll("/>") catch break :stanza null;
+                        break :stanza fbs.getWritten();
+                    } orelse {
+                        noteJidOverflow("account-delete result to connection {d} exceeds {d} bytes; dropped", .{ conn_id, session.write_scratch.len });
+                        return;
+                    };
+                    queueStanzaOrDrop(session, reply_xml, "account-delete result");
 
                     // Close the stream per XEP-0077 §3.2
                     session.conn.queueSend("</stream:stream>") catch {};
@@ -3069,11 +3147,17 @@ pub const Server = struct {
                 } else {
                     var fbs = std.io.fixedBufferStream(&session.write_scratch);
                     const w = fbs.writer();
-                    iq_handler.writeIqHeader(self, w, session, "error", iq_id);
-                    w.writeAll("><error type='cancel'><") catch return;
-                    w.writeAll(m.reason) catch return;
-                    w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch return;
-                    session.queueSendStanza(fbs.getWritten()) catch return;
+                    const reply_xml = stanza: {
+                        iq_handler.writeIqHeader(self, w, session, "error", iq_id) catch break :stanza null;
+                        w.writeAll("><error type='cancel'><") catch break :stanza null;
+                        w.writeAll(m.reason) catch break :stanza null;
+                        w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch break :stanza null;
+                        break :stanza fbs.getWritten();
+                    } orelse {
+                        noteJidOverflow("account-delete error to connection {d} exceeds {d} bytes; dropped", .{ conn_id, session.write_scratch.len });
+                        return;
+                    };
+                    queueStanzaOrDrop(session, reply_xml, "account-delete error");
 
                     if (session.conn.hasPendingWrite()) {
                         changes.addWrite(session.conn.fd, conn_id) catch {};
