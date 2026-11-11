@@ -14,7 +14,7 @@
 
 const std = @import("std");
 
-pub const NAMESPACE = "lastact";
+pub const NAMESPACE = backend_mod.registered("lastact");
 
 /// Record (or refresh) when `bare_jid`'s last resource went offline.
 pub fn record(backend: anytype, bare_jid: []const u8, ts: u64) !void {

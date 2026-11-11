@@ -149,6 +149,17 @@ is still done first so the fix ships even if that ADR is rejected.
 | S22 | stall, high | **Auth loop drops kqueue registrations.** 16-entry changelist, one `addWriteOnce` per reply, `catch {}`. With several worker lanes at overload, replies strand until unrelated activity; prime suspect for the T242 login knee [S]. The OIDC loop already hit this once (`oidc_main.zig:272-273`). | `auth/main.zig:291, 423-424` [V] | Per-lane dirty flag; flush once per iteration; buffer `2*MAX_IPC_CLIENTS+8`; never swallow `ChangeListFull`. Re-measure (M5). |
 | S23 | kTLS rule, high | **TLS write retry length can grow.** After WANT_WRITE, `queueSend` keeps appending at `write_end` and `flushSend` retries with `write_buf[write_start..write_end]`: same pointer, longer length. `compactWriteBuf` only pins the pointer. Violates the AGENTS.md identical pointer-and-length rule; core analog of T253. Same in s2s session/connector [S]. | `core/connection.zig:233-249, 271-291, 409-414` [V] | Track the pending TLS length and retry exactly that slice; new bytes go behind it. Structural: F3/C2 Outbox pin. |
 | S24 | data loss, high | **SM ack on a backwards `h` wipes the replay queue** (Phorge T217). `acked_count = h -% (base_seq -% 1)` wraps above `count` when a client reports a lower `h` than before (for example `<resume h='0'>` after `<a h='5'/>`), and `discardAll()` drops every unacked stanza. | `sm_state.zig:130-137` [V] | Track the last acked `h`; a backwards `h` never discards (log and ignore, or fail the stream with `undefined-condition`). Fix the `<a/>`, local resume and cross-worker resume call sites. Tests: push 10, ack 5, ack 0 keeps 5; u32 wrap. Structural: C11. |
+| S25 | crash, high | **xmppc `parseAll` compacts with a stale position after an inline TLS completion** (Phorge T412). The `start_tls` action calls `onRead` inline, the handshake completes and resets the reader and `read_len`, then `parseAll` slices `read_buf[pos..0]`: a panic in ReleaseSafe, memory corruption in unchecked builds. Crashes the v0.9.0 `xmppc-load`. | `lib/xmppc/session.zig:386-391, 1005` [V] | Stream-epoch check after each handler, return without compaction on reset; client-side read-ahead rule after `<proceed/>`; socketpair regression tests. |
+| S26 | correctness, medium | **XML incomplete-document close runs before the fd-limit check** (T-C3286C8C). Verdict pending. | [S] | Verify, then fix in the reader or accept path. |
+| S27 | correctness, medium | **A nested `<stream:stream>` inside an open stream is accepted** instead of failing the stream. | `lib/xml` reader, core and s2s stream handlers [S] | RFC 6120 stream error (`not-well-formed` or `invalid-xml`), then close; test that sends a second stream header mid-stream. |
+| S28 | crash, high | **xmppd-core aborts under an SM reconnect storm** (integer out of bounds in `Server.run`; M5 baseline cell S1, run 1, whole core died). Likely a staged kevent on fd -1 during resume/close churn [S]. | `event_loop.zig:213, 229`; `server.zig:410`; core dump on board `XMPPD/v091-perf-baseline` [V] | Reproduce with a Debug build, never stage fd < 0, fix the path, regression test. |
+| S29 | refactor, high | **DANE verification is duplicated and hand-rolled.** `lib/tls/tls.zig` (`validateDane`, `CertFingerprint`, `extractSpki`) and `src/s2s/dane.zig` carry two copies of TLSA matching and of a DER parser (T312). Other Zig projects carry more copies. | `lib/tls/tls.zig`; `src/s2s/dane.zig`; `s2s/main.zig` `performInboundDane`, `performOutboundDane` [V] | Replace both with the shared `dane` package (git.morante.net `pacyworld/dane-zig`, module `dane-openssl`): DANE during the handshake for xmppc and outbound s2s (TLSA lookup before the handshake), post-handshake verification for inbound s2s, SASL EXTERNAL gated on the verdict; delete both copies. Implementation is on `v091/openhands-p4-dane` (PR #49) and waits for the P5 window; publication and re-pin are R11. Plan: dane-zig `doc/IMPLEMENTATION_PLAN.md` phase P4. State and evidence: board `XMPPD/pr49-review1-20261107`. |
+| S30 | data loss, high | **Same-nick resource takeover orphans the room `jid_map`** (Phorge T413; production incident 2026-10-08, daniel@morante.dev/NaplesTB could not join, send, or see messages). `handleJoin` collapse overwrote the occupant's `real_jid_buf` in place; `jid_map` keys alias that buffer, so every `findByRealJid` missed from then on: takeover resource got no roster/history/subject, groupchat send bounced `not-acceptable` (sender lookup miss), and on disconnect `removeByRealJid` missed too, so the ghost occupant collapsed every later join. `sendSelfPresence` also hardcoded `affiliation='owner' role='moderator'`. | `muc_handler.zig:954-977`; `room_registry.zig:117-119 (keys alias inline buffers)` [V]; production log `info(muc): ... collapsed into existing occupant` repeated across rebinds [V] | FIXED on master (`270dda8`, deployed to production 2026-10-17): `Room.retargetOccupant` removes the old index key before overwriting the buffer, takeover resource gets the full join response minus the join broadcast, `sendSelfPresence` uses real role/affiliation. e2e `e2e-muc-nick-takeover.py` red 5/10 on old build, green 10/10 at workers=1/4; unit tests double-retarget. S1 hotfix must escape the `sendSelfPresence` attribute writes. T413 stays open until S31 explains the archive gap. |
+| S31 | data loss, high | **Archive writes fail silently** (Phorge T414). Production RocksDB archive has no MUC or 1:1 rows from 2026-06-24 to 2026-10-08 despite months of traffic; the LOG history shows zero table deletions and every WAL recovered in that window was empty, so nothing was written. `Server.archiveStore` swallows store errors (`catch {}`) and the archive queue `enqueue` returns void: no counter, no log line. | `server.zig` `archiveStore`; `archive_queue.zig` [V]; RocksDB `LOG`/`LOG.old.*` in the production jail [V] | Count and log every archive write failure (R5); find the cause by comparing the binaries deployed Jun 24 to Oct 8 with later ones (null archive store in core, column-family cache at open, queue missed wakeup V15); regression test that a groupchat and a 1:1 message reach the store and survive a restart. |
+| S32 | data loss, medium | **MAM `by_contact` index overwrites same-second messages from one contact** (Phorge T415). The key is `owner\0with\0timestamp_be(8)` with a timestamp in seconds, so a later message from the same contact in the same second replaces the index entry, and a `with`-filtered MAM query loses the earlier one. Primary rows survive (the key carries the stanza id). | `store/archive_store.zig` `buildContactKey`; `core/router.zig:304` [V] | With D3: unique ordered key (append the stanza id, or a per-owner sequence shared with the by_id index) plus `xmppctl reindex` migration; regression test with two same-second messages from one contact. Offline-row collisions are PR #9 G2, not this item. |
+| S33 | correctness, medium | **Disco and caps advertise `pubsub#subscribe` with no handler** (forge issue #22). `caps.SERVER_FEATURES` drives both disco#info and the XEP-0115 `ver`, and no code handles a pubsub `<subscribe/>`; PEP notifications come from presence subscriptions (XEP-0163 auto-subscribe). Clients that trust disco or caps send a subscribe that fails. Same family as T163/T164/T169. | `src/core/caps.zig:252`; `iq_handler.zig` pubsub dispatch [V] | Remove `pubsub#subscribe`; audit the other five pubsub claims; consistency test that every advertised `pubsub#*` feature has a dispatch branch. Lands after PR #9 (caps.zig overlap). |
+| S34 | interop, medium | **XEP-0220 conformance** (forge issue #23). (1) `type='error'` dialback verdicts are treated as `invalid`: auth fails and the connection closes, taking every other domain pair with it; XEP-0220 sections 2.1.1 and 2.5 make them non-fatal (queued stanzas bounce with `remote-server-timeout`, Step 3 answers `remote-server-not-found`, the `<error/>` child is parsed). (2) The stream feature `<db:features><db:dialback/>` is defined by no spec; the standard one is `<dialback xmlns='urn:xmpp:features:dialback'><errors/></dialback>` (section 2.4.2). | `src/s2s/main.zig` db:result and db:verify verdict handling; `src/s2s/session.zig:519` [V] | Part 2 (remove the non-standard feature, `buildFeatures` test) lands with S33 after PR #9. Part 1 lands with X1 and the post-PR #8 s2s teardown task, which build the per-stanza bounce it needs; advertise the standard feature only once part 1 works. |
+| S35 | interop, low | **Offline delivery omits XEP-0203 delay stamps** (forge issue #25). XEP-0160 section 2 RECOMMENDS a `<delay/>` on offline delivery; xmppd stamps only MUC history and MAM replay, so clients show queued messages at delivery time. The queue timestamp already sits in the offline pointer key. | `src/core/session_lifecycle.zig` offline delivery; `src/store/offline_store.zig` key schema [V] | Stamp from the pointer timestamp with the MUC history formatter, written in the same pass as the stanza; no duplicate of our own stamp, keep foreign stamps; every route PR #9 adds (cross-worker, SM resume). Lands after PR #9 (offline path rewrite). Flips README footnote 6 and the DOAP XEP-0203 status. |
 
 ### 3.2 First-pass P1s that stay in Phase 0
 
@@ -498,6 +509,51 @@ src/core/
 
 - **Cost.** L (mostly mechanical). **Recommendation: approve.**
 
+### ADR-13: DNS failure policy, retry and cache (operator decision 2026-10-26)
+
+Applies to every consumer of `lib/dns/async.zig` (xmppc today, outbound and
+inbound s2s after X1/X2).
+
+| TLSA result for a connect target | Verification |
+|---|---|
+| Records, a usable one matches | DANE |
+| Records, none match | Fail; no PKIX fallback (RFC 7671) |
+| Authenticated absence: NXDOMAIN or NODATA | PKIX (system CA + hostname) |
+| Lookup failed: SERVFAIL, REFUSED, timeout, or the chain deadline expired with TLSA pending | **Temporary failure of that target** (RFC 7672 section 2.2). Try the next SRV target; when none remain the resolve fails as temporary. Never PKIX. |
+
+- The resolver reports per target `tlsa_status = absent | present |
+  lookup_failed`; an empty record list never means "no TLSA" on its own.
+- **Retry (s2s, v0.9.1).** Today any outbound failure bounces every queued
+  stanza at once (`failOutboundInitiation`). A temporary failure instead keeps
+  the domain's pending queue and retries on lifecycle-timer deadlines with
+  backoff; stanzas bounce with `remote-server-timeout` only when the queue
+  lifetime ends. New stanzas for a domain in backoff join the queue and do not
+  start new attempts. Permanent failures (DANE mismatch, NXDOMAIN for every
+  SRV and A/AAAA) bounce at once with `remote-server-not-found`. Initial
+  values, constants in v0.9.1: retries at 5 s, 15 s, 45 s; queue lifetime
+  120 s; queue bounds from X1.
+- **Cache (v0.9.1).** The resolver cache (X2) serves s2s as well as xmppc:
+  positive and NXDOMAIN/NODATA entries, TTL honored with a ceiling, SERVFAIL
+  and timeouts never cached. Sized for federation (hash map, bounded entries
+  with LRU eviction, not a 64-entry linear FIFO).
+- **Serve-stale (RFC 8767, v0.9.1, approved 2026-10-26).** An expired entry is
+  used only after a refresh attempt fails: timeout, SERVFAIL, REFUSED or any
+  RCODE other than NOERROR/NXDOMAIN (section 4). NOERROR and NXDOMAIN always
+  replace the entry. Failed refreshes are retried no more often than every
+  30 s (section 5 failure recheck timer); a refresh still in flight when the
+  per-query timeout passes returns the stale answer and keeps resolving.
+  Maximum stale age 1 day (section 5 suggests 1 to 3 days). 0-TTL records are
+  never cached, so never served stale (section 7). A CNAME at an owner
+  evicts other cached types for that owner (section 7). Under memory pressure
+  stale entries are evicted before fresh ones (section 6). Stale answers of
+  every type are served, TLSA and negative answers included: each was a real
+  answer when received, and the TLS check (DANE or PKIX) still authenticates
+  the peer, so a stale address that now points elsewhere fails closed.
+  Stale serves are counted and logged per name.
+- **Later (v0.10.x or v0.12.x).** Operator-configurable case-4 policy;
+  remembered-DANE domains (fail closed for domains seen with TLSA, configurable
+  for unknown ones).
+
 ---
 
 ## 5. Work plan
@@ -632,8 +688,8 @@ recorded.
 
 | ID | Task | Depends | Size |
 |----|------|---------|------|
-| X1 | s2s on `lib/net` (Transport/Outbox/Loop, purge on close) and the stanza reader with raw forwarding; s2s IPC reconnect in core (T274); bounded pending queues with delivery-failed per stanza (T275, T277, T278, T331-T335); TLS handshakes and DANE checks on the F7 handshake pool with bounded concurrent outbound handshakes; probe emission paced through a continuation queue (T65) | F3, C5, F7 | L |
-| X2 | Shared async resolver (`lib/dns/async.zig`, lifted from `lib/xmppc/resolver.zig`, service parameter client/server) with a short-TTL per-domain cache; one DANE-EE, DANE-TA, PKIX policy for s2s; multiple SRV targets and connect deadlines (T276, T296, T312, T333) | F2 | M |
+| X1 | s2s on `lib/net` (Transport/Outbox/Loop, purge on close) and the stanza reader with raw forwarding; s2s IPC reconnect in core (T274); bounded pending queues with delivery-failed per stanza (T275, T277, T278, T331-T335); ADR-13 retry with backoff on temporary failures instead of bouncing at once; non-fatal XEP-0220 dialback errors and the standard dialback errors feature (S34 part 1); TLS handshakes and DANE checks on the F7 handshake pool with bounded concurrent outbound handshakes; probe emission paced through a continuation queue (T65) | F3, C5, F7 | L |
+| X2 | Shared async resolver (`lib/dns/async.zig`, lifted from `lib/xmppc/resolver.zig`, service parameter client/server) with a short-TTL per-domain cache sized for federation (ADR-13); per-target `tlsa_status` with lookup failure as a temporary target failure (ADR-13); s2s outbound and inbound moved off blocking `getaddrinfo` (IPv4 only today) and the blocking TLSA lookup onto it; asynchronous TLSA lookups feeding the S29 `dane` module before the outbound handshake and after the inbound stream header; multiple SRV targets and connect deadlines (T276, T296, T333) | F2 | M |
 | X3 | Master: readiness pipes per child (T282), loop-driven shutdown with SIGKILL escalation on a one-shot timer, SIGHUP to all children, pid files on respawn and identity-checked orphan kill (T259, T336, T337), shared `bindTcp` honoring `bind_address` and IPv6 (V16) | F2 | M |
 | X4 | All daemons on `lib/conf` (ADR-9), master first | F5 | M |
 
@@ -663,6 +719,13 @@ The 64-entry staged-change cap and its "do not block while changes remain"
 workaround (805e2d2) go away with the `lib/net` loop (T240). The resolver's
 1 s housekeeping tick (`engine.zig` `TICK_UDATA`) is replaced by timer-wheel
 deadlines in X2/WS8. First consumer of these APIs: continuum-xmpp-bridge.
+
+Consumers outside this repository (Kumiko Chat, continuum-xmpp-bridge, Sonya
+Core planned) depend on `lib/xmppc` as a module of this repository and should
+pin a commit, not track master, while WS8 is in progress. Extraction into its
+own package (`git subtree split` of `lib/xmppc` and the libraries it imports,
+consumed by url and hash, xmppd included) follows the v0.9.1 tag, once
+`lib/net`, `lib/dns/async`, the stanza reader and S29 have landed.
 
 ---
 
@@ -700,6 +763,8 @@ targets marked TBD are set from the M5 baseline before Phase 1 merges.
 | R8 | Docs: `ARCHITECTURE.md` rewritten (thread-per-core workers, actors, Outbox, envelope ring, storage service), `STORAGE_DESIGN.md` corrected, `CONFIGURATION.md` generated from the schema, `CHANGELOG.md` |
 | R9 | Port: poudriere ReleaseSafe build with the release allocator; package installs and runs in the xmppd jail |
 | R10 | Operator approval; then tag |
+| R11 | S29: the `dane` package is published (dane-zig phase P5) and xmppd depends on it by archive URL and hash; `net-im/xmppd` carries the matching `ZIG_TUPLE`. "Published" is the tag on git.morante.net, which is internal-only but serves anonymously to the port fetch; there is no public mirror |
+| R12 | S30/T413: the takeover fix (6085363) is pushed, `e2e-muc-nick-takeover.py` green in the w1/w4 lanes, and the corrupt production room state in `firstroom@conference.morante.dev` is cleared (service restart) |
 
 ---
 
@@ -758,7 +823,8 @@ These apply to every change in this plan and are checked in review.
 | C (core data path) | T301, T303, T304, T306 (C5); T305 (C6); T307, T319, T322 (C1); T313 (C2); T316 (C3); T317 (C11); T320, T321 (C8); T245 correlate (C4) |
 | D (storage) | T269, T270 (D4); T271 (D2); T315, T318 (C11 with ADR-7 allocator); T323 (D1 + M1 counters) |
 | A (auth) | T272, T308, T309, T327 (A5); T273 (A8); T280 (A3/A4); T281 (A3); T324, T325 (A9); T326 (A4); T328, T329, T330 (A2) |
-| X (s2s, master) | T274, T278, T331, T332, T333, T334, T335 (X1); T276, T312 (X2); T282, T336, T337 (X3) |
+| X (s2s, master) | T274, T278, T331, T332, T333, T334, T335 (X1); T276 (X2); T282, T336, T337 (X3) |
+| Phase 0 (S29) | T312 |
 | WS8 (xmppc gate) | T283-T300 except those listed above |
 
 Corrections to the first pass:
@@ -941,6 +1007,45 @@ SM, no carbons. Counts from code tracing [S]; frames [M].
 | Stack | 117,696 B frame probed per message [M] | <= 16 KiB |
 | **Total** | **~59 allocations, ~11 payload copies, ~340 per-byte calls** | **0-1 allocations, <= 3 copies** |
 
+### D.1 Measured baseline (M5, 2026-10-05)
+
+Server: d85dd37 (v0.9.0 code) ReleaseSafe on cores 0-7. Driver: xmppc-load
+from v091/devin-m2 (M2 scenarios, S25 fix) on cores 8-18, 8 engines,
+userland TLS. ECDSA P-256, `rate_limit = false`, fresh rig per run, 3 runs
+per cell, medians. Raw data, scripts and the S28 core dump: board
+`XMPPD/v091-perf-baseline`.
+
+| Cell | Result (median of 3) |
+|------|----------------------|
+| L1 w1, 5000 logins, one account, burst 2000/s | 794 logins/s, stall 24 ms, core RSS 580 MB |
+| L2 w4, same | 2121 logins/s, stall 48 ms, RSS 528 MB |
+| L3 w4, 2000 distinct accounts, burst | 195 logins/s, stall 170 ms (one PBKDF2 derive per login) |
+| L4 w4, 10000 sessions at 500/s, 5000 msg/s | 0 lost, p50 0.96 ms, p99 2.0 ms, RSS 1098 MB (~110 KB/session) |
+| C1 w4, 1000 accounts, peer chat 20000 msg/s | 0 lost, p50 2.3 ms, p99 148 ms, max 755 ms |
+| C2 w1, same | 0 lost, p50 6.9 ms, p99 95 ms, max 308 ms |
+| Z1 4 KiB peer chat 2000/s | **75% lost silently** (S14) |
+| Z2 8 KiB | **74% lost silently** (S14) |
+| Z3 32 KiB 1000/s | 0 lost (path to be explained in the S14 review) |
+| P1 presence 5000/s | 0 lost, p99 1.8 ms |
+| M1-M3 MUC 10/100/128 occupants | complete fan-out, p99 11.4 / 2.7 / 1.6 ms |
+| S1 SM reconnect storm 50/s + 2000 msg/s | **run 1: xmppd-core abort (S28)**; runs 2-3 lost 281 / 83 |
+| R1 50 slow readers + 5000 msg/s | **24% lost**: slow sessions closed at SM queue overflow, messages not stored offline (C2/C11) |
+
+Profiles (dtrace profile-997):
+
+- Login burst: xmppd-core spends 50% in `continueTlsHandshake` (ADR-11
+  handshake pool). xmppd-auth spends ~51% in std SHA-256/HMAC (no SHA-NI on
+  dev1; Q7 moves to OpenSSL, ~7x) and 27% in `write()`.
+- Chat 20k/s: ~1 `write()` per delivered message (no coalescing, ADR-2),
+  126k `_umtx_op` (lock contention, ADR-4/ADR-7), `memset` 5.7% (zeroing
+  large buffers, Q10).
+- MUC 128: `memset` 11%, `smTrackOutbound` 10% (SM copy per occupant, ADR-3
+  shared blobs).
+
+Release-gate deltas: Z1/Z2, S1 and R1 loss must reach 0 (or bounce/offline
+with counters); S1 must not crash; L3 and L2 must improve with Q7 and the
+handshake pool; C1 writes per message must drop with ADR-2.
+
 ## Appendix E: task map
 
 Continuum scope `XMPPD`, 93 tasks created 2026-10-04 by zed, with
@@ -962,6 +1067,17 @@ corrected (S21), T249 annotated as a v0.9.0 regression (S11).
 | S21 | T-10C123F7 | T302 |
 | S22, S23 | T-FF8442D6, T-FA72FC5D | T369, T370 |
 | S24 | T-19EB034C | T217 |
+| S25 | T-41BBBA06 | T412 |
+| S26 | T-C3286C8C | pending |
+| S27 | T-901D7B19 | pending |
+| S28 | T-B9746EC8 | pending |
+| S29 | T-F6FF5130 (scope `DANE-ZIG`, phase P4) | pending |
+| S30 | T-2CE71D47 | T413 |
+| S31 | T-A112F53F | T414 |
+| S32 | T-7531B1E1 | T415 |
+| S33 | T-578F76C8 (forge #22) | pending |
+| S34 | T-53D82879 (forge #23; part 1 with X1 T-8D056B55) | pending |
+| S35 | T-ABAFD7B2 (forge #25) | pending |
 | First-pass P1 batch (3.2) | T-96F6A8B5 | T211, T215, T250-T254, T256-T261, T263, T275, T277, T279 |
 | V1 .. V19 verify-then-fix | T-3FE08568 | T371 |
 | M1 .. M5 | T-2B49596E, T-E7096DCE, T-61BC40BB, T-4D163119, T-9213A076 | T372-T376 |

@@ -16,7 +16,7 @@ const backend_mod = @import("backend");
 
 const log = std.log.scoped(.invite_store);
 
-const NAMESPACE = "invites";
+pub const NAMESPACE = backend_mod.registered("invites");
 const VALUE_SIZE = 12;
 
 pub const InviteRecord = struct {

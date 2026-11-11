@@ -12,23 +12,28 @@
 
 const std = @import("std");
 const sasl = @import("sasl");
+const precis = @import("precis_username");
+
+/// Per-thread auth scratch. IdP PLAIN copies the typed authcid into a small
+/// local buffer before reusing it, so nested lock-store preparation stays
+/// independent without a third 64 KiB thread-local instance. The lock store
+/// owns the only other instance: it is called from inside this prepared
+/// authcid and therefore cannot share the same buffer.
+threadlocal var auth_precis_scratch: precis.Scratch = undefined;
 const protocol = @import("ipc_protocol");
 const RateLimiter = @import("rate_limiter").RateLimiter;
+const policy_mod = @import("policy");
 const lock_store_mod = @import("lock_store");
 const crypto_pool_mod = @import("crypto_pool");
 
 const log = std.log.scoped(.auth_handler);
 
-/// Interface for permanent lock checking. The auth daemon sets this to
-/// a closure over the LockStore. Decouples handler from Backend type.
-pub const LockChecker = struct {
-    ctx: *anyopaque,
-    checkFn: *const fn (ctx: *anyopaque, username: []const u8) bool,
-
-    pub fn isLocked(self: LockChecker, username: []const u8) bool {
-        return self.checkFn(self.ctx, username);
-    }
-};
+/// The lock types live in the policy module; these aliases keep the daemon
+/// and test call sites stable.
+pub const LockCheckResult = policy_mod.LockCheckResult;
+pub const LockChecker = policy_mod.LockChecker;
+pub const makeLockChecker = policy_mod.makeLockChecker;
+pub const localpartOf = policy_mod.localpartOf;
 
 /// Interface for invite code validation. The auth daemon sets this to
 /// a closure over the InviteStore.
@@ -114,14 +119,32 @@ const ScramSession = struct {
     conn_id: u32,
     server: sasl.ScramServer,
     active: bool = false,
+    /// IPC lane slot of the client that started the exchange: lets a dead
+    /// lane sweep its in-flight sessions on close (T279).
+    lane: u16 = 0,
     /// Last activity (unix seconds); drives lazy reclamation of slots whose
     /// XMPP connection died mid-exchange (see SCRAM_SLOT_STALE_SECONDS).
     touched_at: i64 = 0,
+    /// Client address from the auth request, kept for the client-final
+    /// outcome. The request buffer does not outlive the first message.
+    client_ip: [64]u8 = undefined,
+    client_ip_len: u8 = 0,
 
     fn deinit(self: *ScramSession) void {
         self.server.deinit();
         self.active = false;
         self.touched_at = 0;
+        self.client_ip_len = 0;
+    }
+
+    fn setClientIp(self: *ScramSession, ip: []const u8) void {
+        const n = @min(ip.len, self.client_ip.len);
+        @memcpy(self.client_ip[0..n], ip[0..n]);
+        self.client_ip_len = @intCast(n);
+    }
+
+    fn clientIp(self: *const ScramSession) []const u8 {
+        return self.client_ip[0..self.client_ip_len];
     }
 };
 
@@ -131,10 +154,8 @@ pub fn AuthHandler(comptime Store: type) type {
         allocator: std.mem.Allocator,
         /// Active SCRAM sessions indexed by slot.
         scram_sessions: [MAX_SCRAM_SESSIONS]ScramSession = undefined,
-        /// Rate limiter (optional — null disables rate limiting).
-        rate_limiter: ?*RateLimiter = null,
-        /// Permanent lock checker (optional — null disables lock checking).
-        lock_checker: ?LockChecker = null,
+        /// Admission policy: permanent locks and the rate limiter.
+        policy: policy_mod.Policy = .{},
         /// Registration configuration.
         reg_config: RegistrationConfig = .{},
         /// Invite code validator (optional — required when reg_config.require_invite is true).
@@ -170,12 +191,12 @@ pub fn AuthHandler(comptime Store: type) type {
 
         /// Set the rate limiter (call after init).
         pub fn setRateLimiter(self: *Self, limiter: *RateLimiter) void {
-            self.rate_limiter = limiter;
+            self.policy.limiter = limiter;
         }
 
         /// Set the lock checker (call after init).
         pub fn setLockChecker(self: *Self, checker: LockChecker) void {
-            self.lock_checker = checker;
+            self.policy.lock_checker = checker;
         }
 
         /// Look up credentials in cache by precomputed hash.
@@ -221,6 +242,21 @@ pub fn AuthHandler(comptime Store: type) type {
             self.pending_plain.deinit(self.allocator);
         }
 
+        /// Queued PLAIN jobs for this account, keyed by the folded localpart.
+        /// Counts in-flight crypto-pool work against the lockout threshold.
+        fn pendingFor(self: *Self, username: []const u8) usize {
+            var current_buf: [policy_mod.account_key_max]u8 = undefined;
+            const current = policy_mod.accountKey(username, &current_buf);
+            var count: usize = 0;
+            var it = self.pending_plain.iterator();
+            while (it.next()) |kv| {
+                var key_buf: [policy_mod.account_key_max]u8 = undefined;
+                const key = policy_mod.accountKey(kv.value_ptr.username, &key_buf);
+                if (std.mem.eql(u8, key, current)) count += 1;
+            }
+            return count;
+        }
+
         /// Attach a crypto pool (T121). Local-store PLAIN derives start
         /// deferring after this; the IPC loop must poll takeCryptoReply()
         /// whenever the pool's wake pipe fires.
@@ -238,7 +274,7 @@ pub fn AuthHandler(comptime Store: type) type {
 
             if (completion.ok) {
                 log.info("PLAIN auth success: '{s}'", .{pend.username});
-                if (self.rate_limiter) |rl| rl.recordSuccess(pend.username);
+                self.policy.recordOutcome(pend.username, pend.client_ip, .success);
                 return .{
                     .slot = pend.slot,
                     .slot_gen = pend.slot_gen,
@@ -252,7 +288,7 @@ pub fn AuthHandler(comptime Store: type) type {
             }
 
             log.info("PLAIN auth failed: wrong password for '{s}'", .{pend.username});
-            if (self.rate_limiter) |rl| rl.recordFailure(pend.username, pend.client_ip);
+            self.policy.recordOutcome(pend.username, pend.client_ip, .failure);
             self.allocator.free(pend.username);
             return .{
                 .slot = pend.slot,
@@ -266,12 +302,12 @@ pub fn AuthHandler(comptime Store: type) type {
         pub fn handleMessage(self: *Self, msg: protocol.Message, slot: u32, slot_gen: u32) HandleResult {
             return switch (msg) {
                 .auth_request => |req| self.handleAuthRequest(req, slot, slot_gen),
-                .sasl_response => |resp| .{ .reply = self.handleSaslResponse(resp) },
+                .sasl_response => |resp| .{ .reply = self.handleSaslResponse(@intCast(slot), resp) },
                 .auth_abort => |a| blk: {
                     // The XMPP connection vanished mid-exchange; release its
                     // SCRAM slot immediately instead of waiting for the stale
                     // sweep — the core may already be reusing the conn.id.
-                    self.cleanupSession(a.conn_id);
+                    self.cleanupSession(@intCast(slot), a.conn_id);
                     break :blk .none;
                 },
                 .password_change_request => |req| .{ .reply = self.handlePasswordChange(req) },
@@ -282,29 +318,12 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         fn handleAuthRequest(self: *Self, req: protocol.AuthRequest, slot: u32, slot_gen: u32) HandleResult {
-            // Permanent lock check (if enabled)
-            if (self.lock_checker) |checker| {
-                if (req.username.len > 0 and checker.isLocked(req.username)) {
-                    log.info("auth rejected: account '{s}' is permanently locked", .{req.username});
-                    return .{ .reply = authFailure(req.conn_id, "account-disabled") };
-                }
-            }
-
-            // Rate limiting (if enabled). Per-IP only here: core sends
-            // username="" (the daemon extracts it from the SASL payload), so
-            // the per-account check runs in each mechanism handler once the
-            // username is known.
-            if (self.rate_limiter) |rl| {
-                if (rl.checkAllowed("", req.client_ip)) |reason| {
-                    return .{ .reply = authFailure(req.conn_id, reason) };
-                }
-                rl.recordAttempt("", req.client_ip);
-            }
-
+            // Each mechanism admits the IP before doing work and the account
+            // once the identity is known, so every key is counted once.
             return switch (req.mechanism) {
                 .plain => self.handlePlainAuth(req, slot, slot_gen),
                 .scram_sha_256 => if (comptime @hasDecl(Store, "lookup"))
-                    .{ .reply = self.handleScramInit(req) }
+                    .{ .reply = self.handleScramInit(req, slot) }
                 else
                     .{ .reply = authFailure(req.conn_id, "mechanism-not-supported") },
                 .oauthbearer => if (comptime @hasDecl(Store, "validateToken"))
@@ -344,42 +363,105 @@ pub fn AuthHandler(comptime Store: type) type {
             const username = payload[authcid_start..authcid_end];
             const password = payload[passwd_start..];
 
-            // Per-account rate limiting (username was "" at auth_request entry)
-            if (self.rate_limiter) |rl| {
-                if (rl.checkAllowed(username, "")) |reason| {
-                    return .{ .reply = authFailure(req.conn_id, reason) };
-                }
-                rl.recordAttempt(username, "");
+            // Count the IP attempt before any lookup or KDF.
+            if (self.policy.admitIp(req.client_ip)) |reason| {
+                return .{ .reply = authFailure(req.conn_id, reason) };
             }
 
             // If the store supports validatePassword (OIDC/IdP delegation), use that
             if (comptime @hasDecl(Store, "validatePassword")) {
+                // Prepare the supplied name for its lock pre-check. An
+                // unpreparable name gets the wrong-password reply and an
+                // IP-only charge, never a store-error oracle or an IdP call.
+                const typed_username = auth_precis_scratch.localpart(localpartOf(username)) catch {
+                    log.info("PLAIN auth failed (IdP): invalid supplied name", .{});
+                    self.policy.recordOutcome("", req.client_ip, .failure);
+                    return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                };
+                if (self.policy.check(typed_username, req.client_ip)) |reason| {
+                    return .{ .reply = authFailure(req.conn_id, reason) };
+                }
+
                 const result = self.store.validatePassword(self.allocator, username, password) catch {
                     return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                 };
                 if (result) |validated_user| {
-                    log.info("PLAIN auth success (IdP): '{s}'", .{validated_user});
-                    if (self.rate_limiter) |rl| rl.recordSuccess(username);
+                    // S3: locks and the bound JID use the prepared localpart
+                    // of the identity the IdP handed back, never its domain.
+                    var typed_account_buf: [precis.max_username_octets]u8 = undefined;
+                    @memcpy(typed_account_buf[0..typed_username.len], typed_username);
+                    const typed_stable = typed_account_buf[0..typed_username.len];
+                    const identity = auth_precis_scratch.localpart(
+                        localpartOf(validated_user),
+                    ) catch {
+                        log.info("PLAIN auth failed (IdP): invalid returned identity", .{});
+                        self.policy.recordOutcome("", req.client_ip, .failure);
+                        return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                    };
+                    // The pre-check ran on the typed name, which the IdP may
+                    // resolve to a different identity. Check the identity's
+                    // own lock now and answer it exactly like a wrong
+                    // password, so a right password for a locked identity is
+                    // indistinguishable from a wrong one.
+                    if (self.policy.check(identity, "")) |reason| {
+                        if (std.mem.eql(u8, reason, "account-disabled")) {
+                            log.info("PLAIN auth failed (IdP): '{s}' maps to a locked identity", .{username});
+                            // Same bookkeeping as a wrong password: the typed
+                            // name and the IP, never the locked identity.
+                            self.policy.recordOutcome(typed_stable, req.client_ip, .failure);
+                            return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                        }
+                        return .{ .reply = authFailure(req.conn_id, reason) };
+                    }
+                    if (self.policy.admitAccount(identity)) |reason| {
+                        return .{ .reply = authFailure(req.conn_id, reason) };
+                    }
+                    log.info("PLAIN auth success (IdP): '{s}' as '{s}'", .{ typed_stable, identity });
+                    self.policy.recordOutcome(identity, req.client_ip, .success);
                     return .{ .reply = protocol.Message{ .auth_success = .{
                         .conn_id = req.conn_id,
-                        .username = validated_user,
+                        .username = identity,
                         .server_final = "",
                     } } };
                 } else {
-                    log.info("PLAIN auth failed (IdP): '{s}'", .{username});
-                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    log.info("PLAIN auth failed (IdP): '{s}'", .{typed_username});
+                    self.policy.recordOutcome(typed_username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 }
             }
 
             // Traditional credential lookup + SCRAM derive
             if (comptime @hasDecl(Store, "lookup")) {
-                const maybe_creds = self.store.lookup(self.allocator, username) catch {
+                // The users namespace is keyed by RFC 7622 localparts. A name
+                // that fails preparation can never match an account: answer
+                // exactly like a wrong password, charge only the IP key, and
+                // create no account key. Buffer contract of xmppLocalpart:
+                // buf 6x input.len, scratch 3x input.len each.
+                const account_username = auth_precis_scratch.localpart(
+                    username,
+                ) catch {
+                    log.info("PLAIN auth failed: invalid account name", .{});
+                    self.policy.recordOutcome("", req.client_ip, .failure);
+                    return .{ .reply = authFailure(req.conn_id, "not-authorized") };
+                };
+
+                // Count the account attempt and enforce the lock before the
+                // lookup and KDF. A crypto-pool job also counts against the
+                // lockout threshold while it is in flight.
+                const account_reason = if (self.crypto_pool != null)
+                    self.policy.admitAccountPending(account_username, self.pendingFor(account_username))
+                else
+                    self.policy.admitAccount(account_username);
+                if (account_reason) |reason| {
+                    return .{ .reply = authFailure(req.conn_id, reason) };
+                }
+
+                const maybe_creds = self.store.lookup(self.allocator, account_username) catch {
                     return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                 };
                 const creds = maybe_creds orelse {
-                    log.info("PLAIN auth failed: user '{s}' not found", .{username});
-                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    log.info("PLAIN auth failed: user '{s}' not found", .{account_username});
+                    self.policy.recordOutcome(account_username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 };
 
@@ -392,7 +474,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     const job_id = pool.put(password, creds.salt, creds.iteration_count, creds.stored_key) catch {
                         return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                     };
-                    const username_owned = self.allocator.dupe(u8, username) catch {
+                    const username_owned = self.allocator.dupe(u8, account_username) catch {
                         log.err("pending auth alloc failed; job {d} completes orphaned", .{job_id});
                         return .{ .reply = authFailure(req.conn_id, "temporary-auth-failure") };
                     };
@@ -419,21 +501,22 @@ pub fn AuthHandler(comptime Store: type) type {
                 // A password that fails OpaqueString prep cannot match a
                 // prepped stored credential: treat as a failed auth.
                 const test_creds = sasl.StoredCredentials.derive(password, creds.salt, creds.iteration_count) catch {
-                    log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
-                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                    log.info("PLAIN auth failed: wrong password for '{s}'", .{account_username});
+                    self.policy.recordOutcome(account_username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 };
-                if (!std.mem.eql(u8, &test_creds.stored_key, &creds.stored_key)) {
-                    log.info("PLAIN auth failed: wrong password for '{s}'", .{username});
-                    if (self.rate_limiter) |rl| rl.recordFailure(username, req.client_ip);
+                // T211 follow-up: constant-time compare for StoredKey.
+                if (!std.crypto.timing_safe.eql([32]u8, test_creds.stored_key, creds.stored_key)) {
+                    log.info("PLAIN auth failed: wrong password for '{s}'", .{account_username});
+                    self.policy.recordOutcome(account_username, req.client_ip, .failure);
                     return .{ .reply = authFailure(req.conn_id, "not-authorized") };
                 }
 
-                log.info("PLAIN auth success: '{s}'", .{username});
-                if (self.rate_limiter) |rl| rl.recordSuccess(username);
+                log.info("PLAIN auth success: '{s}'", .{account_username});
+                self.policy.recordOutcome(account_username, req.client_ip, .success);
                 return .{ .reply = protocol.Message{ .auth_success = .{
                     .conn_id = req.conn_id,
-                    .username = username,
+                    .username = account_username,
                     .server_final = "",
                 } } };
             }
@@ -448,6 +531,13 @@ pub fn AuthHandler(comptime Store: type) type {
         fn handleOAuthBearerAuth(self: *Self, req: protocol.AuthRequest) protocol.Message {
             if (comptime !@hasDecl(Store, "validateToken")) {
                 return authFailure(req.conn_id, "mechanism-not-supported");
+            }
+
+            // Count the IP attempt before the IdP call: a locked IP must not
+            // spend token-validation work.
+            if (self.policy.admitIp(req.client_ip)) |reason| {
+                log.info("OAUTHBEARER rejected before token validation: {s}", .{reason});
+                return authFailure(req.conn_id, reason);
             }
 
             // Extract bearer token from RFC 7628 OAUTHBEARER initial response
@@ -478,37 +568,58 @@ pub fn AuthHandler(comptime Store: type) type {
             };
 
             if (result) |validated_user| {
-                log.info("OAUTHBEARER auth success: '{s}'", .{validated_user});
-                if (self.rate_limiter) |rl| rl.recordSuccess(validated_user);
+                // Policy and the bound JID use the prepared localpart of the
+                // IdP-verified identity, never the full IdP-qualified string.
+                const identity = auth_precis_scratch.localpart(
+                    localpartOf(validated_user),
+                ) catch {
+                    log.info("OAUTHBEARER failed: invalid returned identity", .{});
+                    self.policy.recordOutcome("", req.client_ip, .failure);
+                    return authFailure(req.conn_id, "not-authorized");
+                };
+                if (self.policy.admitAccount(identity)) |reason| {
+                    return authFailure(req.conn_id, reason);
+                }
+                log.info("OAUTHBEARER auth success: '{s}'", .{identity});
+                self.policy.recordOutcome(identity, req.client_ip, .success);
                 const photo_url = if (comptime @hasDecl(Store, "getPhotoUrl"))
                     self.store.getPhotoUrl()
                 else
                     "";
                 return protocol.Message{ .auth_success = .{
                     .conn_id = req.conn_id,
-                    .username = validated_user,
+                    .username = identity,
                     .server_final = "",
                     .photo_url = photo_url,
                 } };
             } else {
                 log.info("OAUTHBEARER auth failed", .{});
-                if (self.rate_limiter) |rl| rl.recordFailure(req.username, req.client_ip);
+                self.policy.recordOutcome(req.username, req.client_ip, .failure);
                 return authFailure(req.conn_id, "not-authorized");
             }
         }
 
-        fn handleScramInit(self: *Self, req: protocol.AuthRequest) protocol.Message {
+        fn handleScramInit(self: *Self, req: protocol.AuthRequest, ipc_slot: usize) protocol.Message {
             if (comptime !@hasDecl(Store, "lookup")) {
                 return authFailure(req.conn_id, "mechanism-not-supported");
             } else {
+                // Count the IP attempt before creating exchange state.
+                if (self.policy.admitIp(req.client_ip)) |reason| {
+                    return authFailure(req.conn_id, reason);
+                }
+
                 // Find or create a SCRAM session for this conn_id
-                const slot = self.findOrCreateScramSlot(req.conn_id) orelse {
+                const slot = self.findOrCreateScramSlot(@intCast(ipc_slot), req.conn_id) orelse {
                     return authFailure(req.conn_id, "temporary-auth-failure");
                 };
 
                 var session = &self.scram_sessions[slot];
+                // Re-auth on an already-live conn_id: the previous exchange's
+                // ScramServer must go before we overwrite it (T279).
+                if (session.active) session.deinit();
                 session.server = sasl.ScramServer.init(self.allocator);
                 session.conn_id = req.conn_id;
+                session.lane = @intCast(ipc_slot);
                 session.active = true;
                 session.touched_at = std.time.timestamp();
 
@@ -521,25 +632,40 @@ pub fn AuthHandler(comptime Store: type) type {
                     return authFailure(req.conn_id, "invalid-encoding");
                 };
 
-                // Per-account rate limiting (username was "" at auth_request entry)
-                if (self.rate_limiter) |rl| {
-                    if (rl.checkAllowed(username, "")) |reason| {
-                        session.deinit();
-                        return authFailure(req.conn_id, reason);
-                    }
-                    rl.recordAttempt(username, "");
+                // Look up by the RFC 7622 localpart, but keep the raw n= name
+                // in the SCRAM exchange: client-first remains part of the
+                // AuthMessage. An unpreparable name gets the same reply as a
+                // wrong password, with IP-only bookkeeping and no account key.
+                const account_username = auth_precis_scratch.localpart(
+                    username,
+                ) catch {
+                    log.info("SCRAM auth failed: invalid account name", .{});
+                    self.policy.recordOutcome("", req.client_ip, .failure);
+                    session.deinit();
+                    return authFailure(req.conn_id, "not-authorized");
+                };
+
+                // Count the account attempt and enforce the lock before any
+                // store lookup or challenge work.
+                if (self.policy.admitAccount(account_username)) |reason| {
+                    session.deinit();
+                    return authFailure(req.conn_id, reason);
                 }
+                session.setClientIp(req.client_ip);
 
                 // Look up credentials — try cache first, fall back to store
-                const name_hash = hashUsername(username);
+                const name_hash = hashUsername(account_username);
                 const now = std.time.timestamp();
                 const creds = self.cacheLookup(name_hash, now) orelse blk: {
-                    const maybe_creds = self.store.lookup(self.allocator, username) catch {
+                    const maybe_creds = self.store.lookup(self.allocator, account_username) catch {
                         session.deinit();
                         return authFailure(req.conn_id, "temporary-auth-failure");
                     };
                     const c = maybe_creds orelse {
-                        log.info("SCRAM auth failed: user '{s}' not found", .{username});
+                        log.info("SCRAM auth failed: user '{s}' not found", .{account_username});
+                        // The attempt was counted at admission; an unknown
+                        // user is still a failed authentication.
+                        self.policy.recordOutcome(account_username, req.client_ip, .failure);
                         session.deinit();
                         return authFailure(req.conn_id, "not-authorized");
                     };
@@ -564,9 +690,10 @@ pub fn AuthHandler(comptime Store: type) type {
             }
         }
 
-        fn handleSaslResponse(self: *Self, resp: protocol.SaslResponse) protocol.Message {
-            // Find the SCRAM session for this conn_id
-            const slot = self.findScramSlot(resp.conn_id) orelse {
+        fn handleSaslResponse(self: *Self, lane: u16, resp: protocol.SaslResponse) protocol.Message {
+            // Find the SCRAM session for this lane's conn_id (T279:
+            // another lane's identical conn_id must not qualify).
+            const slot = self.findScramSlot(lane, resp.conn_id) orelse {
                 // No exchange for this conn: aborted, swept as stale, or the
                 // auth_request never arrived. Was completely silent.
                 log.warn("SCRAM final for conn={d} has no exchange (aborted/swept/lost)", .{resp.conn_id});
@@ -576,23 +703,40 @@ pub fn AuthHandler(comptime Store: type) type {
             var session = &self.scram_sessions[slot];
             session.touched_at = std.time.timestamp();
 
-            // Process client-final-message
-            const server_final = session.server.handleClientFinal(resp.payload) catch {
-                log.info("SCRAM auth failed: proof verification for conn={d}", .{resp.conn_id});
-                const username = session.server.username;
-                if (self.rate_limiter) |rl| rl.recordFailure(username, "");
+            const username = session.server.username;
+            // The SCRAM proof uses the raw n= name above. Account policy and
+            // the bound identity use its RFC 7622 localpart, as at init.
+            const account_username = auth_precis_scratch.localpart(
+                username,
+            ) catch {
+                self.policy.recordOutcome("", session.clientIp(), .failure);
                 session.deinit();
                 return authFailure(resp.conn_id, "not-authorized");
             };
 
-            const username = session.server.username;
-            log.info("SCRAM auth success: '{s}' conn={d}", .{ username, resp.conn_id });
-            if (self.rate_limiter) |rl| rl.recordSuccess(username);
+            // S3/A1: re-check both keys without counting before the proof is
+            // verified, so a lock that arrived between challenge and final
+            // gets the same reply for a right and a wrong password.
+            if (self.policy.check(account_username, session.clientIp())) |reason| {
+                session.deinit();
+                return authFailure(resp.conn_id, reason);
+            }
 
-            // Keep session alive briefly for the username reference, then clean up
+            // Process client-final-message
+            const server_final = session.server.handleClientFinal(resp.payload) catch {
+                log.info("SCRAM auth failed: proof verification for conn={d}", .{resp.conn_id});
+                self.policy.recordOutcome(account_username, session.clientIp(), .failure);
+                session.deinit();
+                return authFailure(resp.conn_id, "not-authorized");
+            };
+
+            log.info("SCRAM auth success: '{s}' conn={d}", .{ account_username, resp.conn_id });
+            self.policy.recordOutcome(account_username, session.clientIp(), .success);
+
+            // Keep session alive for server_final's arena-backed slice.
             const result = protocol.Message{ .auth_success = .{
                 .conn_id = resp.conn_id,
-                .username = username,
+                .username = account_username,
                 .server_final = server_final,
             } };
 
@@ -619,12 +763,23 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            self.store.changePassword(self.allocator, req.username, req.new_password) catch |err| {
+            // Resolve the account through the one RFC 7622 localpart function.
+            const account_username = auth_precis_scratch.localpart(
+                req.username,
+            ) catch {
+                return protocol.Message{ .password_change_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-acceptable",
+                } };
+            };
+
+            self.store.changePassword(self.allocator, account_username, req.new_password) catch |err| {
                 const reason: []const u8 = switch (err) {
                     error.UserNotFound => "item-not-found",
                     else => "internal-server-error",
                 };
-                log.info("password change failed for '{s}': {s}", .{ req.username, reason });
+                log.info("password change failed for '{s}': {s}", .{ account_username, reason });
                 return protocol.Message{ .password_change_result = .{
                     .conn_id = req.conn_id,
                     .success = false,
@@ -632,8 +787,8 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             };
 
-            self.cacheInvalidate(req.username);
-            log.info("password changed for '{s}'", .{req.username});
+            self.cacheInvalidate(account_username);
+            log.info("password changed for '{s}'", .{account_username});
             return protocol.Message{ .password_change_result = .{
                 .conn_id = req.conn_id,
                 .success = true,
@@ -658,12 +813,23 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
+            // Resolve the account through the one RFC 7622 localpart function.
+            const account_username = auth_precis_scratch.localpart(
+                req.username,
+            ) catch {
+                return protocol.Message{ .account_delete_result = .{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-acceptable",
+                } };
+            };
+
             // Remove from UserStore (ignore UserNotFound — may be external auth)
-            self.store.removeUser(self.allocator, req.username) catch |err| {
+            self.store.removeUser(self.allocator, account_username) catch |err| {
                 switch (err) {
                     error.UserNotFound => {},
                     else => {
-                        log.err("account delete failed for '{s}': store error", .{req.username});
+                        log.err("account delete failed for '{s}': store error", .{account_username});
                         return protocol.Message{ .account_delete_result = .{
                             .conn_id = req.conn_id,
                             .success = false,
@@ -678,7 +844,7 @@ pub fn AuthHandler(comptime Store: type) type {
             // delete callback for cleanup. For now, locks are cleaned via xmppctl unlock
             // or naturally don't apply once the account is gone.
 
-            log.info("account deleted (auth): '{s}'", .{req.username});
+            log.info("account deleted (auth): '{s}'", .{account_username});
             return protocol.Message{ .account_delete_result = .{
                 .conn_id = req.conn_id,
                 .success = true,
@@ -698,7 +864,10 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            // Privileged admin requests (xmppctl) bypass registration policy
+            // Privileged admin requests (xmppctl) bypass registration policy.
+            // The marker remains a convention between local daemons; the
+            // socket itself is now peer-credential checked at accept (T258),
+            // so only root or the daemon uid may even open it.
             const is_admin = std.mem.eql(u8, req.client_ip, "ctl");
 
             // Check if registration is enabled (skip for admin)
@@ -710,17 +879,15 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             }
 
-            // Rate limit registration attempts (skip for admin)
+            // Count and rate limit registration attempts (skip for admin).
+            // Registration outcomes are not authentication outcomes.
             if (!is_admin) {
-                if (self.rate_limiter) |rl| {
-                    if (rl.checkAllowed("", req.client_ip)) |reason| {
-                        return protocol.Message{ .register_result = regResult{
-                            .conn_id = req.conn_id,
-                            .success = false,
-                            .reason = reason,
-                        } };
-                    }
-                    rl.recordAttempt("", req.client_ip);
+                if (self.policy.admitIp(req.client_ip)) |reason| {
+                    return protocol.Message{ .register_result = regResult{
+                        .conn_id = req.conn_id,
+                        .success = false,
+                        .reason = reason,
+                    } };
                 }
             }
 
@@ -732,6 +899,23 @@ pub fn AuthHandler(comptime Store: type) type {
                     .reason = "bad-request",
                 } };
             }
+
+            // RFC 7622 Section 3.3: store and compare canonical localparts
+            // only. Core prepares the name before the IPC hop; preparing
+            // again is idempotent (RFC 8264 Section 7 stability), and the
+            // xmppctl admin path arrives raw. Buffer contract of
+            // xmppLocalpart: buf 6x input.len, scratch 3x input.len each;
+            // input over max_input_octets is rejected by the profile itself.
+            const canon_username = auth_precis_scratch.localpart(
+                req.username,
+            ) catch {
+                log.info("registration rejected: '{s}' is not a valid UsernameCaseMapped name", .{req.username});
+                return protocol.Message{ .register_result = regResult{
+                    .conn_id = req.conn_id,
+                    .success = false,
+                    .reason = "not-acceptable",
+                } };
+            };
 
             // Validate invitation code if required (skip for admin)
             if (!is_admin and self.reg_config.require_invite) {
@@ -761,13 +945,14 @@ pub fn AuthHandler(comptime Store: type) type {
                 }
             }
 
-            // Create the user
-            self.store.addUser(self.allocator, req.username, req.password) catch |err| {
+            // Create the user (canonical name: conflicts are canonical-name
+            // conflicts).
+            self.store.addUser(self.allocator, canon_username, req.password) catch |err| {
                 const reason: []const u8 = switch (err) {
                     error.UserExists => "conflict",
                     else => "internal-server-error",
                 };
-                log.info("registration failed for '{s}': {s}", .{ req.username, reason });
+                log.info("registration failed for '{s}': {s}", .{ canon_username, reason });
                 return protocol.Message{ .register_result = regResult{
                     .conn_id = req.conn_id,
                     .success = false,
@@ -775,7 +960,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 } };
             };
 
-            log.info("user registered: '{s}'", .{req.username});
+            log.info("user registered: '{s}'", .{canon_username});
             return protocol.Message{ .register_result = regResult{
                 .conn_id = req.conn_id,
                 .success = true,
@@ -784,9 +969,21 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         /// Clean up a SCRAM session after the response has been sent.
-        pub fn cleanupSession(self: *Self, conn_id: u32) void {
-            if (self.findScramSlot(conn_id)) |slot| {
+        /// Lookup is keyed on (lane, conn_id): conn_id alone collides
+        /// across core worker lanes each numbering from 1 (T279).
+        pub fn cleanupSession(self: *Self, lane: u16, conn_id: u32) void {
+            if (self.findScramSlot(lane, conn_id)) |slot| {
                 self.scram_sessions[slot].deinit();
+            }
+        }
+
+        /// Deinit every in-flight SCRAM session the given IPC lane owns;
+        /// called before closing that IPC client so dead lanes cannot wedge
+        /// sessions into the 60 s stale probe (T279).
+        pub fn closeLaneSessions(self: *Self, lane: usize) void {
+            const lane_u16: u16 = @intCast(lane);
+            for (&self.scram_sessions) |*s| {
+                if (s.active and s.lane == lane_u16) s.deinit();
             }
         }
 
@@ -795,8 +992,10 @@ pub fn AuthHandler(comptime Store: type) type {
         /// by construction. The table must probe instead of failing on the
         /// first occupied home slot (birthday collisions are guaranteed);
         /// null now means the table is genuinely full.
-        fn findOrCreateScramSlot(self: *Self, conn_id: u32) ?usize {
-            if (self.findScramSlot(conn_id)) |slot| return slot;
+        /// (lane, conn_id) is the key: the same conn_id legimately recurs
+        /// once per core worker lane (T279).
+        fn findOrCreateScramSlot(self: *Self, lane: u16, conn_id: u32) ?usize {
+            if (self.findScramSlot(lane, conn_id)) |slot| return slot;
             const now = std.time.timestamp();
             const start = (conn_id & 0xFFFF) % MAX_SCRAM_SESSIONS;
             var i: usize = 0;
@@ -814,11 +1013,12 @@ pub fn AuthHandler(comptime Store: type) type {
             return null;
         }
 
-        fn findScramSlot(self: *Self, conn_id: u32) ?usize {
+        fn findScramSlot(self: *Self, lane: u16, conn_id: u32) ?usize {
             // Probing leaves holes on cleanup; a full scan over 256 entries
-            // is cheaper than tombstone bookkeeping.
+            // is cheaper than tombstone bookkeeping. (lane, conn_id) key
+            // (T279): never hand another lane's active exchange back here.
             for (&self.scram_sessions, 0..) |*s, slot| {
-                if (s.active and s.conn_id == conn_id) return slot;
+                if (s.active and s.conn_id == conn_id and s.lane == lane) return slot;
             }
             return null;
         }
@@ -854,12 +1054,59 @@ const TestHandler = AuthHandler(TestUserStore);
 const TestCryptoPool = crypto_pool_mod.CryptoPool;
 
 /// Test helper: drive the synchronous variant of handleMessage.
-fn handleSync(handler: *TestHandler, msg: protocol.Message) ?protocol.Message {
+fn handleSync(handler: anytype, msg: protocol.Message) ?protocol.Message {
     return switch (handler.handleMessage(msg, 0, 1)) {
         .reply => |m| m,
         .deferred, .none => null,
     };
 }
+
+/// Wait for the pool's completion wake byte. The read end is non-blocking.
+fn waitForPoolWake(pool: *TestCryptoPool) !void {
+    var buf: [8]u8 = undefined;
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (std.time.milliTimestamp() < deadline) {
+        const n = std.posix.read(pool.pipe_rd, &buf) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        if (n > 0) return;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    return error.PoolWakeTimeout;
+}
+
+/// IdP-delegating test store: credentials and tokens are answered by the
+/// identity provider instead of a local user table, so the
+/// @hasDecl(Store, "validatePassword"/"validateToken") admit paths compile
+/// and run (the local UserStore never reaches them).
+const TestIdpStore = struct {
+    password_user: ?[]const u8 = null,
+    password_secret: ?[]const u8 = null,
+    token_user: ?[]const u8 = null,
+    /// Number of IdP calls, so a test can prove a lock is checked before
+    /// any IdP work.
+    password_calls: u32 = 0,
+    token_calls: u32 = 0,
+
+    pub fn validatePassword(self: *@This(), allocator: std.mem.Allocator, username: []const u8, password: []const u8) !?[]const u8 {
+        _ = allocator;
+        _ = username;
+        self.password_calls += 1;
+        if (self.password_secret) |secret| {
+            if (!std.mem.eql(u8, password, secret)) return null;
+        }
+        return self.password_user;
+    }
+
+    pub fn validateToken(self: *@This(), allocator: std.mem.Allocator, token: []const u8) !?[]const u8 {
+        _ = allocator;
+        _ = token;
+        self.token_calls += 1;
+        return self.token_user;
+    }
+};
+const TestIdpHandler = AuthHandler(TestIdpStore);
 
 test "AuthHandler: SCRAM slot table probes past conn_id home-slot collisions" {
     const allocator = std.testing.allocator;
@@ -898,7 +1145,7 @@ test "AuthHandler: SCRAM slot table probes past conn_id home-slot collisions" {
             else => return error.UnexpectedReply,
         }
     }
-    for (conn_ids) |cid| handler.cleanupSession(cid);
+    for (conn_ids) |cid| handler.cleanupSession(0, cid);
 }
 
 test "AuthHandler: SCRAM slot table full means null, not aliasing" {
@@ -947,7 +1194,7 @@ test "AuthHandler: SCRAM slot table full means null, not aliasing" {
     try std.testing.expectEqualStrings("temporary-auth-failure", overflow.auth_failure.reason);
 
     cid = 1;
-    while (cid <= MAX_SCRAM_SESSIONS) : (cid += 1) handler.cleanupSession(cid);
+    while (cid <= MAX_SCRAM_SESSIONS) : (cid += 1) handler.cleanupSession(0, cid);
 }
 
 test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path" {
@@ -962,7 +1209,7 @@ test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path"
 
     // Simulate a connection that died mid-exchange: its slot stays active.
     const dead_conn: u32 = 42;
-    const dead_slot = handler.findOrCreateScramSlot(dead_conn).?;
+    const dead_slot = handler.findOrCreateScramSlot(0, dead_conn).?;
     handler.scram_sessions[dead_slot] = .{
         .conn_id = dead_conn,
         .server = sasl.ScramServer.init(allocator),
@@ -973,7 +1220,7 @@ test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path"
     // A fresh login aliasing the same home slot (same low 16 bits = same
     // session slot, newer generation) must reclaim it, not fail.
     const fresh_conn: u32 = 42 + (1 << 16);
-    const got = handler.findOrCreateScramSlot(fresh_conn).?;
+    const got = handler.findOrCreateScramSlot(0, fresh_conn).?;
     try std.testing.expectEqual(dead_slot, got);
     try std.testing.expect(!handler.scram_sessions[got].active); // reclaimed, caller activates
 
@@ -985,7 +1232,7 @@ test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path"
         .touched_at = std.time.timestamp(),
     };
     const blocked_conn: u32 = 43 + (1 << 16); // aliases neighbor slot 43
-    const alt = handler.findOrCreateScramSlot(blocked_conn).?;
+    const alt = handler.findOrCreateScramSlot(0, blocked_conn).?;
     try std.testing.expect(alt != dead_slot);
     handler.scram_sessions[dead_slot].deinit();
     handler.scram_sessions[alt].deinit();
@@ -1024,6 +1271,60 @@ test "AuthHandler: PLAIN auth success" {
     try std.testing.expectEqualStrings("alice", result.auth_success.username);
 }
 
+test "AuthHandler: PLAIN prepares the authcid for lookup and the bound identity" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "naplestb", "pw");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const result = handleSync(&handler, plainRequest(6, "10.0.0.6", plainPayload(&buf, "NaplesTB", "pw"))) orelse return error.NoResponse;
+
+    // The stored key and the identity returned for the bound JID are both
+    // the prepared localpart, not the typed spelling.
+    try std.testing.expectEqualStrings("naplestb", result.auth_success.username);
+}
+
+test "AuthHandler: PLAIN invalid names are indistinguishable from a wrong password" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    // Even a legacy raw row must not make an invalid name match an account.
+    try store.addUser(allocator, "bad name", "pw");
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var bad_buf: [64]u8 = undefined;
+    const bad = handleSync(&handler, plainRequest(7, "10.0.0.7", plainPayload(&bad_buf, "bad name", "pw"))) orelse return error.NoResponse;
+    try std.testing.expect(bad == .auth_failure);
+    var wrong_buf: [64]u8 = undefined;
+    const wrong = handleSync(&handler, plainRequest(8, "10.0.0.8", plainPayload(&wrong_buf, "ghost", "pw"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", bad.auth_failure.reason);
+    try std.testing.expectEqualStrings(wrong.auth_failure.reason, bad.auth_failure.reason);
+
+    // No account key was created for the invalid name, but its attempt was
+    // charged to the IP key.
+    try std.testing.expect(handler.policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.7") orelse return error.ExpectedDenial);
+}
+
 test "AuthHandler: PLAIN auth wrong password" {
     const allocator = std.testing.allocator;
 
@@ -1053,6 +1354,575 @@ test "AuthHandler: PLAIN auth wrong password" {
     } }) orelse return error.NoResponse;
 
     try std.testing.expectEqualStrings("not-authorized", result.auth_failure.reason);
+}
+
+test "AuthHandler: locked account rejected at PLAIN regardless of credentials (T352)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "lockeduser", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var dummy: u8 = 0;
+    handler.setLockChecker(.{ .ctx = @ptrCast(&dummy), .checkFn = struct {
+        fn f(_: *anyopaque, username: []const u8) LockCheckResult {
+            return if (std.mem.eql(u8, username, "lockeduser")) .locked else .unlocked;
+        }
+    }.f });
+
+    var payload: [25]u8 = undefined;
+    payload[0] = 0;
+    @memcpy(payload[1..11], "lockeduser");
+    payload[11] = 0;
+    @memcpy(payload[12..21], "secret123");
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 1,
+        .mechanism = .plain,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = payload[0..21],
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+}
+
+test "AuthHandler: locked account rejected at SCRAM before the challenge is issued (T352)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "lockedscram", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var dummy: u8 = 0;
+    handler.setLockChecker(.{ .ctx = @ptrCast(&dummy), .checkFn = struct {
+        fn f(_: *anyopaque, username: []const u8) LockCheckResult {
+            return if (std.mem.eql(u8, username, "lockedscram")) .locked else .unlocked;
+        }
+    }.f });
+
+    var client = sasl.ScramClient.init(allocator, "lockedscram", "secret123");
+    defer client.deinit();
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 7,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try client.clientFirst(),
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+    // No challenge state may linger for the rejected conn_id.
+    try std.testing.expect(handler.findScramSlot(0, 7) == null);
+}
+
+test "AuthHandler: lock store error fails closed (T352)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var dummy: u8 = 0;
+    handler.setLockChecker(.{ .ctx = @ptrCast(&dummy), .checkFn = struct {
+        fn f(_: *anyopaque, _: []const u8) LockCheckResult {
+            return .store_error;
+        }
+    }.f });
+
+    var payload: [16]u8 = undefined;
+    payload[0] = 0;
+    @memcpy(payload[1..6], "alice");
+    payload[6] = 0;
+    @memcpy(payload[7..16], "secret123");
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 2,
+        .mechanism = .plain,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = payload[0..16],
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("temporary-auth-failure", result.auth_failure.reason);
+}
+
+test "AuthHandler: locks catch case variants and full-JID authcids are invalid" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    // A real LockStore on its own backend: xmppctl locks the canonical name
+    // and every variant of it must hit the same row.
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    // Case variant of the locked name, correct password.
+    {
+        var payload: [16]u8 = undefined;
+        payload[0] = 0;
+        @memcpy(payload[1..6], "Alice");
+        payload[6] = 0;
+        @memcpy(payload[7..16], "secret123");
+        const result = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 21,
+            .mechanism = .plain,
+            .client_ip = "127.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = payload[0..16],
+        } }) orelse return error.NoResponse;
+        try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+    }
+    // A full JID is not an authcid localpart: U+0040 fails RFC 7622
+    // preparation, so the reply is the same as for a wrong password rather
+    // than an account-lock oracle.
+    {
+        const user = "ALICE@us.example";
+        const pass = "secret123";
+        var payload: [64]u8 = undefined;
+        payload[0] = 0;
+        @memcpy(payload[1 .. 1 + user.len], user);
+        payload[1 + user.len] = 0;
+        @memcpy(payload[2 + user.len .. 2 + user.len + pass.len], pass);
+        const result = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 22,
+            .mechanism = .plain,
+            .client_ip = "127.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = payload[0 .. 2 + user.len + pass.len],
+        } }) orelse return error.NoResponse;
+        try std.testing.expectEqualStrings("not-authorized", result.auth_failure.reason);
+    }
+}
+
+test "AuthHandler: IdP PLAIN admits the localpart of the returned identity" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{ .password_user = "alice@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const user = "alice";
+    const pass = "anypassword";
+    var payload: [64]u8 = undefined;
+    payload[0] = 0;
+    @memcpy(payload[1 .. 1 + user.len], user);
+    payload[1 + user.len] = 0;
+    @memcpy(payload[2 + user.len .. 2 + user.len + pass.len], pass);
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 41,
+        .mechanism = .plain,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = payload[0 .. 2 + user.len + pass.len],
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("alice", result.auth_success.username);
+}
+
+test "AuthHandler: a lock on the IdP identity rejects PLAIN" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    // The IdP hands the identity back with a domain and mixed case: the
+    // admission check runs on its localpart, not on the requested name.
+    var store = TestIdpStore{ .password_user = "Alice@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    const user = "alicework";
+    const pass = "anypassword";
+    var payload: [64]u8 = undefined;
+    payload[0] = 0;
+    @memcpy(payload[1 .. 1 + user.len], user);
+    payload[1 + user.len] = 0;
+    @memcpy(payload[2 + user.len .. 2 + user.len + pass.len], pass);
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 42,
+        .mechanism = .plain,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = payload[0 .. 2 + user.len + pass.len],
+    } }) orelse return error.NoResponse;
+    if (result != .auth_failure) return error.ExpectedAuthFailure;
+
+    // alicework is an alias for the locked alice: reply exactly as for a
+    // wrong password, not with a lock reason that reveals the password.
+    try std.testing.expectEqualStrings("not-authorized", result.auth_failure.reason);
+}
+
+test "AuthHandler: OAUTHBEARER admits the identity the IdP returns" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{ .token_user = "bob@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 43,
+        .mechanism = .oauthbearer,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok123\x01\x01",
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("bob", result.auth_success.username);
+}
+
+test "AuthHandler: IdP PLAIN prepares the supplied and returned identities" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "NaplesTB@idp.example",
+        .password_secret = "right",
+    };
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var bad_buf: [64]u8 = undefined;
+    const bad = handleSync(&handler, plainRequest(44, "10.0.0.44", plainPayload(&bad_buf, "bad name", "wrong"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", bad.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+    try std.testing.expect(handler.policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.44") orelse return error.ExpectedDenial);
+
+    var good_buf: [64]u8 = undefined;
+    const good = handleSync(&handler, plainRequest(45, "10.0.0.45", plainPayload(&good_buf, "alice", "right"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("naplestb", good.auth_success.username);
+}
+
+test "AuthHandler: IdP PLAIN accepts an email or JID authcid" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var buf: [96]u8 = undefined;
+    const result = handleSync(&handler, plainRequest(49, "10.0.0.49", plainPayload(&buf, "alice@idp.example", "right"))) orelse return error.NoResponse;
+
+    // The IdP receives the raw login, while the lock key and bound JID use
+    // only its prepared localpart.
+    try std.testing.expectEqualStrings("alice", result.auth_success.username);
+    try std.testing.expectEqual(@as(u32, 1), store.password_calls);
+}
+
+test "AuthHandler: OAUTHBEARER binds the prepared localpart" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{ .token_user = "NaplesTB@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 46,
+        .mechanism = .oauthbearer,
+        .client_ip = "10.0.0.46",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok123\x01\x01",
+    } }) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("naplestb", result.auth_success.username);
+}
+
+test "AuthHandler: invalid IdP identities get not-authorized with IP-only charge" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "bad name@idp.example",
+        .password_secret = "right",
+        .token_user = "bad name@idp.example",
+    };
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const plain = handleSync(&handler, plainRequest(47, "10.0.0.47", plainPayload(&buf, "alice", "right"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", plain.auth_failure.reason);
+    try std.testing.expect(handler.policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.47") orelse return error.ExpectedDenial);
+
+    const oauth = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 48,
+        .mechanism = .oauthbearer,
+        .client_ip = "10.0.0.48",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok123\x01\x01",
+    } }) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("not-authorized", oauth.auth_failure.reason);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.48") orelse return error.ExpectedDenial);
+}
+
+test "AuthHandler: a lock on the IdP identity rejects OAUTHBEARER" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("bob", .permanent);
+
+    var store = TestIdpStore{ .token_user = "Bob@idp.example" };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 44,
+        .mechanism = .oauthbearer,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok456\x01\x01",
+    } }) orelse return error.NoResponse;
+    if (result != .auth_failure) return error.ExpectedAuthFailure;
+
+    try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+}
+
+test "AuthHandler: a lock landing between challenge and client-final rejects" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const Gate = struct { locked: bool = false };
+    var gate = Gate{};
+    handler.setLockChecker(.{ .ctx = @ptrCast(&gate), .checkFn = struct {
+        fn f(ctx: *anyopaque, _: []const u8) LockCheckResult {
+            const g: *const Gate = @ptrCast(@alignCast(ctx));
+            return if (g.locked) .locked else .unlocked;
+        }
+    }.f });
+
+    var client = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer client.deinit();
+
+    const challenge_msg = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 23,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try client.clientFirst(),
+    } }) orelse return error.NoResponse;
+    const challenge = challenge_msg.auth_challenge.challenge;
+    try std.testing.expect(challenge.len > 0);
+
+    // The account is locked while the exchange is in flight.
+    gate.locked = true;
+
+    const result = handleSync(&handler, .{ .sasl_response = .{
+        .conn_id = 23,
+        .payload = try client.handleServerFirst(challenge),
+    } }) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("account-disabled", result.auth_failure.reason);
+    // The rejected exchange leaves no session behind.
+    try std.testing.expect(handler.findScramSlot(0, 23) == null);
+}
+
+test "AuthHandler: re-auth on a live conn_id deinits the previous exchange (T279)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var client_a = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer client_a.deinit();
+    var client_b = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer client_b.deinit();
+
+    for ([_]*sasl.ScramClient{ &client_a, &client_b }) |client| {
+        const reply = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 42,
+            .mechanism = .scram_sha_256,
+            .client_ip = "127.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try client.clientFirst(),
+        } }) orelse return error.NoResponse;
+        try std.testing.expect(reply == .auth_challenge);
+    }
+}
+
+test "AuthHandler: closing an IPC lane sweeps its in-flight SCRAM sessions (T279)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var other_lane = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer other_lane.deinit();
+    var doomed_lane = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer doomed_lane.deinit();
+
+    // conn 1 rides lane 3, conn 2 rides lane 4 (the slot arg of
+    // handleMessage is the IPC lane).
+    const conn1 = 42;
+    const conn2 = 43;
+    {
+        const r1 = handler.handleMessage(.{ .auth_request = .{
+            .conn_id = conn1,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try doomed_lane.clientFirst(),
+        } }, 3, 1);
+        try std.testing.expect(r1 == .reply);
+        _ = handler.handleMessage(.{ .auth_request = .{
+            .conn_id = conn2,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try other_lane.clientFirst(),
+        } }, 4, 1);
+    }
+
+    try std.testing.expect(handler.findScramSlot(3, conn1) != null);
+    try std.testing.expect(handler.findScramSlot(4, conn2) != null);
+
+    handler.closeLaneSessions(3);
+    try std.testing.expect(handler.findScramSlot(3, conn1) == null);
+    try std.testing.expect(handler.findScramSlot(4, conn2) != null);
+}
+
+test "AuthHandler: identical conn_id on two lanes holds two exchanges; abort(kill) on one leaves the other (T279)" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var lane_a = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer lane_a.deinit();
+    var lane_b = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer lane_b.deinit();
+
+    // Each worker lane numbers its connections from 1; conn_id 7 exists
+    // once per lane legitimately. Both exchanges must be alive at once.
+    _ = handler.handleMessage(.{ .auth_request = .{
+        .conn_id = 7,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try lane_a.clientFirst(),
+    } }, 3, 1);
+    _ = handler.handleMessage(.{ .auth_request = .{
+        .conn_id = 7,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try lane_b.clientFirst(),
+    } }, 4, 1);
+
+    try std.testing.expect(handler.findScramSlot(3, 7) != null);
+    try std.testing.expect(handler.findScramSlot(4, 7) != null);
+
+    // Killing lane 3's client mid-exchange must not disturb lane 4's
+    // exchange with the same conn_id.
+    _ = handler.handleMessage(.{ .auth_abort = .{ .conn_id = 7 } }, 3, 1);
+    try std.testing.expect(handler.findScramSlot(3, 7) == null);
+    try std.testing.expect(handler.findScramSlot(4, 7) != null);
 }
 
 test "AuthHandler: SCRAM-SHA-256 full exchange" {
@@ -1103,7 +1973,85 @@ test "AuthHandler: SCRAM-SHA-256 full exchange" {
     try client.handleServerFinal(success_msg.auth_success.server_final);
     try std.testing.expect(client.isComplete());
 
-    handler.cleanupSession(5);
+    handler.cleanupSession(0, 5);
+}
+
+test "AuthHandler: SCRAM prepares the account name but preserves the exchange" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "testuser", "testpassword");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    // The client proves the exchange with its typed n= spelling while the
+    // server looks up and returns the prepared localpart.
+    var client = sasl.ScramClient.init(allocator, "TestUser", "testpassword");
+    defer client.deinit();
+    const client_first = try client.clientFirst();
+    const challenge_msg = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 15,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.15",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "TestUser",
+        .payload = client_first,
+    } }) orelse return error.NoResponse;
+
+    const client_final = try client.handleServerFirst(challenge_msg.auth_challenge.challenge);
+    const success_msg = handleSync(&handler, .{ .sasl_response = .{
+        .conn_id = 15,
+        .payload = client_final,
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expectEqualStrings("testuser", success_msg.auth_success.username);
+    try client.handleServerFinal(success_msg.auth_success.server_final);
+    try std.testing.expect(client.isComplete());
+    handler.cleanupSession(0, 15);
+}
+
+test "AuthHandler: SCRAM invalid names fail closed to not-authorized with IP-only charge" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    // A raw legacy row still cannot make the invalid name match an account.
+    try store.addUser(allocator, "bad name", "pw");
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var client = sasl.ScramClient.init(allocator, "bad name", "pw");
+    defer client.deinit();
+    const client_first = try client.clientFirst();
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 16,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.16",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "bad name",
+        .payload = client_first,
+    } }) orelse return error.NoResponse;
+
+    try std.testing.expect(result == .auth_failure);
+    try std.testing.expectEqualStrings("not-authorized", result.auth_failure.reason);
+    try std.testing.expect(handler.policy.admitAccount("bad name") == null);
+    try std.testing.expectEqualStrings("policy-violation", handler.policy.admitIp("10.0.0.16") orelse return error.ExpectedDenial);
 }
 
 test "AuthHandler: SCRAM unknown user" {
@@ -1167,7 +2115,7 @@ test "AuthHandler: credential cache hit on second SCRAM auth" {
         } }) orelse return error.NoResponse;
 
         try std.testing.expectEqualStrings("cached", success_msg.auth_success.username);
-        handler.cleanupSession(20);
+        handler.cleanupSession(0, 20);
     }
 
     // Verify cache is populated
@@ -1196,7 +2144,7 @@ test "AuthHandler: credential cache hit on second SCRAM auth" {
         } }) orelse return error.NoResponse;
 
         try std.testing.expectEqualStrings("cached", success_msg.auth_success.username);
-        handler.cleanupSession(21);
+        handler.cleanupSession(0, 21);
     }
 }
 
@@ -1233,7 +2181,7 @@ test "AuthHandler: credential cache invalidated on password change" {
             .payload = client_final,
         } }) orelse return error.NoResponse;
 
-        handler.cleanupSession(30);
+        handler.cleanupSession(0, 30);
     }
 
     // Cache should be populated
@@ -1325,7 +2273,7 @@ test "AuthHandler: PLAIN auth defers to crypto pool and completes (T121)" {
     handler.enableCryptoPool(&pool);
 
     var buf: [16]u8 = undefined;
-    const res = handleSync(&handler, plainRequest(42, "10.0.0.9", plainPayload(&buf, "dave", "pw123")));
+    const res = handleSync(&handler, plainRequest(42, "10.0.0.9", plainPayload(&buf, "Dave", "pw123")));
     // With a pool attached the sync helper reports no immediate reply...
     try std.testing.expect(res == null);
     // ...because the request went deferred.
@@ -1409,4 +2357,1001 @@ test "AuthHandler: PLAIN account lockout engages on parsed username" {
 
     const locked = handleSync(&handler, plainRequest(12, "10.9.0.3", wrong)) orelse return error.NoResponse;
     try std.testing.expectEqualStrings("account-disabled", locked.auth_failure.reason);
+}
+
+test "AuthHandler: SCRAM counts the attempt at client-first" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 3,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var i: u32 = 0;
+    while (i < 4) : (i += 1) {
+        var client = sasl.ScramClient.init(allocator, "alice", "secret123");
+        defer client.deinit();
+        const reply = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 100 + i,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.1",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try client.clientFirst(),
+        } }) orelse return error.NoResponse;
+        if (i < 3) {
+            try std.testing.expect(reply == .auth_challenge);
+        } else {
+            if (reply != .auth_failure) return error.ExpectedAuthFailure;
+            try std.testing.expectEqualStrings("policy-violation", reply.auth_failure.reason);
+        }
+    }
+}
+
+test "AuthHandler: SCRAM final lock reply is uniform for right and wrong passwords" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var right = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer right.deinit();
+    var wrong = sasl.ScramClient.init(allocator, "alice", "wrongpw");
+    defer wrong.deinit();
+
+    const right_challenge = (handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 110,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try right.clientFirst(),
+    } }) orelse return error.NoResponse).auth_challenge.challenge;
+    const wrong_challenge = (handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 111,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try wrong.clientFirst(),
+    } }) orelse return error.NoResponse).auth_challenge.challenge;
+
+    // One failure locks the account while both exchanges are in flight.
+    limiter.recordOutcome("alice", "10.0.0.1", false);
+
+    const right_reply = handleSync(&handler, .{ .sasl_response = .{
+        .conn_id = 110,
+        .payload = try right.handleServerFirst(right_challenge),
+    } }) orelse return error.NoResponse;
+    if (right_reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("account-disabled", right_reply.auth_failure.reason);
+
+    const wrong_reply = handleSync(&handler, .{ .sasl_response = .{
+        .conn_id = 111,
+        .payload = try wrong.handleServerFirst(wrong_challenge),
+    } }) orelse return error.NoResponse;
+    if (wrong_reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("account-disabled", wrong_reply.auth_failure.reason);
+}
+
+test "AuthHandler: PLAIN crypto-pool admission counts before the job" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "dave", "pw123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 3,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var pool = TestCryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(2);
+    defer pool.stop();
+    handler.enableCryptoPool(&pool);
+
+    var buf: [24]u8 = undefined;
+    const payload = plainPayload(&buf, "dave", "wrongpw");
+
+    // Three attempts are counted and deferred; the fourth is denied before
+    // a job is queued.
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        try std.testing.expect(handleSync(&handler, plainRequest(120 + i, "10.0.0.9", payload)) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 3), handler.pending_plain.count());
+
+    const fourth = handleSync(&handler, plainRequest(123, "10.0.0.9", payload)) orelse return error.NoResponse;
+    if (fourth != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("policy-violation", fourth.auth_failure.reason);
+}
+
+test "AuthHandler: denied registrations do not count as auth failures" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    // Registration is disabled (the default): two denied registrations from
+    // the same IP must not count as authentication failures.
+    var i: u32 = 0;
+    while (i < 2) : (i += 1) {
+        const reply = handleSync(&handler, .{ .register_request = .{
+            .conn_id = 150 + i,
+            .username = "newuser",
+            .password = "pw",
+            .invite_code = "",
+            .client_ip = "10.0.0.9",
+        } }) orelse return error.NoResponse;
+        if (reply != .register_result) return error.UnexpectedReply;
+        try std.testing.expect(!reply.register_result.success);
+        try std.testing.expectEqualStrings("not-allowed", reply.register_result.reason);
+    }
+
+    var buf: [24]u8 = undefined;
+    const success = handleSync(&handler, plainRequest(152, "10.0.0.9", plainPayload(&buf, "alice", "secret123"))) orelse return error.NoResponse;
+    if (success != .auth_success) return error.ExpectedAuthSuccess;
+    try std.testing.expectEqualStrings("alice", success.auth_success.username);
+}
+
+test "AuthHandler: OAUTHBEARER denies a locked IP before validating the token" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{ .token_user = "bob@idp.example" };
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    limiter.recordOutcome("anyone", "10.0.0.7", false);
+
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 130,
+        .mechanism = .oauthbearer,
+        .client_ip = "10.0.0.7",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok\x01\x01",
+    } }) orelse return error.NoResponse;
+    if (result != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("policy-violation", result.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.token_calls);
+}
+
+test "AuthHandler: SCRAM unknown user records a failure" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var i: u32 = 0;
+    while (i < 2) : (i += 1) {
+        var client = sasl.ScramClient.init(allocator, "ghost", "whatever");
+        defer client.deinit();
+        const reply = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 140 + i,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.8",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try client.clientFirst(),
+        } }) orelse return error.NoResponse;
+        if (reply != .auth_failure) return error.ExpectedAuthFailure;
+        if (i == 0) {
+            try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+        } else {
+            try std.testing.expectEqualStrings("account-disabled", reply.auth_failure.reason);
+        }
+    }
+}
+
+test "AuthHandler: SCRAM abandoned client-firsts count against the IP" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 2,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    const names = [_][]const u8{ "ghost1", "ghost2", "ghost3" };
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        var client = sasl.ScramClient.init(allocator, names[i], "whatever");
+        defer client.deinit();
+        const reply = handleSync(&handler, .{ .auth_request = .{
+            .conn_id = 160 + i,
+            .mechanism = .scram_sha_256,
+            .client_ip = "10.0.0.10",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "",
+            .payload = try client.clientFirst(),
+        } }) orelse return error.NoResponse;
+        if (reply != .auth_failure) return error.ExpectedAuthFailure;
+        if (i < 2) {
+            try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+        } else {
+            // The third abandoned exchange is denied by the IP window before
+            // the unknown-user lookup.
+            try std.testing.expectEqualStrings("policy-violation", reply.auth_failure.reason);
+        }
+    }
+}
+
+test "AuthHandler: PLAIN counts the IP before the lookup" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 1,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [24]u8 = undefined;
+    const payload = plainPayload(&buf, "alice", "secret123");
+
+    const first = handleSync(&handler, plainRequest(170, "10.0.0.11", payload)) orelse return error.NoResponse;
+    if (first != .auth_success) return error.ExpectedAuthSuccess;
+
+    const second = handleSync(&handler, plainRequest(171, "10.0.0.11", payload)) orelse return error.NoResponse;
+    if (second != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("policy-violation", second.auth_failure.reason);
+}
+
+test "AuthHandler: registration counts the IP before adding a user" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 1,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    const first = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 180,
+        .username = "new1",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.12",
+    } }) orelse return error.NoResponse;
+    if (first != .register_result or !first.register_result.success) return error.ExpectedRegisterSuccess;
+
+    const second = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 181,
+        .username = "new2",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.12",
+    } }) orelse return error.NoResponse;
+    if (second != .register_result) return error.UnexpectedReply;
+    try std.testing.expect(!second.register_result.success);
+    try std.testing.expectEqualStrings("policy-violation", second.register_result.reason);
+}
+
+test "AuthHandler: SCRAM client-final ignores a filled IP window" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 1,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var alice = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer alice.deinit();
+    var bob = sasl.ScramClient.init(allocator, "bob", "whatever");
+    defer bob.deinit();
+
+    const challenge = (handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 300,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.20",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try alice.clientFirst(),
+    } }) orelse return error.NoResponse).auth_challenge.challenge;
+
+    // A second client-first fills the IP window; alice's exchange is still
+    // in flight and must be allowed to finish.
+    const blocked = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 301,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.20",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = try bob.clientFirst(),
+    } }) orelse return error.NoResponse;
+    if (blocked != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("policy-violation", blocked.auth_failure.reason);
+
+    const success = handleSync(&handler, .{ .sasl_response = .{
+        .conn_id = 300,
+        .payload = try alice.handleServerFirst(challenge),
+    } }) orelse return error.NoResponse;
+    if (success != .auth_success) return error.ExpectedAuthSuccess;
+    try std.testing.expectEqualStrings("alice", success.auth_success.username);
+}
+
+test "AuthHandler: PLAIN-IdP rejects a locked supplied name before the IdP" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    var buf: [64]u8 = undefined;
+    const right_reply = handleSync(&handler, plainRequest(200, "127.0.0.1", plainPayload(&buf, "alice", "right"))) orelse return error.NoResponse;
+    const wrong_reply = handleSync(&handler, plainRequest(200, "127.0.0.1", plainPayload(&buf, "alice", "wrong"))) orelse return error.NoResponse;
+
+    if (right_reply != .auth_failure or wrong_reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualDeep(right_reply, wrong_reply);
+    try std.testing.expectEqualStrings("account-disabled", right_reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+}
+
+test "AuthHandler: crypto-pool pending jobs count against the lockout threshold" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "dave", "pw123");
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 2,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var pool = TestCryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(2);
+    defer pool.stop();
+    handler.enableCryptoPool(&pool);
+
+    var buf: [24]u8 = undefined;
+    const payload = plainPayload(&buf, "dave", "wrongpw");
+
+    var i: u32 = 0;
+    while (i < 2) : (i += 1) {
+        try std.testing.expect(handleSync(&handler, plainRequest(310 + i, "10.0.0.30", payload)) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler.pending_plain.count());
+
+    // Two jobs are in flight, equal to the lockout threshold: the next
+    // attempt must not be queued.
+    const third = handleSync(&handler, plainRequest(312, "10.0.0.30", payload)) orelse return error.NoResponse;
+    if (third != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("policy-violation", third.auth_failure.reason);
+    try std.testing.expectEqual(@as(usize, 2), handler.pending_plain.count());
+}
+
+test "AuthHandler: a PLAIN prep failure completes and replies" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "dave", "pw123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var pool = TestCryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(2);
+    defer pool.stop();
+    handler.enableCryptoPool(&pool);
+
+    var buf: [32]u8 = undefined;
+    const payload = plainPayload(&buf, "dave", "x\x07y");
+    try std.testing.expect(handleSync(&handler, plainRequest(400, "10.0.0.40", payload)) == null);
+    try std.testing.expectEqual(@as(usize, 1), handler.pending_plain.count());
+
+    try waitForPoolWake(&pool);
+    const completion = pool.popCompletion() orelse return error.NoCompletion;
+    try std.testing.expect(!completion.ok);
+
+    var reply = handler.takeCryptoReply(completion) orelse return error.NoReply;
+    defer reply.deinit(allocator);
+    if (reply.msg != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("not-authorized", reply.msg.auth_failure.reason);
+    try std.testing.expectEqual(@as(usize, 0), handler.pending_plain.count());
+}
+
+test "AuthHandler: a locked IdP alias gets the wrong-password reply" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    var buf: [64]u8 = undefined;
+    const right_reply = handleSync(&handler, plainRequest(410, "127.0.0.1", plainPayload(&buf, "a.smith", "right"))) orelse return error.NoResponse;
+    const wrong_reply = handleSync(&handler, plainRequest(410, "127.0.0.1", plainPayload(&buf, "a.smith", "wrong"))) orelse return error.NoResponse;
+
+    if (right_reply != .auth_failure or wrong_reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualDeep(right_reply, wrong_reply);
+    try std.testing.expectEqualStrings("not-authorized", right_reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 2), store.password_calls);
+}
+
+test "AuthHandler: an alias failure charges the typed name" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    // A temporary lock on the identity, which the alias path resolves to.
+    limiter.recordOutcome("alice", "10.0.0.1", false);
+
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const reply = handleSync(&handler, plainRequest(415, "10.0.0.2", plainPayload(&buf, "a.smith", "right"))) orelse return error.NoResponse;
+    if (reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+
+    // The wrong-password bookkeeping charged a.smith; the handler must not
+    // return here without charging the typed name.
+    try std.testing.expectEqualStrings("account-disabled", handler.policy.check("a.smith", "") orelse return error.ExpectedDenial);
+}
+
+test "AuthHandler: an alias failure does not charge the locked identity" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const reply = handleSync(&handler, plainRequest(416, "10.0.0.9", plainPayload(&buf, "a.smith", "right"))) orelse return error.NoResponse;
+    if (reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+
+    // The locked identity is left alone: once the permanent lock is lifted,
+    // no limiter failure may remain on it, or a failure arrived through the
+    // alias and re-armed the identity's lock.
+    try locks.unlock(allocator, "alice");
+    try std.testing.expect(handler.policy.check("alice", "") == null);
+}
+
+test "AuthHandler: an alias failure charges the IP once" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("alice", .permanent);
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const reply = handleSync(&handler, plainRequest(417, "10.0.0.7", plainPayload(&buf, "a.smith", "right"))) orelse return error.NoResponse;
+    if (reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("not-authorized", reply.auth_failure.reason);
+
+    // One alias failure charged the IP exactly once: with an IP lockout
+    // threshold of two, a second charge would have locked the egress.
+    try std.testing.expect(handler.policy.check("", "10.0.0.7") == null);
+}
+
+test "AuthHandler: a failed crypto-pool completion leaves no pending entry" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "dave", "pw123");
+
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    var pool = TestCryptoPool{ .allocator = std.testing.allocator };
+    try pool.start(2);
+    defer pool.stop();
+    handler.enableCryptoPool(&pool);
+
+    var buf: [24]u8 = undefined;
+    const payload = plainPayload(&buf, "dave", "wrongpw");
+    try std.testing.expect(handleSync(&handler, plainRequest(420, "10.0.0.50", payload)) == null);
+    try std.testing.expectEqual(@as(usize, 1), handler.pending_plain.count());
+
+    try waitForPoolWake(&pool);
+    const completion = pool.popCompletion() orelse return error.NoCompletion;
+    try std.testing.expect(!completion.ok);
+
+    var reply = handler.takeCryptoReply(completion) orelse return error.NoReply;
+    defer reply.deinit(allocator);
+    if (reply.msg != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualStrings("not-authorized", reply.msg.auth_failure.reason);
+    try std.testing.expectEqual(@as(usize, 0), handler.pending_plain.count());
+}
+
+test "AuthHandler: PLAIN-IdP pre-check sees a temporary lock" {
+    const allocator = std.testing.allocator;
+
+    var store = TestIdpStore{
+        .password_user = "alice@idp.example",
+        .password_secret = "right",
+    };
+
+    var limiter = try RateLimiter.init(std.testing.allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    limiter.recordOutcome("alice", "10.0.0.1", false);
+
+    var handler = TestIdpHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    var buf: [64]u8 = undefined;
+    const right_reply = handleSync(&handler, plainRequest(430, "10.0.0.2", plainPayload(&buf, "alice", "right"))) orelse return error.NoResponse;
+    const wrong_reply = handleSync(&handler, plainRequest(430, "10.0.0.2", plainPayload(&buf, "alice", "wrong"))) orelse return error.NoResponse;
+
+    if (right_reply != .auth_failure or wrong_reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualDeep(right_reply, wrong_reply);
+    try std.testing.expectEqualStrings("account-disabled", right_reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+}
+
+test "AuthHandler: a permanently locked IdP identity rejects the Kelvin-sign alias" {
+    const allocator = std.testing.allocator;
+
+    var lock_db = try MemoryBackend.open("", .{});
+    defer lock_db.close();
+    var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
+    try locks.lock("kate", .permanent);
+
+    var store = TestIdpStore{
+        .password_user = "kate@idp.example",
+        .password_secret = "right",
+    };
+    var handler = TestIdpHandler.init(allocator, &store);
+    defer handler.deinit();
+    handler.setLockChecker(makeLockChecker(MemoryBackend, &locks, allocator));
+
+    // "<U+212A>ate" and "kate" are the same identity: the pre-check must
+    // see the permanent lock through the folded key and reject before the
+    // IdP call, so the right password gets the same reply as the wrong one.
+    var buf: [64]u8 = undefined;
+    const right_reply = handleSync(&handler, plainRequest(440, "127.0.0.1", plainPayload(&buf, "\u{212A}ate", "right"))) orelse return error.NoResponse;
+    const wrong_reply = handleSync(&handler, plainRequest(440, "127.0.0.1", plainPayload(&buf, "\u{212A}ate", "wrong"))) orelse return error.NoResponse;
+
+    if (right_reply != .auth_failure or wrong_reply != .auth_failure) return error.ExpectedAuthFailure;
+    try std.testing.expectEqualDeep(right_reply, wrong_reply);
+    try std.testing.expectEqualStrings("account-disabled", right_reply.auth_failure.reason);
+    try std.testing.expectEqual(@as(u32, 0), store.password_calls);
+}
+
+test "AuthHandler: registration stores the PRECIS canonical name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    // "ΟΔΟΣ" prepares to "οδοσ": U+03A3 folds to U+03C3 unconditionally (no
+    // final-sigma rule), so the account is stored under the canonical name
+    // and the typed name is not a key of its own.
+    const reply = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 300,
+        .username = "\u{039F}\u{0394}\u{039F}\u{03A3}",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.20",
+    } }) orelse return error.NoResponse;
+    if (reply != .register_result or !reply.register_result.success) return error.ExpectedRegisterSuccess;
+
+    try std.testing.expect((try store.lookup(allocator, "\u{03BF}\u{03B4}\u{03BF}\u{03C3}")) != null);
+    try std.testing.expect((try store.lookup(allocator, "\u{039F}\u{0394}\u{039F}\u{03A3}")) == null);
+}
+
+test "AuthHandler: registration conflict is on the canonical name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    // Case variants of one name collide on the canonical form.
+    const first = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 310,
+        .username = "Alice",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.21",
+    } }) orelse return error.NoResponse;
+    if (first != .register_result or !first.register_result.success) return error.ExpectedRegisterSuccess;
+
+    for ([_][]const u8{ "alice", "ALICE" }) |variant| {
+        const dup = handleSync(&handler, .{ .register_request = .{
+            .conn_id = 311,
+            .username = variant,
+            .password = "pw",
+            .invite_code = "",
+            .client_ip = "10.0.0.21",
+        } }) orelse return error.NoResponse;
+        if (dup != .register_result) return error.UnexpectedReply;
+        try std.testing.expect(!dup.register_result.success);
+        try std.testing.expectEqualStrings("conflict", dup.register_result.reason);
+    }
+
+    // The Kelvin sign folds to 'k': U+212A and "k" are one account name.
+    const kelvin = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 312,
+        .username = "\u{212A}",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.22",
+    } }) orelse return error.NoResponse;
+    if (kelvin != .register_result or !kelvin.register_result.success) return error.ExpectedRegisterSuccess;
+    try std.testing.expect((try store.lookup(allocator, "k")) != null);
+
+    const kdup = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 313,
+        .username = "k",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.22",
+    } }) orelse return error.NoResponse;
+    if (kdup != .register_result) return error.UnexpectedReply;
+    try std.testing.expect(!kdup.register_result.success);
+    try std.testing.expectEqualStrings("conflict", kdup.register_result.reason);
+}
+
+test "AuthHandler: password change resolves the RFC 7622 account name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "naplestb", "oldpw");
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const changed = handleSync(&handler, .{ .password_change_request = .{
+        .conn_id = 330,
+        .username = "NaplesTB",
+        .new_password = "newpw",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(changed.password_change_result.success);
+
+    var buf: [64]u8 = undefined;
+    const login = handleSync(&handler, plainRequest(331, "10.0.0.31", plainPayload(&buf, "NAPLESTB", "newpw"))) orelse return error.NoResponse;
+    try std.testing.expectEqualStrings("naplestb", login.auth_success.username);
+
+    const invalid = handleSync(&handler, .{ .password_change_request = .{
+        .conn_id = 332,
+        .username = "bad name",
+        .new_password = "pw",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(!invalid.password_change_result.success);
+    try std.testing.expectEqualStrings("not-acceptable", invalid.password_change_result.reason);
+}
+
+test "AuthHandler: account delete resolves the RFC 7622 account name" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "naplestb", "pw");
+    try store.addUser(allocator, "bad name", "pw");
+    var handler = TestHandler.init(allocator, &store);
+    defer handler.deinit();
+
+    const deleted = handleSync(&handler, .{ .account_delete_request = .{
+        .conn_id = 340,
+        .username = "NaplesTB",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(deleted.account_delete_result.success);
+    try std.testing.expect((try store.lookup(allocator, "naplestb")) == null);
+
+    // An invalid name cannot delete even an exact raw legacy row.
+    const invalid = handleSync(&handler, .{ .account_delete_request = .{
+        .conn_id = 341,
+        .username = "bad name",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(!invalid.account_delete_result.success);
+    try std.testing.expectEqualStrings("not-acceptable", invalid.account_delete_result.reason);
+    try std.testing.expect((try store.lookup(allocator, "bad name")) != null);
+}
+
+test "AuthHandler: registration rejects PRECIS-invalid names with not-acceptable" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    // Spaces and symbols fail the IdentifierClass; "@" is PVALID there but
+    // excluded from XMPP localparts by RFC 7622 Section 3.3.1.
+    for ([_][]const u8{ "a b", "\u{2603}", "\u{00A0}x", "a@b" }) |bad| {
+        const reply = handleSync(&handler, .{ .register_request = .{
+            .conn_id = 320,
+            .username = bad,
+            .password = "pw",
+            .invite_code = "",
+            .client_ip = "10.0.0.23",
+        } }) orelse return error.NoResponse;
+        if (reply != .register_result) return error.UnexpectedReply;
+        try std.testing.expect(!reply.register_result.success);
+        try std.testing.expectEqualStrings("not-acceptable", reply.register_result.reason);
+    }
+    try std.testing.expect((try store.lookup(allocator, "a b")) == null);
+
+    // Printable ASCII punctuation is PVALID (RFC 8264 section 8.2 ASCII7):
+    // "a!" is a valid account name and registers.
+    const ok = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 321,
+        .username = "a!",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.23",
+    } }) orelse return error.NoResponse;
+    if (ok != .register_result or !ok.register_result.success) return error.ExpectedRegisterSuccess;
+
+    // An empty name stays a bad request (the form-level check runs first).
+    const empty = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 322,
+        .username = "",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.23",
+    } }) orelse return error.NoResponse;
+    if (empty != .register_result) return error.UnexpectedReply;
+    try std.testing.expect(!empty.register_result.success);
+    try std.testing.expectEqualStrings("bad-request", empty.register_result.reason);
 }

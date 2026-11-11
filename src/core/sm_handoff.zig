@@ -52,11 +52,22 @@ pub const ResumeBundle = struct {
     stanzas: std.ArrayListUnmanaged([]u8) = .{},
     /// sm_out_seq value of stanzas[0], i.e. the source queue's base_seq.
     base_seq: u32,
+    /// Source queue's last acked h (S24). Carried so a backwards h after the
+    /// handoff is still rejected instead of wiping the rebuilt queue.
+    last_h: u32 = 0,
     /// Room JIDs of every MUC room the detached session occupied at handoff
     /// (T177 occupant migration). Nicks/roles/affiliations are NOT bundled:
     /// the canonical occupant record on each room's owning worker is the
     /// source of truth and is moved in place.
     rooms: std.ArrayListUnmanaged([]u8) = .{},
+    /// The detached session's offline tail was still draining at handoff
+    /// (H3). Resume sends no initial presence, so without this the target
+    /// worker clears the flag and the tail is stranded until the next login.
+    offline_pending: bool = false,
+    /// Sequence the drain last handed to the connection but could not delete.
+    /// A resumed session that lost it resends that row alongside the SM replay
+    /// of the same stanza, so the client sees it twice.
+    offline_last_sent_sequence: u64 = 0,
     created: i64,
 
     pub fn deinit(self: *ResumeBundle) void {
