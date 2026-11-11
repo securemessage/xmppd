@@ -48,6 +48,16 @@ var signal_owners = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)
 /// protects; it is null everywhere else.
 pub var window_hook: ?*const fn () void = null;
 
+/// Test seam for the NOTE_EXIT reap race: replaces the waitpid call in
+/// the proc translate path and the deferred re-check, so a test can hold
+/// a child mid-transition. Null everywhere else.
+pub var proc_wait_hook: ?*const fn (posix.pid_t, *c_int, c_int) posix.pid_t = null;
+
+fn waitReap(pid: posix.pid_t, st: *c_int, flags: c_int) posix.pid_t {
+    if (proc_wait_hook) |f| return f(pid, st, flags);
+    return std.c.waitpid(pid, st, flags);
+}
+
 /// Ident and udata of the loop's EVFILT_USER knote.
 pub const wake_ident: usize = 0;
 pub const wake_token: Token = .{ .index = 0, .gen = 1, .kind = wake_kind };
@@ -110,6 +120,10 @@ pub const Stats = struct {
     handles_attached: u64 = 0,
     handles_closed: u64 = 0,
     wakes: u64 = 0,
+    /// Exits deferred because waitpid raced the zombie transition.
+    proc_deferred: u64 = 0,
+    /// Deferrals dropped by a full table; the event emits with status 0.
+    proc_defer_lost: u64 = 0,
     last_errno: u32 = 0,
 };
 
@@ -157,6 +171,9 @@ pub const Options = struct {
 };
 
 const extras_max = 2; // loop-internal changes beyond the two per handle
+/// In-flight exits whose waitpid raced the zombie transition. Transient
+/// state: each entry resolves within passes, so the table stays small.
+const proc_pending_max = 64;
 
 pub const Loop = struct {
     kq: posix.fd_t,
@@ -190,6 +207,8 @@ pub const Loop = struct {
     watched_signals: std.StaticBitSet(max_signal),
     saved_dispositions: [max_signal]posix.Sigaction,
     pending_signals: std.StaticBitSet(max_signal),
+    pending_procs: [proc_pending_max]posix.pid_t,
+    pending_proc_len: usize,
 
     const InternalFailure = enum { timer, broadcast };
 
@@ -258,6 +277,8 @@ pub const Loop = struct {
             .watched_signals = std.StaticBitSet(max_signal).initEmpty(),
             .saved_dispositions = undefined,
             .pending_signals = std.StaticBitSet(max_signal).initEmpty(),
+            .pending_procs = undefined,
+            .pending_proc_len = 0,
         };
 
         // The EVFILT_USER wake knote lives for the loop's lifetime; EV_CLEAR
@@ -728,6 +749,26 @@ pub const Loop = struct {
             self.stats_.delivered_events += 1;
             return .{ .signal = .{ .signo = @intCast(signo), .count = 1 } };
         }
+        if (self.pending_proc_len != 0) {
+            var i: usize = 0;
+            while (i < self.pending_proc_len) {
+                const pid = self.pending_procs[i];
+                var st: c_int = 0;
+                const r = waitReap(pid, &st, w_nohang);
+                if (r == 0) {
+                    i += 1;
+                    continue;
+                }
+                self.pending_procs[i] = self.pending_procs[self.pending_proc_len - 1];
+                self.pending_proc_len -= 1;
+                const status: u32 = if (r == pid) @bitCast(st) else 0;
+                self.stats_.synthetic_events += 1;
+                self.stats_.delivered_events += 1;
+                return .{ .process_exit = .{ .pid = pid, .status = status } };
+            }
+            // Still mid-transition: keep the next wait a poll.
+            self.immediate = true;
+        }
         return null;
     }
 
@@ -1004,13 +1045,25 @@ pub const Loop = struct {
             },
             proc_kind => {
                 const pid: posix.pid_t = @intCast(raw.ident);
-                // Reap when it is our child so the event carries the exit
-                // status; a non-child or already-reaped pid reports 0.
+                // NOTE_EXIT is posted in exit1 before the process is
+                // reapable, so waitpid(WNOHANG) can still see it running.
+                // Defer the event instead of reporting status 0; the
+                // re-check in next() emits it once the reap lands.
                 var st: c_int = 0;
-                const status: u32 = if (std.c.waitpid(pid, &st, w_nohang) == pid)
-                    @bitCast(st)
-                else
-                    0;
+                const r = waitReap(pid, &st, w_nohang);
+                if (r == 0) {
+                    if (self.pending_proc_len < proc_pending_max) {
+                        self.pending_procs[self.pending_proc_len] = pid;
+                        self.pending_proc_len += 1;
+                        self.immediate = true;
+                        self.stats_.proc_deferred += 1;
+                        return null;
+                    }
+                    self.stats_.proc_defer_lost += 1;
+                    self.stats_.delivered_events += 1;
+                    return .{ .process_exit = .{ .pid = pid, .status = 0 } };
+                }
+                const status: u32 = if (r == pid) @bitCast(st) else 0;
                 self.stats_.delivered_events += 1;
                 return .{ .process_exit = .{ .pid = pid, .status = status } };
             },
@@ -2404,15 +2457,63 @@ test "Loop: watchProcess reports the child's exit" {
     }
     try loop.watchProcess(pid); // the loop reaps the child for the status
 
-    try loop.wait();
-    const ev = loop.next().?;
-    try std.testing.expect(ev == .process_exit);
-    try std.testing.expectEqual(pid, ev.process_exit.pid);
-    try std.testing.expect(posix.W.IFEXITED(ev.process_exit.status));
-    try std.testing.expectEqual(@as(u8, 42), posix.W.EXITSTATUS(ev.process_exit.status));
+    // NOTE_EXIT can beat the zombie transition: the exit then defers and
+    // emits on a later pass, so pump until it arrives.
+    var ev: ?Event = null;
+    var passes: usize = 0;
+    while (ev == null and passes < 100) : (passes += 1) {
+        try loop.wait();
+        while (loop.next()) |e| {
+            if (e == .process_exit) ev = e;
+        }
+    }
+    const pex = (ev orelse return error.ExitEventNeverArrived).process_exit;
+    try std.testing.expectEqual(pid, pex.pid);
+    try std.testing.expect(posix.W.IFEXITED(pex.status));
+    try std.testing.expectEqual(@as(u8, 42), posix.W.EXITSTATUS(pex.status));
 
     try std.testing.expectError(error.ProcessNotFound, loop.watchProcess(1 << 22));
     try std.testing.expectEqual(@intFromEnum(posix.E.SRCH), loop.stats().last_errno);
+}
+
+var reap_hold: usize = 0;
+fn holdReap(pid: posix.pid_t, st: *c_int, flags: c_int) posix.pid_t {
+    if (reap_hold != 0) {
+        reap_hold -= 1;
+        return 0;
+    }
+    return std.c.waitpid(pid, st, flags);
+}
+
+test "Loop: watchProcess defers an exit until the child is reapable" {
+    // The seam forces the first waitpid to 0, the mid-transition state
+    // the defer covers: the event must arrive later with the real
+    // status, not 0.
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const pid = try posix.fork();
+    if (pid == 0) {
+        posix.exit(42);
+    }
+    try loop.watchProcess(pid);
+    reap_hold = 1;
+    proc_wait_hook = holdReap;
+    defer proc_wait_hook = null;
+
+    var ev: ?Event = null;
+    var passes: usize = 0;
+    while (ev == null and passes < 100) : (passes += 1) {
+        try loop.wait();
+        while (loop.next()) |e| {
+            if (e == .process_exit) ev = e;
+        }
+    }
+    const pex = (ev orelse return error.ExitEventNeverArrived).process_exit;
+    try std.testing.expectEqual(pid, pex.pid);
+    try std.testing.expect(posix.W.IFEXITED(pex.status));
+    try std.testing.expectEqual(@as(u8, 42), posix.W.EXITSTATUS(pex.status));
+    try std.testing.expectEqual(@as(u64, 1), loop.stats().proc_deferred);
 }
 
 test "Loop: attach at capacity fails with HandleTableFull" {
