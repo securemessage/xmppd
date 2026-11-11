@@ -61,6 +61,9 @@ pub const Io = struct {
     ctx: Token,
     data: i64,
     eof: bool,
+    /// EV_EOF fflags (0 without EOF). A failed connect can report writable
+    /// with no EOF before the socket error arrives; a connect consumer
+    /// must latch SO_ERROR once instead of trusting the first event.
     errno: u32,
 };
 
@@ -1256,22 +1259,44 @@ test "Loop: socket error arrives as eof plus errno" {
     };
     const h = try loop.attach(cfd, tctx(1), .{ .write = true });
 
-    try loop.wait();
+    // The write knote can fire on so_error alone before the socket is
+    // marked disconnected (filt_sowrite, uipc_socket.c): the first
+    // writable then carries eof=0 errno=0 and the EOF plus errno arrives
+    // on a later pass. Take whichever order this run produced; a guard
+    // deadline turns a missing second event into a failure, not a hang.
+    const guard = try loop.scheduleIn(10_000, tctx(9));
+    defer _ = loop.cancelTimer(guard);
     var events: std.ArrayList(Event) = .empty;
     defer events.deinit(std.testing.allocator);
-    try drain(&loop, &events);
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    const ev = events.items[0].writable;
-    try std.testing.expect(ev.handle.eql(h));
-    try std.testing.expect(ev.eof);
+    var ev: ?Io = null;
+    var timed_out = false;
+    while (ev == null and !timed_out) {
+        try loop.wait();
+        events.clearRetainingCapacity();
+        try drain(&loop, &events);
+        for (events.items) |e| switch (e) {
+            .writable => |io| {
+                try std.testing.expect(io.handle.eql(h));
+                if (io.eof) {
+                    ev = io;
+                } else {
+                    try std.testing.expectEqual(@as(u32, 0), io.errno);
+                }
+            },
+            .deadline => timed_out = true,
+            else => {},
+        };
+    }
+    const io = ev orelse return error.EofNeverArrived;
+    try std.testing.expect(io.eof);
     // A synchronous refusal clears so_error (uipc_syscalls.c): the write
     // knote then reports EV_EOF with fflags = 0. A pended connect keeps
     // the error, so the async path must report ECONNREFUSED.
     const refused = @intFromEnum(posix.E.CONNREFUSED);
     if (sync_refused) {
-        try std.testing.expect(ev.errno == 0 or ev.errno == refused);
+        try std.testing.expect(io.errno == 0 or io.errno == refused);
     } else {
-        try std.testing.expectEqual(refused, ev.errno);
+        try std.testing.expectEqual(refused, io.errno);
     }
 }
 
