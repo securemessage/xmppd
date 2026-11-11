@@ -22,6 +22,7 @@
 const std = @import("std");
 const xml = @import("xml");
 const room_registry = @import("room_registry");
+const jid_bounds = @import("jid_bounds.zig");
 const Room = room_registry.Room;
 const Occupant = room_registry.Occupant;
 const RoomRegistry = room_registry.RoomRegistry;
@@ -35,10 +36,11 @@ pub const DEFAULT_BATCH_SIZE: u8 = 32;
 /// Maximum concurrent pending fan-out operations.
 pub const MAX_PENDING: usize = 4;
 
-/// Capacity of a queued pre-built stanza prefix and suffix. A suffix longer
-/// than this is rejected at build time rather than truncated, so the same
-/// limit applies to a stanza delivered live and to one parked in the queue.
-pub const PREFIX_CAPACITY: usize = 512;
+/// Capacity of a queued pre-built stanza prefix. The prefix is
+/// "<message|presence from='" plus an occupant JID (a maximum-length room
+/// bare JID, '/', and a nick) plus "' to='", so it must hold a full JID in
+/// the worst case rather than truncate the stanza mid-attribute.
+pub const PREFIX_CAPACITY: usize = jid_bounds.FULL_JID_MAX;
 pub const SUFFIX_CAPACITY: usize = 16500;
 
 /// A pending fan-out operation that delivers a pre-built stanza to room
@@ -50,7 +52,7 @@ pub const PendingFanout = struct {
     next_slot: u8 = 0,
 
     /// Room JID for safe re-lookup (room may have been destroyed between ticks).
-    room_jid_buf: [320]u8 = undefined,
+    room_jid_buf: [jid_bounds.BARE_JID_MAX]u8 = undefined,
     room_jid_len: u16 = 0,
 
     /// Pre-built stanza prefix: everything up to and including " to='"
@@ -65,6 +67,12 @@ pub const PendingFanout = struct {
 
     pub fn getRoomJid(self: *const PendingFanout) []const u8 {
         return self.room_jid_buf[0..self.room_jid_len];
+    }
+
+    // The queue's room JID copy assumes this buffer holds any JID the room
+    // registry can store.
+    comptime {
+        std.debug.assert(@sizeOf(@FieldType(@This(), "room_jid_buf")) >= @sizeOf(@FieldType(Room, "jid_buf")));
     }
 
     pub fn getPrefix(self: *const PendingFanout) []const u8 {

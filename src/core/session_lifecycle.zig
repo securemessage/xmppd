@@ -23,10 +23,19 @@ const ChangeList = @import("event_loop.zig").ChangeList;
 const muc_handler = @import("muc_handler.zig");
 const presence_handler = @import("presence_handler.zig");
 const lastact_store = @import("last_activity_store");
+const router = @import("router.zig");
 const connection_mod = @import("connection.zig");
 const delivery_queue_mod = @import("delivery_queue");
 
 const log = std.log.scoped(.lifecycle);
+
+/// Cold error paths. The helper is noinline and marked cold so the log
+/// formatter's stack frame stays out of the per-message callers; the call
+/// site holds only the call.
+noinline fn noteDrop(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    log.warn(fmt, args);
+}
 
 /// Drain all pending connections from the listener socket.
 pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
@@ -360,16 +369,13 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
     }
 
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
-    if (session.stream.bound_jid) |bound| {
-        var close_jid_buf: [256]u8 = undefined;
-        var close_jid_fbs = std.io.fixedBufferStream(&close_jid_buf);
-        const cw = close_jid_fbs.writer();
-        cw.writeAll(bound.local) catch {};
-        cw.writeByte('@') catch {};
-        cw.writeAll(bound.domain) catch {};
-        cw.writeByte('/') catch {};
-        cw.writeAll(bound.resource) catch {};
-        muc_handler.handleSessionClose(server, close_jid_fbs.getWritten(), changes);
+    if (session.stream.bound_jid) |bound| close_cleanup: {
+        var close_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
+        const close_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &close_jid_buf) catch {
+            noteDrop("session {d} close: full JID exceeds {d} bytes; room cleanup skipped", .{ id, router.FULL_JID_MAX });
+            break :close_cleanup;
+        };
+        muc_handler.handleSessionClose(server, close_jid, changes);
     }
 
     // Unregister from session map and broadcast unavailable presence
@@ -412,13 +418,13 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
 /// T164: write the account's last-offline timestamp after its final resource
 /// unbound (best-effort; on error the next teardown retries).
 fn recordLastOffline(roster: anytype, bound: anytype) void {
-    var bare_buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&bare_buf);
-    fbs.writer().writeAll(bound.local) catch return;
-    fbs.writer().writeByte('@') catch return;
-    fbs.writer().writeAll(bound.domain) catch return;
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
+    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
+        noteDrop("last-activity record skipped for {s}@{s}: bare JID exceeds {d} bytes", .{ bound.local, bound.domain, router.BARE_JID_MAX });
+        return;
+    };
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
-    lastact_store.record(roster.backend, fbs.getWritten(), now) catch |err| {
+    lastact_store.record(roster.backend, bare_jid, now) catch |err| {
         log.warn("last-activity record failed for {s}@{s}: {}", .{ bound.local, bound.domain, err });
     };
 }
@@ -476,12 +482,11 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
     // precondition: a deployment without one still drains what it stored.
     const archive = server.archive;
 
-    var bare_buf: [256]u8 = undefined;
-    var bare_fbs = std.io.fixedBufferStream(&bare_buf);
-    bare_fbs.writer().writeAll(local) catch return;
-    bare_fbs.writer().writeByte('@') catch return;
-    bare_fbs.writer().writeAll(domain) catch return;
-    const bare_jid = bare_fbs.getWritten();
+    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
+    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
+        noteDrop("offline delivery for {s}@{s} skipped: bare JID exceeds {d} bytes", .{ local, domain, router.BARE_JID_MAX });
+        return;
+    };
 
     // A failed count is a store failure like any other: without a staged
     // retry the session stays parked with nothing armed to drain it.
@@ -571,7 +576,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
             if (muc_handler.formatDelayStamp(&delay_buf, ptr.timestamp)) |stamp| {
                 if (delay_lease) |*lease| {
                     wire = stampOfflineDelay(xml_data, domain, stamp, lease.buf) catch |err| blk: {
-                        log.warn("offline delay stamp for {s} skipped: {s}", .{ bare_jid, @errorName(err) });
+                        noteDrop("offline delay stamp for {s} skipped: {s}", .{ bare_jid, @errorName(err) });
                         break :blk xml_data;
                     };
                 }
@@ -584,13 +589,13 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
             // and the drain moves on.
             if (wire.len > connection_mod.WRITE_BUF_SIZE) {
                 if (xml_data.len <= connection_mod.WRITE_BUF_SIZE) {
-                    log.warn("offline message to {s} does not fit once stamped ({d} bytes); sending unstamped", .{ bare_jid, wire.len });
+                    noteDrop("offline message to {s} does not fit once stamped ({d} bytes); sending unstamped", .{ bare_jid, wire.len });
                     wire = xml_data;
                 } else {
                     _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
-                    log.warn("offline message to {s} is {d} bytes and can never fit the {d}-byte send buffer; dropping it", .{ bare_jid, xml_data.len, connection_mod.WRITE_BUF_SIZE });
+                    noteDrop("offline message to {s} is {d} bytes and can never fit the {d}-byte send buffer; dropping it", .{ bare_jid, xml_data.len, connection_mod.WRITE_BUF_SIZE });
                     store.deletePointer(ptr) catch |err| {
-                        log.warn("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
+                        noteDrop("offline pointer delete failed for {s}: {s}", .{ bare_jid, @errorName(err) });
                     };
                     dropped += 1;
                     continue;

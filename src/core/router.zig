@@ -29,14 +29,45 @@ const connection_mod = @import("connection.zig");
 const offline_store = @import("generic_offline_store");
 const ipc_protocol = @import("ipc_protocol");
 
+const jid_bounds = @import("jid_bounds.zig");
+
 const log = std.log.scoped(.router);
 
-/// A bare JID that can be a store key is at most MAX_KEY_LEN (511) bytes, so
-/// this buffer holds every valid key in full (S4).
-pub const BARE_JID_MAX = 512;
-/// Worst-case full JID from bind: two 256-byte parts, the separators, and the
-/// server host. A shorter buffer silently dropped the stanza on overflow.
-pub const FULL_JID_MAX = 1024;
+/// Cold error paths. Each helper is noinline and marked cold so the log
+/// formatter's stack frame stays out of the per-message callers; the call
+/// site holds only the call.
+noinline fn noteDrop(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    log.warn(fmt, args);
+}
+
+/// Record one over-long-JID skip on the cold path (S4).
+noinline fn noteJidOverflow(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    countJidOverflow();
+    log.warn(fmt, args);
+}
+
+/// Record one cross-worker delivery drop on the cold path (S14).
+noinline fn noteCrossWorkerDrop(comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
+    log.warn(fmt, args);
+}
+
+pub const BARE_JID_MAX = jid_bounds.BARE_JID_MAX;
+pub const FULL_JID_MAX = jid_bounds.FULL_JID_MAX;
+pub const JID_STANZA_MAX = jid_bounds.JID_STANZA_MAX;
+
+/// Counted reason (S4): bumped once per delivery skipped because a JID or a
+/// JID-bearing stanza did not fit its bounded buffer. Operators can diff the
+/// counter to spot the drop; each site also logs the context.
+pub var jid_overflow_drops = std.atomic.Value(usize).init(0);
+
+/// Record one over-long-JID skip (S4).
+pub fn countJidOverflow() void {
+    _ = jid_overflow_drops.fetchAdd(1, .monotonic);
+}
 
 /// Build a bare JID "local@domain" into out. A JID that does not fit returns
 /// NoSpaceLeft rather than a truncated prefix (S4).
@@ -46,6 +77,21 @@ pub fn buildBareJid(local: []const u8, domain: []const u8, out: *[BARE_JID_MAX]u
     try w.writeAll(local);
     try w.writeByte('@');
     try w.writeAll(domain);
+    return fbs.getWritten();
+}
+
+/// Build a full JID "local@domain/resource" into out (the resource part is
+/// optional). A JID that does not fit returns NoSpaceLeft (S4).
+pub fn buildFullJid(local: []const u8, domain: []const u8, resource: []const u8, out: *[FULL_JID_MAX]u8) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(out);
+    const w = fbs.writer();
+    try w.writeAll(local);
+    try w.writeByte('@');
+    try w.writeAll(domain);
+    if (resource.len > 0) {
+        try w.writeByte('/');
+        try w.writeAll(resource);
+    }
     return fbs.getWritten();
 }
 
@@ -121,7 +167,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     // Parse target JID
     const to_jid = xmpp.Jid.parse(to_str) catch {
-        log.warn("connection {d} stanza with invalid 'to': {s}", .{ session.conn.id, to_str });
+        noteDrop("connection {d} stanza with invalid 'to': {s}", .{ session.conn.id, to_str });
         return;
     };
 
@@ -152,35 +198,27 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // localpart and resource at 256 bytes each, so the full JID can exceed
     // 256 and a smaller buffer would drop the stanza with no answer.
     var from_buf: [FULL_JID_MAX]u8 = undefined;
-    var from_fbs = std.io.fixedBufferStream(&from_buf);
-    const from_w = from_fbs.writer();
-    from_w.writeAll(from_jid.local) catch {
-        log.warn("connection {d} sender JID exceeds {d} bytes, stanza dropped", .{ session.conn.id, FULL_JID_MAX });
+    const from_str = buildFullJid(from_jid.local, from_jid.domain, from_jid.resource, &from_buf) catch {
+        noteJidOverflow("connection {d} sender JID exceeds {d} bytes, stanza dropped", .{ session.conn.id, FULL_JID_MAX });
         return;
     };
-    from_w.writeByte('@') catch return;
-    from_w.writeAll(from_jid.domain) catch return;
-    if (from_jid.resource.len > 0) {
-        from_w.writeByte('/') catch return;
-        from_w.writeAll(from_jid.resource) catch return;
-    }
-    const from_str = from_fbs.getWritten();
 
     // XEP-0191: Block check — silently drop stanzas from blocked contacts.
-    if (server.block_store) |bs| {
-        var rblk_buf: [256]u8 = undefined;
-        var rblk_fbs = std.io.fixedBufferStream(&rblk_buf);
-        rblk_fbs.writer().writeAll(to_jid.local) catch {};
-        rblk_fbs.writer().writeByte('@') catch {};
-        rblk_fbs.writer().writeAll(to_jid.domain) catch {};
-        const recip_bare = rblk_fbs.getWritten();
+    // A bare JID longer than BARE_JID_MAX cannot exist in the bounded block
+    // store (store keys cap at 511 bytes), so the check is vacuous for it;
+    // count and log the skip instead of silently passing a truncated JID.
+    if (server.block_store) |bs| block_check: {
+        var rblk_buf: [BARE_JID_MAX]u8 = undefined;
+        const recip_bare = buildBareJid(to_jid.local, to_jid.domain, &rblk_buf) catch {
+            noteJidOverflow("connection {d} recipient JID exceeds {d} bytes; block check vacuous", .{ session.conn.id, BARE_JID_MAX });
+            break :block_check;
+        };
 
-        var sblk_buf: [256]u8 = undefined;
-        var sblk_fbs = std.io.fixedBufferStream(&sblk_buf);
-        sblk_fbs.writer().writeAll(from_jid.local) catch {};
-        sblk_fbs.writer().writeByte('@') catch {};
-        sblk_fbs.writer().writeAll(from_jid.domain) catch {};
-        const sender_bare = sblk_fbs.getWritten();
+        var sblk_buf: [BARE_JID_MAX]u8 = undefined;
+        const sender_bare = buildBareJid(from_jid.local, from_jid.domain, &sblk_buf) catch {
+            noteJidOverflow("connection {d} sender bare JID exceeds {d} bytes; block check vacuous", .{ session.conn.id, BARE_JID_MAX });
+            break :block_check;
+        };
 
         if (bs.isBlocked(server.allocator, recip_bare, sender_bare) catch false) {
             return;
@@ -376,7 +414,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // null here only disables the archive and offline branches.
     var sender_bare_buf: [BARE_JID_MAX]u8 = undefined;
     const sender_bare: ?[]const u8 = buildBareJid(from_jid.local, from_jid.domain, &sender_bare_buf) catch blk: {
-        log.warn("connection {d} sender bare JID exceeds {d} bytes, not archived or stored offline", .{ session.conn.id, BARE_JID_MAX });
+        noteDrop("connection {d} sender bare JID exceeds {d} bytes, not archived or stored offline", .{ session.conn.id, BARE_JID_MAX });
         break :blk null;
     };
 
@@ -396,7 +434,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     if (is_archivable and sender_bare != null) {
         if (server.archive != null) {
             archive_stanza = buildStoredStanza(out_buf, from_str, to_str, type_str, id_str, inner_xml, archive_stanza_id, server.server_host) orelse blk: {
-                log.warn("connection {d} archive form for {s} exceeds the serialization buffer, not archived", .{ session.conn.id, to_str });
+                noteDrop("connection {d} archive form for {s} exceeds the serialization buffer, not archived", .{ session.conn.id, to_str });
                 break :blk "";
             };
 
@@ -406,7 +444,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                     server.archiveStore(recipient_bare, sender_bare.?, archive_stanza_id, archive_timestamp, archive_stanza);
                     server.archiveStore(sender_bare.?, recipient_bare, archive_stanza_id, archive_timestamp, archive_stanza);
                 } else {
-                    log.warn("connection {d} recipient bare JID exceeds {d} bytes, not archived", .{ session.conn.id, BARE_JID_MAX });
+                    noteDrop("connection {d} recipient bare JID exceeds {d} bytes, not archived", .{ session.conn.id, BARE_JID_MAX });
                 }
             }
         }
@@ -443,7 +481,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 // unanswered drop loses the message silently.
                 if (sender_bare == null or recipient_bare2 == null) {
                     _ = delivery_queue_mod.offline_not_stored.fetchAdd(1, .monotonic);
-                    log.warn("connection {d} message to {s} has a JID over the store-key limit, not stored offline", .{ session.conn.id, to_str });
+                    noteDrop("connection {d} message to {s} has a JID over the store-key limit, not stored offline", .{ session.conn.id, to_str });
                 } else {
                     const sender_key = sender_bare.?;
                     const recipient_key = recipient_bare2.?;
@@ -486,7 +524,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                         }
                     } else {
                         _ = delivery_queue_mod.offline_not_stored.fetchAdd(1, .monotonic);
-                        log.warn("connection {d} message to {s} has no storable form, not stored offline", .{ session.conn.id, to_str });
+                        noteDrop("connection {d} message to {s} has no storable form, not stored offline", .{ session.conn.id, to_str });
                     }
                 }
             }
@@ -516,7 +554,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     const emit_type = emitTypeFor(session.stanza_kind, type_str);
     const built = buildDeliveryStanza(out_buf, tag_name, from_str, to_str, type_str, emit_type, id_str, delivery_inner_xml);
     if (built == null) {
-        log.warn("connection {d} stanza to {s} exceeds the delivery buffer, not routed", .{ session.conn.id, to_str });
+        noteDrop("connection {d} stanza to {s} exceeds the delivery buffer, not routed", .{ session.conn.id, to_str });
     }
 
     var hold_bounced = false;
@@ -603,12 +641,12 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             if (err == error.WriteBufferFull) {
                 if (sent_data.len <= connection_mod.WRITE_BUF_SIZE) {
                     target_session.sm_overflow = true;
-                    log.warn("connection {d} outbound buffer full for {s}; marking the session for overflow teardown", .{ tid, to_str });
+                    noteDrop("connection {d} outbound buffer full for {s}; marking the session for overflow teardown", .{ tid, to_str });
                 } else {
-                    log.warn("connection {d} stanza for {s} of {d} bytes exceeds the write buffer", .{ tid, to_str, sent_data.len });
+                    noteDrop("connection {d} stanza for {s} of {d} bytes exceeds the write buffer", .{ tid, to_str, sent_data.len });
                 }
             } else {
-                log.warn("connection {d} could not queue stanza for {s}: {s}", .{ tid, to_str, @errorName(err) });
+                noteDrop("connection {d} could not queue stanza for {s}: {s}", .{ tid, to_str, @errorName(err) });
             }
             continue;
         };
@@ -871,16 +909,14 @@ fn enqueueCrossThreadStanza(
     // Carry the dispatch identity so the receiving worker holds this message
     // under the same token every other holder uses.
     ds.deliverDelivery(route.worker_id, route.local_session_id, route.generation, payload, hold_token, receipt_ts, .stanza) catch |err| {
-        log.warn("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
-        _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
+        noteCrossWorkerDrop("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
         return false;
     };
     return true;
 }
 
 fn dropOversize(inner_len: usize, route: SessionEntry) bool {
-    _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
-    log.warn("cross-thread stanza exceeds {d}-byte delivery slot (inner {d} bytes) to worker {d} session {d} — routed to offline/bounce fallback (S14)", .{ delivery_queue_mod.MAX_PAYLOAD_SIZE, inner_len, route.worker_id, route.local_session_id });
+    noteCrossWorkerDrop("cross-thread stanza exceeds {d}-byte delivery slot (inner {d} bytes) to worker {d} session {d} — routed to offline/bounce fallback (S14)", .{ delivery_queue_mod.MAX_PAYLOAD_SIZE, inner_len, route.worker_id, route.local_session_id });
     return false;
 }
 
@@ -1037,8 +1073,7 @@ fn sendCarbons(
             // apply carbons_enabled and the live-only rules; this worker
             // cannot see them on the remote Session.
             ds.deliverDelivery(entry.worker_id, entry.local_session_id, entry.generation, cfbs.getWritten(), 0, 0, .carbon) catch |err| {
-                log.warn("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
-                _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
+                noteCrossWorkerDrop("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
             };
         }
     }
