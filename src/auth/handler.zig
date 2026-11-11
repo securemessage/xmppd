@@ -1049,6 +1049,7 @@ fn hashUsername(username: []const u8) u64 {
 // ============================================================================
 
 const backend_mod = @import("backend");
+const oidc_ids = @import("oidc_identity_store");
 const user_store_mod = @import("user_store");
 const MemoryBackend = backend_mod.MemoryBackend;
 const TestUserStore = user_store_mod.UserStore(MemoryBackend);
@@ -3246,7 +3247,7 @@ test "AuthHandler: registration of an OIDC-bound localpart is refused" {
     var db = try MemoryBackend.open("", .{});
     defer db.close();
     // A reverse-index row ('l' ++ localpart) binds the name to a subject.
-    try db.put("oidc_identities", "lbound-lp", "row");
+    try db.put(oidc_ids.NAMESPACE, "lbound-lp", "row");
 
     var store = TestUserStore.init(&db);
     var limiter = try RateLimiter.init(allocator, .{

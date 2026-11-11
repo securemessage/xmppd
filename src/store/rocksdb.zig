@@ -566,7 +566,8 @@ test "RocksDbBackend: open and close" {
 }
 
 test "RocksDbBackend: putIfAbsent claims once and conflicts on committed keys" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();

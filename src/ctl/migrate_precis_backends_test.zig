@@ -1008,6 +1008,10 @@ const NoDeleteBackend = struct {
             try self.inner.put(ns, key, value);
         }
 
+        pub fn putIfAbsent(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
+            try self.inner.putIfAbsent(ns, key, value);
+        }
+
         pub fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void {
             _ = self;
             _ = ns;
@@ -1082,6 +1086,10 @@ const FailingCommitBackend = struct {
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
             try self.inner.put(ns, key, value);
+        }
+
+        pub fn putIfAbsent(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
+            try self.inner.putIfAbsent(ns, key, value);
         }
 
         pub fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void {
