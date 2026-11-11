@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const atomic = std.atomic;
+const posix = std.posix;
 
 const log = std.log.scoped(.metrics);
 
@@ -66,6 +67,16 @@ pub threadlocal var current: ?*Counters = null;
 
 pub fn bind(worker_id: u16) void {
     if (worker_id < MAX_WORKERS) current = &workers[worker_id];
+}
+
+/// Block SIGUSR1 on the calling thread. main() calls this before any
+/// thread exists so every spawned thread inherits the mask: a
+/// process-directed USR1 can never take its default terminate, and each
+/// worker's EVFILT_SIGNAL knote still records it for the dump.
+pub fn blockUsr1() void {
+    var mask = posix.sigemptyset();
+    posix.sigaddset(&mask, posix.SIG.USR1);
+    posix.sigprocmask(posix.SIG.BLOCK, &mask, null);
 }
 
 pub inline fn get() ?*Counters {
@@ -138,6 +149,29 @@ test "recordIteration assigns log2 buckets" {
     try std.testing.expectEqual(@as(u64, 1), read(&c.loop_hist_us[1]));
     try std.testing.expectEqual(@as(u64, 1), read(&c.loop_hist_us[9]));
     try std.testing.expectEqual(@as(u64, 1), read(&c.loop_hist_us[HIST_BUCKETS - 1]));
+}
+
+test "blockUsr1 masks SIGUSR1 and spawned threads inherit the mask" {
+    // Without the block a process-directed USR1 terminates the core on
+    // whichever thread did not mask it.
+    blockUsr1();
+
+    var empty = posix.sigemptyset();
+    var probe: posix.sigset_t = undefined;
+    posix.sigprocmask(posix.SIG.BLOCK, &empty, &probe);
+    try std.testing.expect(posix.sigismember(&probe, posix.SIG.USR1));
+
+    var inherited = false;
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(ok: *bool) void {
+            var e = posix.sigemptyset();
+            var m: posix.sigset_t = undefined;
+            posix.sigprocmask(posix.SIG.BLOCK, &e, &m);
+            ok.* = posix.sigismember(&m, posix.SIG.USR1);
+        }
+    }.run, .{&inherited});
+    t.join();
+    try std.testing.expect(inherited);
 }
 
 test "bind rejects out-of-range worker ids" {

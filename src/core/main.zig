@@ -53,10 +53,17 @@ const session_map_mod = @import("session_map");
 const SessionMap = session_map_mod.SessionMap;
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
+const metrics = @import("metrics.zig");
 
 const log = std.log.scoped(.@"xmppd-core");
 
 pub fn main() !void {
+    // M1: block SIGUSR1 before any thread exists so every spawned thread
+    // inherits the mask. A process-directed USR1 can then never take its
+    // default terminate on an unblocked thread; each worker's
+    // EVFILT_SIGNAL knote still records it and dumps its counters.
+    metrics.blockUsr1();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
