@@ -1,0 +1,20 @@
+# src/core stack-frame caps in bytes (name<TAB>cap).
+# Generated from the xmppd-core Debug build on freebsd-dev1 at the
+# v091/measure-m4 merge of master 8086a6a (Zig emits __zig_probe_stack;
+# caps record the probe immediate). A function fails the check when its
+# frame exceeds its cap or has no cap at all; lower caps as frames shrink.
+archive_queue.ArchiveWriteQueue.init	186000
+fanout.longestEncodedRealJid	212224
+listener.Listener.accept	74704
+main.configureServer	167696
+main.main	3067136
+main.workerThread	710848
+muc_handler.handleMucDiscoItems	178448
+muc_handler.handleMucGroupchat	17024
+presence_handler.sendPresenceProbes	17040
+room_registry.RoomRegistry.createRoom	275920
+server.Server.initFromFdOpts	2132640
+server.Server.initWithMaxSessions	2488096
+server.Server.run	66608
+server.Session.init	31520
+session_lifecycle.acceptConnections	130112
