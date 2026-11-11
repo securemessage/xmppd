@@ -40,6 +40,11 @@ const TCP_TIMEOUT_MS: i64 = 4000;
 /// per-query deadline still applies inside it.
 const CHAIN_DEADLINE_MS: i64 = 10_000;
 const MAX_JOBS: usize = 64;
+/// Stale ICMP errors a single send drains before giving up: a
+/// connected UDP socket surfaces each port-unreachable as
+/// ECONNREFUSED on the next send, and the job table bounds the
+/// datagrams in flight that can produce them.
+const STALE_ICMP_MAX: usize = MAX_JOBS;
 /// Flattened connect targets per resolution; a hostile SRV answer
 /// cannot grow a job's target list past this.
 const TARGET_CAP: usize = 16;
@@ -959,21 +964,28 @@ pub const Resolver = struct {
     /// Connected-UDP send. An ICMP port-unreachable queued from an
     /// earlier datagram surfaces as ECONNREFUSED on a later send; that
     /// error belongs to the earlier packet, so it is consumed and the
-    /// send retried once instead of failing the wrong job.
+    /// send retried instead of failing the wrong job. A dead
+    /// nameserver under a query burst queues several at once, so the
+    /// drain runs until the send goes out or the backlog bound trips.
     fn sendUdp(self: *Resolver, pkt: []const u8) !void {
         // Test seam: report a wire send failure without touching the
         // socket (a closed fd is UB territory, not a failure path).
         if (builtin.is_test) {
             if (self.fail_sends) return error.SendFailed;
         }
-        _ = rawSend(self.fd, pkt, 0) catch |err| switch (err) {
-            error.Refused => {
-                self.stale_icmp += 1;
-                _ = rawSend(self.fd, pkt, 0) catch return error.SendFailed;
-                return;
-            },
-            else => return error.SendFailed,
-        };
+        var refused: usize = 0;
+        while (true) {
+            _ = rawSend(self.fd, pkt, 0) catch |err| switch (err) {
+                error.Refused => {
+                    self.stale_icmp += 1;
+                    refused += 1;
+                    if (refused >= STALE_ICMP_MAX) return error.SendFailed;
+                    continue;
+                },
+                else => return error.SendFailed,
+            };
+            return;
+        }
     }
 
     /// Apply changelist entries and surface per-entry failures. Every
