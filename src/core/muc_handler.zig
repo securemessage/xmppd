@@ -72,6 +72,13 @@ noinline fn noteJidOverflowCrossWorker(comptime fmt: []const u8, args: anytype) 
     log.warn(fmt, args);
 }
 
+/// Hot-path info logs: noinline, but NOT cold; they fire on every normal
+/// join. They keep the formatter's stack frame out of the per-stanza
+/// callers; the call site holds only the call.
+noinline fn logJoin(real_jid: []const u8, room_jid: []const u8, nick: []const u8) void {
+    log.info("{s} joined {s} as '{s}'", .{ real_jid, room_jid, nick });
+}
+
 /// Handle a presence stanza addressed to a MUC room JID.
 /// Called when to_domain matches the MUC service host.
 ///
@@ -1201,7 +1208,7 @@ fn handleJoin(
         return;
     };
 
-    log.info("{s} joined {s} as '{s}'", .{ real_jid, room_jid, nick });
+    logJoin(real_jid, room_jid, nick);
 
     // 1. Send existing occupants' presence to the new joiner
     for (&r.occupants) |*slot| {
