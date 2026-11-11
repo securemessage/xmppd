@@ -2130,7 +2130,13 @@ test "readForwarded refuses low, unsealed and dead fds without panicking" {
     try testing.expectError(error.UnsealedFd, readForwarded(f.handle, testing.allocator, &diag));
     try testing.expectEqualStrings("conf fd is not fully sealed", diag.detail);
     // An already-closed fd errors instead of panicking through close.
-    try testing.expectError(error.ReadFailed, readForwarded(99, testing.allocator, &diag));
+    // The number must be provably dead: a literal can be inherited
+    // open (fd 99 is live under daemon(8)), so open a fd, record its
+    // number and close it before the call.
+    const dead_fd = try posix.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    try testing.expect(dead_fd >= 3);
+    posix.close(dead_fd);
+    try testing.expectError(error.ReadFailed, readForwarded(dead_fd, testing.allocator, &diag));
     // Slot 0 is below the remap range. The reader closes even a refused
     // fd, and stdin is the test runner's message channel, so the check
     // runs in a forked child where slot 0 is expendable.

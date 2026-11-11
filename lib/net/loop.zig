@@ -41,6 +41,23 @@ pub const proc_kind: u8 = 0x06;
 pub const max_signal = 128;
 var signal_owners = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_signal;
 
+/// Test seam for the signal-order windows: invoked between the knote
+/// attach and the pending read in watchSignal, and between the
+/// disposition restore and the knote delete in unwatchSignal. A test sets
+/// it around one call to post a signal into the gap the ordering
+/// protects; it is null everywhere else.
+pub var window_hook: ?*const fn () void = null;
+
+/// Test seam for the NOTE_EXIT reap race: replaces the waitpid call in
+/// the proc translate path and the deferred re-check, so a test can hold
+/// a child mid-transition. Null everywhere else.
+pub var proc_wait_hook: ?*const fn (posix.pid_t, *c_int, c_int) posix.pid_t = null;
+
+fn waitReap(pid: posix.pid_t, st: *c_int, flags: c_int) posix.pid_t {
+    if (proc_wait_hook) |f| return f(pid, st, flags);
+    return std.c.waitpid(pid, st, flags);
+}
+
 /// Ident and udata of the loop's EVFILT_USER knote.
 pub const wake_ident: usize = 0;
 pub const wake_token: Token = .{ .index = 0, .gen = 1, .kind = wake_kind };
@@ -61,6 +78,9 @@ pub const Io = struct {
     ctx: Token,
     data: i64,
     eof: bool,
+    /// EV_EOF fflags (0 without EOF). A failed connect can report writable
+    /// with no EOF before the socket error arrives; a connect consumer
+    /// must latch SO_ERROR once instead of trusting the first event.
     errno: u32,
 };
 
@@ -100,6 +120,10 @@ pub const Stats = struct {
     handles_attached: u64 = 0,
     handles_closed: u64 = 0,
     wakes: u64 = 0,
+    /// Exits deferred because waitpid raced the zombie transition.
+    proc_deferred: u64 = 0,
+    /// Deferrals dropped by a full table; the event emits with status 0.
+    proc_defer_lost: u64 = 0,
     last_errno: u32 = 0,
 };
 
@@ -147,6 +171,9 @@ pub const Options = struct {
 };
 
 const extras_max = 2; // loop-internal changes beyond the two per handle
+/// In-flight exits whose waitpid raced the zombie transition. Transient
+/// state: each entry resolves within passes, so the table stays small.
+const proc_pending_max = 64;
 
 pub const Loop = struct {
     kq: posix.fd_t,
@@ -180,6 +207,8 @@ pub const Loop = struct {
     watched_signals: std.StaticBitSet(max_signal),
     saved_dispositions: [max_signal]posix.Sigaction,
     pending_signals: std.StaticBitSet(max_signal),
+    pending_procs: [proc_pending_max]posix.pid_t,
+    pending_proc_len: usize,
 
     const InternalFailure = enum { timer, broadcast };
 
@@ -248,6 +277,8 @@ pub const Loop = struct {
             .watched_signals = std.StaticBitSet(max_signal).initEmpty(),
             .saved_dispositions = undefined,
             .pending_signals = std.StaticBitSet(max_signal).initEmpty(),
+            .pending_procs = undefined,
+            .pending_proc_len = 0,
         };
 
         // The EVFILT_USER wake knote lives for the loop's lifetime; EV_CLEAR
@@ -539,6 +570,7 @@ pub const Loop = struct {
             .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
         };
         try kev.applyNow(self.kq, &add, &self.stats_.last_errno);
+        if (window_hook) |f| f();
 
         // Installing SIG_IGN discards pending instances of the signal
         // (POSIX), so the pending check must read before it lands. Pending
@@ -581,6 +613,7 @@ pub const Loop = struct {
         // the gap is seen by the still-registered knote instead of being
         // dropped by the not-yet-restored disposition.
         posix.sigaction(signo, &self.saved_dispositions[signo], null);
+        if (window_hook) |f| f();
         kev.applyNow(self.kq, &del, &self.stats_.last_errno) catch |err| switch (err) {
             error.NotFound, error.BadDescriptor => {},
             else => |e| return e,
@@ -715,6 +748,26 @@ pub const Loop = struct {
             self.stats_.synthetic_events += 1;
             self.stats_.delivered_events += 1;
             return .{ .signal = .{ .signo = @intCast(signo), .count = 1 } };
+        }
+        if (self.pending_proc_len != 0) {
+            var i: usize = 0;
+            while (i < self.pending_proc_len) {
+                const pid = self.pending_procs[i];
+                var st: c_int = 0;
+                const r = waitReap(pid, &st, w_nohang);
+                if (r == 0) {
+                    i += 1;
+                    continue;
+                }
+                self.pending_procs[i] = self.pending_procs[self.pending_proc_len - 1];
+                self.pending_proc_len -= 1;
+                const status: u32 = if (r == pid) @bitCast(st) else 0;
+                self.stats_.synthetic_events += 1;
+                self.stats_.delivered_events += 1;
+                return .{ .process_exit = .{ .pid = pid, .status = status } };
+            }
+            // Still mid-transition: keep the next wait a poll.
+            self.immediate = true;
         }
         return null;
     }
@@ -992,13 +1045,25 @@ pub const Loop = struct {
             },
             proc_kind => {
                 const pid: posix.pid_t = @intCast(raw.ident);
-                // Reap when it is our child so the event carries the exit
-                // status; a non-child or already-reaped pid reports 0.
+                // NOTE_EXIT is posted in exit1 before the process is
+                // reapable, so waitpid(WNOHANG) can still see it running.
+                // Defer the event instead of reporting status 0; the
+                // re-check in next() emits it once the reap lands.
                 var st: c_int = 0;
-                const status: u32 = if (std.c.waitpid(pid, &st, w_nohang) == pid)
-                    @bitCast(st)
-                else
-                    0;
+                const r = waitReap(pid, &st, w_nohang);
+                if (r == 0) {
+                    if (self.pending_proc_len < proc_pending_max) {
+                        self.pending_procs[self.pending_proc_len] = pid;
+                        self.pending_proc_len += 1;
+                        self.immediate = true;
+                        self.stats_.proc_deferred += 1;
+                        return null;
+                    }
+                    self.stats_.proc_defer_lost += 1;
+                    self.stats_.delivered_events += 1;
+                    return .{ .process_exit = .{ .pid = pid, .status = 0 } };
+                }
+                const status: u32 = if (r == pid) @bitCast(st) else 0;
                 self.stats_.delivered_events += 1;
                 return .{ .process_exit = .{ .pid = pid, .status = status } };
             },
@@ -1256,22 +1321,44 @@ test "Loop: socket error arrives as eof plus errno" {
     };
     const h = try loop.attach(cfd, tctx(1), .{ .write = true });
 
-    try loop.wait();
+    // The write knote can fire on so_error alone before the socket is
+    // marked disconnected (filt_sowrite, uipc_socket.c): the first
+    // writable then carries eof=0 errno=0 and the EOF plus errno arrives
+    // on a later pass. Take whichever order this run produced; a guard
+    // deadline turns a missing second event into a failure, not a hang.
+    const guard = try loop.scheduleIn(10_000, tctx(9));
+    defer _ = loop.cancelTimer(guard);
     var events: std.ArrayList(Event) = .empty;
     defer events.deinit(std.testing.allocator);
-    try drain(&loop, &events);
-    try std.testing.expectEqual(@as(usize, 1), events.items.len);
-    const ev = events.items[0].writable;
-    try std.testing.expect(ev.handle.eql(h));
-    try std.testing.expect(ev.eof);
+    var ev: ?Io = null;
+    var timed_out = false;
+    while (ev == null and !timed_out) {
+        try loop.wait();
+        events.clearRetainingCapacity();
+        try drain(&loop, &events);
+        for (events.items) |e| switch (e) {
+            .writable => |io| {
+                try std.testing.expect(io.handle.eql(h));
+                if (io.eof) {
+                    ev = io;
+                } else {
+                    try std.testing.expectEqual(@as(u32, 0), io.errno);
+                }
+            },
+            .deadline => timed_out = true,
+            else => {},
+        };
+    }
+    const io = ev orelse return error.EofNeverArrived;
+    try std.testing.expect(io.eof);
     // A synchronous refusal clears so_error (uipc_syscalls.c): the write
     // knote then reports EV_EOF with fflags = 0. A pended connect keeps
     // the error, so the async path must report ECONNREFUSED.
     const refused = @intFromEnum(posix.E.CONNREFUSED);
     if (sync_refused) {
-        try std.testing.expect(ev.errno == 0 or ev.errno == refused);
+        try std.testing.expect(io.errno == 0 or io.errno == refused);
     } else {
-        try std.testing.expectEqual(refused, ev.errno);
+        try std.testing.expectEqual(refused, io.errno);
     }
 }
 
@@ -2295,6 +2382,71 @@ fn testSigHandler(signo: c_int) callconv(.c) void {
     _ = signo;
 }
 
+var usr2_hits: usize = 0;
+fn countUsr2(signo: c_int) callconv(.c) void {
+    _ = signo;
+    usr2_hits += 1;
+}
+fn postUsr2() void {
+    _ = std.c.kill(std.c.getpid(), posix.SIG.USR2);
+}
+
+test "Loop: a signal posted in the watch window is reported twice" {
+    // The watch order attaches the knote before reading the pending set
+    // and installing SIG_IGN: a blocked signal posted inside that window
+    // fires the knote once and still sits in the pending set, reported
+    // twice. The pending-before-attach order reports it once.
+    var set: posix.sigset_t = posix.sigemptyset();
+    posix.sigaddset(&set, posix.SIG.USR2);
+    var oldset: posix.sigset_t = undefined;
+    posix.sigprocmask(posix.SIG.BLOCK, &set, &oldset);
+    defer posix.sigprocmask(posix.SIG.SETMASK, &oldset, null);
+
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+    window_hook = postUsr2;
+    try loop.watchSignal(posix.SIG.USR2);
+    window_hook = null;
+
+    var reported: usize = 0;
+    for (0..3) |_| {
+        loop.requestImmediate();
+        try loop.wait();
+        while (loop.next()) |e| {
+            if (e == .signal) reported += @intCast(e.signal.count);
+        }
+    }
+    try loop.unwatchSignal(posix.SIG.USR2);
+    try std.testing.expectEqual(@as(usize, 2), reported);
+}
+
+test "Loop: a signal posted in the unwatch window reaches the restored disposition" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    // A counting handler is the saved disposition: a signal posted inside
+    // the restore-then-delete gap must reach it. A delete-then-restore
+    // order would drop it to the still-installed SIG_IGN.
+    usr2_hits = 0;
+    const h: posix.Sigaction = .{
+        .handler = .{ .handler = countUsr2 },
+        .flags = 0,
+        .mask = posix.sigemptyset(),
+    };
+    posix.sigaction(posix.SIG.USR2, &h, null);
+    try loop.watchSignal(posix.SIG.USR2);
+    window_hook = postUsr2;
+    try loop.unwatchSignal(posix.SIG.USR2);
+    window_hook = null;
+    try std.testing.expectEqual(@as(usize, 1), usr2_hits);
+    const dfl: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .flags = 0,
+        .mask = posix.sigemptyset(),
+    };
+    posix.sigaction(posix.SIG.USR2, &dfl, null);
+}
+
 test "Loop: watchProcess reports the child's exit" {
     var loop = try testLoop(null);
     defer loop.deinit(std.testing.allocator);
@@ -2305,15 +2457,63 @@ test "Loop: watchProcess reports the child's exit" {
     }
     try loop.watchProcess(pid); // the loop reaps the child for the status
 
-    try loop.wait();
-    const ev = loop.next().?;
-    try std.testing.expect(ev == .process_exit);
-    try std.testing.expectEqual(pid, ev.process_exit.pid);
-    try std.testing.expect(posix.W.IFEXITED(ev.process_exit.status));
-    try std.testing.expectEqual(@as(u8, 42), posix.W.EXITSTATUS(ev.process_exit.status));
+    // NOTE_EXIT can beat the zombie transition: the exit then defers and
+    // emits on a later pass, so pump until it arrives.
+    var ev: ?Event = null;
+    var passes: usize = 0;
+    while (ev == null and passes < 100) : (passes += 1) {
+        try loop.wait();
+        while (loop.next()) |e| {
+            if (e == .process_exit) ev = e;
+        }
+    }
+    const pex = (ev orelse return error.ExitEventNeverArrived).process_exit;
+    try std.testing.expectEqual(pid, pex.pid);
+    try std.testing.expect(posix.W.IFEXITED(pex.status));
+    try std.testing.expectEqual(@as(u8, 42), posix.W.EXITSTATUS(pex.status));
 
     try std.testing.expectError(error.ProcessNotFound, loop.watchProcess(1 << 22));
     try std.testing.expectEqual(@intFromEnum(posix.E.SRCH), loop.stats().last_errno);
+}
+
+var reap_hold: usize = 0;
+fn holdReap(pid: posix.pid_t, st: *c_int, flags: c_int) posix.pid_t {
+    if (reap_hold != 0) {
+        reap_hold -= 1;
+        return 0;
+    }
+    return std.c.waitpid(pid, st, flags);
+}
+
+test "Loop: watchProcess defers an exit until the child is reapable" {
+    // The seam forces the first waitpid to 0, the mid-transition state
+    // the defer covers: the event must arrive later with the real
+    // status, not 0.
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    const pid = try posix.fork();
+    if (pid == 0) {
+        posix.exit(42);
+    }
+    try loop.watchProcess(pid);
+    reap_hold = 1;
+    proc_wait_hook = holdReap;
+    defer proc_wait_hook = null;
+
+    var ev: ?Event = null;
+    var passes: usize = 0;
+    while (ev == null and passes < 100) : (passes += 1) {
+        try loop.wait();
+        while (loop.next()) |e| {
+            if (e == .process_exit) ev = e;
+        }
+    }
+    const pex = (ev orelse return error.ExitEventNeverArrived).process_exit;
+    try std.testing.expectEqual(pid, pex.pid);
+    try std.testing.expect(posix.W.IFEXITED(pex.status));
+    try std.testing.expectEqual(@as(u8, 42), posix.W.EXITSTATUS(pex.status));
+    try std.testing.expectEqual(@as(u64, 1), loop.stats().proc_deferred);
 }
 
 test "Loop: attach at capacity fails with HandleTableFull" {

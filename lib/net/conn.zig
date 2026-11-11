@@ -748,6 +748,11 @@ pub const Conn = struct {
         list.link(c);
     }
 
+    /// Test seam: observes the events onEvent does not consume, so a
+    /// driver test can prove a foreign deadline reaches the conn instead
+    /// of being swallowed. Null everywhere else.
+    pub var unhandled_hook: ?*const fn (*Conn, Event) void = null;
+
     /// State machine driver: translates loop events into drain/flush
     /// calls and interest updates, returning the Outcome the consumer
     /// switches on. A second batched event for a conn closed by the
@@ -763,7 +768,10 @@ pub const Conn = struct {
                 c.markClosing(list, .{ .err = error.ChangeFailed });
                 return .{ .closed = .{ .err = error.ChangeFailed } };
             },
-            else => .none,
+            else => {
+                if (unhandled_hook) |f| f(c, ev);
+                return .none;
+            },
         };
     }
 
@@ -2045,7 +2053,13 @@ fn hsToEnd(c: *Conn, client: *ssl.SslConn, list: *ConnList) !Outcome {
         try loop.wait();
         while (loop.next()) |ev| {
             switch (ev) {
-                .deadline => |d| if (d.timer.eql(deadline)) return error.HandshakeDeadline,
+                .deadline => |d| if (d.timer.eql(deadline)) {
+                    return error.HandshakeDeadline;
+                } else {
+                    // Consumer deadlines are not the helper's to swallow.
+                    const out = c.onEvent(ev, list);
+                    if (out != .none) return out;
+                },
                 .readable, .writable => |io| if (!io.handle.eql(cli)) {
                     const out = c.onEvent(ev, list);
                     if (out != .none) return out;
@@ -2830,6 +2844,47 @@ test "Conn: an established TLS conn frees the SSL at teardown" {
     try std.testing.expectEqual(@as(?posix.fd_t, null), c.loop.fdOf(c.handle));
     c.deinit();
     try std.testing.expectEqual(@as(usize, 1), ssl_mark_frees - before);
+}
+
+var hs_foreign_deadlines: usize = 0;
+fn countForeignDeadline(c: *Conn, ev: Event) void {
+    _ = c;
+    if (ev == .deadline) hs_foreign_deadlines += 1;
+}
+
+test "Conn: hsToEnd hands a foreign deadline to the conn" {
+    const alloc = std.testing.allocator;
+    var loop = try mkLoop(alloc);
+    defer loop.deinit(alloc);
+    var pki = try makeTestPki(alloc);
+    defer pki.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls(); // one userland end (PR 296498)
+
+    const pair = try socketpair();
+    defer posix.close(pair[1]);
+
+    var counters: Counters = .{};
+    var c: Conn = undefined;
+    try c.init(&loop, pair[0], mkConnCtx(1), alloc, .{ .counters = &counters });
+    defer c.deinit();
+    try c.startTls(pki.ctx, .accept, null, mkConnCtx(2));
+
+    var client = try ssl.SslConn.initClient(client_ctx, pair[1], null);
+    defer client.deinit();
+    var list: ConnList = .{};
+
+    // A consumer deadline already due lands in the first drained batch;
+    // the driver must forward it to onEvent, not eat it.
+    const consumer_timer = try loop.scheduleIn(0, mkConnCtx(9));
+    defer _ = loop.cancelTimer(consumer_timer);
+    hs_foreign_deadlines = 0;
+    Conn.unhandled_hook = countForeignDeadline;
+    defer Conn.unhandled_hook = null;
+
+    try std.testing.expectEqual(Outcome.handshake_done, try hsToEnd(&c, &client, &list));
+    try std.testing.expectEqual(@as(usize, 1), hs_foreign_deadlines);
 }
 
 test "Conn: prefer records full kTLS on TCP loopback with a userland client" {
