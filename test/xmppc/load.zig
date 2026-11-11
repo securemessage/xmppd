@@ -24,18 +24,25 @@
 //!   5. report — one machine-readable `LOAD …` summary line plus scenario
 //!               lines.
 //!
-//! Scenarios (-scenario chat|presence|muc|smstorm|slowread):
-//!   chat      — <message> at msg-rate; -to self|peer|split picks the target
-//!               (peer: i<->i+1, split: i -> i+count/2). Large stanzas are
-//!               chat with -msg-size 8192..65536. Distinct-account logins
-//!               are any scenario with -accounts N and -msg-rate 0.
-//!   presence  — directed <presence> with cycling <show> at msg-rate.
-//!   muc       — all N sessions join -room, then groupchat at msg-rate;
+//! Scenarios (-scenario chat|presence|muc|smstorm|slowread|login|large):
+//!   chat      - <message> at msg-rate; -to self|peer|split|same|cross picks
+//!               the target (peer: i<->i+1, split: i -> i+count/2; same/cross
+//!               pair sessions by worker, parsed from the SM id the server
+//!               embeds its worker_id in). Distinct-account logins are any
+//!               scenario with -accounts N and -msg-rate 0.
+//!   presence  - directed <presence> with cycling <show> at msg-rate.
+//!   muc       - all N sessions join -room, then groupchat at msg-rate;
 //!               fan-out completeness is counted per posted seq.
-//!   smstorm   — chat traffic plus SM reconnects at -reconnect-rate
+//!   smstorm   - chat traffic plus SM reconnects at -reconnect-rate
 //!               sessions/sec (stop + start with sm_resume_id/h), reporting
 //!               resumed vs fresh outcomes and resume latency.
-//!   slowread  — the first -slow-readers sessions drop their read interest
+//!   login     - distinct-account ramp plus full-login churn: stop + start
+//!               WITHOUT sm_resume at -reconnect-rate sessions/sec (TLS +
+//!               SASL + bind + teardown each round trip).
+//!   large     - chat traffic cycling stanza bodies over 8/16/32/64 KiB, so
+//!               the >4080-byte cross-worker path is exercised in one run;
+//!               loss is reported per size class.
+//!   slowread  - the first -slow-readers sessions drop their read interest
 //!               after establishment; everyone else messages them at
 //!               msg-rate; at -drain the reads re-arm and rx is compared
 //!               against posted (the silent-drop check).
@@ -61,8 +68,11 @@ const Handle = xmppc.Handle;
 // CLI options
 // ---------------------------------------------------------------------------
 
-const Scenario = enum { chat, presence, muc, smstorm, slowread };
-const ToMode = enum { self, peer, split };
+const Scenario = enum { chat, presence, muc, smstorm, slowread, login, large };
+const ToMode = enum { self, peer, split, same, cross };
+/// `large` cycles stanza bodies over these sizes so a single run covers the
+/// sub-4080, just-over and far-over cross-worker payload classes.
+const LARGE_SIZES = [_]usize{ 8192, 16384, 32768, 65536 };
 
 const Options = struct {
     host: []const u8 = "127.0.0.1",
@@ -120,14 +130,15 @@ const Options = struct {
                         "  -user-prefix P       (default m2u-)\n" ++
                         "  -resource PREFIX     (default load)\n" ++
                         "  -n N                 (sessions; default 1000; muc: occupants)\n" ++
-                        "  -scenario S          (chat|presence|muc|smstorm|slowread)\n" ++
+                        "  -scenario S          (chat|presence|muc|smstorm|slowread|login|large)\n" ++
                         "  -connect-rate R      (sessions/sec ramp pace; 0=burst)\n" ++
                         "  -hold S              (seconds after all settled; default 5)\n" ++
                         "  -msg-rate R          (aggregate stanzas/sec during hold; 0=off)\n" ++
                         "  -msg-size B          (body payload bytes; default 128)\n" ++
-                        "  -to M                (self|peer|split; chat+presence target rule)\n" ++
+                        "  -to M                (self|peer|split|same|cross; chat/large target rule;\n" ++
+                        "                       same|cross pair sessions by server worker via SM id)\n" ++
                         "  -room J              (muc room JID; default m2load@conference.localhost)\n" ++
-                        "  -reconnect-rate R    (smstorm: SM resumes/sec; requires -scenario smstorm)\n" ++
+                        "  -reconnect-rate R    (smstorm/login: reconnects/sec during hold; 0=off)\n" ++
                         "  -slow-readers S      (slowread: sessions that stop reading)\n" ++
                         "  -drain S             (post-hold drain window; default 3)\n" ++
                         "  -deadline S          (max seconds to reach all-settled)\n" ++
@@ -223,6 +234,16 @@ const Options = struct {
             std.debug.print("load: presence needs -to peer or -to split\n", .{});
             return error.BadOption;
         }
+        if ((o.to_mode == .same or o.to_mode == .cross) and
+            o.scenario != .chat and o.scenario != .large)
+        {
+            std.debug.print("load: -to same|cross pairs chat/large sessions by worker\n", .{});
+            return error.BadOption;
+        }
+        if (o.scenario == .login and o.msg_rate > 0) {
+            std.debug.print("load: login measures establishment, not hold traffic (-msg-rate 0)\n", .{});
+            return error.BadOption;
+        }
     }
 };
 
@@ -314,7 +335,7 @@ var g = struct {
     /// Per posted seq: how many copies arrived. Complete fan-out == the
     /// joined occupant count (or the server's observed reflection count).
     muc_fan: std.ArrayListUnmanaged(u32) = .{},
-    // --- smstorm ----------------------------------------------------------
+    // --- smstorm / login churn ---------------------------------------------
     /// new handle keyOf -> (handles pos, reconnect start ns), engine thread.
     storm_pending: std.AutoHashMapUnmanaged(usize, StormEntry) = .{},
     storm_attempts: u64 = 0,
@@ -323,6 +344,17 @@ var g = struct {
     storm_sm_failed: u64 = 0, // explicit SM <failed/> on resume attempt
     storm_churn: u64 = 0, // closes caused by our own storm stops
     storm_lat_ns: std.ArrayListUnmanaged(u64) = .{},
+    // --- worker-aware pairing (-to same|cross) ------------------------------
+    /// Server worker per handles pos, parsed from the session's sm_id
+    /// (server embeds worker_id in its first four hex chars). -1 unknown.
+    worker_of: std.ArrayListUnmanaged(i32) = .{},
+    /// pair_of[i] = handles pos of i's traffic target for -to same|cross,
+    /// computed once after the ramp; -1 falls back to peer pairing.
+    pair_of: std.ArrayListUnmanaged(i32) = .{},
+    pairs_same: u64 = 0,
+    pairs_cross: u64 = 0,
+    pairs_unknown: u64 = 0,
+    workers_seen: u64 = 0,
     // --- slowread ---------------------------------------------------------
     /// fd of each slow reader at removeRead time, by handles position.
     sr_fd: std.ArrayListUnmanaged(std.posix.fd_t) = .{},
@@ -341,6 +373,54 @@ var opts: Options = .{};
 /// across engines (T-E232E8AE -engines), so key on (engine, index).
 fn keyOf(engine_idx: usize, handle_index: u32) usize {
     return engine_idx * 65536 + @as(usize, handle_index);
+}
+
+/// Server worker id from a session sm_id. Server format (sm_state.zig):
+/// "[2 bytes worker_id BE][14 bytes random]" as 32 hex chars.
+fn workerFromSmId(sm_id: []const u8) ?i32 {
+    if (sm_id.len != 32) return null;
+    const hi = std.fmt.parseInt(u8, sm_id[0..2], 16) catch return null;
+    const lo = std.fmt.parseInt(u8, sm_id[2..4], 16) catch return null;
+    return (@as(u16, hi) << 8) | lo;
+}
+
+/// -to same|cross: for each handles pos pick the nearest target session on
+/// the same / a different server worker. Sessions whose worker is unknown
+/// (no sm_id, e.g. SM disabled server-side) get pair -1 and fall back to
+/// peer pairing in buildTraffic.
+fn computePairs(o: *const Options) void {
+    g.lock.lock();
+    defer g.lock.unlock();
+    const n = g.handles.items.len;
+    g.pair_of.ensureTotalCapacity(std.heap.c_allocator, n) catch return;
+    var seen = [_]u8{0} ** 64;
+    for (g.worker_of.items) |w| {
+        if (w >= 0 and w < 64) seen[@intCast(w)] = 1;
+    }
+    for (seen) |s| g.workers_seen += s;
+    for (0..n) |i| {
+        const my_w = if (i < g.worker_of.items.len) g.worker_of.items[i] else -1;
+        var pair: i32 = -1;
+        if (my_w >= 0) {
+            for (0..n) |j| {
+                if (j == i) continue;
+                const w = if (j < g.worker_of.items.len) g.worker_of.items[j] else -1;
+                if (w < 0) continue;
+                if ((o.to_mode == .same) == (w == my_w)) {
+                    pair = @intCast(j);
+                    break;
+                }
+            }
+        }
+        g.pair_of.appendAssumeCapacity(pair);
+        if (pair < 0) {
+            g.pairs_unknown += 1;
+        } else if (o.to_mode == .same) {
+            g.pairs_same += 1;
+        } else {
+            g.pairs_cross += 1;
+        }
+    }
 }
 
 fn slotEnsure(comptime T: type, list: *std.ArrayListUnmanaged(T), idx: usize, fill: T) !*T {
@@ -439,13 +519,21 @@ fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
             g.cond.signal();
             const pos_opt = g.pos_of.get(k);
             var storm_entry: ?StormEntry = null;
-            if (opts.scenario == .smstorm) {
+            if (opts.scenario == .smstorm or opts.scenario == .login) {
                 if (g.storm_pending.fetchRemove(k)) |kv| storm_entry = kv.value;
             }
             if (storm_entry) |se| {
                 const now: u64 = @intCast(@max(0, std.time.nanoTimestamp()));
                 if (now > se.t0_ns) g.storm_lat_ns.append(std.heap.c_allocator, now - se.t0_ns) catch {};
                 if (session.smResumed()) g.storm_resumed += 1 else g.storm_fresh += 1;
+            }
+            // Worker map for -to same|cross: the server embeds worker_id in
+            // the sm_id it hands at <enabled>. Churned sessions re-key to
+            // their ramp position via storm_entry.
+            const wpos: ?usize = pos_opt orelse if (storm_entry) |se| se.pos else null;
+            if (wpos) |pos| {
+                const wid: i32 = if (workerFromSmId(session.smId())) |w| w else -1;
+                if (slotEnsure(i32, &g.worker_of, pos, -1)) |wp| wp.* = wid else |_| {}
             }
             const slow_pos: ?usize = if (opts.scenario == .slowread) pos_opt else null;
             g.lock.unlock();
@@ -477,7 +565,7 @@ fn onEvent(ctx: ?*anyopaque, engine: *Engine, handle: Handle, ev: Event) void {
             defer g.lock.unlock();
             const was = k < g.was_established.items.len and g.was_established.items[k];
             if (was) {
-                if (std.mem.eql(u8, reason, "smstorm")) {
+                if (std.mem.eql(u8, reason, "smstorm") or std.mem.eql(u8, reason, "loginchurn")) {
                     g.storm_churn += 1;
                 } else if (!g.draining) {
                     g.post_closes += 1;
@@ -604,16 +692,22 @@ fn stormOne(sc: *StormCtx, eng: *Engine) void {
     defer std.heap.c_allocator.free(user);
     defer std.heap.c_allocator.free(res);
 
-    // Snapshot the SM resume coordinate from the live session.
-    const session = eng.sessionAt(ref.h) orelse return;
-    if (!session.smEnabled()) return;
+    // smstorm resumes in place; login churn starts a full fresh session
+    // (TLS + SASL + bind each round trip), so no SM coordinate is taken.
     var id_buf: [64]u8 = undefined;
-    const sm_id = session.smId();
-    if (sm_id.len == 0 or sm_id.len > id_buf.len) return;
-    @memcpy(id_buf[0..sm_id.len], sm_id);
-    const sm_h = session.smH();
+    var resume_id: []const u8 = "";
+    var resume_h: u32 = 0;
+    if (opts.scenario == .smstorm) {
+        const session = eng.sessionAt(ref.h) orelse return;
+        if (!session.smEnabled()) return;
+        const sm_id = session.smId();
+        if (sm_id.len == 0 or sm_id.len > id_buf.len) return;
+        @memcpy(id_buf[0..sm_id.len], sm_id);
+        resume_id = id_buf[0..sm_id.len];
+        resume_h = session.smH();
+    }
 
-    eng.stopSession(ref.h, "smstorm");
+    eng.stopSession(ref.h, if (opts.scenario == .smstorm) "smstorm" else "loginchurn");
     const new_h = eng.startSession(.{
         .host = opts.host,
         .port = opts.port,
@@ -621,8 +715,8 @@ fn stormOne(sc: *StormCtx, eng: *Engine) void {
         .user = user,
         .password = opts.password,
         .resource = res,
-        .sm_resume_id = id_buf[0..sm_id.len],
-        .sm_resume_h = sm_h,
+        .sm_resume_id = resume_id,
+        .sm_resume_h = resume_h,
     }) catch return;
     g.lock.lock();
     g.handles.items[pos] = .{ .eng = sc.engine_idx, .h = new_h };
@@ -740,6 +834,9 @@ pub fn main() !void {
         .{ ramp_wall_s, settled_established, g.total, settled_failed, conn_s, login_s_pipe, login_s_wall, snap_ramp.bytes_rx, snap_ramp.bytes_tx, snap_ramp.max_iter_us, scramTotal(engines), hitsTotal(engines) },
     );
 
+    // -to same|cross: worker-aware pairs come from the post-ramp sm_ids.
+    if (o.to_mode == .same or o.to_mode == .cross) computePairs(&o);
+
     // MUC join phase: hold traffic must start only after every occupant is
     // joined, or early groupchat draws error replies and pollutes fan-out.
     if (o.scenario == .muc) {
@@ -759,7 +856,8 @@ pub fn main() !void {
     const hold_start = std.time.nanoTimestamp();
     const hold_end = hold_start + @as(i128, o.hold) * std.time.ns_per_s;
     g.hold_end_ns.store(@intCast(hold_end), .release);
-    const body_pad = try std.heap.c_allocator.alloc(u8, o.msg_size);
+    const pad_len: usize = if (o.scenario == .large) LARGE_SIZES[LARGE_SIZES.len - 1] else o.msg_size;
+    const body_pad = try std.heap.c_allocator.alloc(u8, pad_len);
     defer std.heap.c_allocator.free(body_pad);
     @memset(body_pad, 'x');
     // T239: message ids carry their send sequence and timestamp so true
@@ -778,9 +876,10 @@ pub fn main() !void {
     }
     defer g.muc_fan.deinit(std.heap.c_allocator);
 
-    // smstorm: one recurring timer per engine runs reconnects on its thread.
+    // smstorm/login churn: one recurring timer per engine runs reconnects on
+    // its thread. login with -reconnect-rate 0 measures the ramp only.
     var storm_ctxs: ?[]StormCtx = null;
-    if (o.scenario == .smstorm) {
+    if (o.scenario == .smstorm or (o.scenario == .login and o.reconnect_rate > 0)) {
         storm_ctxs = try std.heap.c_allocator.alloc(StormCtx, o.engines);
         for (storm_ctxs.?, 0..) |*sc, ei| {
             sc.* = .{ .engine_idx = ei, .eng = &engines[ei] };
@@ -918,9 +1017,12 @@ pub fn main() !void {
     else
         -1;
 
+    const hold_tx_s = @as(f64, @floatFromInt(stanzas_posted)) / hold_wall_s;
+    const hold_rx_s = @as(f64, @floatFromInt(stanzas_rx)) / hold_wall_s;
+
     std.debug.print(
-        "load: LOAD scenario={s} n={d} accounts={d} established={d} failed={d} post_closes={d} ramp_s={d:.2} conn_per_s={d:.0} login_per_s_pipe={d:.0} login_per_s_wall={d:.0} ramp_bytes_per_session={d} hold_s={d:.1} hold_posted={d} hold_rx={d} hold_rx_distinct={d} hold_dupes={d} hold_lost={d} hold_drops={d} lat_p50_us={d} lat_p99_us={d} lat_max_us={d} hold_bytes_per_session={d} stall_max_us={d} scram_derives={d} cache_hits={d} mem_bytes_per_session_est={d} first_fail={s}\n",
-        .{ @tagName(o.scenario), o.count, o.accounts, est, failed, post_closes, ramp_wall_s, conn_s, login_s_pipe, login_s_wall, @divTrunc(ramp_bytes, n_est), hold_wall_s, stanzas_posted, stanzas_rx, rx_distinct, rx_dupes, hold_lost, post_drops, lat_p50_us, lat_p99_us, lat_max_us, @divTrunc(hold_bytes, n_est), snap_end.max_iter_us, scramTotal(engines), hitsTotal(engines), mem_est_bytes, first_fail },
+        "load: LOAD scenario={s} n={d} accounts={d} established={d} failed={d} post_closes={d} ramp_s={d:.2} conn_per_s={d:.0} login_per_s_pipe={d:.0} login_per_s_wall={d:.0} ramp_bytes_per_session={d} hold_s={d:.1} hold_posted={d} hold_rx={d} hold_rx_distinct={d} hold_dupes={d} hold_lost={d} hold_drops={d} hold_tx_per_s={d:.0} hold_rx_per_s={d:.0} lat_p50_us={d} lat_p99_us={d} lat_max_us={d} hold_bytes_per_session={d} stall_max_us={d} scram_derives={d} cache_hits={d} mem_bytes_per_session_est={d} first_fail={s}\n",
+        .{ @tagName(o.scenario), o.count, o.accounts, est, failed, post_closes, ramp_wall_s, conn_s, login_s_pipe, login_s_wall, @divTrunc(ramp_bytes, n_est), hold_wall_s, stanzas_posted, stanzas_rx, rx_distinct, rx_dupes, hold_lost, post_drops, hold_tx_s, hold_rx_s, lat_p50_us, lat_p99_us, lat_max_us, @divTrunc(hold_bytes, n_est), snap_end.max_iter_us, scramTotal(engines), hitsTotal(engines), mem_est_bytes, first_fail },
     );
 
     // Scenario lines.
@@ -963,7 +1065,7 @@ fn buildTraffic(o: *const Options, body_pad: []u8, seq: u64, sender_pos: usize) 
     const send_ns: u64 = @intCast(@max(0, std.time.nanoTimestamp()));
     // id prefix marks the traffic shape for rx accounting.
     const prefix: u8 = switch (o.scenario) {
-        .chat, .smstorm => 'l',
+        .chat, .smstorm, .login, .large => 'l',
         .presence => 'p',
         .muc => 'm',
         .slowread => 's',
@@ -986,6 +1088,10 @@ fn buildTraffic(o: *const Options, body_pad: []u8, seq: u64, sender_pos: usize) 
                 .self => {},
                 .peer => tpos = if (sender_pos % 2 == 0) sender_pos + 1 else sender_pos - 1,
                 .split => tpos = (sender_pos + o.count / 2) % o.count,
+                .same, .cross => {
+                    const p = if (sender_pos < g.pair_of.items.len) g.pair_of.items[sender_pos] else -1;
+                    tpos = if (p >= 0) @as(usize, @intCast(p)) else if (sender_pos % 2 == 0) sender_pos + 1 else sender_pos - 1;
+                },
             }
             if (tpos >= o.count) break :blk null;
             const tref = g.handles.items[tpos];
@@ -995,6 +1101,9 @@ fn buildTraffic(o: *const Options, body_pad: []u8, seq: u64, sender_pos: usize) 
     };
     g.lock.unlock();
     const jid = target orelse return null;
+    // `large` cycles the body over its size classes; seq determines the class
+    // so per-size loss is derivable at report time.
+    const pad = if (o.scenario == .large) body_pad[0..LARGE_SIZES[@intCast((seq - 1) % LARGE_SIZES.len)]] else body_pad;
 
     return switch (o.scenario) {
         .presence => blk: {
@@ -1002,8 +1111,8 @@ fn buildTraffic(o: *const Options, body_pad: []u8, seq: u64, sender_pos: usize) 
             const stanza = std.fmt.allocPrint(std.heap.c_allocator, "<presence to='{s}' id='{c}{d}-{d}'><show>{s}</show></presence>", .{ jid, prefix, seq, send_ns, shows[@as(usize, @intCast(seq % shows.len))] }) catch return null;
             break :blk stanza;
         },
-        .muc => std.fmt.allocPrint(std.heap.c_allocator, "<message type='groupchat' to='{s}' id='m{d}-{d}'><body>{s}</body></message>", .{ jid, seq, send_ns, body_pad }) catch null,
-        else => std.fmt.allocPrint(std.heap.c_allocator, "<message id='{c}{d}-{d}' to='{s}'><body>{s}</body></message>", .{ prefix, seq, send_ns, jid, body_pad }) catch null,
+        .muc => std.fmt.allocPrint(std.heap.c_allocator, "<message type='groupchat' to='{s}' id='m{d}-{d}'><body>{s}</body></message>", .{ jid, seq, send_ns, pad }) catch null,
+        else => std.fmt.allocPrint(std.heap.c_allocator, "<message id='{c}{d}-{d}' to='{s}'><body>{s}</body></message>", .{ prefix, seq, send_ns, jid, pad }) catch null,
     };
 }
 
@@ -1053,7 +1162,47 @@ fn reportScenario(o: *const Options) void {
             const lost = if (g.sr_posted > g.rx_distinct) g.sr_posted - g.rx_distinct else 0;
             std.debug.print("load: slowread slow_readers={d} posted_to_slow={d} rx_distinct={d} lost={d} slow_closed={d}\n", .{ o.slow_readers, g.sr_posted, g.rx_distinct, lost, g.sr_closed });
         },
+        .login => {
+            g.lock.lock();
+            defer g.lock.unlock();
+            const n = g.storm_lat_ns.items.len;
+            var p50: u64 = 0;
+            var p99: u64 = 0;
+            var mx: u64 = 0;
+            if (n > 0) {
+                std.mem.sort(u64, g.storm_lat_ns.items, {}, std.sort.asc(u64));
+                p50 = g.storm_lat_ns.items[n / 2] / 1000;
+                p99 = g.storm_lat_ns.items[@min(n - 1, (n * 99) / 100)] / 1000;
+                mx = g.storm_lat_ns.items[n - 1] / 1000;
+            }
+            std.debug.print("load: login churn_attempts={d} re_established={d} churn_closes={d} login_lat_p50_us={d} p99_us={d} max_us={d}\n", .{ g.storm_attempts, g.storm_fresh, g.storm_churn, p50, p99, mx });
+        },
+        .large => {
+            g.lock.lock();
+            defer g.lock.unlock();
+            var posted_c = [_]u64{0} ** LARGE_SIZES.len;
+            var lost_c = [_]u64{0} ** LARGE_SIZES.len;
+            var seq: u64 = 1;
+            while (seq <= g.stanzas_posted) : (seq += 1) {
+                const cls: usize = @intCast((seq - 1) % LARGE_SIZES.len);
+                posted_c[cls] += 1;
+                // Seqs past the bitset are counted under rx_untracked in the
+                // LOAD line; treat them as unaccounted here, not lost.
+                const accounted = seq >= g.seen_bits or g.seen.isSet(@intCast(seq));
+                if (!accounted) lost_c[cls] += 1;
+            }
+            std.debug.print("load: large sizes={d},{d},{d},{d} posted={d},{d},{d},{d} lost={d},{d},{d},{d}\n", .{
+                LARGE_SIZES[0], LARGE_SIZES[1], LARGE_SIZES[2], LARGE_SIZES[3],
+                posted_c[0],     posted_c[1],     posted_c[2],     posted_c[3],
+                lost_c[0],       lost_c[1],       lost_c[2],       lost_c[3],
+            });
+        },
         else => {},
+    }
+    if ((o.scenario == .chat or o.scenario == .large) and (o.to_mode == .same or o.to_mode == .cross)) {
+        g.lock.lock();
+        defer g.lock.unlock();
+        std.debug.print("load: workers pair_to={s} workers_seen={d} pairs_same={d} pairs_cross={d} pairs_unknown={d}\n", .{ @tagName(o.to_mode), g.workers_seen, g.pairs_same, g.pairs_cross, g.pairs_unknown });
     }
 }
 
