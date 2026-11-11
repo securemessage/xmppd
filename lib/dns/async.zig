@@ -3927,16 +3927,17 @@ test "dns-async: the whole-chain deadline bounds a silent target list" {
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
-    const start = std.time.milliTimestamp();
     try r.resolve("svc.test", .client, 5222, 3, true);
     var spins: usize = 0;
     while (ctx.status == null and spins < 400) : (spins += 1) r.step(50);
-    const elapsed = std.time.milliTimestamp() - start;
 
     try std.testing.expectEqual(Status.failed, ctx.status.?);
     // The chain bound fired long before two 2 s per-query retries
-    // plus a 10 s fallback tail could.
-    try std.testing.expect(elapsed < 1500);
+    // plus a 10 s fallback tail could (~280 spins). spins is counted,
+    // not clocked: a fired timer waits in the kqueue and returns the
+    // next step at once, so a descheduled test process cannot inflate
+    // the count.
+    try std.testing.expect(spins < 30);
 }
 
 test "dns-async: the chain deadline completes with collected targets" {
