@@ -15,6 +15,7 @@ const std = @import("std");
 const sasl = @import("sasl");
 const backend_mod = @import("backend");
 const precis = @import("precis_username");
+const oidc_ids = @import("oidc_identity_store");
 
 const log = std.log.scoped(.user_store);
 
@@ -79,13 +80,22 @@ pub fn UserStore(comptime Backend: type) type {
         }
 
         /// Add a new user. Derives SCRAM credentials from the password.
-        /// Returns error.UserExists if the username is taken.
+        /// Returns error.UserExists if the username is taken and
+        /// error.OidcBound when the localpart belongs to an OIDC subject.
         pub fn addUser(self: *Self, allocator: std.mem.Allocator, username: []const u8, password: []const u8) !void {
             // Check for duplicate
             const existing = try self.backend.get(allocator, NAMESPACE, username);
             if (existing) |v| {
                 allocator.free(v);
                 return error.UserExists;
+            }
+
+            // A localpart bound to an OIDC (iss, sub) belongs to that
+            // subject; a local users row would hand a password credential
+            // into the bound account (T-52633E2B).
+            if (try oidc_ids.localpartBound(self.backend, allocator, username)) {
+                log.info("refusing local registration of OIDC-bound localpart '{s}'", .{username});
+                return error.OidcBound;
             }
 
             const creds = try sasl.StoredCredentials.generate(password, 4096);
@@ -192,6 +202,20 @@ test "UserStore: duplicate user rejected" {
 
     try store.addUser(std.testing.allocator, "alice", "pass");
     try std.testing.expectError(error.UserExists, store.addUser(std.testing.allocator, "alice", "other"));
+}
+
+test "UserStore: addUser refuses an OIDC-bound localpart (T-52633E2B)" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestStore.init(&db);
+
+    var ids = oidc_ids.Store(MemoryBackend).init(&db);
+    _ = try ids.bind("https://idp.example", "sub-1", "bound-lp", .auto, 1);
+
+    try std.testing.expectError(error.OidcBound, store.addUser(std.testing.allocator, "bound-lp", "pw"));
+    // No users row was created and an unbound name still registers.
+    try std.testing.expect((try store.lookup(std.testing.allocator, "bound-lp")) == null);
+    try store.addUser(std.testing.allocator, "free-lp", "pw");
 }
 
 test "UserStore: remove user" {

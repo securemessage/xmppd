@@ -300,6 +300,18 @@ pub fn normalizeLocalpart(raw: []const u8, out: *[max_localpart_len]u8) ?usize {
     return prepared.len;
 }
 
+/// True when localpart is bound to an OIDC subject (reverse-index hit).
+/// Registration consults this before creating a users row: a bound
+/// localpart belongs to the subject, never to a local account
+/// (T-52633E2B). Works on any backend exposing the auth env.
+pub fn localpartBound(backend: anytype, allocator: std.mem.Allocator, localpart: []const u8) !bool {
+    var kbuf: [512]u8 = undefined;
+    const key = try reverseKey(&kbuf, localpart);
+    const row = (try backend.get(allocator, NAMESPACE, key)) orelse return false;
+    allocator.free(row);
+    return true;
+}
+
 /// First-login and operator-binding resolution. Generic over the
 /// operational backend (used for both the auth env that holds the
 /// bindings/users namespaces and the op env data probe) and the archive

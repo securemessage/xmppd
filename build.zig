@@ -748,6 +748,7 @@ pub fn build(b: *std.Build) void {
     server_oidc_identity_mod.addImport("backend", server_backend_mod);
     server_oidc_identity_mod.addImport("precis_username", precis_username_mod);
     server_test_mod.addImport("oidc_identity_store", server_oidc_identity_mod);
+    server_user_store_mod.addImport("oidc_identity_store", server_oidc_identity_mod);
     server_test_mod.addImport("build_options", build_options_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
@@ -1157,6 +1158,7 @@ pub fn build(b: *std.Build) void {
     oidc_identity_store_test_mod.addImport("backend", backend_test_mod);
     oidc_identity_store_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
     oidc_identity_store_test_mod.addImport("precis_username", precis_username_mod);
+    generic_user_store_test_mod.addImport("oidc_identity_store", oidc_identity_store_test_mod);
 
     const oidc_identity_store_tests = b.addTest(.{
         .name = "oidc-identity-store-tests",
@@ -1806,6 +1808,7 @@ pub fn build(b: *std.Build) void {
     oidc_ids_mod.addImport("backend", auth_backend_mod);
     oidc_ids_mod.addImport("lmdb_backend", oidc_ids_lmdb_mod);
     oidc_ids_mod.addImport("precis_username", precis_username_mod);
+    auth_user_store_mod.addImport("oidc_identity_store", oidc_ids_mod);
     oidc_store_mod.addImport("oidc_identity_store", oidc_ids_mod);
     oidc_store_mod.linkSystemLibrary("ssl", .{});
     oidc_store_mod.linkSystemLibrary("crypto", .{});
@@ -1972,6 +1975,7 @@ pub fn build(b: *std.Build) void {
     ctl_user_store_mod.addImport("sasl", sasl_mod);
     ctl_user_store_mod.addImport("backend", ctl_backend_mod);
     ctl_user_store_mod.addImport("precis_username", precis_username_mod);
+    ctl_user_store_mod.addImport("oidc_identity_store", ctl_ids_mod);
 
     const ctl_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/main.zig"),

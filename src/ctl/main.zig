@@ -228,7 +228,9 @@ pub fn main() !void {
         };
 
         addUserCanonical(&store, allocator, username, password) catch |err| {
-            switch (err) {
+            if (err == error.OidcBound) {
+                printErr("localpart is bound to an OIDC identity (see xmppctl oidc-links)\n");
+            } else switch (err) {
                 error.InvalidAccountName => printErr("invalid account name\n"),
                 error.UserExists => printErr("user already exists\n"),
                 else => {

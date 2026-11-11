@@ -95,6 +95,10 @@ accepted only when the IdP reports `email_verified = true` and is the
 weakest choice because email is editable at most IdPs. Setting
 `localpart_claim` to an empty string disables auto-provisioning
 entirely: every account then needs an explicit `xmppctl oidc-link`.
+Local registration runs the reverse index too: XEP-0077 registration and
+`xmppctl add` refuse a localpart bound to a subject (`conflict`, and a
+bound-localpart error at the ctl) instead of attaching a password
+credential to the bound account.
 
 | IdP | Recommended keys | Notes |
 |-----|------------------|-------|
