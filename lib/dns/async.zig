@@ -3416,6 +3416,24 @@ fn appendAnswerTail(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), rty
     list.appendSlice(a, std.mem.asBytes(&std.mem.nativeToBig(u16, @intCast(rdlen)))) catch return;
 }
 
+/// A TCP port that is provably dead: the returned socket is bound
+/// but never listens, so connects refuse and the reservation keeps
+/// any other process off the number. "Nobody listens on this port"
+/// does not survive parallel test runs. The caller holds the fd for
+/// the length of the test.
+const DeadTcp = struct { fd: posix.fd_t, port: u16 };
+
+fn deadTcpPort() !DeadTcp {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    errdefer posix.close(fd);
+    const addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(fd, &addr.any, addr.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(fd, &actual, &slen);
+    return .{ .fd = fd, .port = net.Address.initPosix(@alignCast(&actual)).getPort() };
+}
+
 fn startFakeDns(truncate: bool, decoy: []const u8) !*FakeDns {
     const srv = try std.testing.allocator.create(FakeDns);
     srv.* = .{
@@ -5101,7 +5119,11 @@ test "dns-async: a wrong-qtype decoy cannot steer the chain" {
 test "dns-async: a refused TCP connect fails the job via SO_ERROR" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
-    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    // A bound socket that never listens refuses the connect and
+    // holds the port against every other process.
+    const dead = try deadTcpPort();
+    defer posix.close(dead.fd);
+    r.setServer(try net.Address.parseIp("127.0.0.1", dead.port));
     var ctx = TestCtx{};
     r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
 
@@ -5567,18 +5589,37 @@ test "dns-async: a refused TCP connect fails the phase, not the job" {
     // reconnect), so a TLSA leg ends lookup_failed and the resolve
     // completes instead of dropping the whole job.
     // Method: the chain is fed to .tlsa over injected answers, then
-    // the TC upgrade connects to a port nobody listens on. The UDP
-    // target is a bound socket that absorbs the queries: an
-    // unbound port's ICMP refusals could latch onto the resolver's
-    // own sends and fail the leg before TCP is reached.
-    const ufd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    // the TC upgrade connects to a provably dead TCP port: a bound
+    // socket that never listens refuses the connect while holding
+    // the number against every other process. The UDP half of the
+    // same port is bound to absorb the queries: an unbound port's
+    // ICMP refusals could latch onto the resolver's own sends and
+    // fail the leg before TCP is reached.
+    var dead: DeadTcp = undefined;
+    var ufd: posix.fd_t = undefined;
+    var attempts: usize = 0;
+    while (true) : (attempts += 1) {
+        if (attempts == 256) return error.AddressInUse;
+        dead = try deadTcpPort();
+        ufd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+        const uaddr = try net.Address.parseIp("127.0.0.1", dead.port);
+        posix.bind(ufd, &uaddr.any, uaddr.getOsSockLen()) catch |err| switch (err) {
+            error.AddressInUse => {
+                posix.close(ufd);
+                posix.close(dead.fd);
+                continue;
+            },
+            else => {
+                posix.close(ufd);
+                posix.close(dead.fd);
+                return err;
+            },
+        };
+        break;
+    }
     defer posix.close(ufd);
-    const uaddr = try net.Address.parseIp("127.0.0.1", 0);
-    try posix.bind(ufd, &uaddr.any, uaddr.getOsSockLen());
-    var uactual: posix.sockaddr = undefined;
-    var uslen: posix.socklen_t = @sizeOf(posix.sockaddr);
-    try posix.getsockname(ufd, &uactual, &uslen);
-    const port = net.Address.initPosix(@alignCast(&uactual)).getPort();
+    defer posix.close(dead.fd);
+    const port = dead.port;
 
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
