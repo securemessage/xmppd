@@ -2062,12 +2062,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_user_store_tests.step);
     test_step.dependOn(&run_auth_handler_tests.step);
     // xmppd-bench: M3 microbenchmarks (T-61BC40BB). Always ReleaseFast;
-    // bench numbers from a Debug build are useless. Benches ride only the
-    // public API surface that exists at the pinned baseline d85dd37.
+    // bench numbers from a Debug build are useless.
     // The dependency modules get their own ReleaseFast instances: sharing
     // xml_mod/sasl_mod etc. would bench Debug code under a plain build.
     const bench_xml_mod = b.createModule(.{
         .root_source_file = b.path("lib/xml/reader.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_unicode_mod = b.createModule(.{
+        .root_source_file = b.path("lib/unicode/normalize.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
@@ -2076,6 +2080,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    bench_sasl_mod.addImport("unicode", bench_unicode_mod);
     const bench_session_map_mod = b.createModule(.{
         .root_source_file = b.path("src/core/session_map.zig"),
         .target = target,

@@ -1,10 +1,9 @@
 //! M3 microbenchmarks for the v0.9.1 baseline (T-61BC40BB / Phorge T374).
 //!
 //! Built by `zig build bench`, always ReleaseFast, against the public API
-//! surface that exists at the pinned baseline d85dd37: lib/xml Scanner,
-//! src/core MpscQueue (cross-worker envelope ring), SessionMap lookups,
-//! and SCRAM/PBKDF2 verify costs. StanzaWriter has no public API yet
-//! (F4), so it is not benched here.
+//! surface: lib/xml Scanner and StanzaWriter, src/core MpscQueue
+//! (cross-worker envelope ring), SessionMap lookups, and SCRAM/PBKDF2
+//! verify costs.
 //!
 //! Output: one machine-readable `bench: <case> ...` line per case.
 //! Run 3 times and take the median when recording numbers.
@@ -22,6 +21,7 @@ pub const std_options: std.Options = .{ .log_level = .warn };
 
 pub fn main() !void {
     try benchXmlParse();
+    try benchStanzaWriter();
     try benchMpscRing();
     try benchSessionMapLookup();
     try benchPbkdf2();
@@ -60,6 +60,42 @@ fn benchXmlParse() !void {
     const s = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
     const mb = @as(f64, @floatFromInt(data.len)) / (1024 * 1024);
     rateLine("xml_parse corpus_mib={d:.1} tokens={d} stanzas={d} seconds={d:.3} mb_per_s={d:.1} stanzas_per_s={d:.0}", .{ mb, tokens, stanzas, s, mb / s, @as(f64, @floatFromInt(stanzas)) / s });
+}
+
+// -- StanzaWriter: serialize the corpus stanza, stanzas/s and MB/s -----------
+
+fn benchStanzaWriter() !void {
+    var buf: [4096]u8 = undefined;
+    var timer = try std.time.Timer.start();
+    var stanzas: u64 = 0;
+    var bytes: u64 = 0;
+    while (true) {
+        var w: std.Io.Writer = .fixed(&buf);
+        var sw = xml.StanzaWriter.init(&w);
+        try sw.elementOpen("message");
+        try sw.attr("from", "m2u-17@localhost/load-3");
+        try sw.attr("to", "m2u-88@localhost/lab-1");
+        try sw.attr("type", "chat");
+        try sw.attr("id", "v091-0042");
+        try sw.attr("xml:lang", "en");
+        sw.elementOpenEnd();
+        try sw.elementOpen("body");
+        sw.elementOpenEnd();
+        try sw.text("the quick brown fox jumps over the lazy dog while the carrier-grade server chews stanzas at ten thousand per second and nobody even notices the kqueue loop");
+        try sw.elementClose("body");
+        try sw.elementOpen("received");
+        try sw.xmlns("urn:xmpp:receipts");
+        try sw.attr("id", "m2-13");
+        sw.elementSelfClose();
+        try sw.elementClose("message");
+        try sw.finish();
+        bytes += w.buffered().len;
+        stanzas += 1;
+        if (timer.read() >= 2 * std.time.ns_per_s) break;
+    }
+    const seconds = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    const mb = @as(f64, @floatFromInt(bytes)) / (1024 * 1024);
+    rateLine("stanza_write stanzas={d} seconds={d:.3} mb_per_s={d:.1} stanzas_per_s={d:.0}", .{ stanzas, seconds, mb / seconds, @as(f64, @floatFromInt(stanzas)) / seconds });
 }
 
 // -- MPSC ring: enqueue+drain ops/s at 128-byte payloads ---------------------
