@@ -2011,15 +2011,52 @@ fn synthIo(c: *Conn, kind: enum { r, w }) Event {
     };
 }
 
-/// Drive a server-side handshake through synthetic readable events until
-/// onEvent reports something, pumping the client end between steps.
+/// Drive a server-side handshake on the conn's real loop events until
+/// onEvent reports something. The client end rides the same kqueue: TCP
+/// loopback delivery is deferred kernel work, so a readable event is the
+/// only reliable signal that the peer's flight reached its socket.
+/// Pumping only when the conn's fd fires deadlocks once both ends want
+/// read (the client queue then holds an unread flight forever); the
+/// deadline bounds a genuinely stuck peer.
 fn hsToEnd(c: *Conn, client: *ssl.SslConn, list: *ConnList) !Outcome {
-    for (0..100) |_| {
-        _ = client.doHandshake() catch {};
-        const out = c.onEvent(synthIo(c, .r), list);
-        if (out != .none) return out;
+    const loop = c.loop;
+    const deadline = try loop.scheduleIn(30_000, .none);
+    defer _ = loop.cancelTimer(deadline);
+    const cli = try loop.attach(client.sock_fd, .none, .{ .read = true });
+    defer _ = loop.detach(cli) catch -1;
+    var client_done = false;
+    while (true) {
+        if (!client_done) {
+            const r = client.doHandshake() catch blk: {
+                // A fatal client leaves the server reading its alert or
+                // EOF; the conn events or the deadline decide the outcome.
+                client_done = true;
+                break :blk ssl.HandshakeResult.complete;
+            };
+            switch (r) {
+                .complete => {
+                    client_done = true;
+                    try loop.setInterest(cli, .{});
+                },
+                .want_read => try loop.setInterest(cli, .{ .read = true }),
+                .want_write => try loop.setInterest(cli, .{ .read = true, .write = true }),
+            }
+        }
+        try loop.wait();
+        while (loop.next()) |ev| {
+            switch (ev) {
+                .deadline => |d| if (d.timer.eql(deadline)) return error.HandshakeDeadline,
+                .readable, .writable => |io| if (!io.handle.eql(cli)) {
+                    const out = c.onEvent(ev, list);
+                    if (out != .none) return out;
+                },
+                else => {
+                    const out = c.onEvent(ev, list);
+                    if (out != .none) return out;
+                },
+            }
+        }
     }
-    return error.HandshakeStuck;
 }
 
 test "Conn: readable event delivers .readable and inbox bytes" {

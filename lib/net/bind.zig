@@ -920,6 +920,25 @@ test "Listener: EMFILE pauses, a close resumes (forked child, lowered RLIMIT)" {
     try std.testing.expectEqual(@as(u32, 0), @as(u32, @intCast(res.status)));
 }
 
+/// Wait for the listener's readable event. A blocking connect() only
+/// proves the client half completed; the accept-queue entry appears when
+/// the kernel processes the final ACK, which a loaded host defers past
+/// the caller's next accept4 (drained/EAGAIN instead of the connection).
+fn waitAcceptable(loop: *Loop, listener: *Listener) !void {
+    const deadline = try loop.scheduleIn(30_000, .none);
+    defer _ = loop.cancelTimer(deadline);
+    while (true) {
+        try loop.wait();
+        while (loop.next()) |ev| {
+            switch (ev) {
+                .readable => |io| if (io.handle.eql(listener.handle)) return,
+                .deadline => |d| if (d.timer.eql(deadline)) return error.AcceptQueueDeadline,
+                else => {},
+            }
+        }
+    }
+}
+
 fn childEmfile() void {
     // Open every fd first, then clamp RLIMIT_NOFILE below the open count so
     // the next accept() trips EMFILE.
@@ -985,24 +1004,32 @@ fn childEmfile() void {
     const st_cx2 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
     const cfd2 = posix.socket(posix.AF.INET, st_cx2, 0) catch posix.exit(22);
     posix.connect(cfd2, @ptrCast(&bound), @sizeOf(posix.sockaddr.in)) catch posix.exit(23);
-    loop.wait() catch posix.exit(19);
-    while (loop.next()) |ev| {
-        if (ev == .readable) {
-            while (true) {
-                const out = listener.acceptNext() catch posix.exit(26);
-                switch (out) {
-                    .accepted => |a| {
-                        posix.close(a.fd);
-                        n += 1;
-                    },
-                    else => break,
-                }
+    // The EMFILE'd connection stayed in the backlog: it and the fresh one
+    // are both accepted after the resume. The fresh one's queue entry can
+    // lag behind connect() under load, so keep waiting on readable events
+    // until both arrive; the deadline fails the child instead of hanging.
+    const deadline = loop.scheduleIn(30_000, test_ctx) catch posix.exit(28);
+    while (n < 2) {
+        loop.wait() catch posix.exit(19);
+        while (loop.next()) |ev| {
+            switch (ev) {
+                .readable => {
+                    while (true) {
+                        const out = listener.acceptNext() catch posix.exit(26);
+                        switch (out) {
+                            .accepted => |a| {
+                                posix.close(a.fd);
+                                n += 1;
+                            },
+                            else => break,
+                        }
+                    }
+                },
+                .deadline => |d| if (d.timer.eql(deadline)) posix.exit(29),
+                else => {},
             }
         }
     }
-    // The EMFILE'd connection stayed in the backlog: it and the fresh one
-    // are both accepted after the resume.
-    if (n != 2) posix.exit(20);
     posix.exit(0);
 }
 
@@ -1060,7 +1087,11 @@ test "Listener: pause and peer_rejected reset the accept budget" {
 
     // peer_rejected: a TCP accepted fd cannot carry unix credentials, so
     // a listener declared unix reports rejection and resets the budget.
+    // The second connect's accept-queue entry can lag behind connect()
+    // under load; wait for the readable event instead of accepting into
+    // an EAGAIN.
     listener.family = .unix;
+    try waitAcceptable(&loop, &listener);
     const out2 = try listener.acceptNext();
     try std.testing.expect(out2 == .peer_rejected);
     try std.testing.expectEqual(@as(u16, 0), listener.accepted_this_pass);

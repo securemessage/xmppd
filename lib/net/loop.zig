@@ -1989,18 +1989,30 @@ test "Loop: a collected deadline emits on a busy loop" {
     defer loop.deinit(std.testing.allocator);
 
     for (0..10) |_| {
-        const t0 = monotonicMs();
         _ = try loop.scheduleIn(20, tctx(1));
-        var fired_ms: u64 = std.math.maxInt(u64);
-        while (fired_ms == std.math.maxInt(u64)) {
+        const due = monotonicMs() + 20;
+        const give_up = due + 5_000;
+        // Wall ms counts scheduler preemption, not loop work, so measure
+        // the miss in busy passes: once a pass collects after the due
+        // time the deadline must emit on the spot. A few passes of slack
+        // covers timer quantization and a preempted drain.
+        var overdue_passes: usize = 0;
+        var fired = false;
+        while (!fired and monotonicMs() < give_up) {
             loop.requestImmediate();
             try loop.wait();
+            var saw = false;
             while (loop.next()) |ev| {
-                if (ev == .deadline) fired_ms = monotonicMs() - t0;
+                if (ev == .deadline) saw = true;
             }
-            if (monotonicMs() - t0 > 250) break;
+            if (saw) {
+                fired = true;
+            } else if (monotonicMs() >= due) {
+                overdue_passes += 1;
+            }
         }
-        try std.testing.expect(fired_ms < 40);
+        try std.testing.expect(fired);
+        try std.testing.expect(overdue_passes <= 3);
     }
 }
 
