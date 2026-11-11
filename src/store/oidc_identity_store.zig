@@ -779,6 +779,35 @@ test "Resolver: suggestion prefix and domain rules" {
     try testing.expectEqual(foreign, Resolution{ .refused = .no_suggestion });
 }
 
+test "Resolver: an existing account only binds through an operator link" {
+    var auth = try backend_mod.MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try backend_mod.MemoryBackend.open("", .{});
+    defer op.close();
+    var arch = try backend_mod.MemoryBackend.open("", .{});
+    defer arch.close();
+    try auth.put(USERS_NS, "alice", "creds");
+    var r = memResolver(&auth, &op, &arch);
+
+    var lp: [max_localpart_len]u8 = undefined;
+    var len: usize = 0;
+    // Upgrade path: the first OIDC login never claims a provisioned
+    // account, and the refusal writes no binding rows.
+    const refused = try r.resolve(testing.allocator, "https://idp.example", "sub-1", "alice", &lp, &len);
+    try testing.expectEqual(refused, Resolution{ .refused = .local_account });
+    const stray = try r.store.lookupSubject(testing.allocator, "https://idp.example", "sub-1");
+    defer if (stray) |v| testing.allocator.free(v);
+    try testing.expect(stray == null);
+
+    // xmppctl oidc-link binds the account to the subject; the next login
+    // resolves to the linked localpart.
+    const claimed = try r.store.bind("https://idp.example", "sub-1", "alice", .operator, 1);
+    try testing.expectEqual(MemStore.Claimed.bound, claimed);
+    const out = try r.resolve(testing.allocator, "https://idp.example", "sub-1", "ignored", &lp, &len);
+    try testing.expectEqual(out, Resolution{ .bound = 5 });
+    try testing.expectEqualStrings("alice", lp[0..len]);
+}
+
 test "Resolver: operator bind wins over later auto claims" {
     var auth = try backend_mod.MemoryBackend.open("", .{});
     defer auth.close();
