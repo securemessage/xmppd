@@ -54,6 +54,8 @@ const oidc_ids = @import("oidc_identity_store");
 const LockStore = lock_store_mod.LockStore(OpBackendType);
 const BindingStore = oidc_ids.Store(OpBackendType);
 const BindingResolver = oidc_ids.Resolver(OpBackendType, ArchiveBackendType);
+const MemBindingStore = oidc_ids.Store(backend_mod.MemoryBackend);
+const MemBindingResolver = oidc_ids.Resolver(backend_mod.MemoryBackend, backend_mod.MemoryBackend);
 
 const log = std.log.scoped(.xmppd_auth_oidc);
 
@@ -1206,6 +1208,13 @@ const DaemonFixture = struct {
     store: OidcStore = undefined,
     handler: AuthHandler = undefined,
     daemon: Daemon = undefined,
+    // Binding seam: in-memory envs stand in for {db}/auth, {db}/op and
+    // {db}/archive so verified exchanges resolve through the real
+    // Resolver exactly as main() wires it.
+    bind_backend: backend_mod.MemoryBackend = undefined,
+    op_probe: backend_mod.MemoryBackend = undefined,
+    archive_probe: backend_mod.MemoryBackend = undefined,
+    binding_resolver: MemBindingResolver = undefined,
 
     fn init(
         self: *DaemonFixture,
@@ -1247,6 +1256,20 @@ const DaemonFixture = struct {
         self.handler.setRateLimiter(&self.limiter);
         errdefer self.handler.deinit();
 
+        self.bind_backend = try backend_mod.MemoryBackend.open("", .{});
+        errdefer self.bind_backend.close();
+        self.op_probe = try backend_mod.MemoryBackend.open("", .{});
+        errdefer self.op_probe.close();
+        self.archive_probe = try backend_mod.MemoryBackend.open("", .{});
+        errdefer self.archive_probe.close();
+        self.binding_resolver = .{
+            .store = MemBindingStore.init(&self.bind_backend),
+            .op_backend = &self.op_probe,
+            .archive_backend = &self.archive_probe,
+            .user_domain = "localhost",
+        };
+        self.store.bindings = self.binding_resolver.bindingOps();
+
         try self.daemon.init(allocator, &self.store, &self.handler, self.sock_path, pool_options);
     }
 
@@ -1255,6 +1278,9 @@ const DaemonFixture = struct {
         self.handler.deinit();
         self.limiter.deinit();
         self.store.deinit();
+        self.bind_backend.close();
+        self.op_probe.close();
+        self.archive_probe.close();
         allocator.free(self.sock_path);
         self.tmp.cleanup();
     }
@@ -2463,7 +2489,7 @@ test "a correct password answers auth_success end to end" {
         cert_path.ptr,
         key_path.ptr,
         "200 OK",
-        "{\"active\":true,\"username\":\"alice\"}",
+        "{\"active\":true,\"sub\":\"sub-alice\",\"username\":\"alice\"}",
         &intro_port,
     });
     defer intro_stub.join();
