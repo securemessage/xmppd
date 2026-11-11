@@ -15,8 +15,15 @@
 //!
 //! ## DANE Integration
 //!
-//! After handshake completes, extract the peer certificate chain with
-//! `getPeerCertDer()` / `getPeerChainDer()` and pass to `tls.validateDane()`.
+//! Verification runs inside the handshake. Build the state with `initDane()`,
+//! arm it on the connection with `prepareDane()` before `doHandshake()`, and
+//! read the outcome with `daneVerdict()` afterwards. The records, the
+//! usability filter, digest agility and the verdict all come from the shared
+//! `pacyworld/dane-zig` module; this file only bridges it to `SSL_CTX`/`SSL`.
+//!
+//! Inbound S2S learns the peer domain only after TLS, so it cannot arm the
+//! handshake. `verifyPeerDane()` verifies the presented chain afterwards on a
+//! dedicated context from `initDaneVerifier()`.
 //!
 //! ## Build Requirements
 //!
@@ -33,6 +40,11 @@ const c = @cImport({
     @cInclude("openssl/err.h");
     @cInclude("openssl/x509.h");
 });
+
+// The DANE backend keeps its own extern declarations and opaque types, so
+// every crossing between the two type worlds happens in this file.
+const dane = @import("dane");
+const dane_openssl = @import("dane-openssl");
 
 /// Result of a non-blocking TLS handshake attempt.
 pub const HandshakeResult = enum {
@@ -86,6 +98,108 @@ pub const SslError = error{
 fn alwaysAcceptVerify(_: c_int, _: ?*c.X509_STORE_CTX) callconv(.c) c_int {
     return 1; // Always OK
 }
+
+/// One TLSA record as the caller sees it: the fields of the DNSSEC RR that
+/// participate in verification (RFC 6698 section 2.1).
+pub const DaneRecord = struct {
+    usage: u8,
+    selector: u8,
+    matching_type: u8,
+    data: []const u8,
+};
+
+/// DANE policy for a single handshake. XMPP disables the DANE-EE name check
+/// (RFC 7671 section 5.1) and supplies the service domain plus the SRV target
+/// as reference identifiers (RFC 7673 section 4).
+pub const DanePolicy = struct {
+    /// First entry is the SNI value and the base domain for OpenSSL.
+    names: []const []const u8,
+};
+
+/// A prepared DANE handshake: the record set plus the identifier copies the
+/// handshake needs. Owns one allocation, released by `deinit`.
+pub const DaneState = struct {
+    arena: std.heap.ArenaAllocator,
+    set: dane.RecordSet,
+    names: []const []const u8,
+    policy: dane.Policy,
+
+    pub fn deinit(self: *DaneState) void {
+        self.arena.deinit();
+    }
+
+    /// Reference identifiers in the form the backend wants them.
+    fn refs(self: *const DaneState) dane.ReferenceIds {
+        return .{ .names = self.names };
+    }
+
+    /// Whether the usable records demand DANE or, with none surviving
+    /// filtering, PKIX against the reference identifiers (module plan
+    /// section 7). An empty set never means "skip verification".
+    pub fn mode(self: *const DaneState) dane.Mode {
+        return dane.set.mode(&self.set);
+    }
+};
+
+/// Verification mode an RRset implies: `.pkix` when no record survives
+/// filtering, so a caller can fall back to the system store instead of
+/// treating an unusable-only RRset as a match or as a hard failure.
+pub const DaneMode = dane.Mode;
+
+/// Upper bound on records and identifiers per handshake, matching the
+/// module's own limits so an oversized RRset is rejected, never truncated.
+pub const dane_max_records = dane.max_records;
+
+/// Build the DANE state for a handshake from raw TLSA records.
+///
+/// `records` may contain unusable entries: the module filters them and
+/// applies digest agility. An RRset whose usable survivors exceed the
+/// module's cap is `error.TooManyRecords`, never truncated. The caller
+/// decides what an empty surviving set means; it reads `.pkix` from `mode`.
+pub fn initDane(alloc: std.mem.Allocator, policy: DanePolicy, records: []const DaneRecord) DaneError!DaneState {
+    if (policy.names.len == 0) return error.NoReferenceIds;
+    if (policy.names.len > dane.max_names) return error.TooManyReferenceIds;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    const names = a.alloc([]const u8, policy.names.len) catch return error.OutOfMemory;
+    for (policy.names, 0..) |n, i| names[i] = a.dupe(u8, n) catch return error.OutOfMemory;
+
+    const recs = a.alloc(dane.Record, records.len) catch return error.OutOfMemory;
+    for (records, 0..) |r, i| {
+        recs[i] = .{
+            .usage = @enumFromInt(r.usage),
+            .selector = @enumFromInt(r.selector),
+            .matching_type = @enumFromInt(r.matching_type),
+            .data = a.dupe(u8, r.data) catch return error.OutOfMemory,
+        };
+    }
+    const set = dane.RecordSet.init(recs) catch return error.TooManyRecords;
+
+    return .{
+        .arena = arena,
+        .set = set,
+        .names = names,
+        .policy = .{ .dane_ee_name_check = false },
+    };
+}
+
+pub const DaneError = error{
+    OutOfMemory,
+    TooManyRecords,
+    NoReferenceIds,
+    TooManyReferenceIds,
+};
+
+/// Outcome of `SslConn.daneVerdict`: verified, or failed with a named
+/// failure. Re-exported so callers need not import the module directly.
+pub const DaneVerdict = dane.Verdict;
+pub const Outcome = dane.Outcome;
+pub const Failure = dane.Failure;
+pub const Usage = dane.Usage;
+pub const DanePrepared = dane_openssl.Prepared;
 
 /// An OpenSSL `SSL_CTX` wrapper. Create once at server startup, share across
 /// all connections. Thread-safe after initialization (OpenSSL 3.x guarantee).
@@ -166,6 +280,63 @@ pub const SslContext = struct {
         return .{ .ctx = ctx };
     }
 
+    /// Initialize a client-side TLS context that verifies through DANE.
+    ///
+    /// SSL_VERIFY_PEER makes the handshake fail unless a TLSA record matches,
+    /// and the store is left empty so no traditional anchor can satisfy it
+    /// (the TLSA match is the only possible anchor). No verify callback is
+    /// installed: nothing may override the result. Kernel TLS is armed as in
+    /// `initClient`; callers disable it when the peer may also offload.
+    pub fn initClientDane() SslError!SslContext {
+        return initClientDaneWithCert(null, null);
+    }
+
+    /// Initialize a client-side TLS context that verifies through DANE and
+    /// presents our certificate (SASL EXTERNAL needs it).
+    ///
+    /// `SSL_VERIFY_PEER` makes the handshake fail unless a TLSA record
+    /// matches, and the store is left empty so no traditional anchor can
+    /// satisfy it. No verify callback is installed: nothing may override the
+    /// result. Kernel TLS is armed as in `initClient`; callers disable it when
+    /// the peer may also offload.
+    pub fn initClientDaneWithCert(cert_path: ?[*:0]const u8, key_path: ?[*:0]const u8) SslError!SslContext {
+        const method = c.TLS_client_method() orelse return SslError.SslInitFailed;
+        const ctx = c.SSL_CTX_new(method) orelse return SslError.SslInitFailed;
+        errdefer c.SSL_CTX_free(ctx);
+
+        c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
+        dane_openssl.enableContext(@ptrCast(ctx)) catch return SslError.SslInitFailed;
+
+        if (cert_path) |cp| {
+            if (c.SSL_CTX_use_certificate_chain_file(ctx, cp) != 1) {
+                return SslError.CertLoadFailed;
+            }
+        }
+        if (key_path) |kp| {
+            if (c.SSL_CTX_use_PrivateKey_file(ctx, kp, c.SSL_FILETYPE_PEM) != 1) {
+                return SslError.KeyLoadFailed;
+            }
+            if (c.SSL_CTX_check_private_key(ctx) != 1) {
+                return SslError.KeyMismatch;
+            }
+        }
+
+        _ = c.SSL_CTX_set_options(ctx, 0x8);
+        return .{ .ctx = ctx };
+    }
+
+    /// Initialize a context used only to verify a peer chain after the
+    /// handshake (`SslConn.verifyPeerDane`). It carries the DANE settings and
+    /// an empty store; it is never used for a connection.
+    pub fn initDaneVerifier() SslError!SslContext {
+        const method = c.TLS_client_method() orelse return SslError.SslInitFailed;
+        const ctx = c.SSL_CTX_new(method) orelse return SslError.SslInitFailed;
+        errdefer c.SSL_CTX_free(ctx);
+
+        dane_openssl.enableContext(@ptrCast(ctx)) catch return SslError.SslInitFailed;
+        return .{ .ctx = ctx };
+    }
+
     /// Initialize a client-side TLS context with a certificate for mutual TLS.
     ///
     /// The cert/key are presented to the remote server so it can authenticate us
@@ -233,6 +404,16 @@ pub const SslConn = struct {
     /// The socket this connection is bound to (kept for callers that swap
     /// transports — e.g. lib/xmppc's Transport union — and need the fd back).
     sock_fd: std.posix.fd_t = -1,
+    /// Client role (initClient): channel binding picks the PEER certificate
+    /// for tls-server-end-point, not our own (T263).
+    is_client: bool = false,
+    /// A non-want SSL_get_error result ended the conn. SSL_shutdown is
+    /// skipped on a fatal conn: it would only push more entries onto the
+    /// thread's shared error queue.
+    fatal: bool = false,
+    /// errno captured when a call fails with SSL_ERROR_SYSCALL, kept for
+    /// the caller's close diagnostics (the queue entry does not carry it).
+    syscall_errno: c_int = 0,
 
     pub fn sockFd(self: *const SslConn) std.posix.fd_t {
         return self.sock_fd;
@@ -279,7 +460,7 @@ pub const SslConn = struct {
             _ = c.SSL_ctrl(ssl, c.SSL_CTRL_SET_TLSEXT_HOSTNAME, c.TLSEXT_NAMETYPE_host_name, @ptrCast(@constCast(h)));
         }
 
-        return SslConn{ .ssl = ssl, .sock_fd = fd };
+        return SslConn{ .ssl = ssl, .sock_fd = fd, .is_client = true };
     }
 
     /// Require the peer certificate to match `hostname` (PKIX path only;
@@ -300,6 +481,9 @@ pub const SslConn = struct {
     ///
     /// Returns `.complete` when the handshake finishes successfully.
     pub fn doHandshake(self: *SslConn) SslError!HandshakeResult {
+        // The error queue is per-thread and shared by every conn: a stale
+        // entry left by another conn would mis-classify this call.
+        c.ERR_clear_error();
         const ret = c.SSL_do_handshake(self.ssl);
         if (ret == 1) return .complete;
 
@@ -308,6 +492,8 @@ pub const SslConn = struct {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
             else => {
+                self.fatal = true;
+                if (err == c.SSL_ERROR_SYSCALL) self.syscall_errno = std.c._errno().*;
                 // Log the OpenSSL error queue for diagnostics. warn, not
                 // err: handshake failures are client-caused routine noise
                 // (bad certs, port scans, aborted probes), not daemon
@@ -325,6 +511,43 @@ pub const SslConn = struct {
         };
     }
 
+    /// Arm DANE on this connection before the handshake runs. Must be called
+    /// after `initClient` and before the first `doHandshake`.
+    ///
+    /// Returns `.no_usable_records` when the module kept no record; OpenSSL
+    /// then verifies against traditional trust anchors, so the caller applies
+    /// its own fallback instead of reading a DANE result.
+    pub fn prepareDane(self: *SslConn, state: *const DaneState) SslError!dane_openssl.Prepared {
+        return dane_openssl.prepare(@ptrCast(self.ssl), &state.set, state.refs(), state.policy) catch
+            return SslError.SslInitFailed;
+    }
+
+    /// Install PKIX verification for a target whose RRset held no usable
+    /// record: the reference identifiers are checked against DNS names only
+    /// (never a subject CN), and SNI is set when the connection has none.
+    pub fn applyPkixFallback(self: *SslConn, state: *const DaneState) SslError!void {
+        dane_openssl.pkixFallback(@ptrCast(self.ssl), state.refs()) catch return SslError.SslInitFailed;
+    }
+
+    /// Map the completed handshake's verification state to a verdict.
+    /// `prepared` is what `prepareDane` returned.
+    pub fn daneVerdict(self: *SslConn, prepared: dane_openssl.Prepared, state: *const DaneState) dane.Verdict {
+        return dane_openssl.verdict(@ptrCast(self.ssl), prepared, &state.set, state.policy);
+    }
+
+    /// Verify this connection's peer chain against DANE records after the
+    /// handshake (inbound S2S: the peer domain arrives after TLS, so the
+    /// handshake could not be armed). `verify_ctx` must be a dedicated
+    /// context from `initDaneVerifier`; it carries the DANE settings and an
+    /// empty store, so nothing but a TLSA record can anchor the chain.
+    ///
+    /// Chain building and the signature checks run on the calling thread.
+    /// ADR-11/F7 moves that work to the handshake pool; until then this runs
+    /// on the event loop and callers must keep the input bounded.
+    pub fn verifyPeerDane(self: *SslConn, verify_ctx: *const SslContext, state: *const DaneState) dane.Verdict {
+        return dane_openssl.verifyPeer(@ptrCast(self.ssl), @ptrCast(verify_ctx.ctx), &state.set, state.refs(), state.policy);
+    }
+
     /// Read decrypted data from the TLS connection.
     ///
     /// Returns the number of bytes read, or `want_read`/`want_write` if
@@ -332,6 +555,7 @@ pub const SslConn = struct {
     ///
     /// A return of `ConnectionClosed` means the peer sent a TLS close_notify.
     pub fn read(self: *SslConn, buf: []u8) SslError!IoResult {
+        c.ERR_clear_error();
         const ret = c.SSL_read(self.ssl, buf.ptr, @intCast(buf.len));
         if (ret > 0) return .{ .ok = @intCast(ret) };
 
@@ -340,7 +564,11 @@ pub const SslConn = struct {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
             c.SSL_ERROR_ZERO_RETURN => SslError.ConnectionClosed,
-            else => SslError.ReadFailed,
+            else => {
+                self.fatal = true;
+                if (err == c.SSL_ERROR_SYSCALL) self.syscall_errno = std.c._errno().*;
+                return SslError.ReadFailed;
+            },
         };
     }
 
@@ -349,6 +577,7 @@ pub const SslConn = struct {
     /// Returns the number of bytes written, or `want_read`/`want_write` if
     /// the underlying socket isn't ready.
     pub fn write(self: *SslConn, data: []const u8) SslError!IoResult {
+        c.ERR_clear_error();
         const ret = c.SSL_write(self.ssl, data.ptr, @intCast(data.len));
         if (ret > 0) return .{ .ok = @intCast(ret) };
 
@@ -356,7 +585,11 @@ pub const SslConn = struct {
         return switch (err) {
             c.SSL_ERROR_WANT_READ => .want_read,
             c.SSL_ERROR_WANT_WRITE => .want_write,
-            else => SslError.WriteFailed,
+            else => {
+                self.fatal = true;
+                if (err == c.SSL_ERROR_SYSCALL) self.syscall_errno = std.c._errno().*;
+                return SslError.WriteFailed;
+            },
         };
     }
 
@@ -396,84 +629,6 @@ pub const SslConn = struct {
         const cipher = c.SSL_get_current_cipher(self.ssl) orelse return "";
         const name = c.SSL_CIPHER_get_name(cipher) orelse return "";
         return std.mem.span(name);
-    }
-
-    /// Extract the peer's leaf certificate as DER-encoded bytes.
-    ///
-    /// Returns `null` if no peer certificate is available (server-side,
-    /// peer certs are only available if client certificate auth is enabled).
-    ///
-    /// Caller owns the returned memory.
-    pub fn getPeerCertDer(self: *SslConn, alloc: std.mem.Allocator) SslError!?[]u8 {
-        const x509 = c.SSL_get0_peer_certificate(self.ssl) orelse return null;
-
-        // Get DER-encoded length
-        const der_len = c.i2d_X509(x509, null);
-        if (der_len <= 0) return null;
-
-        const buf = alloc.alloc(u8, @intCast(der_len)) catch return SslError.OutOfMemory;
-        errdefer alloc.free(buf);
-
-        var ptr: [*c]u8 = buf.ptr;
-        const written = c.i2d_X509(x509, &ptr);
-        if (written != der_len) {
-            alloc.free(buf);
-            return null;
-        }
-
-        return buf;
-    }
-
-    /// Extract the peer's certificate chain as DER-encoded bytes.
-    ///
-    /// Returns the intermediate/CA certificates (NOT including the leaf).
-    /// The leaf certificate is obtained separately via `getPeerCertDer()`.
-    ///
-    /// Caller owns the returned slices.
-    pub fn getPeerChainDer(self: *SslConn, alloc: std.mem.Allocator) SslError![][]u8 {
-        const chain = c.SSL_get_peer_cert_chain(self.ssl) orelse return &.{};
-
-        const num: usize = @intCast(c.OPENSSL_sk_num(@ptrCast(chain)));
-        if (num == 0) return &.{};
-
-        const result = alloc.alloc([]u8, num) catch return SslError.OutOfMemory;
-        var count: usize = 0;
-        errdefer {
-            for (result[0..count]) |item| alloc.free(item);
-            alloc.free(result);
-        }
-
-        for (0..num) |i| {
-            // Use OPENSSL_sk_value instead of sk_X509_value to avoid
-            // Zig C translator issue with [*c] pointer to opaque X509 type.
-            const x509_raw = c.OPENSSL_sk_value(@ptrCast(chain), @intCast(i)) orelse continue;
-            const x509: *c.X509 = @ptrCast(@alignCast(x509_raw));
-
-            const der_len = c.i2d_X509(x509, null);
-            if (der_len <= 0) continue;
-
-            const buf = alloc.alloc(u8, @intCast(der_len)) catch return SslError.OutOfMemory;
-
-            var ptr: [*c]u8 = buf.ptr;
-            const written = c.i2d_X509(x509, &ptr);
-            if (written != der_len) {
-                alloc.free(buf);
-                continue;
-            }
-
-            result[count] = buf;
-            count += 1;
-        }
-
-        // Return only the populated portion
-        if (count < num) {
-            const trimmed = alloc.alloc([]u8, count) catch return SslError.OutOfMemory;
-            @memcpy(trimmed, result[0..count]);
-            alloc.free(result);
-            return trimmed;
-        }
-
-        return result;
     }
 
     /// Channel binding type identifiers (matches IPC cb_type field).
@@ -518,8 +673,10 @@ pub const SslConn = struct {
             }
             return null;
         } else if (version >= c.TLS1_2_VERSION) {
-            // tls-server-end-point (RFC 5929): SHA-256 hash of server certificate
-            const x509 = c.SSL_get_certificate(self.ssl) orelse return null;
+            // tls-server-end-point (RFC 5929): SHA-256 hash of the SERVER
+            // certificate: our local cert when we are the server (TLS
+            // accept), the PEER's cert when we are the client (T263).
+            const x509 = (if (self.is_client) c.SSL_get0_peer_certificate(self.ssl) else c.SSL_get_certificate(self.ssl)) orelse return null;
             const der_len = c.i2d_X509(x509, null);
             if (der_len <= 0 or der_len > 65535) return null;
 
@@ -542,8 +699,11 @@ pub const SslConn = struct {
     }
 
     /// Initiate a clean TLS shutdown (sends close_notify alert).
-    /// Non-blocking — may need to be called again after kqueue signals readiness.
+    /// Non-blocking — may need to be called again after kqueue signals
+    /// readiness. Skipped on a fatal conn: the conn is already broken and
+    /// the call would only add entries to the shared error queue.
     pub fn shutdown(self: *SslConn) void {
+        if (self.fatal) return;
         _ = c.SSL_shutdown(self.ssl);
     }
 

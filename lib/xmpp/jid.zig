@@ -1,4 +1,5 @@
 const std = @import("std");
+const precis = @import("precis_username");
 
 /// A parsed XMPP JID (Jabber ID).
 ///
@@ -132,9 +133,133 @@ pub const Jid = struct {
     }
 };
 
-/// Validate localpart characters (ASCII subset for MVP).
-/// Per RFC 7622, localpart is a UTF-8 string processed by PRECIS UsernameCaseMapped.
-/// For MVP, we allow: letters, digits, and common punctuation.
+/// RFC 7622 section 3.1: an XMPP JID must not exceed 3071 octets and each
+/// part (localpart, domainpart, resourcepart) must not exceed 1023 octets.
+pub const max_jid_octets = 3071;
+pub const max_part_octets = 1023;
+
+/// Errors from prepareLocalDomainJid. Ingress call sites map every one to a
+/// jid-malformed stanza error.
+pub const PrepareError = error{
+    EmptyJid,
+    EmptyLocalpart,
+    EmptyDomain,
+    InvalidJid,
+    JidTooLong,
+    NoSpaceLeft,
+};
+
+const Parts = struct {
+    local: []const u8,
+    domain: []const u8,
+    resource: []const u8,
+};
+
+/// Split a JID into its three parts. The resource is cut at the FIRST '/',
+/// then the localpart at '@' inside the bare form: "host/res@other" must
+/// parse domain=host (a resource may carry '@'). A second '@' inside the
+/// bare form is structural garbage, never part of a domain. Character
+/// classes are deliberately unchecked here; that validation is the PRECIS
+/// profile's job and the legacy ASCII validator must not run ahead of it.
+fn parseParts(raw: []const u8) PrepareError!Parts {
+    if (raw.len == 0) return error.EmptyJid;
+    if (raw.len > max_jid_octets) return error.JidTooLong;
+
+    var head = raw;
+    var resource: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, raw, '/')) |slash| {
+        head = raw[0..slash];
+        resource = raw[slash + 1 ..];
+    }
+
+    var local: []const u8 = "";
+    var domain = head;
+    if (std.mem.indexOfScalar(u8, head, '@')) |at| {
+        if (at == 0) return error.EmptyLocalpart;
+        local = head[0..at];
+        domain = head[at + 1 ..];
+        if (std.mem.indexOfScalar(u8, domain, '@') != null) return error.InvalidJid;
+    }
+    if (domain.len == 0) return error.EmptyDomain;
+    if (local.len > max_part_octets or domain.len > max_part_octets or
+        resource.len > max_part_octets)
+    {
+        return error.JidTooLong;
+    }
+    return .{ .local = local, .domain = domain, .resource = resource };
+}
+
+/// Per-thread ingress scratch for the localpart preparation. The prepared
+/// slice is copied into the caller's `out` before the function returns, so
+/// the scratch is never live across call sites on one thread.
+threadlocal var ingress_precis_scratch: precis.Scratch = undefined;
+
+/// Prepare `local` as the RFC 7622 Section 3.3 localpart: UsernameCaseMapped
+/// plus the localpart exclusions, identical to the account preparation in
+/// src/store/lock_store.zig prepareAccountKey, registration and SASL. The
+/// result is copied into `out`; every profile rejection maps to InvalidJid
+/// and an over-long prepared name to JidTooLong.
+fn prepareLocalpart(local: []const u8, out: []u8) PrepareError![]const u8 {
+    const prepared = ingress_precis_scratch.localpart(local) catch |err| return switch (err) {
+        error.TooLong => error.JidTooLong,
+        error.NoSpaceLeft => error.NoSpaceLeft,
+        else => error.InvalidJid,
+    };
+    if (prepared.len > out.len) return error.NoSpaceLeft;
+    @memcpy(out[0..prepared.len], prepared);
+    return out[0..prepared.len];
+}
+
+/// Prepare one JID at ingress for the hosted account domain (F6). When the
+/// domain equals `configured_domain` case-insensitively, the domain is
+/// rewritten to the configured spelling; with a localpart present the
+/// localpart is also prepared, so "NaplesTB@US.EXAMPLE" becomes
+/// "naplestb@us.example" and can never build keys that delivery or
+/// migrate-precis fail to match. The localpart preparation is the same
+/// UsernameCaseMapped profile the account store, registration and SASL
+/// apply, so a stanza and the account it names always meet at one spelling.
+/// Remote-domain JIDs are returned as `raw`, unchanged; the resource is
+/// preserved. `out` must not alias `raw`.
+///
+/// One trailing dot on the domainpart is ignored for the match (RFC 7622
+/// 3.2), so "user@localhost." names the hosted domain; an unmatched remote
+/// domain keeps its raw spelling, dot included.
+///
+/// The MUC domain gets no special handling: callers pass the account
+/// domain, so room names and the conference host pass through untouched.
+pub fn prepareLocalDomainJid(raw: []const u8, configured_domain: []const u8, out: []u8) PrepareError![]const u8 {
+    const parts = try parseParts(raw);
+    var domain = parts.domain;
+    if (std.mem.endsWith(u8, domain, ".")) domain = domain[0 .. domain.len - 1];
+    if (!std.ascii.eqlIgnoreCase(domain, configured_domain)) return raw;
+
+    var pos: usize = 0;
+    if (parts.local.len > 0) {
+        const prepared = try prepareLocalpart(parts.local, out);
+        pos = prepared.len;
+        if (pos >= out.len) return error.NoSpaceLeft;
+        out[pos] = '@';
+        pos += 1;
+    }
+    const tail_len = configured_domain.len + (if (parts.resource.len > 0) 1 + parts.resource.len else 0);
+    if (pos + tail_len > out.len) return error.NoSpaceLeft;
+    @memcpy(out[pos..][0..configured_domain.len], configured_domain);
+    pos += configured_domain.len;
+    if (parts.resource.len > 0) {
+        out[pos] = '/';
+        pos += 1;
+        @memcpy(out[pos..][0..parts.resource.len], parts.resource);
+        pos += parts.resource.len;
+    }
+    return out[0..pos];
+}
+
+/// Validate localpart characters. The byte-level check is deliberately
+/// permissive: admission control is the RFC 7622 Section 3.3
+/// UsernameCaseMapped preparation upstream, so this rejects only what a
+/// prepared localpart can never contain: space, control characters, DEL,
+/// and the Section 3.3.1 exclusions. Multibyte UTF-8 passes: this splitter
+/// must not second-guess the profile that produced its input.
 fn isValidLocal(s: []const u8) bool {
     if (s.len == 0) return true; // Empty is valid (means no localpart)
     if (s.len > 1023) return false;
@@ -147,9 +272,9 @@ fn isValidLocal(s: []const u8) bool {
 
 fn isLocalChar(c: u8) bool {
     return switch (c) {
-        'a'...'z', 'A'...'Z', '0'...'9' => true,
-        '.', '-', '_', '+', '~' => true,
-        else => false,
+        0x00...0x20, 0x7F => false,
+        '"', '&', '\'', '/', ':', '<', '>', '@' => false,
+        else => true,
     };
 }
 
@@ -270,4 +395,98 @@ test "JID hash" {
 
     try std.testing.expectEqual(jid1.hash(), jid2.hash());
     try std.testing.expect(jid1.hash() != jid3.hash());
+}
+
+// --- F6 ingress preparation ---
+
+test "prepareLocalpart applies the UsernameCaseMapped profile" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("naplestb", try prepareLocalpart("NaplesTB", &buf));
+    try std.testing.expectEqualStrings("kate", try prepareLocalpart("Kate", &buf));
+    // U+212A KELVIN SIGN folds to "k", matching lock_store.prepareAccountKey.
+    try std.testing.expectEqualStrings("kate", try prepareLocalpart("\xE2\x84\xAAate", &buf));
+    // U+039F U+0394 U+039F U+03A3 prepares to the Greek lowercase form
+    // (U+03A3 maps to U+03C3 unconditionally; there is no final-sigma rule).
+    try std.testing.expectEqualStrings("\xCE\xBF\xCE\xB4\xCE\xBF\xCF\x83", try prepareLocalpart("\xCE\x9F\xCE\x94\xCE\x9F\xCE\xA3", &buf));
+    // Fullwidth letters width-map, decomposed sequences compose under NFC.
+    try std.testing.expectEqualStrings("a", try prepareLocalpart("\xEF\xBC\xA1", &buf));
+    try std.testing.expectEqualStrings("\xC3\xA9", try prepareLocalpart("e\xCC\x81", &buf));
+    // Profile rejections surface as InvalidJid: a localpart-excluded quote,
+    // a space, and non-UTF-8 input.
+    try std.testing.expectError(error.InvalidJid, prepareLocalpart("a\"b", &buf));
+    try std.testing.expectError(error.InvalidJid, prepareLocalpart("a b", &buf));
+    try std.testing.expectError(error.InvalidJid, prepareLocalpart("\xFF", &buf));
+    try std.testing.expectError(error.NoSpaceLeft, prepareLocalpart("abcd", buf[0..3]));
+}
+
+test "prepareLocalDomainJid folds local accounts to the configured spelling" {
+    var out: [512]u8 = undefined;
+    const got = try prepareLocalDomainJid("NaplesTB@US.EXAMPLE", "us.example", &out);
+    try std.testing.expectEqualStrings("naplestb@us.example", got);
+
+    const full = try prepareLocalDomainJid("NaplesTB@US.EXAMPLE/Phone", "us.example", &out);
+    try std.testing.expectEqualStrings("naplestb@us.example/Phone", full);
+
+    // A non-ASCII localpart prepares under UsernameCaseMapped, the same
+    // form a migrated account is stored under.
+    const greek = try prepareLocalDomainJid("\xCE\x9F\xCE\x94\xCE\x9F\xCE\xA3@US.EXAMPLE", "us.example", &out);
+    try std.testing.expectEqualStrings("\xCE\xBF\xCE\xB4\xCE\xBF\xCF\x83@us.example", greek);
+}
+
+test "prepareLocalDomainJid: remote domain and MUC-shaped JIDs pass through" {
+    var out: [512]u8 = undefined;
+    // A remote domain is returned as the input slice, untouched.
+    const remote = "NaplesTB@Remote.Example/Res";
+    const got = try prepareLocalDomainJid(remote, "us.example", &out);
+    try std.testing.expect(got.ptr == remote.ptr);
+    try std.testing.expectEqualStrings(remote, got);
+
+    // Room names are never folded; the conference host is not the account
+    // domain, so the whole JID passes through.
+    const room = "BigRoom@conference.us.example";
+    const room_got = try prepareLocalDomainJid(room, "us.example", &out);
+    try std.testing.expectEqualStrings(room, room_got);
+}
+
+test "prepareLocalDomainJid strips one trailing dot on a local domain" {
+    var out: [max_jid_octets]u8 = undefined;
+    const got = try prepareLocalDomainJid("NaplesTB@LOCALHOST.", "localhost", &out);
+    try std.testing.expectEqualStrings("naplestb@localhost", got);
+    const with_res = try prepareLocalDomainJid("NaplesTB@LOCALHOST./Phone", "localhost", &out);
+    try std.testing.expectEqualStrings("naplestb@localhost/Phone", with_res);
+    // A remote domain keeps its trailing dot and stays a passthrough.
+    const remote = "user@REMOTE.EXAMPLE.";
+    const remote_got = try prepareLocalDomainJid(remote, "localhost", &out);
+    try std.testing.expectEqualStrings(remote, remote_got);
+    // Two trailing dots are not stripped twice; the domain is remote.
+    const dots = "user@localhost..";
+    const dots_got = try prepareLocalDomainJid(dots, "localhost", &out);
+    try std.testing.expectEqualStrings(dots, dots_got);
+}
+
+test "prepareLocalDomainJid: domain-only local JID takes configured spelling" {
+    var out: [512]u8 = undefined;
+    const got = try prepareLocalDomainJid("US.EXAMPLE", "us.example", &out);
+    try std.testing.expectEqualStrings("us.example", got);
+}
+
+test "prepareLocalDomainJid rejects malformed input" {
+    var out: [64]u8 = undefined;
+    try std.testing.expectError(error.EmptyJid, prepareLocalDomainJid("", "us.example", &out));
+    try std.testing.expectError(error.EmptyLocalpart, prepareLocalDomainJid("@us.example", "us.example", &out));
+    try std.testing.expectError(error.EmptyDomain, prepareLocalDomainJid("alice@", "us.example", &out));
+    try std.testing.expectError(error.EmptyDomain, prepareLocalDomainJid("/res", "us.example", &out));
+    try std.testing.expectError(error.InvalidJid, prepareLocalDomainJid("a@b@c", "us.example", &out));
+
+    var long_local: [1024]u8 = undefined;
+    @memset(&long_local, 'a');
+    var big_in: [1100]u8 = undefined;
+    const in_jid = try std.fmt.bufPrint(&big_in, "{s}@x.co", .{&long_local});
+    try std.testing.expectError(error.JidTooLong, prepareLocalDomainJid(in_jid, "us.example", &out));
+}
+
+test "prepareLocalDomainJid: resource may carry '@' without confusing the domain" {
+    var out: [512]u8 = undefined;
+    const got = try prepareLocalDomainJid("NaplesTB@US.EXAMPLE/res@other", "us.example", &out);
+    try std.testing.expectEqualStrings("naplestb@us.example/res@other", got);
 }

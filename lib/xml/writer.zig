@@ -1,0 +1,2056 @@
+//! StanzaWriter: streaming XMPP stanza serializer over std.Io.Writer.
+//!
+//! One StanzaWriter emits one stanza into a caller-provided writer. Element
+//! and attribute names are checked against the XML QName production
+//! (NCName with an optional 'prefix:'; ASCII subset). Attribute values and
+//! text are validated against the XML Char production and always escaped
+//! for the five escapables (`& < > ' "`). Only reader-validated markup may
+//! pass through rawSpan; the ValidatedSpan type carries that proof.
+//!
+//! The writer owns nothing and never allocates: every byte goes to the
+//! caller's writer. When that writer fills or fails, a sticky failure is
+//! latched, later emits are dropped, and finish() reports error.Overflow
+//! once, so partial output can never count as success. The Overflow
+//! contract: a fixed caller buffer then holds a truncated prefix, and
+//! with a streaming outbox the early bytes may already be gone - callers
+//! discard the buffer or fail the stream, never emit it.
+
+const std = @import("std");
+const scanner_mod = @import("scanner.zig");
+
+/// Errors for malformed caller input (operating errors, not asserts).
+pub const Error = error{
+    /// elementClose name does not match the innermost open element.
+    MismatchedClose,
+    /// Element or attribute name outside the XML Name production.
+    InvalidName,
+    /// Value bytes are not well-formed UTF-8.
+    InvalidUtf8,
+    /// Value contains bytes outside the XML Char production: NUL, C0
+    /// controls other than tab/LF/CR, or the noncharacters U+FFFE/U+FFFF.
+    InvalidCharacter,
+    /// rawSpan input is not well-formed XML, or is forbidden inside an
+    /// XMPP stream (comments, PIs, declarations, DTDs: RFC 6120 11.1;
+    /// CDATA is also rejected as an implementation restriction).
+    NotWellFormed,
+};
+
+/// finish() reports the latched output failure once.
+pub const FinishError = error{Overflow};
+
+pub const max_name_len = 256;
+/// Open-element depth bound: far beyond any real stanza, small enough
+/// that the name stack stays cheap to return by value.
+pub const max_depth = 64;
+
+const vec_len = std.simd.suggestVectorLength(u8) orelse 16;
+const ByteVec = @Vector(vec_len, u8);
+const BitMask = std.meta.Int(.unsigned, vec_len);
+
+const v_amp: ByteVec = @splat('&');
+const v_lt: ByteVec = @splat('<');
+const v_gt: ByteVec = @splat('>');
+const v_apos: ByteVec = @splat('\'');
+const v_quot: ByteVec = @splat('"');
+const v_ctrl: ByteVec = @splat(0x20);
+const v_ef: ByteVec = @splat(0xEF);
+
+/// Per-tag bound on attributes and on namespace declarations; a span
+/// that needs more is hostile, not real.
+const span_max_attrs = 32;
+const span_max_decls = 64;
+
+/// A half-open byte range into the caller's span input. Names,
+/// prefixes and URIs tracked while validating are ranges over those
+/// bytes, never slices into the scanner's token arena: a scanner may
+/// reset that arena between sibling elements and free anything a slice
+/// still points at, while the caller's bytes outlive the whole pass.
+const SpanRange = struct { start: usize, end: usize };
+
+const SpanQName = struct { prefix: SpanRange, local: SpanRange };
+
+const SpanAttr = struct { name: SpanRange };
+/// class is the equivalence-class id of the decoded URI: declarations
+/// whose URIs decode equal share a class, so the expanded-name
+/// duplicate check compares ids instead of decoding URIs per pair.
+/// decoded_len and uri_hash summarize the decoded URI once per push
+/// so the pairwise decode-compare only runs on a full match.
+const SpanDecl = struct {
+    depth: usize,
+    prefix: SpanRange,
+    uri: SpanRange,
+    class: usize,
+    decoded_len: usize,
+    uri_hash: u64,
+};
+
+/// Per-process seed for the declaration URI hash; a fixed seed would
+/// let a hostile peer precompute decoded-URI collisions. Zero means
+/// uninitialized; the first caller stores its seed through the
+/// compare-exchange and every other caller takes the winner's, so a
+/// span can never hash two declarations under different seeds.
+var uri_hash_seed = std.atomic.Value(u64).init(0);
+
+fn uriHashSeed() u64 {
+    const seen = uri_hash_seed.load(.acquire);
+    if (seen != 0) return seen;
+    // A low bit keeps the drawn seed out of the sentinel's way: a
+    // zero would look uninitialized and be drawn again.
+    const fresh = std.crypto.random.int(u64) | 1;
+    return uri_hash_seed.cmpxchgStrong(0, fresh, .acq_rel, .acquire) orelse fresh;
+}
+
+fn spanSlice(bytes: []const u8, r: SpanRange) []const u8 {
+    return bytes[r.start..r.end];
+}
+
+/// 'prefix:local' split at the first colon; an empty range means the
+/// name carries no prefix.
+fn spanQName(bytes: []const u8, r: SpanRange) SpanQName {
+    if (std.mem.indexOfScalar(u8, bytes[r.start..r.end], ':')) |colon| {
+        return .{
+            .prefix = .{ .start = r.start, .end = r.start + colon },
+            .local = .{ .start = r.start + colon + 1, .end = r.end },
+        };
+    }
+    return .{ .prefix = .{ .start = r.start, .end = r.start }, .local = r };
+}
+
+fn isSpanWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// The element name range after a '<' at `lt`: through the first
+/// whitespace or '>', or a '/' immediately followed by '>'.
+fn spanTagName(bytes: []const u8, lt: usize) SpanRange {
+    var end = lt + 1;
+    while (end < bytes.len) : (end += 1) {
+        const c = bytes[end];
+        if (isSpanWs(c) or c == '>') break;
+        if (c == '/' and end + 1 < bytes.len and bytes[end + 1] == '>') break;
+    }
+    return .{ .start = lt + 1, .end = end };
+}
+
+/// The attribute name region after `from`: the first non-whitespace
+/// byte through the '=' delimiter, less whitespace between the name
+/// and '=' (which a bare 'S = S' allows). Also reports the '=' offset
+/// so callers can locate the quoted value.
+fn spanAttrHead(bytes: []const u8, from: usize) ?struct { name: SpanRange, eq: usize } {
+    const start = std.mem.indexOfNonePos(u8, bytes, from, " \t\n\r") orelse return null;
+    const eq = std.mem.indexOfScalarPos(u8, bytes, start, '=') orelse return null;
+    var end = eq;
+    while (end > start and isSpanWs(bytes[end - 1])) end -= 1;
+    return .{ .name = .{ .start = start, .end = end }, .eq = eq };
+}
+
+/// A prefix is usable when it is declared in scope or is the
+/// always-bound xml: prefix.
+fn spanPrefixOk(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) bool {
+    if (std.mem.eql(u8, prefix, "xml")) return true;
+    for (decls) |d| {
+        if (std.mem.eql(u8, spanSlice(bytes, d.prefix), prefix)) return true;
+    }
+    return false;
+}
+
+fn isXmlChar(c: u21) bool {
+    return c == 0x9 or c == 0xA or c == 0xD or
+        (c >= 0x20 and c <= 0xD7FF) or
+        (c >= 0xE000 and c <= 0xFFFD) or
+        (c >= 0x10000 and c <= 0x10FFFF);
+}
+
+/// A '#...' body (the text between '&' and ';') parsed as a code
+/// point: decimal digits, or a lowercase 'x' followed by hex digits.
+/// Anything else, an empty body, or a value past U+10FFFF is not a
+/// reference. Only digits count, so the '+' sign and '_' separators
+/// that fmt.parseInt would accept are malformed here.
+fn parseCharref(name: []const u8) ?u21 {
+    var i: usize = 1;
+    var value: u21 = 0;
+    var digits: usize = 0;
+    if (i < name.len and name[i] == 'x') {
+        i += 1;
+        while (i < name.len and std.ascii.isHex(name[i])) : (i += 1) {
+            const c = std.ascii.toLower(name[i]);
+            const digit: u21 = if (std.ascii.isDigit(c)) c - '0' else c - 'a' + 10;
+            value = std.math.mul(u21, value, 16) catch return null;
+            value = std.math.add(u21, value, digit) catch return null;
+            digits += 1;
+        }
+    } else {
+        while (i < name.len and std.ascii.isDigit(name[i])) : (i += 1) {
+            value = std.math.mul(u21, value, 10) catch return null;
+            value = std.math.add(u21, value, name[i] - '0') catch return null;
+            digits += 1;
+        }
+    }
+    if (digits == 0 or i != name.len) return null;
+    return value;
+}
+
+/// Every &#...; reference in the raw span must name a legal XML Char
+/// and end in ';'. Checked on the raw bytes because the scanner's u8
+/// decode cannot express references above U+00FF; those still error
+/// downstream until S21 lands a u21 decode.
+fn spanCheckCharrefs(bytes: []const u8) Error!void {
+    var i: usize = 0;
+    while (i + 2 < bytes.len) : (i += 1) {
+        if (bytes[i] != '&' or bytes[i + 1] != '#') continue;
+        const semi = std.mem.indexOfScalarPos(u8, bytes, i + 2, ';') orelse
+            return error.NotWellFormed;
+        const value = parseCharref(bytes[i + 1 .. semi]) orelse
+            return error.NotWellFormed;
+        if (!isXmlChar(value)) return error.NotWellFormed;
+        i = semi;
+    }
+}
+
+const stream_ns = "http://etherx.jabber.org/streams";
+const xml_ns = "http://www.w3.org/XML/1998/namespace";
+const xmlns_ns = "http://www.w3.org/2000/xmlns/";
+
+/// Stream-level elements must never ride inside a stanza-level span,
+/// and the check is the resolved namespace URI, not a literal prefix:
+/// any binding of the stream namespace makes the element a stream
+/// element, whatever prefix (or none) it was written with.
+fn spanStreamDecl(uri: []const u8) bool {
+    return std.mem.eql(u8, uri, stream_ns);
+}
+
+/// Resolve a prefix against the in-scope declarations; an empty
+/// prefix resolves against the default namespace declaration. The
+/// newest declaration wins, matching in-scope shadowing.
+fn spanResolvePrefix(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) ?[]const u8 {
+    const r = spanResolveRange(bytes, prefix, decls) orelse return null;
+    return spanSlice(bytes, r);
+}
+
+/// Lexical pass over the raw span bytes, independent of the scanner:
+/// attributes must be name='v' or name="v" separated by whitespace
+/// (unquoted values, a '<' where the quote belongs, and adjacent
+/// attributes are all malformed), a '<' is illegal inside the quoted
+/// value itself (an entity-produced '<' like &lt; stays legal, which
+/// is exactly why this runs on the source bytes), ']]>' is illegal
+/// in text, and xmlns:xmlns may never be declared.
+fn spanCheckLex(bytes: []const u8) Error!void {
+    const LexState = enum { text, tag_name, before_attr, attr_name, attr_eq, attr_value, after_attr, close_name };
+    var state: LexState = .text;
+    var quote: u8 = 0;
+    var attr_first: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        const c = bytes[i];
+        switch (state) {
+            .text => {
+                if (c == '<') {
+                    state = .tag_name;
+                    if (i + 1 < bytes.len and bytes[i + 1] == '/') state = .close_name;
+                } else if (std.mem.startsWith(u8, bytes[i..], "]]>")) {
+                    return error.NotWellFormed;
+                }
+            },
+            .close_name => {
+                if (c == '>') state = .text;
+            },
+            .tag_name => {
+                if (c == '>') {
+                    state = .text;
+                } else if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                    state = .before_attr;
+                }
+            },
+            .before_attr => {
+                if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
+                if (c == '>') {
+                    state = .text;
+                } else if (c == '/') {
+                    // '/>' ends the tag; anything else after '/' is not.
+                    if (i + 1 >= bytes.len or bytes[i + 1] != '>') return error.NotWellFormed;
+                } else {
+                    attr_first = i;
+                    state = .attr_name;
+                }
+            },
+            .attr_name => {
+                if (c == '=') {
+                    // xmlns:xmlns can never be declared.
+                    const name = bytes[attr_first..i];
+                    if (std.mem.eql(u8, name, "xmlns:xmlns")) return error.NotWellFormed;
+                    state = .attr_eq;
+                } else if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                    // Whitespace inside name= : the '=' may follow.
+                    var j = i;
+                    while (j < bytes.len and (bytes[j] == ' ' or bytes[j] == '\t' or bytes[j] == '\n' or bytes[j] == '\r')) j += 1;
+                    if (j >= bytes.len or bytes[j] != '=') return error.NotWellFormed;
+                    const name = bytes[attr_first..i];
+                    if (std.mem.eql(u8, name, "xmlns:xmlns")) return error.NotWellFormed;
+                    i = j;
+                    state = .attr_eq;
+                } else if (c == '/' or c == '>') {
+                    // A bare name with no value is not an attribute.
+                    return error.NotWellFormed;
+                }
+            },
+            .attr_eq => {
+                if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
+                if (c != '\'' and c != '"') return error.NotWellFormed;
+                quote = c;
+                state = .attr_value;
+            },
+            .attr_value => {
+                if (c == '<') return error.NotWellFormed;
+                // Another attribute must follow whitespace; an adjacent
+                // name is malformed markup.
+                if (c == quote) state = .after_attr;
+            },
+            .after_attr => {
+                if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                    state = .before_attr;
+                } else if (c == '>') {
+                    state = .text;
+                } else if (c == '/' and i + 1 < bytes.len and bytes[i + 1] == '>') {
+                    state = .text;
+                } else {
+                    return error.NotWellFormed;
+                }
+            },
+        }
+    }
+    // Ending mid-construct is the scanner's problem, not this pass's.
+}
+
+/// The URI range a prefix expands to, newest declaration first;
+/// unresolved prefixes return null (the declared-prefix check
+/// rejects them first).
+fn spanResolveRange(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) ?SpanRange {
+    var i = decls.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, spanSlice(bytes, decls[i].prefix), prefix)) return decls[i].uri;
+    }
+    return null;
+}
+
+/// The URI equivalence class a prefix expands to, newest declaration
+/// first; unresolved prefixes return null (the declared-prefix check
+/// rejects them first).
+fn spanResolveClass(bytes: []const u8, prefix: []const u8, decls: []const SpanDecl) ?usize {
+    var i = decls.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, spanSlice(bytes, decls[i].prefix), prefix)) return decls[i].class;
+    }
+    return null;
+}
+
+/// The next character in a raw attribute value, resolving one entity
+/// or character reference at '&' to its codepoint; literal bytes are
+/// decoded as UTF-8 so both sides of a compare yield code points.
+/// The scanner already accepted every reference in the value, so a
+/// null result only means the range is exhausted.
+fn spanNextDecoded(bytes: []const u8, r: SpanRange, i: *usize) Error!?u21 {
+    if (i.* >= r.end) return null;
+    const c = bytes[i.*];
+    i.* += 1;
+    if (c != '&') {
+        // Attribute-value normalization: a literal TAB, LF or CR in
+        // the source is a space in the value, and a literal CRLF is a
+        // single space. A reference to the same character is not
+        // normalized, so '&#9;' stays U+0009.
+        switch (c) {
+            '\t', '\n' => return ' ',
+            '\r' => {
+                if (i.* < r.end and bytes[i.*] == '\n') i.* += 1;
+                return ' ';
+            },
+            else => {},
+        }
+        if (c < 0x80) return c;
+        // validateChars already proved the slice well-formed UTF-8, so
+        // a decode failure here means the range split a sequence.
+        const len = std.unicode.utf8ByteSequenceLength(c) catch return error.InvalidUtf8;
+        if (i.* - 1 + len > r.end) return error.InvalidUtf8;
+        const cp = std.unicode.utf8Decode(bytes[i.* - 1 .. i.* - 1 + len]) catch
+            return error.InvalidUtf8;
+        i.* += len - 1;
+        return cp;
+    }
+    // The ';' search stays inside the range: a terminator past the
+    // end belongs to another value, and a missing one or a malformed
+    // reference is malformed input, not end of range.
+    const semi = std.mem.indexOfScalar(u8, bytes[i.*..r.end], ';') orelse
+        return error.NotWellFormed;
+    const name = bytes[i.* .. i.* + semi];
+    i.* += semi + 1;
+    if (std.mem.eql(u8, name, "amp")) return '&';
+    if (std.mem.eql(u8, name, "lt")) return '<';
+    if (std.mem.eql(u8, name, "gt")) return '>';
+    if (std.mem.eql(u8, name, "apos")) return '\'';
+    if (std.mem.eql(u8, name, "quot")) return '"';
+    if (name.len > 1 and name[0] == '#')
+        return parseCharref(name) orelse return error.NotWellFormed;
+    return error.NotWellFormed;
+}
+
+/// The decoded UTF-8 length and seeded hash of a raw range; ranges
+/// equal after decoding always share both, so a declaration push can
+/// skip the pairwise decode-compare on either mismatch. With no '&'
+/// and no literal whitespace the decoded form is the raw range
+/// itself, which is hashed in place; otherwise one decode pass
+/// re-encodes each code point.
+fn spanDecodedStats(bytes: []const u8, r: SpanRange, seed: u64) Error!struct { len: usize, hash: u64 } {
+    const raw = bytes[r.start..r.end];
+    if (std.mem.indexOfAny(u8, raw, "&\t\n\r") == null)
+        return .{ .len = raw.len, .hash = std.hash.Wyhash.hash(seed, raw) };
+    var h = std.hash.Wyhash.init(seed);
+    var len: usize = 0;
+    var i = r.start;
+    var enc: [4]u8 = undefined;
+    while (try spanNextDecoded(bytes, r, &i)) |cp| {
+        const n = std.unicode.utf8Encode(cp, &enc) catch return error.InvalidUtf8;
+        h.update(enc[0..n]);
+        len += n;
+    }
+    return .{ .len = len, .hash = h.final() };
+}
+
+/// A live declaration is a decode-compare candidate only when its
+/// decoded length and seeded hash both match the pushed URI; a
+/// match on either alone is not enough.
+fn spanStatsMatch(d: SpanDecl, len: usize, hash: u64) bool {
+    return d.decoded_len == len and d.uri_hash == hash;
+}
+
+/// Two raw ranges are equal once decoded when they yield the same
+/// code point sequence, so 'urn:&#117;' and 'urn:u' collide as URIs.
+fn spanDecodedEql(bytes: []const u8, a: SpanRange, b: SpanRange) Error!bool {
+    var ai = a.start;
+    var bi = b.start;
+    while (true) {
+        const ac = try spanNextDecoded(bytes, a, &ai);
+        const bc = try spanNextDecoded(bytes, b, &bi);
+        if (ac == null or bc == null) return ac == null and bc == null;
+        if (ac.? != bc.?) return false;
+    }
+}
+
+/// Element and attribute prefixes are only resolved once the start
+/// tag ends: an xmlns on the same tag is already in scope for its own
+/// tag name and every attribute on it.
+fn spanCheckPrefixes(
+    bytes: []const u8,
+    elem_prefix: []const u8,
+    attrs: []const SpanAttr,
+    decls: []const SpanDecl,
+) Error!void {
+    // The stream prefix is rejected outright: whatever it is bound
+    // to, xmppd's reader classifies by the literal prefix and would
+    // see stream events inside a forwarded stanza.
+    if (std.mem.eql(u8, elem_prefix, "stream")) return error.NotWellFormed;
+    if (elem_prefix.len > 0 and !spanPrefixOk(bytes, elem_prefix, decls))
+        return error.NotWellFormed;
+    // The element is a stream element whenever its resolved namespace
+    // is the stream namespace, whatever prefix wrote it.
+    if (spanResolvePrefix(bytes, elem_prefix, decls)) |uri| {
+        if (spanStreamDecl(uri)) return error.NotWellFormed;
+    }
+    for (attrs) |a| {
+        const a_prefix = spanSlice(bytes, spanQName(bytes, a.name).prefix);
+        if (std.mem.eql(u8, a_prefix, "xmlns")) continue;
+        if (std.mem.eql(u8, a_prefix, "stream")) return error.NotWellFormed;
+        if (a_prefix.len > 0 and !spanPrefixOk(bytes, a_prefix, decls))
+            return error.NotWellFormed;
+    }
+    // Attribute uniqueness is by expanded name: two prefixes bound to
+    // the same URI collide when their local names match, so comparing
+    // qualified names alone is not enough. Unprefixed attributes have
+    // no namespace and are skipped; xml: cannot collide because the
+    // XML URI may never be bound to another prefix, and same-name
+    // xml: duplicates already failed the qualified-name check. URIs
+    // compare by the equivalence class assigned when their
+    // declaration was pushed (decoding runs once per declaration, not
+    // once per attribute pair), so 'urn:&#117;' equals 'urn:u'.
+    for (attrs, 0..) |a, i| {
+        const aq = spanQName(bytes, a.name);
+        const a_prefix = spanSlice(bytes, aq.prefix);
+        if (a_prefix.len == 0 or std.mem.eql(u8, a_prefix, "xmlns") or
+            std.mem.eql(u8, a_prefix, "xml")) continue;
+        const a_class = spanResolveClass(bytes, a_prefix, decls) orelse continue;
+        for (attrs[i + 1 ..]) |b| {
+            const bq = spanQName(bytes, b.name);
+            const b_prefix = spanSlice(bytes, bq.prefix);
+            if (b_prefix.len == 0 or std.mem.eql(u8, b_prefix, "xmlns") or
+                std.mem.eql(u8, b_prefix, "xml")) continue;
+            if (!std.mem.eql(u8, spanSlice(bytes, aq.local), spanSlice(bytes, bq.local))) continue;
+            const b_class = spanResolveClass(bytes, b_prefix, decls) orelse continue;
+            if (a_class == b_class) return error.NotWellFormed;
+        }
+    }
+}
+
+/// Markup bytes proven valid by the validating reader (XML Char, UTF-8,
+/// balanced elements). rawSpan emits them verbatim; the type exists so
+/// that raw bytes cannot reach the output without that validation.
+pub const ValidatedSpan = struct {
+    bytes: []const u8,
+
+    /// The only constructor, and it validates: XML Char plus a full
+    /// well-formedness pass through lib/xml/scanner. Beyond balanced
+    /// elements it rejects everything RFC 6120 section 11.1 forbids in
+    /// a stream (comments, PIs, declarations, DTDs) plus CDATA, elements
+    /// in the stream namespace, the stream prefix under any binding,
+    /// any declaration of the stream namespace, Namespaces in XML
+    /// violations (xmlns:xml rebinding, the XML and XMLNS URIs bound
+    /// elsewhere, xmlns:p='', duplicate attributes by expanded name),
+    /// invalid names, malformed attribute syntax, ']]>' in text,
+    /// xmlns:xmlns, duplicate attributes, a '<' inside an attribute
+    /// value, non-Char character references, undeclared prefixes other
+    /// than xml:, and truncated input. Elements are capped at 32
+    /// attributes each and at 64 in-scope namespace declarations; a
+    /// span needing more is rejected. A dedicated zero-cost
+    /// reader-produced constructor arrives with C5; until then
+    /// callers pay one scan per span.
+    pub fn fromReader(alloc: std.mem.Allocator, bytes: []const u8) Error!ValidatedSpan {
+        try validateChars(bytes);
+        try spanCheckCharrefs(bytes);
+        // '<!' can only begin a comment or a forbidden construct: '<'
+        // is already illegal inside attribute values and text, so the
+        // raw scan is exact.
+        if (std.mem.indexOf(u8, bytes, "<!") != null) return error.NotWellFormed;
+        try spanCheckLex(bytes);
+        // One seed per call: every declaration pushed below hashes
+        // under this value, so the stats stay comparable with each
+        // other whatever other threads do to the global.
+        const seed = uriHashSeed();
+        var sc = scanner_mod.Scanner.init(alloc);
+        defer sc.deinit();
+        var pos: usize = 0;
+        var depth: usize = 0;
+        var names: [max_depth]SpanRange = undefined;
+        var attrs: [span_max_attrs]SpanAttr = undefined;
+        var attr_count: usize = 0;
+        var decls: [span_max_decls]SpanDecl = undefined;
+        var decl_count: usize = 0;
+        var next_class: usize = 0;
+        var pending_name: SpanRange = .{ .start = 0, .end = 0 };
+        // tag_cursor is where the next tag's '<' is searched from;
+        // attr_cursor is where the next attribute name may start.
+        var tag_cursor: usize = 0;
+        var attr_cursor: usize = 0;
+        while (true) {
+            const tok = sc.next(bytes, &pos) catch return error.NotWellFormed;
+            if (tok == null) break;
+            switch (tok.?.type) {
+                .element_open => {
+                    if (depth >= max_depth) return error.NotWellFormed;
+                    const lt = std.mem.indexOfScalarPos(u8, bytes, tag_cursor, '<') orelse
+                        return error.NotWellFormed;
+                    const name = spanTagName(bytes, lt);
+                    if (!isValidName(spanSlice(bytes, name))) return error.NotWellFormed;
+                    pending_name = name;
+                    attr_cursor = name.end;
+                    attr_count = 0;
+                },
+                .attribute, .namespace_decl => {
+                    const head = spanAttrHead(bytes, attr_cursor) orelse
+                        return error.NotWellFormed;
+                    if (attr_count >= span_max_attrs) return error.NotWellFormed;
+                    if (!isValidName(spanSlice(bytes, head.name))) return error.NotWellFormed;
+                    for (attrs[0..attr_count]) |p| {
+                        if (std.mem.eql(u8, spanSlice(bytes, p.name), spanSlice(bytes, head.name)))
+                            return error.NotWellFormed;
+                    }
+                    attrs[attr_count] = .{ .name = head.name };
+                    attr_count += 1;
+                    attr_cursor = pos;
+                    const dname = spanSlice(bytes, head.name);
+                    // xmlns and xmlns:* are namespace declarations.
+                    // Classify on the source name, not the token type:
+                    // an entity in the value can clobber the name the
+                    // scanner carries on the token.
+                    if (std.mem.eql(u8, dname, "xmlns") or std.mem.startsWith(u8, dname, "xmlns:")) {
+                        if (decl_count >= span_max_decls) return error.NotWellFormed;
+                        var prefix: SpanRange = .{ .start = head.name.end, .end = head.name.end };
+                        if (std.mem.indexOfScalar(u8, dname, ':')) |colon| {
+                            prefix = .{ .start = head.name.start + colon + 1, .end = head.name.end };
+                        }
+                        // The 'stream' prefix is reserved for the stream
+                        // element: inside a stanza-level span it is
+                        // rejected whatever it is bound to. The stream
+                        // namespace may never be declared here at all;
+                        // the decoded value is compared so an
+                        // entity-encoded URI cannot slip past.
+                        if (std.mem.eql(u8, spanSlice(bytes, prefix), "stream"))
+                            return error.NotWellFormed;
+                        if (spanStreamDecl(tok.?.value)) return error.NotWellFormed;
+                        // Namespaces in XML: a non-empty prefix may not
+                        // be unbound (xmlns:p='' is NS 1.0 illegal), the
+                        // xml prefix may only bind its own fixed URI,
+                        // and nothing else may bind the XML or XMLNS
+                        // namespace names, default included.
+                        const declared = spanSlice(bytes, prefix);
+                        if (declared.len > 0 and tok.?.value.len == 0)
+                            return error.NotWellFormed;
+                        if (std.mem.eql(u8, declared, "xml")) {
+                            if (!std.mem.eql(u8, tok.?.value, xml_ns))
+                                return error.NotWellFormed;
+                        } else if (std.mem.eql(u8, tok.?.value, xml_ns) or
+                            std.mem.eql(u8, tok.?.value, xmlns_ns))
+                        {
+                            return error.NotWellFormed;
+                        }
+                        // The stored URI is the raw range between the
+                        // value quotes; pos-1 is the closing quote.
+                        const oq = std.mem.indexOfAnyPos(u8, bytes, head.eq + 1, "'\"") orelse
+                            return error.NotWellFormed;
+                        if (oq >= pos - 1) return error.NotWellFormed;
+                        const uri: SpanRange = .{ .start = oq + 1, .end = pos - 1 };
+                        // The decoded URI is compared once, against
+                        // the live declarations, to assign its
+                        // equivalence class: the expanded-name check
+                        // then compares class ids, never URIs. Each
+                        // declaration carries its decoded length and
+                        // seeded hash, so the pairwise decode runs
+                        // only on a full match.
+                        const uri_stats = try spanDecodedStats(bytes, uri, seed);
+                        var class: ?usize = null;
+                        for (decls[0..decl_count]) |d| {
+                            if (!spanStatsMatch(d, uri_stats.len, uri_stats.hash)) continue;
+                            if (try spanDecodedEql(bytes, d.uri, uri)) {
+                                class = d.class;
+                                break;
+                            }
+                        }
+                        if (class == null) {
+                            class = next_class;
+                            next_class += 1;
+                        }
+                        decls[decl_count] = .{
+                            .depth = depth,
+                            .prefix = prefix,
+                            .uri = uri,
+                            .class = class.?,
+                            .decoded_len = uri_stats.len,
+                            .uri_hash = uri_stats.hash,
+                        };
+                        decl_count += 1;
+                    }
+                },
+                .element_open_end => {
+                    try spanCheckPrefixes(
+                        bytes,
+                        spanSlice(bytes, spanQName(bytes, pending_name).prefix),
+                        attrs[0..attr_count],
+                        decls[0..decl_count],
+                    );
+                    names[depth] = pending_name;
+                    depth += 1;
+                    tag_cursor = pos;
+                },
+                .element_self_close => {
+                    try spanCheckPrefixes(
+                        bytes,
+                        spanSlice(bytes, spanQName(bytes, pending_name).prefix),
+                        attrs[0..attr_count],
+                        decls[0..decl_count],
+                    );
+                    // Declarations inside this tag die with it.
+                    while (decl_count > 0 and decls[decl_count - 1].depth == depth) decl_count -= 1;
+                    tag_cursor = pos;
+                },
+                .element_close => {
+                    if (depth == 0) return error.NotWellFormed;
+                    const lt = std.mem.indexOfScalarPos(u8, bytes, tag_cursor, '<') orelse
+                        return error.NotWellFormed;
+                    // The close name runs from '</' to '>'; trailing
+                    // whitespace before '>' is legal and ignored.
+                    var end = pos - 1;
+                    while (end > lt + 2 and isSpanWs(bytes[end - 1])) end -= 1;
+                    const name: SpanRange = .{ .start = lt + 2, .end = end };
+                    if (!isValidName(spanSlice(bytes, name))) return error.NotWellFormed;
+                    depth -= 1;
+                    if (!std.mem.eql(u8, spanSlice(bytes, names[depth]), spanSlice(bytes, name)))
+                        return error.NotWellFormed;
+                    while (decl_count > 0 and decls[decl_count - 1].depth == depth) decl_count -= 1;
+                    tag_cursor = pos;
+                },
+                .text => {},
+                .xml_declaration, .eof => return error.NotWellFormed,
+            }
+        }
+        // A clean stop means the scanner sits in content state with no
+        // open element; anything else is a truncated construct.
+        if (sc.state != .content or depth != 0) return error.NotWellFormed;
+        return .{ .bytes = bytes };
+    }
+};
+
+pub const StanzaWriter = struct {
+    out: *std.Io.Writer,
+    /// Latched when the underlying writer reports WriteFailed; once set, no
+    /// further bytes are emitted and finish() reports error.Overflow.
+    failed: bool = false,
+    /// True between elementOpen and elementOpenEnd/elementSelfClose.
+    in_start_tag: bool = false,
+    /// Open element names, so elementClose can refuse a mismatched
+    /// `</other>` instead of emitting it. Callers' names outlive the
+    /// writer, so the stack borrows slices instead of copying bytes.
+    name_stack: [max_depth][]const u8 = undefined,
+    /// Escaping context for the current typed value: attribute values
+    /// also escape tab/LF/CR as char refs so a parser cannot turn them
+    /// into spaces; text escapes CR so it does not normalize to LF.
+    escape_mode: EscapeMode = .text,
+    /// Open element depth.
+    depth: u16 = 0,
+
+    pub fn init(out: *std.Io.Writer) StanzaWriter {
+        return .{ .out = out };
+    }
+
+    /// Emits `<name`, opening a start tag. Attributes follow until
+    /// elementOpenEnd or elementSelfClose. The name slice is borrowed:
+    /// it is kept on the element stack for the later elementClose
+    /// match, so it must outlive the writer.
+    pub fn elementOpen(self: *StanzaWriter, name: []const u8) Error!void {
+        assert(!self.in_start_tag);
+        assert(self.depth < max_depth);
+        validateName(name) catch |e| {
+            self.failed = true;
+            return e;
+        };
+        self.emitByte('<');
+        self.emit(name);
+        self.in_start_tag = true;
+        self.name_stack[self.depth] = name;
+        self.depth += 1;
+    }
+
+    /// ` name='value'` inside an open start tag. The value is typed:
+    /// strings are validated and escaped, integers formatted, enums written
+    /// by tag name, bools as "true"/"false", optionals recurse on the
+    /// payload (null writes an empty value).
+    pub fn attr(self: *StanzaWriter, name: []const u8, value: anytype) Error!void {
+        assert(self.in_start_tag);
+        validateName(name) catch |e| {
+            self.failed = true;
+            return e;
+        };
+        validateValue(value) catch |e| {
+            self.failed = true;
+            return e;
+        };
+        self.emitByte(' ');
+        self.emit(name);
+        self.emit("='");
+        self.escape_mode = .attr;
+        defer self.escape_mode = .text;
+        self.emitTyped(value) catch |e| {
+            self.failed = true;
+            return e;
+        };
+        self.emitByte('\'');
+    }
+
+    /// attr that omits the attribute entirely when the optional is
+    /// null (C1 needs it for absent `id`/`type`).
+    pub fn attrOpt(self: *StanzaWriter, name: []const u8, value: anytype) Error!void {
+        const inner = switch (@typeInfo(@TypeOf(value))) {
+            .optional => value orelse return,
+            else => value,
+        };
+        try self.attr(name, inner);
+    }
+
+    /// ` xmlns='uri'` convenience for the common default-namespace
+    /// attribute (C1).
+    pub fn xmlns(self: *StanzaWriter, uri: []const u8) Error!void {
+        try self.attr("xmlns", uri);
+    }
+
+    /// Emits `>`, ending an open start tag.
+    pub fn elementOpenEnd(self: *StanzaWriter) void {
+        assert(self.in_start_tag);
+        self.emitByte('>');
+        self.in_start_tag = false;
+    }
+
+    /// Emits `/>`, ending an open start tag and its element.
+    pub fn elementSelfClose(self: *StanzaWriter) void {
+        assert(self.in_start_tag);
+        assert(self.depth > 0);
+        self.emit("/>");
+        self.in_start_tag = false;
+        self.depth -= 1;
+    }
+
+    /// `</name>`.
+    pub fn elementClose(self: *StanzaWriter, name: []const u8) Error!void {
+        assert(!self.in_start_tag);
+        assert(self.depth > 0);
+        validateName(name) catch |e| {
+            self.failed = true;
+            return e;
+        };
+        const open = self.name_stack[self.depth - 1];
+        if (!std.mem.eql(u8, open, name)) {
+            self.failed = true;
+            return error.MismatchedClose;
+        }
+        self.emit("</");
+        self.emit(name);
+        self.emitByte('>');
+        self.depth -= 1;
+    }
+
+    /// Character data, validated and escaped. Same typed values as attr.
+    pub fn text(self: *StanzaWriter, value: anytype) Error!void {
+        assert(!self.in_start_tag);
+        assert(self.depth > 0);
+        validateValue(value) catch |e| {
+            self.failed = true;
+            return e;
+        };
+        self.emitTyped(value) catch |e| {
+            self.failed = true;
+            return e;
+        };
+    }
+
+    /// Reader-validated markup emitted verbatim, escaping nothing. The
+    /// ValidatedSpan type is the enforcement: no plain slice may be
+    /// passed, and a span must ride inside an element, never stand
+    /// alone at the top level where it could pose as a second stanza.
+    pub fn rawSpan(self: *StanzaWriter, span: ValidatedSpan) void {
+        assert(!self.in_start_tag);
+        assert(self.depth > 0);
+        self.emit(span.bytes);
+    }
+
+    /// Reports the latched output failure once. Asserts the stanza is
+    /// complete (all elements closed) when nothing failed.
+    pub fn finish(self: *StanzaWriter) FinishError!void {
+        if (self.failed) return error.Overflow;
+        assert(self.depth == 0);
+        assert(!self.in_start_tag);
+    }
+
+    fn emit(self: *StanzaWriter, bytes: []const u8) void {
+        if (self.failed) return;
+        self.out.writeAll(bytes) catch {
+            self.failed = true;
+        };
+    }
+
+    fn emitByte(self: *StanzaWriter, b: u8) void {
+        if (self.failed) return;
+        self.out.writeByte(b) catch {
+            self.failed = true;
+        };
+    }
+
+    fn emitFmt(self: *StanzaWriter, comptime fmt: []const u8, args: anytype) void {
+        if (self.failed) return;
+        self.out.print(fmt, args) catch {
+            self.failed = true;
+        };
+    }
+
+    fn emitEscaped(self: *StanzaWriter, s: []const u8, mode: EscapeMode) void {
+        if (self.failed) return;
+        writeEscaped(self.out, s, mode) catch {
+            self.failed = true;
+        };
+    }
+
+    /// Validation-only twin of emitTyped: every rejection is decided
+    /// before a single output byte is emitted for this value.
+    fn validateValue(value: anytype) Error!void {
+        const T = @TypeOf(value);
+        switch (@typeInfo(T)) {
+            .optional => {
+                if (value) |v| try validateValue(v);
+            },
+            .bool, .int, .comptime_int => {},
+            .@"enum" => try validateChars(@tagName(value)),
+            .pointer => {
+                comptime {
+                    if (!isStringArg(T)) {
+                        @compileError("StanzaWriter: unsupported value type " ++ @typeName(T));
+                    }
+                }
+                const s: []const u8 = value;
+                try validateChars(s);
+            },
+            else => @compileError("StanzaWriter: unsupported value type " ++ @typeName(T)),
+        }
+    }
+
+    fn emitTyped(self: *StanzaWriter, value: anytype) Error!void {
+        const T = @TypeOf(value);
+        switch (@typeInfo(T)) {
+            .optional => {
+                if (value) |v| try self.emitTyped(v);
+            },
+            .bool => self.emit(if (value) "true" else "false"),
+            .int, .comptime_int => self.emitFmt("{d}", .{value}),
+            .@"enum" => {
+                // validateValue already ran before any byte was emitted.
+                self.emitEscaped(@tagName(value), self.escape_mode);
+            },
+            .pointer => {
+                comptime {
+                    if (!isStringArg(T)) {
+                        @compileError("StanzaWriter: unsupported value type " ++ @typeName(T));
+                    }
+                }
+                self.emitEscaped(value, self.escape_mode);
+            },
+            else => @compileError("StanzaWriter: unsupported value type " ++ @typeName(T)),
+        }
+    }
+};
+
+/// True for `[]const u8`-compatible arguments: u8 slices and pointers to
+/// u8 arrays, which covers string literals.
+fn isStringArg(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| (p.size == .slice and p.child == u8) or
+            (p.size == .one and switch (@typeInfo(p.child)) {
+                .array => |a| a.child == u8,
+                else => false,
+            }),
+        else => false,
+    };
+}
+
+fn isNcNameStart(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '_';
+}
+
+fn isNcNameChar(c: u8) bool {
+    return isNcNameStart(c) or (c >= '0' and c <= '9') or c == '-' or c == '.';
+}
+
+/// XML QName restricted to ASCII: NCName, optionally 'prefix:local'.
+/// Bare colons anywhere else are rejected (":a", "a:", "a:b:c").
+pub fn isValidName(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_name_len) return false;
+    var parts: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= name.len) : (i += 1) {
+        if (i == name.len or name[i] == ':') {
+            const part = name[start..i];
+            parts += 1;
+            if (parts > 2 or part.len == 0) return false;
+            if (!isNcNameStart(part[0])) return false;
+            for (part[1..]) |c| {
+                if (!isNcNameChar(c)) return false;
+            }
+            start = i + 1;
+        }
+    }
+    return true;
+}
+
+fn validateName(name: []const u8) Error!void {
+    if (!isValidName(name)) return error.InvalidName;
+}
+
+/// Validates UTF-8 well-formedness and the XML Char production
+/// (#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]).
+/// Vector scan finds C0 bytes and 0xEF lead bytes; each is checked scalar.
+/// 0xEF is the lead byte of U+F000..U+FFFF sequences, so only its U+FFFE
+/// and U+FFFF encodings (EF BF BE, EF BF BF) are rejected; utf8ValidateSlice
+/// has already ruled out surrogates and values above U+10FFFF.
+pub fn validateChars(s: []const u8) Error!void {
+    if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+    var i: usize = 0;
+    while (i + vec_len <= s.len) : (i += vec_len) {
+        const chunk: ByteVec = s[i..][0..vec_len].*;
+        const suspect = (chunk < v_ctrl) | (chunk == v_ef);
+        var mask: BitMask = @bitCast(suspect);
+        while (mask != 0) {
+            const idx: usize = @ctz(mask);
+            const c = s[i + idx];
+            if (c < 0x20) {
+                if (c != '\t' and c != '\n' and c != '\r') return error.InvalidCharacter;
+            } else {
+                // 0xEF leads a valid three-byte sequence, so both
+                // continuation bytes are present.
+                if (s[i + idx + 1] == 0xBF and (s[i + idx + 2] == 0xBE or s[i + idx + 2] == 0xBF)) {
+                    return error.InvalidCharacter;
+                }
+            }
+            mask &= mask - 1;
+        }
+    }
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c < 0x20) {
+            if (c != '\t' and c != '\n' and c != '\r') return error.InvalidCharacter;
+        } else if (c == 0xEF) {
+            if (s[i + 1] == 0xBF and (s[i + 2] == 0xBE or s[i + 2] == 0xBF)) {
+                return error.InvalidCharacter;
+            }
+        }
+    }
+}
+
+/// Escaping context: inside a start-tag attribute, tab/LF/CR would be
+/// normalized to spaces by any conformant parser, so they are escaped as
+/// numeric references; in text only CR needs that protection.
+pub const EscapeMode = enum { attr, text };
+
+/// Writes `s` to `w` with the XML escapables replaced by entities (plus
+/// the mode's whitespace references). SIMD run-copy: each vector locates
+/// escapable bytes and the clean run before each is copied in a single
+/// writeAll.
+pub fn writeEscaped(w: *std.Io.Writer, s: []const u8, mode: EscapeMode) std.Io.Writer.Error!void {
+    var run_start: usize = 0;
+    var i: usize = 0;
+    while (i + vec_len <= s.len) : (i += vec_len) {
+        const chunk: ByteVec = s[i..][0..vec_len].*;
+        var mask = escapeMask(chunk, mode);
+        while (mask != 0) {
+            const idx: usize = @ctz(mask);
+            const hit = i + idx;
+            try w.writeAll(s[run_start..hit]);
+            try w.writeAll(entityFor(s[hit]));
+            run_start = hit + 1;
+            mask &= mask - 1;
+        }
+    }
+    while (i < s.len) : (i += 1) {
+        if (isEscapable(s[i], mode)) {
+            try w.writeAll(s[run_start..i]);
+            try w.writeAll(entityFor(s[i]));
+            run_start = i + 1;
+        }
+    }
+    try w.writeAll(s[run_start..]);
+}
+
+const v_tab: ByteVec = @splat('\t');
+const v_lf: ByteVec = @splat('\n');
+const v_cr: ByteVec = @splat('\r');
+
+fn escapeMask(chunk: ByteVec, mode: EscapeMode) BitMask {
+    var hits = (chunk == v_amp) | (chunk == v_lt) | (chunk == v_gt) |
+        (chunk == v_apos) | (chunk == v_quot);
+    if (mode == .attr) {
+        hits = hits | (chunk == v_tab) | (chunk == v_lf) | (chunk == v_cr);
+    } else {
+        hits = hits | (chunk == v_cr);
+    }
+    return @bitCast(hits);
+}
+
+fn isEscapable(c: u8, mode: EscapeMode) bool {
+    if (c == '&' or c == '<' or c == '>' or c == '\'' or c == '"') return true;
+    if (mode == .attr) return c == '\t' or c == '\n' or c == '\r';
+    return c == '\r';
+}
+
+fn entityFor(c: u8) []const u8 {
+    return switch (c) {
+        '&' => "&amp;",
+        '<' => "&lt;",
+        '>' => "&gt;",
+        '\'' => "&apos;",
+        '"' => "&quot;",
+        '\t' => "&#9;",
+        '\n' => "&#10;",
+        '\r' => "&#13;",
+        else => unreachable,
+    };
+}
+
+const assert = std.debug.assert;
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+/// Scalar reference escaper: the differential oracle for writeEscaped.
+fn refEscape(w: *std.Io.Writer, s: []const u8, mode: EscapeMode) std.Io.Writer.Error!void {
+    for (s) |c| {
+        switch (c) {
+            '&' => try w.writeAll("&amp;"),
+            '<' => try w.writeAll("&lt;"),
+            '>' => try w.writeAll("&gt;"),
+            '\'' => try w.writeAll("&apos;"),
+            '"' => try w.writeAll("&quot;"),
+            '\t' => if (mode == .attr) try w.writeAll("&#9;") else try w.writeByte(c),
+            '\n' => if (mode == .attr) try w.writeAll("&#10;") else try w.writeByte(c),
+            '\r' => try w.writeAll("&#13;"),
+            else => try w.writeByte(c),
+        }
+    }
+}
+
+const StanzaType = enum { chat, normal, groupchat };
+
+/// Emits one fixed sample stanza used by the output and overflow tests.
+fn writeSample(x: *StanzaWriter) Error!void {
+    try x.elementOpen("message");
+    try x.attr("from", "alice@example.test");
+    try x.attr("to", "bob@example.test");
+    try x.attr("type", StanzaType.chat);
+    x.elementOpenEnd();
+    try x.elementOpen("body");
+    x.elementOpenEnd();
+    try x.text("Hi & bye <now> \"quoted\" 'q'");
+    try x.elementClose("body");
+    try x.elementClose("message");
+}
+
+test "elements, typed attributes and escaped text serialize correctly" {
+    // Goal: verify exact wire bytes for the whole API surface.
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try writeSample(&x);
+    try x.finish();
+
+    try testing.expectEqualStrings(
+        "<message from='alice@example.test' to='bob@example.test' type='chat'>" ++
+            "<body>Hi &amp; bye &lt;now&gt; &quot;quoted&quot; &apos;q&apos;</body></message>",
+        w.buffered(),
+    );
+}
+
+test "typed attribute values: int, bool, enum, optional" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("iq");
+    try x.attr("n", @as(u32, 42));
+    try x.attr("flag", true);
+    try x.attr("type", StanzaType.normal);
+    const none: ?[]const u8 = null;
+    try x.attr("empty", none);
+    x.elementSelfClose();
+    try x.finish();
+
+    try testing.expectEqualStrings(
+        "<iq n='42' flag='true' type='normal' empty=''/>",
+        w.buffered(),
+    );
+}
+
+test "injection: quote in attribute value cannot terminate it" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("s");
+    try x.attr("a", "x' onload='evil");
+    try x.attr("b", "y\" z=\"");
+    x.elementOpenEnd();
+    try x.text("ok");
+    try x.elementClose("s");
+    try x.finish();
+
+    try testing.expectEqualStrings(
+        "<s a='x&apos; onload=&apos;evil' b='y&quot; z=&quot;'>ok</s>",
+        w.buffered(),
+    );
+}
+
+test "injection: </ and ]]> in text are escaped" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("t");
+    x.elementOpenEnd();
+    try x.text("a</t><evil/>]]>");
+    try x.elementClose("t");
+    try x.finish();
+
+    try testing.expectEqualStrings("<t>a&lt;/t&gt;&lt;evil/&gt;]]&gt;</t>", w.buffered());
+}
+
+test "NUL, control characters and invalid UTF-8 are rejected" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+    try x.elementOpen("t");
+    x.elementOpenEnd();
+
+    try testing.expectError(error.InvalidCharacter, x.text("a\x00b"));
+    try testing.expectError(error.InvalidCharacter, x.text("\x01\x02"));
+    try testing.expectError(error.InvalidCharacter, x.text("\x0b")); // vertical tab
+    try testing.expectError(error.InvalidUtf8, x.text("\xff\xfe"));
+    try testing.expectError(error.InvalidUtf8, x.text("ok\xc0")); // truncated lead byte
+    // U+FFFE and U+FFFF are valid UTF-8 but outside the XML Char production.
+    try testing.expectError(error.InvalidCharacter, x.text("\xef\xbf\xbe"));
+    try testing.expectError(error.InvalidCharacter, x.text("\xef\xbf\xbf"));
+    // A rejected input latches the writer: the stanza can no longer
+    // report success at finish().
+    try testing.expectError(error.Overflow, x.finish());
+}
+
+test "element and attribute names are validated" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try testing.expectError(error.InvalidName, x.elementOpen("bad name"));
+    try testing.expectError(error.InvalidName, x.elementOpen("1digit"));
+    try testing.expectError(error.InvalidName, x.elementOpen(""));
+
+    try x.elementOpen("ns:tag");
+    try testing.expectError(error.InvalidName, x.attr("na'me", "v"));
+    try testing.expectError(error.InvalidName, x.attr("=x", "v"));
+    try x.attr("xml:lang", "en");
+    x.elementSelfClose();
+    // The earlier name rejections are latched: finish() fails.
+    try testing.expectError(error.Overflow, x.finish());
+}
+
+test "SIMD escaper matches scalar reference, 100000 random inputs" {
+    // Goal: differential proof that writeEscaped equals the per-byte
+    // reference on arbitrary input, fixed seed for reproducibility.
+    var prng = std.Random.DefaultPrng.init(0xF4_1001);
+    const rand = prng.random();
+    // Alphabet biased toward escapables so hits are dense.
+    const alphabet = "ab&<>'\"cd\n\t\r&<>'\"ef&<>'\"gh&<>'\"";
+    var input_buf: [300]u8 = undefined;
+    var want_buf: [2048]u8 = undefined;
+    var got_buf: [2048]u8 = undefined;
+
+    var iter: usize = 0;
+    while (iter < 100_000) : (iter += 1) {
+        const len = rand.uintLessThan(usize, input_buf.len + 1);
+        for (input_buf[0..len]) |*b| {
+            b.* = alphabet[rand.uintLessThan(usize, alphabet.len)];
+        }
+        const input = input_buf[0..len];
+
+        var wwant: std.Io.Writer = .fixed(&want_buf);
+        try refEscape(&wwant, input, .text);
+        var wgot: std.Io.Writer = .fixed(&got_buf);
+        try writeEscaped(&wgot, input, .text);
+        try testing.expectEqualStrings(wwant.buffered(), wgot.buffered());
+
+        var wwant2: std.Io.Writer = .fixed(&want_buf);
+        try refEscape(&wwant2, input, .attr);
+        var wgot2: std.Io.Writer = .fixed(&got_buf);
+        try writeEscaped(&wgot2, input, .attr);
+        try testing.expectEqualStrings(wwant2.buffered(), wgot2.buffered());
+    }
+}
+
+test "overflow at every byte boundary fails once at finish" {
+    // Goal: any prefix capacity must surface as exactly one Overflow at
+    // finish(); a full-size buffer must produce the exact stanza.
+    var full_buf: [512]u8 = undefined;
+    var wfull: std.Io.Writer = .fixed(&full_buf);
+    var xfull = StanzaWriter.init(&wfull);
+    try writeSample(&xfull);
+    try xfull.finish();
+    const expected = wfull.buffered();
+
+    var cap: usize = 0;
+    while (cap <= expected.len) : (cap += 1) {
+        var buf: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(buf[0..cap]);
+        var x = StanzaWriter.init(&w);
+        try writeSample(&x);
+        // After failure the writer stays latched: further calls drop bytes
+        // and finish() reports the single sticky error.
+        if (cap < expected.len) {
+            try testing.expectError(error.Overflow, x.finish());
+        } else {
+            try x.finish();
+            try testing.expectEqualStrings(expected, w.buffered());
+        }
+    }
+}
+
+test "writer latches failure and drops later output" {
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("message");
+    try x.attr("to", "a@b.c"); // overflows inside the attribute
+    x.elementOpenEnd();
+    try x.text("more text that cannot fit");
+
+    try testing.expectError(error.Overflow, x.finish());
+    // Sticky: a second finish reports the same single failure.
+    try testing.expectError(error.Overflow, x.finish());
+}
+
+test "StanzaWriter performs zero heap allocations" {
+    // Goal: prove the no-allocator contract. The API takes no allocator, so
+    // the only proof is structural (no Allocator field anywhere in the
+    // writer state) plus behavioral (a full stanza into a caller buffer).
+    comptime {
+        for (@typeInfo(StanzaWriter).@"struct".fields) |f| {
+            std.debug.assert(f.type != std.mem.Allocator);
+        }
+    }
+
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+    try x.elementOpen("presence");
+    try x.attr("from", "a@b.c/r");
+    x.elementSelfClose();
+    try x.finish();
+    try testing.expectEqualStrings("<presence from='a@b.c/r'/>", w.buffered());
+}
+
+test "a rejected attribute emits nothing and latches finish() (L1)" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("m");
+    try testing.expectError(error.InvalidCharacter, x.attr("a", "bad\x00"));
+    // Nothing of the attribute reached the output: no name, no quote.
+    try testing.expectEqualStrings("<m", w.buffered());
+    // The rejection is sticky: finish() cannot report success.
+    try testing.expectError(error.Overflow, x.finish());
+
+    // Same for a bad close-tag name and bad text.
+    var w2: std.Io.Writer = .fixed(&buf);
+    var y = StanzaWriter.init(&w2);
+    try y.elementOpen("m");
+    y.elementOpenEnd();
+    try testing.expectError(error.InvalidName, y.elementClose("bad name"));
+    try testing.expectEqualStrings("<m>", w2.buffered());
+    try testing.expectError(error.Overflow, y.finish());
+}
+
+test "ValidatedSpan rejects malformed or unvalidated markup (L2)" {
+    // Rejected: control byte smuggled inside markup, unbalanced tags,
+    // mismatched close name, truncated element.
+    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(
+        testing.allocator,
+        "</m><iq type='set'>\x00",
+    ));
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, "<a></b>"),
+    );
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, "<a>"),
+    );
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, "</a>"),
+    );
+
+    // Accepted: balanced elements and bare text both scan cleanly.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<c><d t='1'/>x</c>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "plain text &amp; entities");
+
+    // And a rejected span cannot reach the output at all.
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+    try x.elementOpen("iq");
+    x.elementOpenEnd();
+    try testing.expectError(error.InvalidCharacter, ValidatedSpan.fromReader(
+        testing.allocator,
+        "</m><iq type='set'>\x00",
+    ));
+    try x.elementClose("iq");
+    try x.finish();
+    try testing.expectEqualStrings("<iq></iq>", w.buffered());
+}
+
+test "attribute whitespace and text CR escape as char refs (L3)" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("m");
+    try x.attr("a", "t\tn\n r\rs");
+    x.elementOpenEnd();
+    try x.text("l1\rl2\nl3");
+    try x.elementClose("m");
+    try x.finish();
+
+    try testing.expectEqualStrings(
+        "<m a='t&#9;n&#10; r&#13;s'>l1&#13;l2\nl3</m>",
+        w.buffered(),
+    );
+}
+
+/// A writer whose drain fails once, then accepts everything. Pins the
+/// sticky-failure mutation where a later successful write clears `failed`.
+const FailOnceWriter = struct {
+    w: std.Io.Writer,
+    failed_once: bool = false,
+    accepted: usize = 0,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *FailOnceWriter = @fieldParentPtr("w", w);
+        if (!self.failed_once) {
+            self.failed_once = true;
+            return error.WriteFailed;
+        }
+        var n: usize = 0;
+        for (data) |d| n += d.len * splat;
+        self.accepted += n;
+        return n;
+    }
+
+    fn make() FailOnceWriter {
+        return .{ .w = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
+    }
+};
+
+test "a transient writer failure stays latched through later writes (L4)" {
+    var fo = FailOnceWriter.make();
+    var x = StanzaWriter.init(&fo.w);
+
+    // First emit hits the one-shot WriteFailed; every later emit goes
+    // through fine, but finish() must still report the failure.
+    try x.elementOpen("m");
+    try x.attr("a", "still-written");
+    x.elementOpenEnd();
+    try x.text("accepted bytes");
+    try x.elementClose("m");
+
+    // Correct latching drops every later byte (accepted stays 0); a
+    // mutation that clears `failed` on a good write would both emit
+    // them and let finish() pass.
+    try testing.expectEqual(@as(usize, 0), fo.accepted);
+    try testing.expectError(error.Overflow, x.finish());
+    try testing.expectError(error.Overflow, x.finish());
+}
+
+test "rejection at every byte position across lengths 0..67 (L4)" {
+    // Goal: the vector path and the scalar tail must both reject; a bad
+    // byte anywhere, at any length, for each rejection class.
+    const bads = [_]u8{ 0x00, 0x01, 0x1F, 0xFF, 0x80, 0xC0 };
+    var s: [70]u8 = undefined;
+    var len: usize = 0;
+    while (len <= 67) : (len += 1) {
+        const base = s[0..len];
+        @memset(base, 'a');
+        for (0..len) |pos| {
+            for (bads) |bad| {
+                base[pos] = bad;
+                if (bad < 0x20) {
+                    try testing.expectError(error.InvalidCharacter, validateChars(base));
+                } else {
+                    try testing.expectError(error.InvalidUtf8, validateChars(base));
+                }
+                base[pos] = 'a';
+            }
+            // Noncharacters U+FFFE/U+FFFF embedded at this position.
+            if (pos + 3 <= len) {
+                @memcpy(base[pos .. pos + 3], "\xef\xbf\xbe");
+                try testing.expectError(error.InvalidCharacter, validateChars(base));
+                base[pos + 2] = 0xbf;
+                try testing.expectError(error.InvalidCharacter, validateChars(base));
+                @memcpy(base[pos .. pos + 3], "aaa");
+            }
+        }
+        // The clean baseline itself is always accepted.
+        try validateChars(base);
+    }
+}
+
+test "elementClose refuses a mismatched close name" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("message");
+    x.elementOpenEnd();
+    try x.elementOpen("body");
+    x.elementOpenEnd();
+    try testing.expectError(error.MismatchedClose, x.elementClose("iq"));
+    // Latched like every other rejection.
+    try testing.expectError(error.Overflow, x.finish());
+    try testing.expectEqualStrings("<message><body>", w.buffered());
+}
+
+test "names must be QName: at most one colon, NCName on each side" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try testing.expectError(error.InvalidName, x.elementOpen(":a"));
+    try testing.expectError(error.InvalidName, x.elementOpen("a:"));
+    try testing.expectError(error.InvalidName, x.elementOpen("a:b:c"));
+    try testing.expectError(error.InvalidName, x.elementOpen("xmlns:"));
+    // First character rules still apply inside each part.
+    try testing.expectError(error.InvalidName, x.elementOpen("a:1b"));
+    try testing.expectError(error.Overflow, x.finish());
+
+    var w2: std.Io.Writer = .fixed(&buf);
+    var y = StanzaWriter.init(&w2);
+    try y.elementOpen("stream:stream");
+    try y.attrOpt("type", @as(?[]const u8, null)); // omitted entirely
+    try y.attrOpt("id", @as(?[]const u8, "s1"));
+    try y.xmlns("jabber:client");
+    y.elementSelfClose();
+    try y.finish();
+    try testing.expectEqualStrings(
+        "<stream:stream id='s1' xmlns='jabber:client'/>",
+        w2.buffered(),
+    );
+}
+
+test "a name at the 256-byte limit writes; one over is rejected (L5)" {
+    var buf: [600]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    // 256 bytes is the largest legal name: it must round-trip without
+    // crashing the name stack (the old fixed-byte stack overflowed).
+    var long_name: [256]u8 = undefined;
+    @memset(&long_name, 'n');
+    try x.elementOpen(&long_name);
+    x.elementSelfClose();
+    try x.finish();
+
+    var w2: std.Io.Writer = .fixed(&buf);
+    var y = StanzaWriter.init(&w2);
+    var over_name: [257]u8 = undefined;
+    @memset(&over_name, 'n');
+    try testing.expectError(error.InvalidName, y.elementOpen(&over_name));
+    try testing.expectError(error.Overflow, y.finish());
+}
+
+test "ValidatedSpan rejects every forbidden or malformed probe (L6)" {
+    const bad = [_][]const u8{
+        "<a", // truncated element
+        "<a/><", // truncated after a complete element
+        "<!-- c --><a/>", // comment before the element
+        "<a/><!-- c -->", // trailing comment
+        "<?xml version='1.0'?><a/>", // xml declaration
+        "<a><?pi data?></a>", // processing instruction
+        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams'></stream:stream>",
+        "<stream:error/>",
+        "<x:stream xmlns:x='http://etherx.jabber.org/streams'/>",
+        "<error xmlns='http://etherx.jabber.org/streams'/>",
+        "<a><f:error xmlns:f='http://etherx.jabber.org/streams'/></a>",
+        "<a>&#0;</a>", // character reference to a non-Char
+        "<a>&#x1;</a>",
+        "<a x='1<'/>", // '<' inside an attribute value
+        "<a x=<'1'/>", // '<' where the quote belongs
+        "<a x=1/>", // unquoted attribute value
+        "<a x='1'y='2'/>", // adjacent attributes
+        "<a>x ]]> y</a>", // ']]>' in text
+        "<a xmlns:xmlns='urn:x'/>", // xmlns:xmlns is never declarable
+        "<a x='1' x='2'/>", // duplicate attribute
+        "<1a/>", // invalid element name
+        "<a 1b='v'/>", // invalid attribute name
+        "<u:a xmlns:v='urn:v'/>", // undeclared element prefix
+        "<a u:b='1'/>", // undeclared attribute prefix
+        "<a></b>", // mismatched close
+        "</a>", // stray close
+        "<a>", // unbalanced element
+        "<a xmlns:u='urn:u' xmlns:u='urn:v'/>", // duplicate declaration
+    };
+    for (bad) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+
+    const good = [_][]const u8{
+        "<c><d t='1'/>x</c>",
+        "plain text &amp; entities",
+        "<u:a xmlns:u='urn:u' u:b='1' xml:lang='en'><u:c/></u:a>",
+        "<e xmlns='urn:d' x='v'/>",
+        "<a>text &amp; &#233;tities</a>",
+    };
+    for (good) |probe| {
+        _ = try ValidatedSpan.fromReader(testing.allocator, probe);
+    }
+}
+
+test "a literal '<' in an attribute value is rejected" {
+    // The '<' check runs on the source bytes: an entity-produced '<'
+    // like &lt; is well-formed and becomes acceptable once the scanner
+    // entity fix lands; a literal '<' inside the quotes never is.
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, "<a x='<'/>"),
+    );
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, "<a x=\"a<b\"/>"),
+    );
+}
+
+test "span names, prefixes and URIs are caller byte ranges (R4-1)" {
+    // Sibling elements at depth <= 1: a scanner that resets its token
+    // arena at each '<' frees token slices kept across next(), so the
+    // span check tracks ranges into the caller's bytes instead. These
+    // siblings exercise that reset path whichever scanner is present.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a><b/><c/></a>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a/><b/>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u'><b/><p:c x='1'/><d/></a>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u'><b xmlns:p='urn:v'/><p:c/></a>");
+
+    // A mismatched close is still caught against the recorded range.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a></b>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><b/><c/></d>"));
+
+    // Whitespace the tag grammar allows is legal input; names derived
+    // from the source bytes accept it regardless of how the scanner
+    // buffers names.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a></a >");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x = '1'/>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x =\t'1'/>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x='&lt;'/>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x='a&lt;b'/>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x='&#60;'/>");
+
+    // A '/' only closes the tag when '>' follows it; otherwise it is
+    // name content and the name is invalid.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a//>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a/b x='1'/>"));
+}
+
+test "spans reject the stream prefix and stream namespace declarations (R4-2)" {
+    // xmppd's reader classifies stream elements by the literal 'stream'
+    // prefix, so a span may not carry that prefix whatever it is bound
+    // to, and may not declare the stream namespace at all (used or not).
+    const bad = [_][]const u8{
+        "<stream:stream xmlns:stream='urn:evil'></stream:stream>",
+        "<stream:features xmlns:stream='urn:evil'/>",
+        "<stream:error xmlns:stream='urn:x'/>",
+        "<stream:x/>",
+        "<a><stream:features xmlns:stream='urn:x'/></a>",
+        "<a xmlns:stream='urn:x'><b/></a>",
+        "<a xmlns:s='http://etherx.jabber.org/streams'><b/></a>",
+        "<a xmlns:s='http://etherx.jabber.org/streams'><s:b xmlns:s='urn:x'/></a>",
+        "<a xmlns:s='http://etherx.jabber.org/streams' s:x='1'/>",
+        "<a xmlns='http://etherx.jabber.org/streams'><b/></a>",
+        "<a><b/><c xmlns:s='http://etherx.jabber.org/streams'/></a>",
+        "<a xmlns:s='http://etherx.jabber.org/str&#101;ams'/>",
+    };
+    for (bad) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    // Ordinary prefixes and namespaces are unaffected.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:s='urn:x'><s:b/></a>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns='urn:x'><b/></a>");
+}
+
+test "spans enforce Namespaces in XML constraints (R4-3)" {
+    // A strict peer parser drops the stream on any of these.
+    const bad = [_][]const u8{
+        "<a xmlns:xml='urn:x'/>", // the xml prefix may not be rebound
+        "<a xmlns:xml='http://www.w3.org/2000/xmlns/'/>",
+        "<a xmlns:q='http://www.w3.org/XML/1998/namespace'/>", // xml URI bound elsewhere
+        "<a xmlns='http://www.w3.org/XML/1998/namespace'/>",
+        "<a xmlns:q='http://www.w3.org/2000/xmlns/'/>", // xmlns URI bound at all
+        "<a xmlns='http://www.w3.org/2000/xmlns/'/>",
+        "<a xmlns:p=''/>", // prefix undeclare is NS 1.0 illegal
+        "<a xmlns:p=\"\"/>",
+        "<a xmlns:p='urn:u' xmlns:q='urn:u' p:x='1' q:x='2'/>", // dup expanded name
+        "<a xmlns:p=\"urn:u\" xmlns:q='urn:u' p:x='1' q:x='2'/>", // dup across quote styles
+    };
+    for (bad) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    const good = [_][]const u8{
+        "<a xmlns:xml='http://www.w3.org/XML/1998/namespace'/>",
+        "<a xmlns:p='urn:u' xmlns:q='urn:v' p:x='1' q:x='2'/>",
+        "<a xml:lang='en' xml:space='preserve'/>",
+        "<a xmlns=''/>",
+        // An unprefixed attribute has no namespace and can never
+        // collide with a prefixed one in the expanded-name check.
+        "<a xmlns='urn:u' xmlns:p='urn:u' x='1' p:x='2'/>",
+    };
+    for (good) |probe| {
+        _ = try ValidatedSpan.fromReader(testing.allocator, probe);
+    }
+}
+
+test "span validator pins: '<!' scan, declaration pops, newest-first (R4-4)" {
+    // '<!' can only begin a forbidden construct; a comment without a
+    // space slips past the lexical pass, so the raw scan is what
+    // rejects it.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><!----></a>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><!--x--></a>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><!-- c --></a>"));
+    // A comment after the last tag has no following tag token, so the
+    // '<!' raw scan is the only guard that rejects it.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a/><!--c-->"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a/>x<!--c-->"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<!--c--><a/>"));
+
+    // Declarations die with their element: after a self-close or a
+    // close, the prefix is out of scope again.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><b xmlns:p='urn:u'/><p:c/></a>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a><b xmlns:p='urn:u'></b><p:c/></a>"));
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u'><b/><p:c/></a>");
+
+    // Prefix resolution is newest-first: q is shadowed inside <b>, so
+    // q:x expands to urn:v and is not a duplicate of p:x. Resolving
+    // oldest-first wrongly reports a duplicate here.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u' xmlns:q='urn:u'><b xmlns:q='urn:v' p:x='1' q:x='2'/></a>");
+
+    // xmlns:xmlns can never be declared, whitespace before '=' or not.
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a xmlns:xmlns = 'u'/>"));
+    try testing.expectError(error.NotWellFormed, ValidatedSpan.fromReader(testing.allocator, "<a xmlns:xmlns='u'/>"));
+}
+
+test "expanded-name duplicates compare decoded URIs (R5-1)" {
+    // Stored URI ranges are raw bytes, so the expanded-name check must
+    // decode before comparing or entity-encoded duplicates slip past.
+    const bad = [_][]const u8{
+        "<a xmlns:p='urn:u' xmlns:q='urn:&#117;' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:u' xmlns:q='urn:&#x75;' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&amp;b' xmlns:q='urn:a&#38;b' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&amp;b' xmlns:q='urn:a&#x26;b' p:x='1' q:x='2'/>",
+    };
+    for (bad) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    // Distinct decoded URIs still pass.
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a xmlns:p='urn:u' xmlns:q='urn:v' p:x='1' q:x='2'/>");
+}
+
+test "a hex character reference needs a lowercase x (R6-4)" {
+    // The CharRef production is '&#x', never '&#X'.
+    const bad = [_][]const u8{
+        "<a>&#X75;</a>",
+        "<a x='&#X75;'/>",
+        "<a xmlns:p='urn:u&#X75;' xmlns:q='urn:u&#117;' p:x='1' q:x='2'/>",
+    };
+    for (bad) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a>&#x75;</a>");
+    _ = try ValidatedSpan.fromReader(testing.allocator, "<a x='&#x75;'/>");
+}
+
+test "expanded-name URIs decode literal UTF-8 to code points (R6-1)" {
+    // A literal multi-byte character must yield its code point, not
+    // its lead byte: U+00E9 equals '&#233;' and U+20AC equals
+    // '&#x20AC;', so these expanded names collide.
+    const dup = [_][]const u8{
+        "<a xmlns:p='urn:\xc3\xa9' xmlns:q='urn:&#233;' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:\xe2\x82\xac' xmlns:q='urn:&#x20AC;' p:x='1' q:x='2'/>",
+    };
+    for (dup) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    // '&#195;&#169;' decodes to U+00C3 U+00A9: the UTF-8 bytes of
+    // U+00E9 as two separate code points, a different URI.
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:\xc3\xa9' xmlns:q='urn:&#195;&#169;' p:x='1' q:x='2'/>",
+    );
+}
+
+test "literal whitespace normalizes in the expanded-name compare (R6-3)" {
+    // Attribute-value normalization maps a literal TAB, LF, CR and
+    // CRLF to spaces, so each of these binds the same URI as 'urn:a b'
+    // and the expanded names collide.
+    const dup = [_][]const u8{
+        "<a xmlns:p='urn:a b' xmlns:q='urn:a\tb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a b' xmlns:q='urn:a\nb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a b' xmlns:q='urn:a\rb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a b' xmlns:q='urn:a\r\nb' p:x='1' q:x='2'/>",
+    };
+    for (dup) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    // A reference is not normalized: '&#9;' is U+0009, not a space,
+    // so these URIs stay distinct from the normalized literals.
+    const distinct = [_][]const u8{
+        "<a xmlns:p='urn:a&#9;b' xmlns:q='urn:a\tb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&#10;b' xmlns:q='urn:a\nb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&#13;b' xmlns:q='urn:a\rb' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&#13;&#10;b' xmlns:q='urn:a\rb' p:x='1' q:x='2'/>",
+    };
+    for (distinct) |probe| {
+        _ = try ValidatedSpan.fromReader(testing.allocator, probe);
+    }
+}
+
+test "the decoded compare rejects malformed references (R6-6)" {
+    // fromReader cannot reach these: the raw charref scan and the
+    // scanner reject bad references first. The pins call the compare
+    // directly: an invalid reference is an error, never end of
+    // range, so 'u&zz;A' and 'u&yy;B' must not compare equal.
+    const eql = struct {
+        fn f(a_lit: []const u8, b_lit: []const u8) Error!bool {
+            var buf: [128]u8 = undefined;
+            @memcpy(buf[0..a_lit.len], a_lit);
+            @memcpy(buf[a_lit.len .. a_lit.len + b_lit.len], b_lit);
+            const bytes = buf[0 .. a_lit.len + b_lit.len];
+            return spanDecodedEql(bytes, .{ .start = 0, .end = a_lit.len }, .{
+                .start = a_lit.len,
+                .end = bytes.len,
+            });
+        }
+    }.f;
+    try testing.expectError(error.NotWellFormed, eql("u&zz;A", "u&yy;B"));
+    try testing.expectError(error.NotWellFormed, eql("u&;A", "u&;B"));
+    // The ';' search is bounded by the range: a's '&amp' has no
+    // terminator inside a, but an unbounded search finds b's ';' and
+    // decodes '&', returning false instead of an error.
+    try testing.expectError(error.NotWellFormed, eql(";&amp", ";x"));
+    // '+' and '_' are not digits: fmt.parseInt would take both.
+    try testing.expectError(error.NotWellFormed, eql("u&#+65;", "u&#65;"));
+    try testing.expectError(error.NotWellFormed, eql("u&#6_5;", "u&#65;"));
+    // Legal references still compare by code point.
+    try testing.expectEqual(@as(bool, true), try eql("u&#65;", "u&#x41;"));
+    try testing.expectEqual(@as(bool, false), try eql("u&#65;", "u&#66;"));
+}
+
+test "expanded-name compare pins: lengths and entity names (R6-5)" {
+    // D9: URIs of different decoded lengths are different URIs; a
+    // compare that stops when the shorter range is exhausted wrongly
+    // calls them equal.
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:u' xmlns:q='urn:uv' p:x='1' q:x='2'/>",
+    );
+    // D3-D6: each predefined entity decodes to its character, so a
+    // URI written with the entity collides with the same URI written
+    // with the numeric reference.
+    const dup = [_][]const u8{
+        "<a xmlns:p='urn:a&lt;b' xmlns:q='urn:a&#60;b' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&gt;b' xmlns:q='urn:a&#62;b' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&apos;b' xmlns:q='urn:a&#39;b' p:x='1' q:x='2'/>",
+        "<a xmlns:p='urn:a&quot;b' xmlns:q='urn:a&#34;b' p:x='1' q:x='2'/>",
+    };
+    for (dup) |probe| {
+        try testing.expectError(
+            error.NotWellFormed,
+            ValidatedSpan.fromReader(testing.allocator, probe),
+        );
+    }
+    // And different entities stay different URIs.
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:a&lt;b' xmlns:q='urn:a&gt;b' p:x='1' q:x='2'/>",
+    );
+}
+
+test "&apos; and &quot; decode inside declaration URIs (R7-2)" {
+    // Accept pins: 'urn:'' and 'urn:"' are real, distinct URIs, so
+    // these spans validate and the expanded names do not collide. A
+    // compare that leaves the entity undecoded errors out, and one
+    // that decodes it to the wrong byte can call them duplicates.
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:x' xmlns:q='urn:&apos;' p:x='1' q:x='2'/>",
+    );
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:x' xmlns:q='urn:&quot;' p:x='1' q:x='2'/>",
+    );
+    // 'urn:a'b' and 'urn:a"b' differ only in the decoded entity.
+    _ = try ValidatedSpan.fromReader(
+        testing.allocator,
+        "<a xmlns:p='urn:a&apos;b' xmlns:q='urn:a&quot;b' p:x='1' q:x='2'/>",
+    );
+}
+
+test "the URI class match sees declarations on every live scope (R7-1)" {
+    // q on <c> decodes to the URI p bound on <r>: a class match that
+    // skips outer-scope declarations misses the collision and wrongly
+    // accepts the duplicate expanded name.
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(
+            testing.allocator,
+            "<r xmlns:p='urn:a'><c xmlns:q='urn:&#97;' p:x='1' q:x='2'/></r>",
+        ),
+    );
+    // The match must see intermediate scopes, not only the current tag
+    // or the outermost element: <c>'s declarations are popped, d's q
+    // and e's p both decode to urn:a and the expanded names collide.
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(
+            testing.allocator,
+            "<r><c xmlns:p='urn:a' xmlns:q='urn:b'/><d xmlns:q='urn:a'><e xmlns:p='urn:&#97;' p:x='1' q:x='2'/></d></r>",
+        ),
+    );
+}
+
+test "concurrent first use hashes every declaration under one seed (R8-1)" {
+    // Threads reaching first use together must not split the seed:
+    // if a span's declarations hash under different seeds, equal URIs
+    // miss the prefilter and a duplicate expanded name is accepted.
+    // Each round resets to a fresh seed and starts 16 threads on a
+    // released flag, so the seeds race the way they will under C5.
+    const span = "<a xmlns:p='urn:u' xmlns:q='urn:u' p:x='1' q:x='2'/>";
+    var go = std.atomic.Value(u32).init(0);
+    var accepted = std.atomic.Value(u32).init(0);
+    const Worker = struct {
+        fn run(probe: []const u8, flag: *std.atomic.Value(u32), acc: *std.atomic.Value(u32)) void {
+            while (flag.load(.acquire) == 0) std.atomic.spinLoopHint();
+            if (ValidatedSpan.fromReader(std.heap.smp_allocator, probe)) |_| {
+                _ = acc.fetchAdd(1, .monotonic);
+            } else |_| {}
+        }
+    };
+    for (0..100) |_| {
+        uri_hash_seed.store(0, .release);
+        go.store(0, .release);
+        var threads: [16]std.Thread = undefined;
+        var spawned: usize = 0;
+        // Threads already started spin on go and accepted, so a spawn
+        // failure releases them before they outlive this frame.
+        errdefer {
+            go.store(1, .release);
+            for (threads[0..spawned]) |t| t.join();
+        }
+        for (&threads) |*t| {
+            t.* = try std.Thread.spawn(.{}, Worker.run, .{ span, &go, &accepted });
+            spawned += 1;
+        }
+        go.store(1, .release);
+        for (threads) |t| t.join();
+    }
+    try testing.expectEqual(@as(u32, 0), accepted.load(.monotonic));
+}
+
+test "the compare and the stats gate are pinned directly (R8-2)" {
+    // The length prefilter keeps 'urn:u' vs 'urn:uv' from reaching
+    // the compare at span level, so pin it here: an exhausted range
+    // is not equality.
+    const eql = struct {
+        fn f(a_lit: []const u8, b_lit: []const u8) Error!bool {
+            var buf: [128]u8 = undefined;
+            @memcpy(buf[0..a_lit.len], a_lit);
+            @memcpy(buf[a_lit.len .. a_lit.len + b_lit.len], b_lit);
+            const bytes = buf[0 .. a_lit.len + b_lit.len];
+            return spanDecodedEql(bytes, .{ .start = 0, .end = a_lit.len }, .{
+                .start = a_lit.len,
+                .end = bytes.len,
+            });
+        }
+    }.f;
+    try testing.expectEqual(@as(bool, false), try eql("urn:u", "urn:uv"));
+    try testing.expectEqual(@as(bool, true), try eql("urn:u", "urn:u"));
+
+    // The stats gate admits a decode-compare only on a full match:
+    // equal length or equal hash alone is not a candidate.
+    const d: SpanDecl = .{
+        .depth = 0,
+        .prefix = .{ .start = 0, .end = 0 },
+        .uri = .{ .start = 0, .end = 5 },
+        .class = 0,
+        .decoded_len = 5,
+        .uri_hash = 42,
+    };
+    try testing.expect(spanStatsMatch(d, 5, 42));
+    try testing.expect(!spanStatsMatch(d, 6, 42));
+    try testing.expect(!spanStatsMatch(d, 5, 43));
+    try testing.expect(!spanStatsMatch(d, 6, 43));
+}
+
+test "ValidatedSpan accepts depth 64 and rejects depth 65" {
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    for (0..64) |d| {
+        buf[pos] = '<';
+        buf[pos + 1] = 'a' + @as(u8, @intCast(d % 26));
+        buf[pos + 2] = '>';
+        pos += 3;
+    }
+    for (0..64) |d| {
+        buf[pos] = '<';
+        buf[pos + 1] = '/';
+        buf[pos + 2] = 'a' + @as(u8, @intCast((63 - d) % 26));
+        buf[pos + 3] = '>';
+        pos += 4;
+    }
+    _ = try ValidatedSpan.fromReader(testing.allocator, buf[0..pos]);
+
+    // One more level of nesting exceeds the name stack bound.
+    var deep: [512]u8 = undefined;
+    pos = 0;
+    for (0..65) |d| {
+        deep[pos] = '<';
+        deep[pos + 1] = 'a' + @as(u8, @intCast(d % 26));
+        deep[pos + 2] = '>';
+        pos += 3;
+    }
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, deep[0..pos]),
+    );
+
+    // The bound rejects a fully balanced 65-level span too, not only
+    // an unclosed one: the error must come from the depth check, not
+    // an end-of-input state check or a bounds panic.
+    pos = 0;
+    for (0..65) |d| {
+        deep[pos] = '<';
+        deep[pos + 1] = 'a' + @as(u8, @intCast(d % 26));
+        deep[pos + 2] = '>';
+        pos += 3;
+    }
+    for (0..65) |d| {
+        deep[pos] = '<';
+        deep[pos + 1] = '/';
+        deep[pos + 2] = 'a' + @as(u8, @intCast((64 - d) % 26));
+        deep[pos + 3] = '>';
+        pos += 4;
+    }
+    try testing.expectError(
+        error.NotWellFormed,
+        ValidatedSpan.fromReader(testing.allocator, deep[0..pos]),
+    );
+}
+
+test "legal tab, LF, CR and multi-byte UTF-8 are accepted (L7)" {
+    // At least vec_len bytes so the SIMD path proves it does not
+    // reject the whitespace characters it scans as suspects.
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var x = StanzaWriter.init(&w);
+
+    try x.elementOpen("m");
+    x.elementOpenEnd();
+    // Over 128 bytes so the SIMD suspect scan runs at full width.
+    try x.text("tab\there line\nfeed cr\r and multi-byte \xc3\xa9\xf0\x9f\x98\x80 chars, padded past the vector width with plain ascii words to keep scanning");
+    try x.elementClose("m");
+    try x.finish();
+
+    try testing.expectEqualStrings(
+        "<m>tab\there line\nfeed cr&#13; and multi-byte \xc3\xa9\xf0\x9f\x98\x80 chars, padded past the vector width with plain ascii words to keep scanning</m>",
+        w.buffered(),
+    );
+}

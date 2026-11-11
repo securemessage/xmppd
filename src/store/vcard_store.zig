@@ -8,7 +8,7 @@
 const std = @import("std");
 const backend_mod = @import("backend");
 
-const NAMESPACE = "vcards";
+pub const NAMESPACE = backend_mod.registered("vcards");
 
 pub fn VCardStore(comptime Backend: type) type {
     comptime backend_mod.assertBackend(Backend);

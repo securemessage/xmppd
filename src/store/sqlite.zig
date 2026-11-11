@@ -11,7 +11,7 @@ const c = @cImport(@cInclude("sqlite3.h"));
 
 const log = std.log.scoped(.sqlite_store);
 
-const MAX_TABLES = 16;
+const MAX_TABLES = 24;
 
 const TableCacheEntry = struct {
     name_buf: [64]u8,
@@ -24,6 +24,10 @@ pub const SqliteBackend = struct {
     db: *c.sqlite3,
     table_cache: [MAX_TABLES]TableCacheEntry,
     table_count: u32,
+    compound_mutex: std.Thread.Mutex = .{},
+    /// Guards table_cache lookups/appends (S9): canonical tables are
+    /// created at open(); the lock covers only test/unknown names.
+    table_lock: std.Thread.Mutex = .{},
 
     comptime {
         backend.assertBackend(SqliteBackend);
@@ -50,11 +54,19 @@ pub const SqliteBackend = struct {
         // Busy timeout 5 seconds
         _ = c.sqlite3_busy_timeout(db.?, 5000);
 
-        return .{
+        var self: SqliteBackend = .{
             .db = db.?,
             .table_cache = undefined,
             .table_count = 0,
         };
+        // Canonical tables exist from day one (S9): workers never race a
+        // lazy CREATE TABLE on the handle cache.
+        try self.ensureCanonicalTables();
+        return self;
+    }
+
+    fn ensureCanonicalTables(self: *SqliteBackend) !void {
+        for (backend.canonical_namespaces) |ns| try self.ensureTable(ns);
     }
 
     pub fn close(self: *SqliteBackend) void {
@@ -140,6 +152,7 @@ pub const SqliteBackend = struct {
     }
 
     pub fn iterator(self: *SqliteBackend, ns: []const u8, prefix: []const u8) !Iterator {
+        if (prefix.len > backend.MAX_PREFIX_LEN) return error.PrefixTooLong;
         try self.ensureTable(ns);
 
         var sql_buf: [256]u8 = undefined;
@@ -149,11 +162,11 @@ pub const SqliteBackend = struct {
 
         // Compute upper bound: prefix with last byte incremented for range query.
         // If prefix is empty or all 0xFF, use an unbounded query (>= prefix, ORDER BY key).
-        var upper: [256]u8 = undefined;
+        var upper: [backend.MAX_PREFIX_LEN]u8 = undefined;
         var upper_len: usize = prefix.len;
         var has_upper = false;
 
-        if (prefix.len > 0 and prefix.len <= 256) {
+        if (prefix.len > 0) {
             @memcpy(upper[0..prefix.len], prefix);
             var i = upper_len;
             while (i > 0) {
@@ -210,8 +223,11 @@ pub const SqliteBackend = struct {
     }
 
     pub fn writeBatch(self: *SqliteBackend) !WriteBatch {
-        _ = execSimple(self.db, "BEGIN IMMEDIATE");
-        return .{ .backend = self, .committed = false, .table_count_at_start = self.table_count };
+        // A batch owns the shared connection's write transaction. A BEGIN
+        // that fails (already in a transaction, or the database is busy)
+        // must be reported, not silently folded into the open transaction.
+        if (execSimple(self.db, "BEGIN IMMEDIATE") != 0) return error.SqliteBeginFailed;
+        return .{ .backend = self, .table_count_at_start = self.table_count };
     }
 
     // -- Iterator --
@@ -245,7 +261,11 @@ pub const SqliteBackend = struct {
 
     pub const WriteBatch = struct {
         backend: *SqliteBackend,
-        committed: bool,
+        /// Ended once commit was attempted (success or failure) or abort
+        /// ran: abort() after a commit attempt is a no-op (S9), and a
+        /// failed commit never leaves the shared connection in a txn a
+        /// later abort() would roll back.
+        ended: bool = false,
         table_count_at_start: u32,
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
@@ -257,23 +277,35 @@ pub const SqliteBackend = struct {
         }
 
         pub fn commit(self: *WriteBatch) !void {
-            _ = execSimple(self.backend.db, "COMMIT");
-            self.committed = true;
+            self.ended = true;
+            if (execSimple(self.backend.db, "COMMIT") != 0) {
+                self.rollback();
+                return error.SqliteCommitFailed;
+            }
         }
 
         pub fn abort(self: *WriteBatch) void {
-            if (!self.committed) {
-                _ = execSimple(self.backend.db, "ROLLBACK");
-                // Rollback may have undone CREATE TABLE statements made inside
-                // the transaction. Reset table cache to the state before BEGIN.
-                self.backend.table_count = self.table_count_at_start;
-            }
+            if (self.ended) return;
+            self.ended = true;
+            self.rollback();
+        }
+
+        fn rollback(self: *WriteBatch) void {
+            _ = execSimple(self.backend.db, "ROLLBACK");
+            // Rollback may have undone CREATE TABLE statements made inside
+            // the transaction. Reset table cache to the state before BEGIN.
+            self.backend.table_lock.lock();
+            self.backend.table_count = self.table_count_at_start;
+            self.backend.table_lock.unlock();
         }
     };
 
     // -- Internal --
 
     fn ensureTable(self: *SqliteBackend, ns: []const u8) !void {
+        // S9: cache lookup and lazy creation share this lock.
+        self.table_lock.lock();
+        defer self.table_lock.unlock();
         // Check cache
         for (self.table_cache[0..self.table_count]) |entry| {
             if (std.mem.eql(u8, entry.name_buf[0..entry.name_len], ns))
@@ -422,6 +454,54 @@ test "SqliteBackend: iterator prefix-bounded" {
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
+test "SqliteBackend: iterator honors a prefix past 256 bytes and rejects over-cap" {
+    const path = "/tmp/xmppd-test-sqlite-iterlong.db";
+    cleanDb(path);
+    defer cleanDb(path);
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+
+    // Two owners whose scan prefixes share the first 290 bytes: a lost
+    // range upper bound or a clipped prefix merges their rows.
+    const owner_a = ("a" ** 290) ++ "-first";
+    const owner_b = ("a" ** 290) ++ "-other";
+    comptime std.debug.assert(std.mem.eql(u8, owner_a[0..290], owner_b[0..290]));
+
+    const ns = comptime backend.registered("rosters");
+    const key_a = owner_a ++ "\x00item1";
+    const key_b = owner_b ++ "\x00item2";
+    try db.put(ns, key_a, "a");
+    try db.put(ns, key_b, "b");
+
+    const prefix = owner_a ++ "\x00";
+
+    // Collect-then-delete, the pattern removeAll/destroyRoom callers use.
+    var keys: [4][backend.MAX_PREFIX_LEN]u8 = undefined;
+    var key_lens: [4]usize = undefined;
+    var scanned: usize = 0;
+    {
+        var iter = try db.iterator(ns, prefix);
+        defer iter.deinit();
+        while (iter.next()) |entry| {
+            if (scanned == keys.len) return error.TooManyEntries;
+            @memcpy(keys[scanned][0..entry.key.len], entry.key);
+            key_lens[scanned] = entry.key.len;
+            scanned += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), scanned);
+    try std.testing.expectEqualStrings(key_a, keys[0][0..key_lens[0]]);
+
+    for (key_lens[0..scanned], 0..) |len, i| {
+        try db.delete(ns, keys[i][0..len]);
+    }
+    const b_val = try db.get(std.testing.allocator, ns, key_b);
+    defer if (b_val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("b", b_val.?);
+
+    try std.testing.expectError(error.PrefixTooLong, db.iterator(ns, "x" ** (backend.MAX_PREFIX_LEN + 1)));
+}
+
 test "SqliteBackend: iterator returns key and value" {
     const path = "/tmp/xmppd-test-sqlite-iterval.db";
     cleanDb(path);
@@ -475,6 +555,155 @@ test "SqliteBackend: writeBatch abort" {
     try std.testing.expect(val == null);
 }
 
+test "SqliteBackend: a second batch cannot begin on a busy connection" {
+    const path = "/tmp/xmppd-test-sqlite-batchbusy.db";
+    cleanDb(path);
+    defer cleanDb(path);
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+
+    var b1 = try db.writeBatch();
+    defer b1.abort();
+
+    // The connection already holds a write transaction: a second batch must
+    // be refused instead of silently joining it.
+    try std.testing.expectError(error.SqliteBeginFailed, db.writeBatch());
+}
+
+test "SqliteBackend: a second connection on a busy database reports SqliteBeginFailed" {
+    const path = "/tmp/xmppd-test-sqlite-twoconnbusy.db";
+    cleanDb(path);
+    defer cleanDb(path);
+
+    var a = try SqliteBackend.open(path, .{});
+    defer a.close();
+    var b = try SqliteBackend.open(path, .{});
+    defer b.close();
+
+    // The open default is five seconds; keep the BUSY window short so the
+    // test proves the error path rather than the timeout.
+    _ = c.sqlite3_busy_timeout(b.db, 10);
+
+    // WAL allows one writer. a holds the write lock; b's BEGIN IMMEDIATE
+    // retries for 10 ms and must surface the failure, not join the txn.
+    var held = try a.writeBatch();
+    defer held.abort();
+
+    try std.testing.expectError(error.SqliteBeginFailed, b.writeBatch());
+}
+
+/// sqlite3_commit_hook callback that vetoes the commit: SQLite rolls the
+/// transaction back and the COMMIT statement fails, the way a busy or full
+/// database fails one. The fault hook for the commit-failure tests.
+fn vetoCommit(_: ?*anyopaque) callconv(.c) c_int {
+    return 1;
+}
+
+test "SqliteBackend: a failed COMMIT ends the batch: a later abort is a no-op" {
+    const path = "/tmp/xmppd-test-sqlite-commitfail.db";
+    cleanDb(path);
+    defer cleanDb(path);
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+
+    // Fault hook: every COMMIT fails while installed.
+    _ = c.sqlite3_commit_hook(db.db, vetoCommit, null);
+
+    var b1 = try db.writeBatch();
+    try b1.put("users", "alice", "a");
+    try std.testing.expectError(error.SqliteCommitFailed, b1.commit());
+    // The commit attempt ended the batch: abort() can never ROLLBACK the
+    // shared connection a second time (S9).
+    try std.testing.expect(b1.ended);
+
+    _ = c.sqlite3_commit_hook(db.db, null, null);
+
+    var b2 = try db.writeBatch();
+    try b2.put("users", "bob", "b");
+    b1.abort(); // no-op
+    try b2.commit();
+
+    const v = try db.get(std.testing.allocator, "users", "bob");
+    defer if (v) |x| std.testing.allocator.free(x);
+    try std.testing.expectEqualStrings("b", v.?);
+}
+
+test "SqliteBackend: a failed COMMIT rolls back and resets the table cache" {
+    const path = "/tmp/xmppd-test-sqlite-commitcache.db";
+    cleanDb(path);
+    defer cleanDb(path);
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+
+    _ = c.sqlite3_commit_hook(db.db, vetoCommit, null);
+
+    const tc0 = db.table_count;
+    var b1 = try db.writeBatch();
+    // A namespace outside the canonical set: its CREATE TABLE lives and
+    // dies with the failed transaction.
+    try b1.put("scratch", "k", "v");
+    try std.testing.expectEqual(tc0 + 1, db.table_count);
+    try std.testing.expectError(error.SqliteCommitFailed, b1.commit());
+    // The rolled-back CREATE TABLE must not leave a cache entry behind.
+    try std.testing.expectEqual(tc0, db.table_count);
+
+    _ = c.sqlite3_commit_hook(db.db, null, null);
+
+    // The namespace is usable again: the table is recreated on demand.
+    var b2 = try db.writeBatch();
+    try b2.put("scratch", "k2", "v2");
+    try b2.commit();
+    const v = try db.get(std.testing.allocator, "scratch", "k2");
+    defer if (v) |x| std.testing.allocator.free(x);
+    try std.testing.expectEqualStrings("v2", v.?);
+}
+
+test "SqliteBackend: a failed COMMIT that leaves the txn open is rolled back" {
+    const path = "/tmp/xmppd-test-sqlite-deferredfk.db";
+    cleanDb(path);
+    defer cleanDb(path);
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+
+    // A deferred foreign key violation fails COMMIT with the transaction
+    // still open, so only the batch's own ROLLBACK ends it. A vetoed commit
+    // (the fault hook above) proves nothing here: SQLite rolls that one back
+    // itself.
+    const setup_rc = c.sqlite3_exec(db.db,
+        \\PRAGMA foreign_keys = ON;
+        \\CREATE TABLE parent (id INTEGER PRIMARY KEY);
+        \\CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent(id));
+        \\CREATE TRIGGER users_child AFTER INSERT ON "users"
+        \\BEGIN INSERT INTO child (parent_id) VALUES (999); END;
+    , null, null, null);
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), setup_rc);
+    // The pragma switches itself off at every commit, so it is set after the
+    // DDL and applies to the batch's transaction.
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_exec(db.db, "PRAGMA defer_foreign_keys = ON", null, null, null));
+
+    const users = comptime backend.registered("users");
+    var b1 = try db.writeBatch();
+    try b1.put(users, "alice", "a");
+    try std.testing.expectError(error.SqliteCommitFailed, b1.commit());
+    try std.testing.expect(b1.ended);
+
+    // Drop the trigger outside any transaction: the failed one is gone.
+    try std.testing.expectEqual(@as(c_int, c.SQLITE_OK), c.sqlite3_exec(db.db, "DROP TRIGGER users_child", null, null, null));
+
+    // The connection begins again, so the ROLLBACK ran; the insert is gone.
+    var b2 = try db.writeBatch();
+    try b2.put(users, "bob", "b");
+    try b2.commit();
+
+    const alice = try db.get(std.testing.allocator, users, "alice");
+    defer if (alice) |v| std.testing.allocator.free(v);
+    try std.testing.expect(alice == null);
+
+    const bob = try db.get(std.testing.allocator, users, "bob");
+    defer if (bob) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("b", bob.?);
+}
+
 test "SqliteBackend: reopen preserves data" {
     const path = "/tmp/xmppd-test-sqlite-reopen.db";
     cleanDb(path);
@@ -491,4 +720,50 @@ test "SqliteBackend: reopen preserves data" {
         defer if (val) |v| std.testing.allocator.free(v);
         try std.testing.expectEqualStrings("persisted", val.?);
     }
+}
+
+fn expectPrefixScan(db: anytype, ns: []const u8, prefix: []const u8, want: usize) !void {
+    var iter = try db.iterator(ns, prefix);
+    defer iter.deinit();
+    var n: usize = 0;
+    while (iter.next()) |e| {
+        try std.testing.expect(std.mem.startsWith(u8, e.key, prefix));
+        n += 1;
+    }
+    try std.testing.expectEqual(want, n);
+}
+
+test "SqliteBackend: iterator scan over 0xFF tails, empty prefix, a shared-head owner and the exact cap" {
+    const path = "/tmp/xmppd-test-sqlite-iteredge.db";
+    cleanDb(path);
+    defer cleanDb(path);
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+    const ns = comptime backend.registered("rosters");
+
+    // Keys that stress the lexicographic edges of a prefix scan: trailing
+    // 0xFF bytes, a key sitting on the computed upper bound, and all-0xFF
+    // prefixes. The counts pin the sorted order the scan must honor.
+    const ks = [_][]const u8{ "ab\xFE\xFF", "ab\xFF", "ab\xFF\x00x", "ab\xFF\xFF", "ac", "\xFF\xFE", "\xFF\xFF", "\xFF\xFF\x01" };
+    for (ks) |k| try db.put(ns, k, "v");
+    try expectPrefixScan(&db, ns, "ab\xFF", 3);
+    try expectPrefixScan(&db, ns, "ab\xFE", 1);
+    try expectPrefixScan(&db, ns, "\xFF\xFF", 2);
+    try expectPrefixScan(&db, ns, "\xFF", 3);
+    try expectPrefixScan(&db, ns, "", 8);
+
+    // Two owners sharing a 296-byte head: a clipped seek or compare merges
+    // their rows.
+    const owner_a = ("a" ** 290) ++ "-first\x00";
+    const owner_b = ("a" ** 290) ++ "-other\x00";
+    try db.put(ns, owner_a ++ "i", "a");
+    try db.put(ns, owner_b ++ "i", "b");
+    try expectPrefixScan(&db, ns, owner_b, 1);
+    try expectPrefixScan(&db, ns, owner_a, 1);
+
+    // An exact-cap prefix must be accepted and matched, not rejected.
+    const cap = "c" ** backend.MAX_PREFIX_LEN;
+    try db.put(ns, cap, "c");
+    try expectPrefixScan(&db, ns, cap, 1);
+    try expectPrefixScan(&db, ns, cap[0 .. backend.MAX_PREFIX_LEN - 1], 1);
 }

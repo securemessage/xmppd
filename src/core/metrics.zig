@@ -24,11 +24,20 @@ pub const HIST_BUCKETS = 32;
 const Counter = atomic.Value(u64);
 
 /// Counters that live in other build modules and are passed to dump().
+/// Includes the counters master already keeps (S4 jid_overflow_drops,
+/// S14 cross_worker_drops, the offline and s2s delivery outcomes) so the
+/// SIGUSR1 dump is the one place every drop reason is visible.
 pub const Externals = struct {
     room_mailbox_drops: u64 = 0,
     ring_drops_full: u64 = 0,
     ring_drops_payload: u64 = 0,
     envelopes_cross_worker: u64 = 0,
+    jid_overflow_drops: u64 = 0,
+    cross_worker_drops: u64 = 0,
+    s2s_bounces: u64 = 0,
+    offline_not_stored: u64 = 0,
+    offline_hold_bounces: u64 = 0,
+    offline_drain_drops: u64 = 0,
 };
 
 pub const Counters = struct {
@@ -92,9 +101,12 @@ pub fn dump(worker_id: u16, ext: Externals) void {
         worker_id,           read(&c.drop_send_buffer_full), read(&c.drop_send_closed), read(&c.drop_changelist_full),
         read(&c.drop_no_route), ext.ring_drops_full,          ext.ring_drops_payload,   ext.room_mailbox_drops,
     });
+    log.info("worker {d} drops (module-global): jid_overflow={d} xworker={d} s2s_bounces={d} offline_not_stored={d} offline_hold_bounces={d} offline_drain={d}", .{
+        worker_id,             ext.jid_overflow_drops, ext.cross_worker_drops,   ext.s2s_bounces,
+        ext.offline_not_stored, ext.offline_hold_bounces, ext.offline_drain_drops,
+    });
     var buf: [HIST_BUCKETS * 24]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(&buf);
     var first = true;
     for (&c.loop_hist_us, 0..) |*b, k| {
         const n = read(b);
@@ -106,7 +118,7 @@ pub fn dump(worker_id: u16, ext: Externals) void {
         else
             w.print("{d}us:{d}", .{ @as(u64, 1) << @intCast(k), n }) catch break;
     }
-    log.info("worker {d} loop us histogram (log2 buckets): {s}", .{ worker_id, fbs.getWritten() });
+    log.info("worker {d} loop us histogram (log2 buckets): {s}", .{ worker_id, w.buffered() });
 }
 
 test "recordIteration assigns log2 buckets" {

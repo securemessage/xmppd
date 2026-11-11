@@ -23,7 +23,13 @@ const store_keys = @import("store_keys");
 
 const log = std.log.scoped(.roster_store);
 
-const NAMESPACE = "rosters";
+// Iterator prefixes share the key budget: the backend cap and the key
+// builder cap must never drift apart.
+comptime {
+    std.debug.assert(backend_mod.MAX_PREFIX_LEN == store_keys.MAX_KEY_LEN);
+}
+
+pub const NAMESPACE = backend_mod.registered("rosters");
 
 pub const Subscription = enum(u8) {
     none = 0,
@@ -293,7 +299,6 @@ pub fn RosterStore(comptime Backend: type) type {
 // Key/Value helpers
 // ============================================================================
 
-
 fn serializeEntry(buf: []u8, name: []const u8, subscription: Subscription, ask: bool, groups_data: []const u8, group_count: u8) []const u8 {
     buf[0] = @intFromEnum(subscription);
     buf[1] = if (ask) 1 else 0;
@@ -479,7 +484,6 @@ test "Subscription: fromString/toString roundtrip" {
     try std.testing.expectEqual(Subscription.remove, Subscription.fromString("remove"));
     try std.testing.expectEqualStrings("both", Subscription.both.toString());
 }
-
 
 test "S4: oversized keys fail with KeyTooLong instead of overflowing the buffer" {
     var db = try MemoryBackend.open("", .{});

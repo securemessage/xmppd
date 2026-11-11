@@ -58,7 +58,9 @@ const READ_BUF_SIZE = 8192;
 /// Write buffer size — 16KB per connection.
 /// Larger than read because the server may need to send stream features + multiple
 /// stanzas before the client has a chance to ACK at the TCP level.
-const WRITE_BUF_SIZE = 16384;
+/// A stanza larger than this can never be queued in one piece, so producers
+/// that can size a stanza up front (MUC fan-out) reject it instead.
+pub const WRITE_BUF_SIZE = 16384;
 
 /// T110 backpressure: at/above this buffered-bytes level the server disables
 /// EVFILT_READ for the connection, so TCP-level flow control propagates to
@@ -263,14 +265,33 @@ pub const Connection = struct {
         self.write_end += data.len;
     }
 
+    /// Queue `data`, first making room with one non-blocking flush when the
+    /// buffer is full. Data already buffered is deliverable, so a buffer the
+    /// server filled itself is not by itself a slow reader: a single flush
+    /// buys another attempt. The caller still treats a second WriteBufferFull
+    /// as a slow reader, whatever the flush freed.
+    pub fn queueSendWithFlush(self: *Connection, data: []const u8) !void {
+        self.queueSend(data) catch |err| {
+            if (err != error.WriteBufferFull) return err;
+            _ = self.flushSend() catch 0;
+            return self.queueSend(data);
+        };
+    }
+
     /// Returns true if there is unsent data in the write buffer.
     /// When true, the caller should register this fd for EVFILT_WRITE.
     pub fn hasPendingWrite(self: *const Connection) bool {
+        // A closed connection has no writable fd, so buffered bytes are
+        // undeliverable, not pending. A detached SM session retains those bytes
+        // for resume but must not arm EVFILT_WRITE until it has a new fd (S28).
+        if (self.closed) return false;
         return self.write_start < self.write_end;
     }
 
     /// Bytes currently buffered for writing (T110 backpressure thresholds).
+    /// Zero once closed: there is no fd left to drain them to (S28).
     pub fn pendingWriteBytes(self: *const Connection) usize {
+        if (self.closed) return 0;
         return self.write_end - self.write_start;
     }
 
@@ -282,7 +303,12 @@ pub const Connection = struct {
     /// ## Errors
     /// - `error.WouldBlock` — socket send buffer is full, try again later
     /// - `error.ConnectionReset` — peer reset the connection
+    /// - `error.ConnectionClosed` - the fd is already closed (S28)
     pub fn flushSend(self: *Connection) !usize {
+        // Nothing to do on a closed fd. posix.write(-1) would fail EBADF and
+        // be reported as ConnectionReset, which drives the caller to close a
+        // session that may still be resumable.
+        if (self.closed) return error.ConnectionClosed;
         if (!self.hasPendingWrite()) return 0;
 
         if (self.tls_conn) |*tls| {
@@ -436,11 +462,12 @@ pub const Connection = struct {
     // --- Private helpers ---
 
     fn compactWriteBuf(self: *Connection) void {
-        // A TLS write retried after WANT_WRITE must use the same buffer
-        // address; moving it gives "bad write retry" (or corrupt data with
-        // kTLS). TLS writes are all-or-nothing, so write_start is already 0
-        // whenever a retry is pending and this is a no-op by construction.
-        if (self.tls_conn != null) return;
+        // A TLS write retried after WANT_WRITE must keep the pinned
+        // (pointer, length) pair; moving it gives "bad write retry" (or
+        // corrupt data with kTLS). Only an active pin blocks compaction:
+        // gating on tls_conn left write_start to creep until queueSend
+        // failed with the front of the buffer free.
+        if (self.tls_write_pending != 0) return;
         if (self.write_start == 0) return;
         const remaining = self.write_end - self.write_start;
         if (remaining > 0) {
@@ -633,6 +660,128 @@ test "Connection: M1 counters track bytes and queueSend drops" {
     try std.testing.expectEqual(base_closed + 1, c.drop_send_closed.load(.monotonic));
 }
 
+test "Connection: a closed connection with a full buffer is not pending (S28)" {
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    var conn = Connection.init(fds[0], 1);
+    try conn.queueSend("<message><body>still buffered</body></message>");
+    try std.testing.expect(conn.hasPendingWrite());
+    try std.testing.expect(conn.pendingWriteBytes() > 0);
+
+    // An SM-detached session keeps its write buffer while its fd is gone.
+    conn.close();
+    try std.testing.expectEqual(@as(posix.fd_t, -1), conn.fd);
+
+    // There is no fd to drain those bytes to, so they are not pending.
+    // Reporting them as pending is what armed EVFILT_WRITE on fd -1 and drove
+    // flushSend to destroy a resumable session.
+    try std.testing.expect(!conn.hasPendingWrite());
+    try std.testing.expectEqual(@as(usize, 0), conn.pendingWriteBytes());
+
+    // Flushing says so explicitly rather than surfacing EBADF as a reset.
+    try std.testing.expectError(error.ConnectionClosed, conn.flushSend());
+
+    // The buffered bytes are untouched: a resume still has them if it wants.
+    try std.testing.expect(conn.write_end > conn.write_start);
+}
+
+test "Connection: flushSync on a dead descriptor returns instead of spinning" {
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    var conn = Connection.init(fds[0], 1);
+    try conn.queueSend("<stream:error/>");
+
+    // The fd dies mid-flush (peer teardown raced the graceful close).
+    // flushSend surfaces EBADF as an error and flushSync must give up
+    // immediately, not retry the dead descriptor 100 times.
+    posix.close(fds[0]);
+    conn.flushSync();
+    try std.testing.expect(conn.hasPendingWrite());
+}
+
+test "Connection: flushSync makes short-write progress then exits bounded" {
+    const fds = try makeSocketPair();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    // Fill the kernel buffer so only part of the payload fits.
+    var filler: [4096]u8 = @splat('x');
+    var filled: usize = 0;
+    while (posix.write(fds[0], &filler)) |n| {
+        filled += n;
+    } else |_| {}
+    try std.testing.expect(filled > 0);
+
+    // Free a slice of space: one short write's worth, not the whole queue.
+    var drain: [4096]u8 = undefined;
+    _ = try posix.read(fds[1], &drain);
+
+    var conn = Connection.init(fds[0], 1);
+    // Bigger than the freed window, smaller than the 16KB write buffer.
+    var payload_buf: [8192]u8 = @splat('y');
+    const marker = "<stream:error";
+    @memcpy(payload_buf[0..marker.len], marker);
+    try conn.queueSend(&payload_buf);
+
+    conn.flushSync();
+
+    // Progress happened (a short write drained into the freed space) but
+    // the peer never reads the rest, so flushSync must exit via its
+    // attempt cap with data still pending, never spin forever.
+    try std.testing.expect(conn.hasPendingWrite());
+    var all: [262144]u8 = undefined;
+    var total: usize = 0;
+    while (posix.read(fds[1], all[total..])) |n| {
+        if (n == 0) break;
+        total += n;
+    } else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, all[0..total], marker) != null);
+}
+
+test "Connection: flushSync on a blocking fd coalesces short writes to completion" {
+    // Blocking pair: a write that cannot complete waits for the peer, so
+    // a slow reader turns one big payload into many short writes.
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds);
+    try std.testing.expectEqual(@as(isize, 0), rc);
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const payload_len = 12 * 1024;
+    var payload: [payload_len]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+
+    // Slow reader: small reads so the writer never lands one big write.
+    const Drainer = struct {
+        fn run(fd: posix.fd_t, want: usize, got: *usize) void {
+            var buf: [97]u8 = undefined;
+            got.* = 0;
+            while (got.* < want) {
+                const n = std.posix.read(fd, &buf) catch return;
+                if (n == 0) return;
+                got.* += n;
+            }
+        }
+    };
+    var got: usize = 0;
+    const t = try std.Thread.spawn(.{}, Drainer.run, .{ fds[1], payload_len, &got });
+
+    var conn = Connection.init(fds[0], 1);
+    try conn.queueSend(&payload);
+    conn.flushSync();
+
+    // Signal end-of-payload so a writer that reports completion but
+    // under-delivers cannot leave the reader blocked forever; a short
+    // transfer fails the count below instead of hanging (ce03221).
+    std.posix.shutdown(fds[0], .send) catch {};
+    t.join();
+
+    try std.testing.expect(!conn.hasPendingWrite());
+    try std.testing.expectEqual(payload_len, got);
+}
+
 // ---------------------------------------------------------------------------
 // S23: TLS write retry pinning (real TLS over a socketpair)
 // ---------------------------------------------------------------------------
@@ -647,7 +796,7 @@ const tls_test_c = @cImport({
 
 /// Generate a self-signed EC cert + key as one combined PEM inside `dir` and
 /// return its path (caller frees). Test-only fixture for TLS socketpair tests.
-fn makeTestPem(allocator: std.mem.Allocator, dir: std.fs.Dir) ![:0]u8 {
+pub fn makeTestPem(allocator: std.mem.Allocator, dir: std.fs.Dir) ![:0]u8 {
     const cc = tls_test_c;
 
     const pctx = cc.EVP_PKEY_CTX_new_id(cc.EVP_PKEY_EC, null) orelse return error.SslInitFailed;
@@ -768,4 +917,89 @@ test "S23: TLS write retry resends only the pinned slice" {
     try std.testing.expectEqualSlices(u8, b, received.items[a.len..]);
     try std.testing.expectEqual(@as(usize, 0), server_conn.tls_write_pending);
     try std.testing.expect(!server_conn.hasPendingWrite());
+}
+
+test "S23: TLS connection with no pinned retry compacts the write buffer" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+
+    var server_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+    defer server_ctx.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+
+    const fds = try makeSocketPair();
+    var server_conn = Connection.init(fds[0], 1);
+    defer server_conn.close();
+    var client_tls = try ssl.SslConn.initClient(client_ctx, fds[1], null);
+    defer client_tls.deinit();
+
+    try server_conn.upgradeToTls(server_ctx);
+
+    var client_done = false;
+    var iter: usize = 0;
+    while (iter < 10000 and !(server_conn.isTlsEstablished() and client_done)) : (iter += 1) {
+        if (!server_conn.isTlsEstablished()) _ = server_conn.continueHandshake() catch {};
+        if (!client_done) {
+            client_done = (client_tls.doHandshake() catch .want_read) == .complete;
+        }
+    }
+    try std.testing.expect(server_conn.isTlsEstablished());
+    try std.testing.expect(client_done);
+
+    {
+        const sndbuf: c_int = 1024;
+        try posix.setsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+        try posix.setsockopt(fds[1], posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&sndbuf));
+    }
+
+    const a = "A" ** 12000;
+    const b = "B" ** 512;
+    try server_conn.queueSend(a);
+    try std.testing.expectError(error.WouldBlock, server_conn.flushSend());
+    try std.testing.expectEqual(@as(usize, a.len), server_conn.tls_write_pending);
+    try server_conn.queueSend(b);
+
+    // Drain only the pinned slice, then stop: write_start has crept past
+    // 0 with no retry pinned.
+    var received = std.ArrayList(u8){};
+    defer received.deinit(allocator);
+    var rbuf: [16384]u8 = undefined;
+    iter = 0;
+    while (iter < 100000) : (iter += 1) {
+        _ = server_conn.flushSend() catch {};
+        if (server_conn.tls_write_pending == 0 and server_conn.write_start > 0) break;
+        switch (client_tls.read(&rbuf) catch .want_read) {
+            .ok => |n| try received.appendSlice(allocator, rbuf[0..n]),
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), server_conn.tls_write_pending);
+    try std.testing.expectEqual(a.len, server_conn.write_start);
+    try std.testing.expectEqual(a.len + b.len, server_conn.write_end);
+
+    // Fewer than c.len bytes remain at the tail; queueSend must compact
+    // the freed front instead of failing WriteBufferFull.
+    const c = "C" ** 4096;
+    try server_conn.queueSend(c);
+    try std.testing.expectEqual(@as(usize, 0), server_conn.write_start);
+    try std.testing.expectEqual(b.len + c.len, server_conn.write_end);
+
+    // Everything queued still arrives, in order.
+    iter = 0;
+    while (iter < 100000 and received.items.len < a.len + b.len + c.len) : (iter += 1) {
+        _ = server_conn.flushSend() catch {};
+        switch (client_tls.read(&rbuf) catch .want_read) {
+            .ok => |n| try received.appendSlice(allocator, rbuf[0..n]),
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(a.len + b.len + c.len, received.items.len);
+    try std.testing.expectEqualSlices(u8, a, received.items[0..a.len]);
+    try std.testing.expectEqualSlices(u8, b, received.items[a.len..][0..b.len]);
+    try std.testing.expectEqualSlices(u8, c, received.items[a.len + b.len ..]);
 }

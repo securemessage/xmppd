@@ -1,24 +1,43 @@
-//! # HTTP Client — Minimal blocking HTTP/1.1 over TLS (OpenSSL)
+//! # HTTP Client -- HTTPS/1.1 over TLS (OpenSSL) with deadlines and cancellation
 //!
 //! Designed for OIDC backend use: JWKS fetch, token introspection, ROPC grant.
-//! Runs inside xmppd-auth-oidc process — blocking calls are fine since the auth
-//! daemon has its own process (won't block C2S event loop).
+//! Requests run on the auth daemon's IdP worker threads, never on its event
+//! loop.
+//!
+//! ## Threading
+//!
+//! A `Client` is safe to share across threads: after `init` its `SSL_CTX` is
+//! only read, never mutated. Each request owns its socket, `SSL` and kqueue
+//! for its whole lifetime; nothing is shared between in-flight requests.
 //!
 //! ## Features
 //!
 //! - HTTP/1.1 GET and POST (application/x-www-form-urlencoded)
-//! - TLS via OpenSSL (reuses lib/tls/ssl.zig FFI)
-//! - DANE-first verification (via lib/tls/tls.zig + lib/dns/dns.zig)
-//! - PKIX fallback with configurable CA bundle
-//! - Connection-per-request (no keepalive — simplicity for 3 fixed endpoints)
+//! - TLS via OpenSSL on a non-blocking socket driven by a per-request kqueue
+//! - Absolute deadline and separate connect budget per request, plus a
+//!   cancellation pipe whose EOF aborts the exchange
+//! - PKIX verification with configurable CA bundle, hostname pinned to the URL
+//! - Connection-per-request (no keepalive -- simplicity for 3 fixed endpoints)
 //! - Response limited to 256KB (JWKS/token responses are small)
+//!
+//! ## Known limits
+//!
+//! - `getaddrinfo` runs blocking with no deadline and requests IPv4 only.
+//!   Replaced later by the async resolver work item (A8/X2).
+//! - Only the first resolved address is tried.
+//! - kTLS is deliberately not enabled on this client.
 //!
 //! ## Usage
 //!
 //! ```zig
-//! const http = @import("http");
-//! var response = try http.get(allocator, "https://auth.example.com/.well-known/openid-configuration", null);
-//! defer allocator.free(response.body);
+//! var client = try http.Client.init(null); // or a CA bundle path
+//! defer client.deinit();
+//! const options = http.RequestOptions{
+//!     .deadline_ns = http.monotonicNs() + 10 * std.time.ns_per_s,
+//!     .connect_timeout_ms = 3000,
+//! };
+//! var response = try client.get(allocator, "https://auth.example.com/jwks", options);
+//! defer response.deinit();
 //! ```
 
 const std = @import("std");
@@ -29,6 +48,7 @@ const c = @cImport({
     @cInclude("openssl/ssl.h");
     @cInclude("openssl/err.h");
     @cInclude("openssl/x509.h");
+    @cInclude("openssl/x509_vfy.h");
     @cInclude("netdb.h");
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
@@ -38,6 +58,8 @@ pub const HttpError = error{
     InvalidUrl,
     DnsResolutionFailed,
     ConnectionFailed,
+    Timeout,
+    Cancelled,
     TlsInitFailed,
     TlsHandshakeFailed,
     TlsWriteFailed,
@@ -47,142 +69,770 @@ pub const HttpError = error{
     OutOfMemory,
 };
 
+/// Per-request timing and cancellation. Every wait inside the exchange
+/// honors `deadline_ns`; the connect+handshake phase additionally ends at
+/// `start + connect_timeout_ms` (freebsd-ktls D5: the handshake is part of
+/// connect).
+pub const RequestOptions = struct {
+    /// Absolute CLOCK_MONOTONIC deadline for the whole exchange, nanoseconds.
+    deadline_ns: u64,
+    /// TCP connect plus TLS handshake budget; the connect phase ends at
+    /// min(start + connect_timeout_ms, deadline_ns).
+    connect_timeout_ms: u32,
+    /// Read end of a pipe whose EOF cancels the request; -1 when not cancellable.
+    cancel_fd: posix.fd_t = -1,
+};
+
+/// CLOCK_MONOTONIC in nanoseconds. std.time.Instant reads
+/// CLOCK_MONOTONIC_FAST on FreeBSD, which advances once per kernel tick and
+/// is too coarse for request deadlines.
+pub fn monotonicNs() u64 {
+    const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
 pub const Response = struct {
     status: u16,
     body: []const u8,
     allocator: Allocator,
 
     pub fn deinit(self: *Response) void {
+        // Bodies can carry tokens; never leave them in freed memory.
+        std.crypto.secureZero(u8, @constCast(self.body));
         self.allocator.free(self.body);
     }
 };
 
-/// Maximum response body size (256KB).
+/// Maximum response size (256KB, headers + body).
 const MAX_RESPONSE_SIZE: usize = 256 * 1024;
 
-/// Perform an HTTPS GET request. Caller owns the returned Response.body.
-pub fn get(allocator: Allocator, url: []const u8, ca_file: ?[]const u8) HttpError!Response {
-    return request(allocator, "GET", url, null, null, ca_file);
+/// Maximum request head size (request line + headers).
+const MAX_HEAD_SIZE: usize = 4096;
+
+/// Persistent HTTPS client: one SSL_CTX per daemon, parsing the CA bundle
+/// once instead of per request (T357/S8).
+pub const Client = struct {
+    ssl_ctx: *c.SSL_CTX,
+
+    pub fn init(ca_file: ?[]const u8) HttpError!Client {
+        const ctx = initTlsClient(ca_file) orelse return HttpError.TlsInitFailed;
+        return .{ .ssl_ctx = ctx };
+    }
+
+    pub fn deinit(self: *Client) void {
+        c.SSL_CTX_free(self.ssl_ctx);
+    }
+
+    /// Perform an HTTPS GET request. Caller owns the returned Response.
+    /// Runs entirely on the calling thread; safe to call from any worker.
+    pub fn get(
+        self: *const Client,
+        allocator: Allocator,
+        url: []const u8,
+        options: RequestOptions,
+    ) HttpError!Response {
+        return request(self.ssl_ctx, allocator, "GET", url, null, null, options);
+    }
+
+    /// Perform an HTTPS POST with form-urlencoded body. Caller owns the
+    /// returned Response.
+    pub fn post(
+        self: *const Client,
+        allocator: Allocator,
+        url: []const u8,
+        body: []const u8,
+        options: RequestOptions,
+    ) HttpError!Response {
+        return request(
+            self.ssl_ctx,
+            allocator,
+            "POST",
+            url,
+            body,
+            "application/x-www-form-urlencoded",
+            options,
+        );
+    }
+};
+
+// ============================================================================
+// Per-request kqueue waits
+// ============================================================================
+
+const WaitError = error{ Timeout, Cancelled, WaitFailed };
+
+fn makeKev(ident: usize, filter: i16, flags: u16) posix.Kevent {
+    return .{
+        .ident = ident,
+        .filter = filter,
+        .flags = flags,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    };
 }
 
-/// Perform an HTTPS POST with form-urlencoded body. Caller owns the returned Response.body.
-pub fn post(allocator: Allocator, url: []const u8, body: []const u8, ca_file: ?[]const u8) HttpError!Response {
-    return request(allocator, "POST", url, body, "application/x-www-form-urlencoded", ca_file);
+/// Wait until `fd` reports `filter` readiness, the cancel pipe signals EOF,
+/// or `deadline_ns` passes. The fd filter is staged EV_ADD|EV_ONESHOT in the
+/// same kevent() call that waits; the cancel fd is staged as a persistent
+/// EV_ADD (re-adding an existing knote is an idempotent modify).
+fn waitIo(
+    kq: posix.fd_t,
+    fd: posix.fd_t,
+    filter: i16,
+    deadline_ns: u64,
+    cancel_fd: posix.fd_t,
+) WaitError!void {
+    const now = monotonicNs();
+    if (now >= deadline_ns) return error.Timeout;
+    const remaining = deadline_ns - now;
+
+    var changes: [2]posix.Kevent = undefined;
+    var n_changes: usize = 0;
+    changes[n_changes] = makeKev(@intCast(fd), filter, std.c.EV.ADD | std.c.EV.ONESHOT);
+    n_changes += 1;
+    if (cancel_fd >= 0) {
+        changes[n_changes] = makeKev(@intCast(cancel_fd), std.c.EVFILT.READ, std.c.EV.ADD);
+        n_changes += 1;
+    }
+
+    var events: [2]posix.Kevent = undefined;
+    const timeout: posix.timespec = .{
+        .sec = @intCast(remaining / std.time.ns_per_s),
+        .nsec = @intCast(remaining % std.time.ns_per_s),
+    };
+    const n = posix.kevent(
+        kq,
+        changes[0..n_changes],
+        &events,
+        &timeout,
+    ) catch return error.WaitFailed;
+    if (n == 0) return error.Timeout;
+
+    var saw_fd = false;
+    for (events[0..n]) |ev| {
+        if (cancel_fd >= 0 and ev.ident == @as(usize, @intCast(cancel_fd))) {
+            return error.Cancelled;
+        }
+        if (ev.flags & std.c.EV.ERROR != 0) return error.WaitFailed;
+        saw_fd = true;
+    }
+    if (saw_fd) return;
+    return error.WaitFailed;
 }
 
-/// Core HTTP request implementation.
+/// One established connection: the socket plus its SSL.
+const Conn = struct {
+    fd: posix.fd_t,
+    ssl_ptr: *c.SSL,
+};
+
+/// Core HTTP request implementation. Owns one socket, one SSL and one
+/// kqueue for the exchange's duration.
 fn request(
+    ssl_ctx: *c.SSL_CTX,
     allocator: Allocator,
     method: []const u8,
     url: []const u8,
     body: ?[]const u8,
     content_type: ?[]const u8,
-    ca_file: ?[]const u8,
+    options: RequestOptions,
 ) HttpError!Response {
+    const start_ns = monotonicNs();
+    const connect_deadline = @min(
+        start_ns + @as(u64, options.connect_timeout_ms) * std.time.ns_per_ms,
+        options.deadline_ns,
+    );
+
     // Parse URL: https://host[:port]/path
     const parsed = parseUrl(url) orelse return HttpError.InvalidUrl;
 
-    // DNS resolution
-    const fd = tcpConnect(parsed.host, parsed.port) orelse return HttpError.ConnectionFailed;
-    defer posix.close(fd);
+    // Zero-terminated host for SNI and the certificate identity check.
+    var host_buf: [256]u8 = undefined;
+    if (parsed.host.len >= host_buf.len) return HttpError.InvalidUrl;
+    @memcpy(host_buf[0..parsed.host.len], parsed.host);
+    host_buf[parsed.host.len] = 0;
+    const host_z: [*:0]const u8 = @ptrCast(&host_buf);
 
-    // TLS setup
-    const ssl_ctx = initTlsClient(ca_file) orelse return HttpError.TlsInitFailed;
-    defer c.SSL_CTX_free(ssl_ctx);
+    const kq = posix.kqueue() catch return HttpError.ConnectionFailed;
+    defer posix.close(kq);
+
+    const conn = try connectAndHandshake(ssl_ctx, kq, host_z, parsed, connect_deadline, options);
+    defer posix.close(conn.fd);
+    defer {
+        // One non-blocking shutdown, never waited on (freebsd-ktls D6).
+        _ = c.SSL_shutdown(conn.ssl_ptr);
+        c.SSL_free(conn.ssl_ptr);
+    }
+
+    try sendRequest(conn, kq, allocator, method, parsed, body, content_type, options);
+    return readResponse(conn, kq, allocator, options);
+}
+
+/// DNS, TCP connect and TLS handshake under the connect-phase deadline
+/// (freebsd-ktls D5: the handshake is part of connect). Caller owns the
+/// returned fd and SSL.
+fn connectAndHandshake(
+    ssl_ctx: *c.SSL_CTX,
+    kq: posix.fd_t,
+    host_z: [*:0]const u8,
+    parsed: ParsedUrl,
+    connect_deadline: u64,
+    options: RequestOptions,
+) HttpError!Conn {
+    // DNS resolution (blocking, IPv4, no deadline -- see module header).
+    const peer = resolvePeer(parsed.host, parsed.port) orelse return HttpError.DnsResolutionFailed;
+    const fd = peer.fd;
+    errdefer posix.close(fd);
+
+    // Non-blocking connect against the connect-phase deadline.
+    posix.connect(fd, @ptrCast(&peer.addr), @sizeOf(std.c.sockaddr.in)) catch |err| switch (err) {
+        error.WouldBlock, error.ConnectionPending => {
+            waitIo(
+                kq,
+                fd,
+                std.c.EVFILT.WRITE,
+                connect_deadline,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
+                error.Timeout => HttpError.Timeout,
+                error.Cancelled => HttpError.Cancelled,
+                error.WaitFailed => HttpError.ConnectionFailed,
+            };
+            // SO_ERROR is read-and-clear; the socket latched the connect
+            // outcome while it was pending.
+            posix.getsockoptError(fd) catch return HttpError.ConnectionFailed;
+        },
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.AddressInUse,
+        error.AddressNotAvailable,
+        error.AddressFamilyNotSupported,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.ConnectionTimedOut,
+        error.FileNotFound,
+        error.SystemResources,
+        error.Unexpected,
+        => return HttpError.ConnectionFailed,
+    };
 
     const ssl_ptr = c.SSL_new(ssl_ctx) orelse return HttpError.TlsInitFailed;
-    defer c.SSL_free(ssl_ptr);
+    errdefer c.SSL_free(ssl_ptr);
 
     _ = c.SSL_set_fd(ssl_ptr, @intCast(fd));
+    _ = c.SSL_set_tlsext_host_name(ssl_ptr, host_z);
 
-    // Set SNI hostname
-    var host_buf: [256]u8 = undefined;
-    if (parsed.host.len < host_buf.len) {
-        @memcpy(host_buf[0..parsed.host.len], parsed.host);
-        host_buf[parsed.host.len] = 0;
-        _ = c.SSL_set_tlsext_host_name(ssl_ptr, &host_buf);
-    }
+    // Pin the certificate identity to the URL host (T357/S8): VERIFY_PEER
+    // alone (chain to a CA) accepts any publicly trusted certificate for
+    // any name, so the IdP token/introspection/JWKS endpoints could be
+    // answered by the wrong server without this.
+    const verify_param = c.SSL_get0_param(ssl_ptr) orelse return HttpError.TlsInitFailed;
+    if (c.X509_VERIFY_PARAM_set1_host(verify_param, host_z, 0) != 1)
+        return HttpError.TlsInitFailed;
 
-    // TLS handshake (blocking)
-    if (c.SSL_connect(ssl_ptr) != 1) return HttpError.TlsHandshakeFailed;
-
-    // Build HTTP request
-    var req_buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&req_buf);
-    const w = fbs.writer();
-
-    w.print("{s} {s} HTTP/1.1\r\n", .{ method, parsed.path }) catch return HttpError.OutOfMemory;
-    w.print("Host: {s}\r\n", .{parsed.host_header}) catch return HttpError.OutOfMemory;
-    w.writeAll("User-Agent: xmppd/0.1\r\n") catch return HttpError.OutOfMemory;
-    w.writeAll("Connection: close\r\n") catch return HttpError.OutOfMemory;
-
-    if (body) |b| {
-        if (content_type) |ct| {
-            w.print("Content-Type: {s}\r\n", .{ct}) catch return HttpError.OutOfMemory;
+    // TLS handshake on the non-blocking socket.
+    while (true) {
+        c.ERR_clear_error();
+        const ret = c.SSL_connect(ssl_ptr);
+        if (ret == 1) return .{ .fd = fd, .ssl_ptr = ssl_ptr };
+        const ssl_err = c.SSL_get_error(ssl_ptr, ret);
+        switch (ssl_err) {
+            c.SSL_ERROR_WANT_READ => waitIo(
+                kq,
+                fd,
+                std.c.EVFILT.READ,
+                connect_deadline,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
+                error.Timeout => HttpError.Timeout,
+                error.Cancelled => HttpError.Cancelled,
+                error.WaitFailed => HttpError.TlsHandshakeFailed,
+            },
+            c.SSL_ERROR_WANT_WRITE => waitIo(
+                kq,
+                fd,
+                std.c.EVFILT.WRITE,
+                connect_deadline,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
+                error.Timeout => HttpError.Timeout,
+                error.Cancelled => HttpError.Cancelled,
+                error.WaitFailed => HttpError.TlsHandshakeFailed,
+            },
+            else => return HttpError.TlsHandshakeFailed,
         }
-        w.print("Content-Length: {d}\r\n", .{b.len}) catch return HttpError.OutOfMemory;
+    }
+}
+
+/// Build the request head plus body into one heap buffer (secrets in the
+/// body are wiped before free) and write it out. On WANT_* the retry
+/// passes the identical pointer and length (freebsd-ktls D3).
+fn sendRequest(
+    conn: Conn,
+    kq: posix.fd_t,
+    allocator: Allocator,
+    method: []const u8,
+    parsed: ParsedUrl,
+    body: ?[]const u8,
+    content_type: ?[]const u8,
+    options: RequestOptions,
+) HttpError!void {
+    const body_len = if (body) |b| b.len else 0;
+    const req_buf = allocator.alloc(
+        u8,
+        MAX_HEAD_SIZE + body_len,
+    ) catch return HttpError.OutOfMemory;
+    defer {
+        std.crypto.secureZero(u8, req_buf);
+        allocator.free(req_buf);
     }
 
-    w.writeAll("\r\n") catch return HttpError.OutOfMemory;
-    if (body) |b| {
-        w.writeAll(b) catch return HttpError.OutOfMemory;
+    var head_len: usize = 0;
+    {
+        var w: std.Io.Writer = .fixed(req_buf[0..MAX_HEAD_SIZE]);
+        w.print("{s} {s} HTTP/1.1\r\n", .{ method, parsed.path }) catch return HttpError.InvalidUrl;
+        w.print("Host: {s}\r\n", .{parsed.host_header}) catch return HttpError.InvalidUrl;
+        w.writeAll("User-Agent: xmppd/0.1\r\n") catch return HttpError.InvalidUrl;
+        w.writeAll("Connection: close\r\n") catch return HttpError.InvalidUrl;
+        if (body) |b| {
+            if (content_type) |ct| {
+                w.print("Content-Type: {s}\r\n", .{ct}) catch return HttpError.InvalidUrl;
+            }
+            w.print("Content-Length: {d}\r\n", .{b.len}) catch return HttpError.InvalidUrl;
+        }
+        w.writeAll("\r\n") catch return HttpError.InvalidUrl;
+        head_len = w.buffered().len;
     }
+    if (body) |b| @memcpy(req_buf[head_len..][0..b.len], b);
+    const req_data = req_buf[0 .. head_len + body_len];
 
-    const req_data = fbs.getWritten();
-
-    // Send request
     var sent: usize = 0;
     while (sent < req_data.len) {
-        const ret = c.SSL_write(ssl_ptr, @ptrCast(req_data.ptr + sent), @intCast(req_data.len - sent));
-        if (ret <= 0) return HttpError.TlsWriteFailed;
-        sent += @intCast(ret);
+        c.ERR_clear_error();
+        const ret = c.SSL_write(
+            conn.ssl_ptr,
+            @ptrCast(req_data.ptr + sent),
+            @intCast(req_data.len - sent),
+        );
+        if (ret > 0) {
+            sent += @intCast(ret);
+            continue;
+        }
+        const ssl_err = c.SSL_get_error(conn.ssl_ptr, ret);
+        switch (ssl_err) {
+            c.SSL_ERROR_WANT_READ => waitIo(
+                kq,
+                conn.fd,
+                std.c.EVFILT.READ,
+                options.deadline_ns,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
+                error.Timeout => HttpError.Timeout,
+                error.Cancelled => HttpError.Cancelled,
+                error.WaitFailed => HttpError.TlsWriteFailed,
+            },
+            c.SSL_ERROR_WANT_WRITE => waitIo(
+                kq,
+                conn.fd,
+                std.c.EVFILT.WRITE,
+                options.deadline_ns,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
+                error.Timeout => HttpError.Timeout,
+                error.Cancelled => HttpError.Cancelled,
+                error.WaitFailed => HttpError.TlsWriteFailed,
+            },
+            else => return HttpError.TlsWriteFailed,
+        }
+    }
+}
+
+/// Read the response against the total deadline, parse it and copy the
+/// body into a right-sized allocation the caller owns.
+fn readResponse(
+    conn: Conn,
+    kq: posix.fd_t,
+    allocator: Allocator,
+    options: RequestOptions,
+) HttpError!Response {
+    const resp_buf = allocator.alloc(u8, MAX_RESPONSE_SIZE) catch return HttpError.OutOfMemory;
+    defer {
+        std.crypto.secureZero(u8, resp_buf);
+        allocator.free(resp_buf);
     }
 
-    // Read response
-    var resp_buf = allocator.alloc(u8, MAX_RESPONSE_SIZE) catch return HttpError.OutOfMemory;
-    errdefer allocator.free(resp_buf);
     var total: usize = 0;
-
-    while (total < MAX_RESPONSE_SIZE) {
-        const ret = c.SSL_read(ssl_ptr, @ptrCast(resp_buf.ptr + total), @intCast(MAX_RESPONSE_SIZE - total));
-        if (ret <= 0) break; // EOF or error
-        total += @intCast(ret);
+    var saw_eof = false;
+    while (!saw_eof) {
+        if (total >= MAX_RESPONSE_SIZE) return HttpError.ResponseTooLarge;
+        if (total > 0) switch (responseComplete(resp_buf[0..total])) {
+            .done => |need| {
+                total = need;
+                break;
+            },
+            .incomplete => {},
+            .err => |herr| return herr,
+        };
+        c.ERR_clear_error();
+        const ret = c.SSL_read(
+            conn.ssl_ptr,
+            @ptrCast(resp_buf.ptr + total),
+            @intCast(MAX_RESPONSE_SIZE - total),
+        );
+        if (ret > 0) {
+            total += @intCast(ret);
+            continue;
+        }
+        const ssl_err = c.SSL_get_error(conn.ssl_ptr, ret);
+        switch (ssl_err) {
+            c.SSL_ERROR_ZERO_RETURN => saw_eof = true,
+            c.SSL_ERROR_SYSCALL => {
+                if (total > 0) {
+                    saw_eof = true;
+                } else {
+                    return HttpError.TlsReadFailed;
+                }
+            },
+            c.SSL_ERROR_WANT_READ => waitIo(
+                kq,
+                conn.fd,
+                std.c.EVFILT.READ,
+                options.deadline_ns,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
+                error.Timeout => HttpError.Timeout,
+                error.Cancelled => HttpError.Cancelled,
+                error.WaitFailed => HttpError.TlsReadFailed,
+            },
+            c.SSL_ERROR_WANT_WRITE => waitIo(
+                kq,
+                conn.fd,
+                std.c.EVFILT.WRITE,
+                options.deadline_ns,
+                options.cancel_fd,
+            ) catch |werr| return switch (werr) {
+                error.Timeout => HttpError.Timeout,
+                error.Cancelled => HttpError.Cancelled,
+                error.WaitFailed => HttpError.TlsReadFailed,
+            },
+            else => return HttpError.TlsReadFailed,
+        }
     }
 
-    if (total == 0) {
-        allocator.free(resp_buf);
-        return HttpError.InvalidResponse;
-    }
+    if (total == 0) return HttpError.InvalidResponse;
 
-    // Parse status line: "HTTP/1.1 200 OK\r\n..."
     const resp_data = resp_buf[0..total];
-    const status = parseStatusLine(resp_data) orelse {
-        allocator.free(resp_buf);
-        return HttpError.InvalidResponse;
-    };
+    const status = parseStatusLine(resp_data) orelse return HttpError.InvalidResponse;
 
     // Find body (after \r\n\r\n)
-    const header_end = std.mem.indexOf(u8, resp_data, "\r\n\r\n") orelse {
-        allocator.free(resp_buf);
-        return HttpError.InvalidResponse;
-    };
-
+    const header_end = std.mem.indexOf(
+        u8,
+        resp_data,
+        "\r\n\r\n",
+    ) orelse return HttpError.InvalidResponse;
     const body_start = header_end + 4;
-    const response_body = resp_data[body_start..];
+
+    // A declared Content-Length bounds the body; a short body at EOF is a
+    // truncated response. A chunked body is validated and decoded in
+    // place; its decoded bytes never outgrow their framing.
+    var body_slice = resp_data[body_start..];
+    switch (parseResponseHead(resp_data[0..header_end])) {
+        .invalid => return HttpError.InvalidResponse,
+        .too_large => return HttpError.ResponseTooLarge,
+        .eof_body => {},
+        .length => |cl| {
+            if (body_slice.len < cl) return HttpError.InvalidResponse;
+            body_slice = body_slice[0..cl];
+        },
+        .chunked => switch (chunkedScan(body_slice, body_slice)) {
+            .incomplete, .invalid => return HttpError.InvalidResponse,
+            .too_large => return HttpError.ResponseTooLarge,
+            .done => |cs| body_slice = body_slice[0..cs.decoded],
+        },
+    }
 
     // Copy body to a right-sized allocation
-    const body_copy = allocator.alloc(u8, response_body.len) catch {
-        allocator.free(resp_buf);
-        return HttpError.OutOfMemory;
-    };
-    @memcpy(body_copy, response_body);
-    allocator.free(resp_buf);
+    const body_copy = allocator.alloc(u8, body_slice.len) catch return HttpError.OutOfMemory;
+    @memcpy(body_copy, body_slice);
 
     return Response{
         .status = status,
         .body = body_copy,
         .allocator = allocator,
     };
+}
+
+/// What a response head declares, once the header terminator is present.
+const HeadParse = union(enum) {
+    /// No Content-Length header: the body runs to EOF.
+    eof_body,
+    /// Declared body length within MAX_RESPONSE_SIZE.
+    length: usize,
+    /// A sole "chunked" Transfer-Encoding (RFC 9112 6.1).
+    chunked,
+    /// A malformed Content-Length, disagreeing duplicates, a
+    /// Transfer-Encoding that is not a sole "chunked", or a
+    /// Transfer-Encoding alongside a Content-Length.
+    invalid,
+    /// A declared length above MAX_RESPONSE_SIZE.
+    too_large,
+};
+
+/// RFC 9110 5.6.2 tchar: the field-name alphabet.
+fn isTchar(ch: u8) bool {
+    return switch (ch) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        '0'...'9', 'A'...'Z', 'a'...'z' => true,
+        else => false,
+    };
+}
+
+/// RFC 9110 5.1 field-line grammar: field-name is 1*tchar, then ":",
+/// then field-value bytes (VCHAR / SP / HTAB / obs-text). A bare CR
+/// (RFC 9112 2.2), NUL or any other CTL is never a field-value byte.
+fn validFieldLine(line: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+    if (colon == 0) return false;
+    for (line[0..colon]) |ch| {
+        if (!isTchar(ch)) return false;
+    }
+    for (line[colon + 1 ..]) |ch| {
+        if (ch != '\t' and (ch < ' ' or ch == 0x7f)) return false;
+    }
+    return true;
+}
+
+/// Parse the response head: strict Content-Length (decimal digits only,
+/// duplicates must agree) and Transfer-Encoding only as a sole "chunked".
+fn parseResponseHead(head: []const u8) HeadParse {
+    var content_length: ?usize = null;
+    var transfer_chunked = false;
+    var it = std.mem.splitScalar(u8, head, '\n');
+    _ = it.next(); // status line
+    while (it.next()) |line_raw| {
+        const line = std.mem.trimRight(u8, line_raw, "\r");
+        // One grammar check for every field line: name 1*tchar, value
+        // bytes VCHAR / SP / HTAB / obs-text. It subsumes the obs-fold
+        // (RFC 9112 5.2), empty-name, no-colon and
+        // whitespace-before-colon rejections, and keeps a bare CR, NUL
+        // or other CTL from hiding a field (RFC 9112 2.2). An empty
+        // line is a tolerated bare-LF artifact of the line split.
+        if (line.len > 0 and !validFieldLine(line)) return .invalid;
+        const te_prefix = "transfer-encoding:";
+        // ">=" counts a bare "Transfer-Encoding:" (empty value) as a
+        // declared TE. The one implemented coding is a sole "chunked"
+        // (RFC 9112 6.1); a stacked coding or "identity" is not, and
+        // the coding is applied only once.
+        if (line.len >= te_prefix.len and
+            std.ascii.eqlIgnoreCase(line[0..te_prefix.len], te_prefix))
+        {
+            const value = std.mem.trim(u8, line[te_prefix.len..], " \t");
+            if (!std.ascii.eqlIgnoreCase(value, "chunked")) return .invalid;
+            if (transfer_chunked) return .invalid;
+            transfer_chunked = true;
+        }
+        const cl_prefix = "content-length:";
+        // A bare "Content-Length:" reaches the value parse and dies on
+        // the empty value (RFC 9112 6.3 rule 5), like every other bad CL.
+        if (line.len < cl_prefix.len) continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..cl_prefix.len], cl_prefix)) continue;
+        const value = std.mem.trim(u8, line[cl_prefix.len..], " \t");
+        const cl = parseContentLengthValue(value) catch |err| switch (err) {
+            error.Invalid => return .invalid,
+            error.Overflow => return .too_large,
+        };
+        if (cl > MAX_RESPONSE_SIZE) return .too_large;
+        if (content_length) |prev| {
+            if (prev != cl) return .invalid;
+        } else {
+            content_length = cl;
+        }
+    }
+    if (transfer_chunked) {
+        // RFC 9112 6.3 rules 3 and 5: a message carrying both a
+        // Transfer-Encoding and a Content-Length is ambiguous framing;
+        // reject it rather than guess.
+        if (content_length != null) return .invalid;
+        return .chunked;
+    }
+    return if (content_length) |cl| .{ .length = cl } else .eof_body;
+}
+
+/// A Content-Length field value: ASCII digits only. No sign, no
+/// underscores, nothing after the trim. Overflow of usize is reported
+/// apart so the caller can answer ResponseTooLarge.
+fn parseContentLengthValue(value: []const u8) error{ Invalid, Overflow }!usize {
+    if (value.len == 0) return error.Invalid;
+    for (value) |ch| {
+        if (ch < '0' or ch > '9') return error.Invalid;
+    }
+    return std.fmt.parseInt(usize, value, 10) catch return error.Overflow;
+}
+
+/// Longest accepted chunk-size line (size digits plus extensions).
+const MAX_CHUNK_SIZE_LINE: usize = 256;
+
+/// One hex digit of a chunk size.
+fn hexDigit(ch: u8) ?u8 {
+    return switch (ch) {
+        '0'...'9' => ch - '0',
+        'a'...'f' => ch - 'a' + 10,
+        'A'...'F' => ch - 'A' + 10,
+        else => null,
+    };
+}
+
+/// RFC 9112 6.1.1 chunk-ext grammar, strict:
+/// *( ";" token [ "=" ( token / quoted-string ) ] ) with no BWS.
+/// Semantics are ignored; the shape is bounded so an extension cannot
+/// hide framing or grow without limit.
+fn validChunkExtensions(exts: []const u8) bool {
+    var i: usize = 0;
+    while (i < exts.len) {
+        if (exts[i] != ';') return false;
+        i += 1;
+        const name_start = i;
+        while (i < exts.len and isTchar(exts[i])) : (i += 1) {}
+        if (i == name_start) return false;
+        if (i < exts.len and exts[i] == '=') {
+            i += 1;
+            if (i < exts.len and exts[i] == '"') {
+                i += 1;
+                var closed = false;
+                while (i < exts.len) {
+                    const ch = exts[i];
+                    if (ch == '"') {
+                        closed = true;
+                        i += 1;
+                        break;
+                    }
+                    if (ch == '\\' and i + 1 < exts.len) {
+                        const esc = exts[i + 1];
+                        if (esc != '\t' and (esc < ' ' or esc == 0x7f)) return false;
+                        i += 2;
+                        continue;
+                    }
+                    if (ch != '\t' and (ch < ' ' or ch == 0x7f)) return false;
+                    i += 1;
+                }
+                if (!closed) return false;
+            } else {
+                const val_start = i;
+                while (i < exts.len and isTchar(exts[i])) : (i += 1) {}
+                if (i == val_start) return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Completeness of a partially read chunked body.
+const ChunkScan = union(enum) {
+    incomplete,
+    invalid,
+    too_large,
+    /// Complete stream: `framed` bytes of chunk coding produced
+    /// `decoded` body bytes.
+    done: struct { framed: usize, decoded: usize },
+};
+
+/// Strict RFC 9112 6.1 chunked-body scan: bounded chunk-size lines and
+/// sizes, strictly shaped extensions (ignored), and no trailers (the
+/// last chunk is followed by one empty line). With `out` non-null the
+/// decoded body is copied into it while scanning; `out.len >= data.len`
+/// is the caller's contract, and the decoded body never outgrows its
+/// framing, so `out` may alias `data`.
+fn chunkedScan(data: []const u8, out: ?[]u8) ChunkScan {
+    var pos: usize = 0;
+    var decoded: usize = 0;
+    while (true) {
+        // Chunk-size line: 1*HEXDIT [ chunk-ext ] CRLF, bounded.
+        const line_start = pos;
+        var line_end: usize = pos;
+        while (line_end < data.len and data[line_end] != '\n') : (line_end += 1) {
+            if (line_end - line_start >= MAX_CHUNK_SIZE_LINE) return .invalid;
+        }
+        if (line_end >= data.len) return .incomplete;
+        if (line_end == line_start or data[line_end - 1] != '\r') return .invalid;
+        const content = data[line_start .. line_end - 1];
+
+        var size: usize = 0;
+        var i: usize = 0;
+        while (i < content.len and content[i] != ';') : (i += 1) {
+            const digit = hexDigit(content[i]) orelse return .invalid;
+            // size stays <= MAX_RESPONSE_SIZE, so the multiply cannot
+            // approach usize overflow.
+            size = size * 16 + digit;
+            if (size > MAX_RESPONSE_SIZE) return .too_large;
+        }
+        if (i == 0) return .invalid;
+        if (!validChunkExtensions(content[i..])) return .invalid;
+        pos = line_end + 1;
+
+        if (size == 0) {
+            // Last chunk: trailers are rejected, so the stream ends
+            // with one empty line (RFC 9112 6.1.2).
+            if (pos + 2 > data.len) return .incomplete;
+            if (!std.mem.eql(u8, data[pos..][0..2], "\r\n")) return .invalid;
+            pos += 2;
+            return .{ .done = .{ .framed = pos, .decoded = decoded } };
+        }
+
+        const data_end = std.math.add(usize, pos, size) catch return .too_large;
+        if (data_end + 2 > data.len) return .incomplete;
+        if (!std.mem.eql(u8, data[data_end..][0..2], "\r\n")) return .invalid;
+        if (out) |dst| {
+            const dst_slice = dst[decoded..][0..size];
+            const src_slice = data[pos..data_end];
+            // dst_slice starts at or before src_slice (decoded bytes
+            // never outgrow the framing consumed), so a forward byte
+            // copy is safe even with `out` aliasing `data`.
+            for (dst_slice, src_slice) |*d, s| d.* = s;
+        }
+        decoded += size;
+        if (decoded > MAX_RESPONSE_SIZE) return .too_large;
+        pos = data_end + 2;
+    }
+}
+
+/// Completeness of a partially read response.
+const Complete = union(enum) {
+    /// Still in flight (or no Content-Length was declared, in which case
+    /// EOF terminates the body).
+    incomplete,
+    /// Total bytes a complete response occupies.
+    done: usize,
+    /// The head is already unusable; stop reading.
+    err: HttpError,
+};
+
+/// Decide whether `data` holds a complete response.
+fn responseComplete(data: []const u8) Complete {
+    const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return .incomplete;
+    const body_start = header_end + 4;
+    switch (parseResponseHead(data[0..header_end])) {
+        .invalid => return .{ .err = HttpError.InvalidResponse },
+        .too_large => return .{ .err = HttpError.ResponseTooLarge },
+        .eof_body => return .incomplete,
+        .length => |cl| {
+            const need = std.math.add(usize, body_start, cl) catch
+                return .{ .err = HttpError.ResponseTooLarge };
+            if (data.len >= need) return .{ .done = need };
+            return .incomplete;
+        },
+        .chunked => switch (chunkedScan(data[body_start..], null)) {
+            .incomplete => return .incomplete,
+            .invalid => return .{ .err = HttpError.InvalidResponse },
+            .too_large => return .{ .err = HttpError.ResponseTooLarge },
+            .done => |cs| {
+                const need = std.math.add(usize, body_start, cs.framed) catch
+                    return .{ .err = HttpError.ResponseTooLarge };
+                return .{ .done = need };
+            },
+        },
+    }
 }
 
 // ============================================================================
@@ -231,7 +881,17 @@ fn parseUrl(url: []const u8) ?ParsedUrl {
 // TCP Connection
 // ============================================================================
 
-fn tcpConnect(host: []const u8, port: u16) ?posix.fd_t {
+/// A resolved peer: a fresh non-blocking socket plus the first resolved
+/// IPv4 address to connect it to.
+const ResolvedPeer = struct {
+    fd: posix.fd_t,
+    addr: std.c.sockaddr.in,
+};
+
+/// Resolve `host` (blocking getaddrinfo, IPv4 only -- a documented limit to
+/// be replaced by the async resolver work item A8/X2) and return a
+/// non-blocking socket plus the first resolved address, or null.
+fn resolvePeer(host: []const u8, port: u16) ?ResolvedPeer {
     // Null-terminate hostname for getaddrinfo
     var host_buf: [256]u8 = undefined;
     if (host.len >= host_buf.len) return null;
@@ -252,15 +912,21 @@ fn tcpConnect(host: []const u8, port: u16) ?posix.fd_t {
     defer c.freeaddrinfo(result.?);
 
     const ai = result.?;
-    const fd = std.c.socket(@intCast(ai.ai_family), @intCast(ai.ai_socktype), @intCast(ai.ai_protocol));
+    if (ai.ai_addrlen > @sizeOf(std.c.sockaddr.in)) return null;
+    const fd = std.c.socket(
+        @intCast(ai.ai_family),
+        @as(u32, @intCast(ai.ai_socktype)) | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
+        @intCast(ai.ai_protocol),
+    );
     if (fd < 0) return null;
 
-    if (std.c.connect(fd, @ptrCast(ai.ai_addr), ai.ai_addrlen) != 0) {
-        _ = std.c.close(fd);
-        return null;
-    }
+    var addr: std.c.sockaddr.in = std.mem.zeroes(std.c.sockaddr.in);
+    @memcpy(
+        std.mem.asBytes(&addr)[0..ai.ai_addrlen],
+        @as([*]const u8, @ptrCast(ai.ai_addr))[0..ai.ai_addrlen],
+    );
 
-    return fd;
+    return .{ .fd = fd, .addr = addr };
 }
 
 // ============================================================================
@@ -302,19 +968,45 @@ fn initTlsClient(ca_file: ?[]const u8) ?*c.SSL_CTX {
 // Response Parsing
 // ============================================================================
 
+/// RFC 9112 4: status-line = HTTP-version SP status-code SP [ reason-phrase ]
+/// Only HTTP/1.1 and HTTP/1.0 are spoken here. The code is exactly three
+/// DIGIT (never signed, never longer) and is followed by the second SP,
+/// even for an empty reason phrase. Reason-phrase bytes are HTAB / SP /
+/// VCHAR / obs-text, never a CTL.
 fn parseStatusLine(data: []const u8) ?u16 {
-    // "HTTP/1.1 200 OK\r\n" or "HTTP/1.0 200 OK\r\n"
-    if (data.len < 12) return null;
-    if (!std.mem.startsWith(u8, data, "HTTP/1.")) return null;
-
-    // Find the status code (starts at offset 9 after "HTTP/1.X ")
-    if (data[8] != ' ') return null;
-    return std.fmt.parseInt(u16, data[9..12], 10) catch null;
+    const line_end = std.mem.indexOf(u8, data, "\r\n") orelse return null;
+    const line = data[0..line_end];
+    // "HTTP/1.X " + 3 DIGIT + " " is the shortest accepted shape.
+    if (line.len < 13) return null;
+    const version = line[0..8];
+    if (!std.mem.eql(u8, version, "HTTP/1.1") and
+        !std.mem.eql(u8, version, "HTTP/1.0"))
+    {
+        return null;
+    }
+    if (line[8] != ' ') return null;
+    var code: u16 = 0;
+    for (line[9..12]) |ch| {
+        if (ch < '0' or ch > '9') return null;
+        code = code * 10 + @as(u16, ch - '0');
+    }
+    if (line[12] != ' ') return null;
+    for (line[13..]) |ch| {
+        if (ch != '\t' and (ch < ' ' or ch == 0x7f)) return null;
+    }
+    return code;
 }
 
 // ============================================================================
 // Tests
 // ============================================================================
+
+fn testOptions(deadline_ms: u64, connect_timeout_ms: u32) RequestOptions {
+    return .{
+        .deadline_ns = monotonicNs() + deadline_ms * std.time.ns_per_ms,
+        .connect_timeout_ms = connect_timeout_ms,
+    };
+}
 
 test "parseUrl: basic https" {
     const p = parseUrl("https://auth.example.com/auth/v1/.well-known/openid-configuration").?;
@@ -355,4 +1047,957 @@ test "parseStatusLine: invalid" {
     try std.testing.expect(parseStatusLine("") == null);
     try std.testing.expect(parseStatusLine("GARBAGE") == null);
     try std.testing.expect(parseStatusLine("HTTP/1.1") == null);
+}
+
+test "parseStatusLine: strict RFC 9112 4 shape" {
+    // The code is exactly three DIGIT followed by the second SP; the
+    // reason phrase may be empty but is never a CTL. The old
+    // fixed-offset parse accepted most shapes below silently.
+    try std.testing.expect(parseStatusLine("HTTP/1.1 2000 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 200OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 +12 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 -00 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.1 20a OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/1.9 200 OK\r\n") == null);
+    try std.testing.expect(parseStatusLine("HTTP/2.0 200 OK\r\n") == null);
+    // The second SP is required even for an empty reason phrase.
+    try std.testing.expect(parseStatusLine("HTTP/1.1 204\r\n") == null);
+    try std.testing.expectEqual(@as(u16, 204), parseStatusLine("HTTP/1.1 204 \r\n").?);
+    // Reason phrases may carry VCHAR, SP, HTAB and obs-text.
+    try std.testing.expectEqual(
+        @as(u16, 200),
+        parseStatusLine("HTTP/1.1 200 fine : yes\ttab\r\n").?,
+    );
+    // A bare CR inside the reason phrase is a CTL, not a phrase byte.
+    try std.testing.expect(parseStatusLine("HTTP/1.1 200 bad\rph\r\n") == null);
+}
+
+/// Loopback TCP listener that accepts connections into a hold array and
+/// never answers, then closes everything after `hold_ms`. Publishes the
+/// bound port once listening.
+fn serveHanging(hold_ms: u64, port_out: *std.atomic.Value(u16)) void {
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return;
+    posix.listen(listen_fd, 4) catch return;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
+    port_out.store(std.mem.bigToNative(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(hold_ms));
+    var held: [8]posix.fd_t = undefined;
+    var held_len: usize = 0;
+    defer for (held[0..held_len]) |conn_fd| posix.close(conn_fd);
+    while (std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 100) catch 0;
+        if (pn <= 0) continue;
+        if (held_len >= held.len) continue;
+        const conn_fd = posix.accept(listen_fd, null, null, 0) catch continue;
+        held[held_len] = conn_fd;
+        held_len += 1;
+    }
+}
+
+test "a server that accepts and never answers hits the connect deadline" {
+    var port = std.atomic.Value(u16).init(0);
+    // The stub lets go after ~3 s so a build whose handshake wait lost its
+    // deadline fails this test on elapsed time instead of hanging forever.
+    const th = try std.Thread.spawn(.{}, serveHanging, .{ @as(u64, 3000), &port });
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    var client = try Client.init(null);
+    defer client.deinit();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{p});
+
+    const t0 = monotonicNs();
+    try std.testing.expectError(
+        HttpError.Timeout,
+        client.get(std.testing.allocator, url, testOptions(2000, 200)),
+    );
+    const elapsed_ms = (monotonicNs() - t0) / std.time.ns_per_ms;
+    try std.testing.expect(elapsed_ms >= 150 and elapsed_ms <= 1000);
+}
+
+test "a refused connection is ConnectionFailed" {
+    // Bind an ephemeral port, then drop it: the port now refuses.
+    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in));
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try posix.getsockname(listen_fd, @ptrCast(&addr), &alen);
+    const port = std.mem.bigToNative(u16, addr.port);
+    posix.close(listen_fd);
+
+    var client = try Client.init(null);
+    defer client.deinit();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{port});
+    try std.testing.expectError(
+        HttpError.ConnectionFailed,
+        client.get(std.testing.allocator, url, testOptions(2000, 2000)),
+    );
+}
+
+fn closeAfter(fds: []const posix.fd_t, delay_ms: u64) void {
+    std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+    for (fds) |fd| posix.close(fd);
+}
+
+test "closing the cancel pipe aborts an in-flight request" {
+    var port = std.atomic.Value(u16).init(0);
+    const th = try std.Thread.spawn(.{}, serveHanging, .{ @as(u64, 10000), &port });
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+
+    const closer = try std.Thread.spawn(
+        .{},
+        closeAfter,
+        .{ @as([]const posix.fd_t, pipe_fds[1..2]), @as(u64, 100) },
+    );
+    defer closer.join();
+
+    var client = try Client.init(null);
+    defer client.deinit();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{p});
+
+    const t0 = monotonicNs();
+    try std.testing.expectError(
+        HttpError.Cancelled,
+        client.get(std.testing.allocator, url, .{
+            .deadline_ns = monotonicNs() + 10 * std.time.ns_per_s,
+            .connect_timeout_ms = 10000,
+            .cancel_fd = pipe_fds[0],
+        }),
+    );
+    const elapsed_ms = (monotonicNs() - t0) / std.time.ns_per_ms;
+    try std.testing.expect(elapsed_ms < 1000);
+}
+
+// --- Hostname verification (T357/S8): in-process TLS server with a     ---
+// --- self-signed cert generated at test time (no key material in-tree). ---
+
+/// Write a fresh self-signed cert+key for "localhost" into `dir` via the
+/// system OpenSSL CLI. Returns error.SkipZigTest when the tool is missing.
+/// openssl writes key-generation progress to stderr, which can exceed a
+/// small output cap under load, so allow generous room for it.
+fn genTestCert(dir: std.fs.Dir) !void {
+    const r = std.process.Child.run(.{
+        .allocator = std.testing.allocator,
+        .argv = &.{
+            "openssl",                      "req",           "-x509",
+            "-newkey",                      "rsa:2048",      "-nodes",
+            "-subj",                        "/CN=localhost", "-addext",
+            "subjectAltName=DNS:localhost", "-days",         "1",
+            "-keyout",                      "key.pem",       "-out",
+            "cert.pem",
+        },
+        .cwd_dir = dir,
+        .max_output_bytes = 64 * 1024,
+    }) catch return error.SkipZigTest;
+    defer std.testing.allocator.free(r.stdout);
+    defer std.testing.allocator.free(r.stderr);
+    switch (r.term) {
+        .Exited => |code| {
+            // Older OpenSSL lacks -addext; retry through the config-less
+            // openssl x509 path only if the first form failed.
+            if (code != 0) return error.SkipZigTest;
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+/// Serve exactly `n` tiny HTTP replies on a loopback TLS listener, then
+/// close. Runs on its own thread; a deadline keeps the test from hanging
+/// when the client never connects (or aborts mid-handshake, the point of
+/// the mismatch case).
+fn serveTlsResponses(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    n: *std.atomic.Value(usize),
+) void {
+    const method = c.TLS_server_method() orelse return;
+    const ctx = c.SSL_CTX_new(method) orelse return;
+    defer c.SSL_CTX_free(ctx);
+    if (c.SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1) return;
+    if (c.SSL_CTX_use_PrivateKey_file(ctx, key_path, c.SSL_FILETYPE_PEM) != 1) return;
+
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return;
+    posix.listen(listen_fd, 4) catch return;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
+    n.store(std.mem.nativeToBig(u16, addr.port), .release);
+
+    // Serve the two expected clients. Only an accepted connection counts
+    // against that budget: poll timeouts and transient accept errors retry
+    // within the deadline, so a pause between client requests is harmless.
+    const deadline = std.time.milliTimestamp() + 10000;
+    var served: usize = 0;
+    while (served < 2 and std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 500) catch 0;
+        if (pn <= 0) continue;
+        const conn = posix.accept(listen_fd, null, null, 0) catch continue;
+        defer posix.close(conn);
+        const ssl_ptr = c.SSL_new(ctx) orelse continue;
+        defer c.SSL_free(ssl_ptr);
+        _ = c.SSL_set_fd(ssl_ptr, conn);
+        served += 1;
+        if (c.SSL_accept(ssl_ptr) != 1) continue; // mismatch case dies here
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len and std.time.milliTimestamp() < deadline) {
+            const r = c.SSL_read(ssl_ptr, @ptrCast(buf[total..].ptr), @intCast(buf.len - total));
+            if (r <= 0) break;
+            total += @intCast(r);
+            if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+        }
+        const resp = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nok\r\n";
+        _ = c.SSL_write(ssl_ptr, resp.ptr, resp.len);
+    }
+}
+
+test "TLS: hostname check pins the certificate identity to the URL host (T357)" {
+    // Throwaway cert/key generated at test time so no key material ever
+    // sits in the tree.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var port = std.atomic.Value(usize).init(0);
+    const th = try std.Thread.spawn(
+        .{},
+        serveTlsResponses,
+        .{ cert_path.ptr, key_path.ptr, &port },
+    );
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    var url_buf: [128]u8 = undefined;
+    const good_url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{p});
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    var resp = try client.get(std.testing.allocator, good_url, testOptions(5000, 2000));
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+
+    // Same endpoint by IP literal: certificate is for 'localhost', so the
+    // handshake must fail before S8 would have silently accepted it.
+    const bad_url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{p});
+    try std.testing.expectError(
+        HttpError.TlsHandshakeFailed,
+        client.get(std.testing.allocator, bad_url, testOptions(5000, 2000)),
+    );
+}
+
+test "TLS: the in-process server keeps serving across a pause between requests" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var port = std.atomic.Value(usize).init(0);
+    const th = try std.Thread.spawn(
+        .{},
+        serveTlsResponses,
+        .{ cert_path.ptr, key_path.ptr, &port },
+    );
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    var first_buf: [128]u8 = undefined;
+    const first_url = try std.fmt.bufPrint(&first_buf, "https://localhost:{d}/", .{p});
+    var resp1 = try client.get(std.testing.allocator, first_url, testOptions(5000, 2000));
+    defer resp1.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp1.status);
+
+    // The pause outlasts one poll timeout in the server thread.
+    std.Thread.sleep(700 * std.time.ns_per_ms);
+
+    var second_buf: [128]u8 = undefined;
+    const second_url = try std.fmt.bufPrint(&second_buf, "https://localhost:{d}/", .{p});
+    var resp2 = try client.get(std.testing.allocator, second_url, testOptions(5000, 2000));
+    defer resp2.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp2.status);
+}
+
+test "responseComplete: a huge declared length is rejected, not panicked on" {
+    const huge = "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\nx";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.ResponseTooLarge },
+        responseComplete(huge),
+    );
+    // Above usize entirely.
+    const beyond = "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\nx";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.ResponseTooLarge },
+        responseComplete(beyond),
+    );
+    // Above the response cap but parseable.
+    var capped_buf: [160]u8 = undefined;
+    const capped = try std.fmt.bufPrint(
+        &capped_buf,
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n",
+        .{MAX_RESPONSE_SIZE + 1},
+    );
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.ResponseTooLarge },
+        responseComplete(capped),
+    );
+}
+
+test "responseComplete: Content-Length accepts digits only" {
+    const cases = [_][]const u8{ "+5", "1_0", "-1", "abc", "", "0x10" };
+    for (cases) |value| {
+        var buf: [160]u8 = undefined;
+        const head = try std.fmt.bufPrint(
+            &buf,
+            "HTTP/1.1 200 OK\r\nContent-Length: {s}\r\n\r\n",
+            .{value},
+        );
+        try std.testing.expectEqual(
+            Complete{ .err = HttpError.InvalidResponse },
+            responseComplete(head),
+        );
+    }
+}
+
+test "responseComplete: duplicate Content-Length headers must agree" {
+    const agree = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = agree.len }, responseComplete(agree));
+
+    const disagree = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 7\r\n\r\nhellow!";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(disagree),
+    );
+}
+
+test "responseComplete: an empty Content-Length value is rejected" {
+    // RFC 9112 6.3 rule 5: an invalid Content-Length in a response is an
+    // unrecoverable error, never EOF framing.
+    const bare = "HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(bare),
+    );
+    // The invalid first value is not dropped as a duplicate either.
+    const then_valid = "HTTP/1.1 200 OK\r\nContent-Length:\r\nContent-Length: 3\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(then_valid),
+    );
+}
+
+test "responseComplete: chunked framing completes at the last chunk" {
+    // RFC 9112 6.1: a sole "chunked" Transfer-Encoding frames the body
+    // by the chunk stream, not by Content-Length or EOF.
+    const resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhelo\r\n0\r\n\r\n";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+    // Declared bytes that have not arrived keep the response in flight.
+    const partial = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhel";
+    try std.testing.expectEqual(Complete.incomplete, responseComplete(partial));
+    // A stream without its last chunk never completes.
+    const no_last = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhelo\r\n";
+    try std.testing.expectEqual(Complete.incomplete, responseComplete(no_last));
+    // Bytes past the last chunk are not part of the message.
+    const junk = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nNEXT";
+    try std.testing.expectEqual(
+        Complete{ .done = junk.len - 4 },
+        responseComplete(junk),
+    );
+}
+
+test "responseComplete: Transfer-Encoding accepts only a sole chunked" {
+    const identity = "HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(identity),
+    );
+    const empty = "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(empty),
+    );
+    const stacked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(stacked),
+    );
+    const twice = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n" ++
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(twice),
+    );
+    // RFC 9112 6.3 rules 3 and 5: TE alongside Content-Length is
+    // ambiguous framing; reject rather than guess.
+    const both = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(both),
+    );
+}
+
+test "responseComplete: chunked streams are strict and bounded" {
+    const head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    // Chunk data must sit exactly between its CRLFs.
+    const short_data = head ++ "4\r\nhel\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(short_data),
+    );
+    // A malformed chunk-size digit is invalid.
+    const bad_size = head ++ "z\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(bad_size),
+    );
+    // Trailers are rejected: the last chunk is followed by one empty
+    // line, not by trailer fields.
+    const trailer = head ++ "0\r\nX-T: 1\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(trailer),
+    );
+    // A huge declared chunk size is too large, like a huge CL.
+    var huge_buf: [160]u8 = undefined;
+    const huge = try std.fmt.bufPrint(
+        &huge_buf,
+        head ++ "{x}\r\n",
+        .{MAX_RESPONSE_SIZE + 1},
+    );
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.ResponseTooLarge },
+        responseComplete(huge),
+    );
+    // Overflowing the size parse is too large, not a wrap.
+    const overflow = head ++ "ffffffffffffffffff\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.ResponseTooLarge },
+        responseComplete(overflow),
+    );
+}
+
+test "responseComplete: chunk extensions are bounded and ignored" {
+    const head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    // Strictly shaped extensions decode as if absent.
+    const ext = head ++ "5;a=b;c=\"x y\"\r\nhello\r\n0;end\r\n\r\n";
+    try std.testing.expectEqual(Complete{ .done = ext.len }, responseComplete(ext));
+    // An unterminated quoted string is not a shape to trust.
+    const bad_ext = head ++ "5;a=\"unterminated\r\nhello\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(bad_ext),
+    );
+    // The chunk-size line bound keeps an extension from growing past
+    // MAX_CHUNK_SIZE_LINE.
+    var long_val: [300]u8 = undefined;
+    @memset(&long_val, 'x');
+    var big_buf: [512]u8 = undefined;
+    const big_line = try std.fmt.bufPrint(
+        &big_buf,
+        head ++ "1;a={s}\r\nx\r\n0\r\n\r\n",
+        .{long_val[0..]},
+    );
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(big_line),
+    );
+}
+
+test "responseComplete: whitespace before the colon is rejected" {
+    // RFC 9112 5.1: a field name followed by whitespace before the colon
+    // is a malformed header, not a renamed one. The spaced TE must not
+    // smuggle chunk text in as the body and the spaced CL must not
+    // silently degrade to EOF framing.
+    const te = "HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\n\r\n4\r\nhelo\r\n0\r\n\r\n";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(te),
+    );
+    const cl = "HTTP/1.1 200 OK\r\nContent-Length : 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(cl),
+    );
+    const tab = "HTTP/1.1 200 OK\r\nContent-Length\t: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(tab),
+    );
+    // An unrelated header with a spaced name is malformed the same way.
+    const other = "HTTP/1.1 200 OK\r\nX-Trace : 1\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(other),
+    );
+    // RFC 9112 5.2 obs-fold: a folded field must not fall back to EOF
+    // framing. The folded line carries no colon, so only the leading-SP
+    // rule catches it.
+    const folded_te = "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n chunked\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(folded_te),
+    );
+    const folded_cl = "HTTP/1.1 200 OK\r\nContent-Length:\r\n 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(folded_cl),
+    );
+    // A fold after an unrelated header is rejected the same way.
+    const folded_bare = "HTTP/1.1 200 OK\r\nX-A: 1\r\n\tchunked\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(folded_bare),
+    );
+    // An empty Transfer-Encoding value still declares the field.
+    const empty_te = "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(empty_te),
+    );
+}
+
+test "responseComplete: a reason phrase may contain ' : '" {
+    // The status line is skipped before the field rules run, so a
+    // reason phrase with whitespace before a colon stays accepted.
+    const resp = "HTTP/1.1 200 OK : yes\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
+test "responseComplete: an empty field name is rejected" {
+    // RFC 9110 5.1: field-name is one or more tchar; ": v" has none.
+    const resp = "HTTP/1.1 200 OK\r\n: v\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(resp),
+    );
+}
+
+test "responseComplete: an empty line inside the head does not panic" {
+    // A bare-LF blank line sits before the CRLFCRLF terminator. The
+    // line.len > 0 guard keeps the field-line grammar check from
+    // treating it as a malformed field.
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\n\nX: 1\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
+test "responseComplete: a one-character field name is accepted" {
+    // tchar allows a single-character name; only the truly empty name
+    // is invalid.
+    const resp = "HTTP/1.1 200 OK\r\nX: 1\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = resp.len }, responseComplete(resp));
+}
+
+test "responseComplete: a field line without a colon is rejected" {
+    // RFC 9112 5: a field line is field-name ":". A colonless TE must
+    // not slip past the TE reject as an unknown line either.
+    const garbage = "HTTP/1.1 200 OK\r\ngarbage\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(garbage),
+    );
+    const te = "HTTP/1.1 200 OK\r\nTransfer-Encoding chunked\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(te),
+    );
+}
+
+test "responseComplete: field lines follow the grammar, not a blocklist" {
+    // RFC 9110 5.6.2 and RFC 9112 2.2: a bare CR, NUL or other CTL in a
+    // field line must not hide a field or reframe the body. Both shapes
+    // below used to degrade to EOF framing with the field gone.
+    const nul_te = "HTTP/1.1 200 OK\r\n\x00Transfer-Encoding: chunked\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(nul_te),
+    );
+    const cr_cl = "HTTP/1.1 200 OK\r\nX-A: a\rContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(cr_cl),
+    );
+    // A CTL in the name is not tchar and DEL is a CTL byte in the value.
+    const vt_cl = "HTTP/1.1 200 OK\r\n\x0bContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(vt_cl),
+    );
+    const del = "HTTP/1.1 200 OK\r\nX-A: a\x7fb\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(
+        Complete{ .err = HttpError.InvalidResponse },
+        responseComplete(del),
+    );
+    // HTAB in a value is a field-value byte (RFC 9110 5.5).
+    const htab = "HTTP/1.1 200 OK\r\nX-A: a\tb\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(Complete{ .done = htab.len }, responseComplete(htab));
+}
+
+test "responseComplete: framing ends the body at Content-Length" {
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloTAIL";
+    try std.testing.expectEqual(
+        Complete{ .done = resp.len - 4 },
+        responseComplete(resp),
+    );
+    // Declared but not yet arrived: still in flight.
+    const partial = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello";
+    try std.testing.expectEqual(Complete.incomplete, responseComplete(partial));
+    // No Content-Length at all: EOF terminates, so never "done".
+    const no_cl = "HTTP/1.1 200 OK\r\n\r\nhello";
+    try std.testing.expectEqual(Complete.incomplete, responseComplete(no_cl));
+}
+
+/// Serve one raw HTTP response over TLS (whatever bytes the test asks),
+/// then close. Unlike serveTlsResponses this does not build a correct
+/// header: malformed framing is the point.
+fn serveTlsRawResponse(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    response: []const u8,
+    port_out: *std.atomic.Value(u16),
+) void {
+    const method = c.TLS_server_method() orelse return;
+    const ctx = c.SSL_CTX_new(method) orelse return;
+    defer c.SSL_CTX_free(ctx);
+    if (c.SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1) return;
+    if (c.SSL_CTX_use_PrivateKey_file(ctx, key_path, c.SSL_FILETYPE_PEM) != 1) return;
+
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return;
+    posix.listen(listen_fd, 4) catch return;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
+    port_out.store(std.mem.bigToNative(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + 10000;
+    while (std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 500) catch 0;
+        if (pn <= 0) continue;
+        const conn_fd = posix.accept(listen_fd, null, null, 0) catch continue;
+        defer posix.close(conn_fd);
+        const ssl_ptr = c.SSL_new(ctx) orelse continue;
+        defer c.SSL_free(ssl_ptr);
+        _ = c.SSL_set_fd(ssl_ptr, conn_fd);
+        if (c.SSL_accept(ssl_ptr) != 1) continue;
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len and std.time.milliTimestamp() < deadline) {
+            const r = c.SSL_read(ssl_ptr, @ptrCast(buf[total..].ptr), @intCast(buf.len - total));
+            if (r <= 0) break;
+            total += @intCast(r);
+            if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+        }
+        _ = c.SSL_write(ssl_ptr, response.ptr, @intCast(response.len));
+        // Close_notify: the client reads a clean EOF, not a transport error.
+        _ = c.SSL_shutdown(ssl_ptr);
+        return;
+    }
+}
+
+const RawStub = struct {
+    thread: std.Thread,
+    port: u16,
+};
+
+/// Spin up a raw-response TLS stub and return it with its bound port.
+fn startRawStub(cert_path: [*:0]const u8, key_path: [*:0]const u8, response: []const u8) !RawStub {
+    var port = std.atomic.Value(u16).init(0);
+    const stub = try std.Thread.spawn(
+        .{},
+        serveTlsRawResponse,
+        .{ cert_path, key_path, response, &port },
+    );
+    errdefer stub.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(port.load(.acquire) != 0);
+    return .{ .thread = stub, .port = port.load(.acquire) };
+}
+
+test "TLS: a huge Content-Length errors instead of panicking the worker" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var url_buf: [128]u8 = undefined;
+    const stub = try startRawStub(
+        cert_path,
+        key_path,
+        "HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\nx",
+    );
+    defer stub.thread.join();
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
+
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    try std.testing.expectError(
+        HttpError.ResponseTooLarge,
+        client.get(std.testing.allocator, url, testOptions(5000, 2000)),
+    );
+}
+
+test "TLS: a body shorter than Content-Length is InvalidResponse" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    // Declares 100 bytes, delivers 4, then closes.
+    var url_buf: [128]u8 = undefined;
+    const stub = try startRawStub(
+        cert_path,
+        key_path,
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nok\r\n",
+    );
+    defer stub.thread.join();
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
+
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    try std.testing.expectError(
+        HttpError.InvalidResponse,
+        client.get(std.testing.allocator, url, testOptions(5000, 2000)),
+    );
+}
+
+test "TLS: bytes past Content-Length are not part of the body" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var url_buf: [128]u8 = undefined;
+    const stub = try startRawStub(
+        cert_path,
+        key_path,
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloTAIL",
+    );
+    defer stub.thread.join();
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
+
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    var resp = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("hello", resp.body);
+}
+
+test "TLS: a Content-Length body comes back exactly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var port = std.atomic.Value(usize).init(0);
+    const th = try std.Thread.spawn(
+        .{},
+        serveTlsResponses,
+        .{ cert_path.ptr, key_path.ptr, &port },
+    );
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{p});
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    var resp = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("ok\r\n", resp.body);
+}
+
+test "TLS: a chunked body is decoded exactly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var url_buf: [128]u8 = undefined;
+    const stub = try startRawStub(
+        cert_path,
+        key_path,
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+    );
+    defer stub.thread.join();
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{stub.port});
+
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    var resp = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("hello world", resp.body);
 }

@@ -39,7 +39,7 @@ const Engine = @import("engine.zig").Engine;
 const Handle = @import("engine.zig").Handle;
 const Parser = @import("parser.zig").Parser;
 const Transport = @import("transport.zig").Transport;
-const resolver_mod = @import("resolver.zig");
+const resolver_mod = @import("dns_async");
 const Resolution = resolver_mod.Resolution;
 
 const Jid = xmpp.Jid;
@@ -70,6 +70,11 @@ pub const SessionConfig = struct {
     user: []const u8,
     password: []const u8,
     resource: []const u8 = "",
+    /// Permit SASL PLAIN (over TLS only — the FSM's tls_required default
+    /// still applies). Off by default so a server listing PLAIN first
+    /// cannot steer the client onto it; enable for servers whose auth
+    /// backend cannot do SCRAM (e.g. OIDC password-grant stores).
+    allow_plain: bool = false,
     /// XEP-0198 resume id when reattaching to a detached stream.
     sm_resume_id: []const u8 = "",
     /// The OLD session's inbound stanza count ('h'), paired with
@@ -170,9 +175,20 @@ pub const Session = struct {
     /// TLSA records to authenticate with when no resolution is attached
     /// (test seam; hostname sessions get records per target from DNS).
     dane_records: []const dns.TlsaRecord = &.{},
-    /// True while the handshake runs in DANE mode (VERIFY_NONE context):
-    /// the TLSA match runs on this thread the moment it completes.
+    /// True while the handshake runs under DANE: the TLSA records are armed
+    /// on the connection before the handshake and the verdict is read when it
+    /// completes (fail closed).
     pending_dane: bool = false,
+    /// DANE handshake state for the current target (owned; released on
+    /// destroy and when a new target is dialed).
+    dane_state: ?ssl.DaneState = null,
+    dane_prepared: ssl.DanePrepared = .dane,
+    /// Reference identifiers for the current target, copied here because the
+    /// DANE state only borrows them. [0] is the service domain (SNI), [1] the
+    /// SRV target when it differs.
+    dane_name_buf: [2][256]u8 = undefined,
+    dane_names: [2][]const u8 = undefined,
+    dane_name_count: usize = 0,
 
     /// Requested TCP port for direct connects (kept for target iteration).
     port: u16 = 0,
@@ -180,6 +196,10 @@ pub const Session = struct {
     /// Freed in destroy.
     resolution: ?Resolution = null,
     target_index: usize = 0,
+    /// Any target skipped for a failed TLSA lookup during this
+    /// resolution. Stays set across connectNextTarget calls so a
+    /// later connect failure cannot mask the more informative reason.
+    tlsa_failed: bool = false,
 
     host: []const u8 = "",
     domain: []const u8 = "",
@@ -220,6 +240,11 @@ pub const Session = struct {
     /// Bytes queued while write_buf is pinned by a pending TLS write and
     /// full, in order; moved into write_buf once the pending write completes.
     overflow: std.ArrayListUnmanaged(u8) = .{},
+    /// Bumped every time the parse state restarts mid-stream (TLS upgrade
+    /// completion, stream restart after SASL). parseAll snapshots it before
+    /// each handler call so a reset detected afterwards can drop the stale
+    /// read-buffer cursor instead of compacting past it (T-41BBBA06).
+    stream_epoch: u32 = 0,
 
     /// Bound full JID (set when the bind result is parsed).
     bound_jid: ?Jid = null,
@@ -265,6 +290,7 @@ pub const Session = struct {
         self.user = try a.dupe(u8, config.user);
         self.password = try a.dupe(u8, config.password);
         self.resource = try a.dupe(u8, config.resource);
+        self.fsm.allow_plain = config.allow_plain;
         self.fsm.resume_id = try a.dupe(u8, config.sm_resume_id);
         self.resume_h = config.sm_resume_h;
     }
@@ -290,6 +316,7 @@ pub const Session = struct {
             }
         }
         if (self.resolution) |*r| r.deinitOn(allocator);
+        self.releaseDane();
         if (self.fd >= 0) posix.close(self.fd);
         allocator.free(self.read_buf);
         allocator.free(self.write_buf);
@@ -300,6 +327,9 @@ pub const Session = struct {
     pub fn fail(self: *Session, allocator: std.mem.Allocator, reason: []const u8) void {
         _ = allocator;
         if (self.failed) return;
+        // A death mid-resolve releases the resolver job before the
+        // phase flag flips; no DNS callback may land afterwards.
+        if (self.phase == .resolving) self.engine.cancelResolve(self.handle);
         self.failed = true;
         self.alive = false;
         self.phase = .dead;
@@ -353,6 +383,15 @@ pub const Session = struct {
                 break :blk tp.tlsConn() orelse return self.fail(engine.allocator, "tls-missing");
             };
             const res = tc.doHandshake() catch {
+                // A DANE handshake that fails did so because the TLSA record
+                // did not authenticate the peer (the context has no other
+                // anchor). Name the actual cause before failing closed.
+                if (self.pending_dane) {
+                    self.pending_dane = false;
+                    self.logDaneHandshakeFailure(tc);
+                    self.fail(engine.allocator, "tls-dane-mismatch");
+                    return;
+                }
                 self.fail(engine.allocator, "tls-handshake-failed");
                 return;
             };
@@ -377,17 +416,19 @@ pub const Session = struct {
                         };
                         self.fsm.cb_available = self.cb_mode.isPlus();
                     }
-                    // DANE mode authenticated nothing yet: match the peer
-                    // chain against the TLSA records now, fail closed.
+                    // DANE verified the peer inside the handshake
+                    // (SSL_VERIFY_PEER with only TLSA anchors); read the
+                    // verdict and fail closed.
                     if (self.pending_dane) {
                         self.pending_dane = false;
-                        self.verifyDane(engine, tc) orelse return;
+                        self.finishDane(engine, tc) orelse return;
                     }
                     // Reset the reader, then tell the FSM TLS is up; the FSM
                     // action re-sends <stream:stream> (RFC 6120 §4.6).
                     self.reader.reset();
                     self.read_len = 0;
                     if (self.parser) |pr| pr.reset();
+                    self.stream_epoch +%= 1;
                     self.handleAction(engine, self.fsm.feed(.tls_established));
                     return;
                 },
@@ -464,9 +505,10 @@ pub const Session = struct {
                 if (r.targets.len == 0) return self.fail(self.engine.allocator, "resolve-failed");
                 self.resolution = r;
                 self.target_index = 0;
+                self.tlsa_failed = false;
                 self.connectNextTarget(true);
             },
-            .nxdomain, .failed => self.fail(self.engine.allocator, "resolve-failed"),
+            .nxdomain, .service_unavailable, .failed => self.fail(self.engine.allocator, "resolve-failed"),
         }
     }
 
@@ -477,6 +519,15 @@ pub const Session = struct {
         const res = &(self.resolution.?);
         while (self.target_index < res.targets.len) {
             const t = res.targets[self.target_index];
+            // ADR-13 applies to dane_first: a failed TLSA lookup is a
+            // temporary failure of the target itself - DANE cannot be
+            // checked and PKIX fallback is not allowed, so the target
+            // is never dialed. Other policies do not consult TLSA.
+            if (t.tlsa_status == .lookup_failed and self.tls_policy == .dane_first) {
+                self.tlsa_failed = true;
+                self.target_index += 1;
+                continue;
+            }
             if (!first and self.fd >= 0) posix.close(self.fd);
 
             self.fd = posix.socket(t.addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
@@ -501,13 +552,24 @@ pub const Session = struct {
             self.write_registered = true;
             return;
         }
-        self.fail(engine.allocator, "connect-failed");
+        self.fail(engine.allocator, if (self.tlsa_failed) "tlsa-lookup-failed" else "connect-failed");
     }
 
     fn armWrite(self: *Session, engine: *Engine) void {
         if (self.write_registered) return;
         engine.addWrite(self.fd, self.handle);
         self.write_registered = true;
+    }
+
+    /// DANE state of the current connection target (ADR-13): the test
+    /// seam's override reads as present; a resolution target reports
+    /// its own status word.
+    fn currentTlsaStatus(self: *const Session) resolver_mod.TlsaStatus {
+        if (self.dane_records.len > 0) return .present;
+        if (self.resolution) |*r| {
+            if (self.target_index < r.targets.len) return r.targets[self.target_index].tlsa_status;
+        }
+        return .absent;
     }
 
     /// TLSA records authenticating the current connection target: the test
@@ -528,54 +590,136 @@ pub const Session = struct {
         return buf[0..domain.len :0].ptr;
     }
 
-    /// DANE match of the just-presented peer chain against the TLSA records
-    /// (engine thread, at handshake completion). Fails the session and
-    /// returns null on mismatch; logs which path validated (T202).
-    fn verifyDane(self: *Session, engine: *Engine, tc: *ssl.SslConn) ?void {
+    /// Read the DANE verdict of a handshake that just completed under
+    /// `SSL_VERIFY_PEER` (engine thread). Fails the session and returns null
+    /// on anything but a verified peer; logs which DANE usage matched.
+    fn finishDane(self: *Session, engine: *Engine, tc: *ssl.SslConn) ?void {
         const allocator = engine.allocator;
-        const leaf = (tc.getPeerCertDer(allocator) catch null) orelse {
-            log.warn("fd={d} tls: no peer certificate for DANE match", .{self.fd});
+        const state = if (self.dane_state) |*s| s else {
+            log.warn("fd={d} tls: DANE armed without state for {s}", .{ self.fd, self.domain });
             self.fail(allocator, "tls-dane-mismatch");
             return null;
         };
-        defer allocator.free(leaf);
-        const chain = tc.getPeerChainDer(allocator) catch &.{};
-        defer {
-            for (chain) |cert| allocator.free(cert);
-            if (chain.len > 0) allocator.free(chain);
-        }
-
-        // Convert lib/dns records to lib/tls records, dropping any with
-        // out-of-range fields (their bytes never authenticate anything).
-        var converted: [16]tls.TlsaRecord = undefined;
-        var n: usize = 0;
-        for (self.currentTlsa()) |r| {
-            if (n == converted.len) break;
-            converted[n] = .{
-                .usage = std.enums.fromInt(tls.TlsaCertUsage, r.usage) orelse continue,
-                .selector = std.enums.fromInt(tls.TlsaSelector, r.selector) orelse continue,
-                .matching_type = std.enums.fromInt(tls.TlsaMatchingType, r.matching_type) orelse continue,
-                .association_data = r.association_data,
-            };
-            n += 1;
-        }
-        if (n == 0) {
-            log.warn("fd={d} tls: TLSA present for {s} but none usable — refusing", .{ self.fd, self.domain });
+        // The RRset survived the module's filtering but OpenSSL accepted none
+        // of it, so no TLSA assertion was checked. The context's store is
+        // empty, so this cannot be a traditional-anchor success; refuse rather
+        // than report a peer we proved nothing about.
+        if (self.dane_prepared == .no_usable_records) {
+            log.warn("fd={d} tls: TLSA for {s} held no usable record — refusing", .{ self.fd, self.domain });
             self.fail(allocator, "tls-dane-mismatch");
             return null;
         }
-
-        switch (tls.validateDane(leaf, chain, converted[0..n])) {
-            .dane_ee_match => log.info("fd={d} tls: DANE-EE match for {s}", .{ self.fd, self.domain }),
-            .dane_ta_match => log.info("fd={d} tls: DANE-TA match for {s}", .{ self.fd, self.domain }),
-            .no_tlsa_records => unreachable, // n > 0 above
-            .dane_failed => {
-                log.warn("fd={d} tls: DANE mismatch for {s} — refusing connection", .{ self.fd, self.domain });
+        const v = tc.daneVerdict(self.dane_prepared, state);
+        switch (v.outcome) {
+            .verified => log.info("fd={d} tls: DANE {s} match for {s}", .{ self.fd, @tagName(v.matched.?.usage), self.domain }),
+            .no_usable_records => {
+                log.warn("fd={d} tls: TLSA for {s} held no usable record — refusing", .{ self.fd, self.domain });
+                self.fail(allocator, "tls-dane-mismatch");
+                return null;
+            },
+            .failed => {
+                log.warn("fd={d} tls: DANE failed for {s}: {s}", .{ self.fd, self.domain, @tagName(v.failure orelse .backend_error) });
                 self.fail(allocator, "tls-dane-mismatch");
                 return null;
             },
         }
     }
+
+    /// Log why a DANE handshake was rejected. The verdict is read off the
+    /// failed SSL: OpenSSL leaves the verification result in place, so the
+    /// named failure survives a handshake that never completed.
+    fn logDaneHandshakeFailure(self: *Session, tc: *ssl.SslConn) void {
+        const state = if (self.dane_state) |*s| s else {
+            log.warn("fd={d} tls: DANE handshake failed for {s}, no state to report", .{ self.fd, self.domain });
+            return;
+        };
+        const v = tc.daneVerdict(self.dane_prepared, state);
+        switch (v.outcome) {
+            .failed => log.warn("fd={d} tls: DANE rejected {s}: {s}", .{ self.fd, self.domain, @tagName(v.failure orelse .backend_error) }),
+            .no_usable_records => log.warn("fd={d} tls: TLSA for {s} held no usable record", .{ self.fd, self.domain }),
+            // A completed handshake cannot land here, but the API allows the
+            // call: report it rather than claim a match.
+            .verified => log.warn("fd={d} tls: DANE reported a match but the handshake failed for {s}", .{ self.fd, self.domain }),
+        }
+    }
+
+    /// The verification path the current target's TLSA RRset demands.
+    const DanePath = enum { dane, pkix, failed };
+
+    /// Build and arm the DANE state for the current target. Called between
+    /// the TCP connect and the STARTTLS upgrade, where the TLSA records and
+    /// the reference identifiers are both known.
+    ///
+    /// The path comes from the module's `mode()` over the usable set, never
+    /// from the lookup status alone: an RRset whose records are all unusable
+    /// is not an assertion, so the module reports `.pkix` and the caller
+    /// verifies against the system store with `applyPkixFallback`, never
+    /// through an empty-store DANE handshake that cannot match (plan
+    /// sections 3 and 7).
+    ///
+    /// `ignore_records` is `.pkix_only`: the state still carries the
+    /// reference identifiers, but no usable record, so the path is PKIX.
+    fn armDane(self: *Session, ignore_records: bool) DanePath {
+        const allocator = self.engine.allocator;
+        self.releaseDane();
+        const tlsa: []const dns.TlsaRecord = if (ignore_records) &.{} else self.currentTlsa();
+        // Reference identifiers: the service domain first (SNI), then the
+        // SRV target host when it differs (RFC 7673 section 4).
+        self.dane_name_count = 0;
+        if (self.domain.len > 0 and self.domain.len < self.dane_name_buf[0].len) {
+            @memcpy(self.dane_name_buf[0][0..self.domain.len], self.domain);
+            self.dane_names[0] = self.dane_name_buf[0][0..self.domain.len];
+            self.dane_name_count = 1;
+        }
+        if (self.resolution) |*r| {
+            if (self.target_index < r.targets.len) {
+                const host = r.targets[self.target_index].host;
+                const differs = self.dane_name_count == 0 or !std.mem.eql(u8, host, self.domain);
+                if (differs and host.len > 0 and host.len < self.dane_name_buf[1].len) {
+                    @memcpy(self.dane_name_buf[1][0..host.len], host);
+                    self.dane_names[self.dane_name_count] = self.dane_name_buf[1][0..host.len];
+                    self.dane_name_count += 1;
+                }
+            }
+        }
+        if (self.dane_name_count == 0) {
+            log.warn("fd={d} tls: no reference identifier for DANE on {s}", .{ self.fd, self.domain });
+            return .failed;
+        }
+
+        // Hand the whole RRset to the module: it owns the per-set cap and
+        // rejects an oversized set, so a matching record is never dropped
+        // here (plan section 4, no truncation).
+        const records = allocator.alloc(ssl.DaneRecord, tlsa.len) catch {
+            log.warn("fd={d} tls: cannot allocate {d} TLSA records for {s}", .{ self.fd, tlsa.len, self.domain });
+            return .failed;
+        };
+        defer allocator.free(records);
+        for (tlsa, 0..) |r, i| {
+            records[i] = .{
+                .usage = r.usage,
+                .selector = r.selector,
+                .matching_type = r.matching_type,
+                .data = r.association_data,
+            };
+        }
+        self.dane_state = ssl.initDane(allocator, .{ .names = self.dane_names[0..self.dane_name_count] }, records) catch |err| {
+            log.warn("fd={d} tls: cannot arm DANE for {s}: {}", .{ self.fd, self.domain, err });
+            return .failed;
+        };
+        const state = if (self.dane_state) |*s| s else return .failed;
+        return switch (state.mode()) {
+            .dane => .dane,
+            .pkix => .pkix,
+        };
+    }
+
+    fn releaseDane(self: *Session) void {
+        if (self.dane_state) |*s| s.deinit();
+        self.dane_state = null;
+        self.pending_dane = false;
+    }
+
     fn disarmWrite(self: *Session, engine: *Engine) void {
         if (!self.write_registered) return;
         engine.removeWrite(self.fd);
@@ -602,6 +746,7 @@ pub const Session = struct {
         const allocator = engine.allocator;
         const parser = self.parser orelse return;
         var pos: usize = 0;
+        var epoch = self.stream_epoch;
         while (true) {
             const ev_start = pos;
             const ev = self.reader.next(self.read_buf[0..self.read_len], &pos) catch {
@@ -642,8 +787,25 @@ pub const Session = struct {
             }
             if (parser.pending) |sev| {
                 parser.pending = null;
+                // STARTTLS hygiene (T215/T250 class): anything buffered past
+                // <proceed/> arrived before our ClientHello could: the peer
+                // spoke out of turn. Reject rather than let the upgrade path
+                // silently discard it.
+                if (sev == .starttls_proceed and pos < self.read_len) {
+                    self.fail(allocator, "protocol-error");
+                    return;
+                }
                 self.handleServerEvent(engine, sev);
                 if (self.failed) return;
+                // A handler that restarts the stream (TLS upgrade zeroed the
+                // read buffer; SASL success reset the reader) invalidates the
+                // cursor: a stale pos must never reach the compaction below
+                // (T-41BBBA06: copyForwards read_buf[50..0] panic).
+                if (self.stream_epoch != epoch) {
+                    if (pos > self.read_len) return;
+                    epoch = self.stream_epoch;
+                    continue;
+                }
             }
         }
         if (pos > 0) {
@@ -715,14 +877,16 @@ pub const Session = struct {
             try self.overflow.appendSlice(self.engine.allocator, data);
             return;
         }
+        // While a TLS write is pinned, EVERY new byte goes to overflow -
+        // even when it would fit: an in-place append would stretch the
+        // pending retry slice, violating the identical-length retry rule
+        // (T253). consumeWritten merges overflow back once the pin clears.
+        const tls_pinned = self.tport != null and self.tport.?.hasPendingWrite();
+        if (tls_pinned) {
+            try self.overflow.appendSlice(self.engine.allocator, data);
+            return;
+        }
         if (self.write_len + data.len > self.write_buf.len) {
-            // Growing would move write_buf under a pending TLS retry.
-            const tls_pinned = self.tport != null and self.tport.?.hasPendingWrite();
-            if (tls_pinned) {
-                try self.overflow.appendSlice(self.engine.allocator, data);
-                return;
-            }
-            // Compact the consumed prefix first — growth is the last resort.
             if (self.write_start > 0) {
                 std.mem.copyForwards(u8, self.write_buf, self.write_buf[self.write_start..self.write_len]);
                 self.write_len -= self.write_start;
@@ -797,7 +961,11 @@ pub const Session = struct {
 
     fn sendSome(self: *Session) !usize {
         const tp = if (self.tport) |*t| t else return error.NoTransport;
-        return switch (try tp.write(self.write_buf[self.write_start..self.write_len])) {
+        // A pending TLS retry must be re-driven with the identical slice
+        // (pointer and length): never with later-appended bytes folded in
+        // (T253; AGENTS.md kTLS rule; SSL_MODE_ENABLE_PARTIAL_WRITE is not set).
+        const end = if (tp.hasPendingWrite()) @min(self.write_start + tp.pinnedLen(), self.write_len) else self.write_len;
+        return switch (try tp.write(self.write_buf[self.write_start..end])) {
             .data => |n| n,
             .would_block => 0,
             .closed => error.ConnectionClosed,
@@ -857,9 +1025,9 @@ pub const Session = struct {
                 const a = self.arena_state.allocator();
                 // The FSM's sm_id/bound_jid borrow parser buffers that the
                 // per-stanza arena reset later frees; consumers hold these
-                // across the session, so copy them (PR #4 review A). OOM
-                // here fails the session (T233): a silently empty sm_id
-                // would make the next resume replay everything.
+                // across the session, so copy them. OOM here fails the
+                // session (T233): a silently empty sm_id would make the
+                // next resume replay everything.
                 self.sm_enabled = self.fsm.sm_enabled;
                 self.sm_resumed = self.fsm.sm_resumed;
                 self.sm_id = a.dupe(u8, self.fsm.sm_id) catch {
@@ -881,8 +1049,8 @@ pub const Session = struct {
                 // 'h' counts stanzas handled since SM enablement. A resume
                 // keeps counting from where the previous session left it
                 // (resume_h); only a fresh .enabled starts at zero
-                // (PR #4 review B: resetting h on resume wraps xmppd's
-                // unacked queue into discardAll and silently loses mail).
+                // (resetting h on resume wraps xmppd's unacked queue into
+                // discardAll and silently loses mail).
                 if (self.parser) |pr| {
                     pr.sm_stanza_count = if (self.fsm.sm_resumed) self.resume_h else 0;
                     pr.after_establishment = true;
@@ -946,6 +1114,7 @@ pub const Session = struct {
                 if (have_tls or self.fsm.state == .awaiting_stream_header_auth) {
                     self.reader.reset();
                     if (self.parser) |pr| pr.reset();
+                    self.stream_epoch +%= 1;
                 }
                 self.queuef("<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='{s}' version='1.0'>", .{self.domain}) catch return error.QueueFailed;
                 self.writeAfter(engine);
@@ -978,29 +1147,58 @@ pub const Session = struct {
             },
             .begin_tls => {
                 const tp = if (self.tport) |*t| t else return error.TlsMissing;
-                // T202 verification decision (before the handshake, since
-                // the PKIX path must verify during it):
-                //   dane_first + TLSA records  -> VERIFY_NONE ctx, manual
-                //     TLSA match at completion (fail closed on mismatch);
-                //   dane_first, no records   -> PKIX ctx (system CA) +
-                //     hostname check on the stream domain;
-                //   none                     -> lab path, no verification.
-                const records = self.currentTlsa();
-                const use_dane = self.tls_policy == .dane_first and records.len > 0;
+                // Verification decision, taken before the handshake because
+                // both real paths must verify during it:
+                //   usable TLSA records -> empty-store DANE context; only a
+                //     TLSA match can authenticate the peer;
+                //   none usable (absent RRset or every record unusable) ->
+                //     PKIX context (system store) with the module's fallback
+                //     identifiers, which never match a subject CN (plan
+                //     rules 2, 6 and 7);
+                //   tlsa_status .lookup_failed       -> never reaches here;
+                //     the target is skipped in connectNextTarget;
+                //   tls_policy .none                 -> lab path, no
+                //     verification and no identifiers.
+                //
+                // Both verified paths need the DANE state: it carries the
+                // reference identifiers the fallback installs.
+                const path: DanePath = if (self.tls_policy == .none) blk: {
+                    self.releaseDane();
+                    break :blk .pkix;
+                } else self.armDane(self.tls_policy == .pkix_only);
                 var sni_buf: [256]u8 = undefined;
                 const sni = domainZ(&sni_buf, self.domain);
-                const ctx = if (use_dane or self.tls_policy == .none)
-                    engine.tls_ctx orelse return error.TlsNotConfigured
-                else
-                    engine.clientCaTlsContext() catch return error.TlsNotConfigured;
+                const ctx = switch (path) {
+                    .dane => engine.clientDaneTlsContext() catch return error.TlsNotConfigured,
+                    .pkix => if (self.tls_policy == .none)
+                        engine.tls_ctx orelse return error.TlsNotConfigured
+                    else
+                        engine.clientCaTlsContext() catch return error.TlsNotConfigured,
+                    .failed => return error.TlsInitFailed,
+                };
                 self.mark(.tls_start);
                 tp.upgradeToTls(ctx, sni) catch return error.TlsInitFailed;
-                if (!use_dane and self.tls_policy != .none) {
-                    const tc = tp.tlsConn() orelse return error.TlsMissing;
-                    const host = sni orelse return error.TlsDomainTooLong;
-                    tc.setHostname(host) catch return error.TlsInitFailed;
+                switch (path) {
+                    .dane => {
+                        // Arm DANE before the handshake: only a TLSA match
+                        // can authenticate the peer, so the handshake itself
+                        // fails closed (no post-handshake window here).
+                        const tc = tp.tlsConn() orelse return error.TlsMissing;
+                        const state = if (self.dane_state) |*s| s else return error.TlsInitFailed;
+                        self.dane_prepared = tc.prepareDane(state) catch return error.TlsInitFailed;
+                    },
+                    .pkix => {
+                        // No usable record: verify against the system store
+                        // with the module's identifiers, so a certificate
+                        // without a DNS SAN cannot match on its subject CN.
+                        if (self.dane_state) |*state| {
+                            const tc = tp.tlsConn() orelse return error.TlsMissing;
+                            tc.applyPkixFallback(state) catch return error.TlsInitFailed;
+                        }
+                    },
+                    .failed => unreachable,
                 }
-                self.pending_dane = use_dane;
+                self.pending_dane = path == .dane;
                 self.tls_handshake = true;
                 _ = self.onRead(engine) catch return error.TlsDriveFailed;
             },
@@ -1188,11 +1386,12 @@ test "write path: appending in place during a pending TLS write keeps the buffer
     s.tport = Transport.initPlain(-1); // only the pin bookkeeping is used
     s.tport.?.tls_pending = s.write_len;
     const pinned = s.write_buf.ptr;
-    // Fits: the retry may legally pass a longer length from the same address.
+    // Fits, but must STILL go to overflow: the pinned retry slice may not
+    // grow (T253; what the retry sees must equal the pinned call exactly).
     try s.queue("<message/>");
     try std.testing.expect(s.write_buf.ptr == pinned);
-    try std.testing.expectEqual(@as(usize, 0), s.overflow.items.len);
-    try std.testing.expectEqualStrings("<presence/><message/>", s.write_buf[0..s.write_len]);
+    try std.testing.expectEqualStrings("<message/>", s.overflow.items);
+    try std.testing.expectEqualStrings("<presence/>", s.write_buf[0..s.write_len]);
 }
 
 test "write path: buffer grows normally when no TLS write is pending" {
@@ -1231,4 +1430,269 @@ test "establishment: allocator failure fails the session (T233)" {
     try std.testing.expect(s.isDead());
     try std.testing.expectEqualStrings("alloc-failed", s.fail_reason_buf[0..s.fail_reason_len]);
     try std.testing.expect(s.phase == .dead);
+}
+
+test "connect: a lookup_failed TLSA target is never dialed" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    const targets = try a.alloc(resolver_mod.Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "t1.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    // The target was skipped before socket(): no fd was opened, and
+    // the failure reports the temporary TLSA reason, not PKIX dialing.
+    try std.testing.expectEqual(@as(posix.fd_t, -1), s.fd);
+    try std.testing.expect(s.isDead());
+    try std.testing.expectEqualStrings("tlsa-lookup-failed", s.fail_reason_buf[0..s.fail_reason_len]);
+}
+
+test "connect: a lookup_failed target falls through to the next target" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    // A live listener gives the second target an instant connect so
+    // the walk provably reached it without dialing the dead one.
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(lfd);
+    const laddr = try std.net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &laddr.any, laddr.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var alen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &alen);
+    const port = std.net.Address.initPosix(@alignCast(&actual)).getPort();
+    try posix.listen(lfd, 4);
+
+    const targets = try a.alloc(resolver_mod.Target, 2);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "dead.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    targets[1] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", port),
+        .host = try a.dupe(u8, "live.test"),
+        .tlsa = &.{},
+        .tlsa_status = .absent,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
+    try std.testing.expectEqual(@as(usize, 1), s.target_index);
+    try std.testing.expect(s.fd >= 0);
+}
+
+fn loopbackListener() !struct { fd: posix.fd_t, port: u16 } {
+    const lfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer posix.close(lfd);
+    const laddr = try std.net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(lfd, &laddr.any, laddr.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var alen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(lfd, &actual, &alen);
+    try posix.listen(lfd, 4);
+    return .{ .fd = lfd, .port = std.net.Address.initPosix(@alignCast(&actual)).getPort() };
+}
+
+test "connect: pkix_only dials a lookup_failed TLSA target" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .pkix_only;
+
+    const l = try loopbackListener();
+    defer posix.close(l.fd);
+    const targets = try a.alloc(resolver_mod.Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", l.port),
+        .host = try a.dupe(u8, "t.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
+    try std.testing.expect(s.fd >= 0);
+}
+
+test "connect: a later connect failure keeps the tlsa-lookup-failed reason" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .dane_first;
+
+    const targets = try a.alloc(resolver_mod.Target, 2);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "dead.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    // A live listener keeps the second target's connect alive through
+    // the first pass, so the second pass reports the exhaustion - and
+    // the temporary TLSA failure remains the informative reason.
+    const l = try loopbackListener();
+    defer posix.close(l.fd);
+    targets[1] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", l.port),
+        .host = try a.dupe(u8, "live.test"),
+        .tlsa = &.{},
+        .tlsa_status = .absent,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
+    try std.testing.expectEqual(@as(usize, 1), s.target_index);
+    // The connect-failure path advances the index before retrying.
+    s.target_index += 1;
+    s.connectNextTarget(false);
+    try std.testing.expect(s.isDead());
+    try std.testing.expectEqualStrings("tlsa-lookup-failed", s.fail_reason_buf[0..s.fail_reason_len]);
+}
+
+test "tls policy: the verification path comes from the usable record set" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+
+    const targets = try a.alloc(resolver_mod.Target, 3);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "absent.test"),
+        .tlsa = &.{},
+        .tlsa_status = .absent,
+        .is_direct_tls = false,
+    };
+    // A SERVFAIL is never a fallback: the target is skipped in
+    // connectNextTarget, so armDane is not reached for it.
+    targets[1] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5223),
+        .host = try a.dupe(u8, "failed.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    var digest: [32]u8 = undefined;
+    @memset(&digest, 0x11);
+    // Owned like a real resolution: deinitOn frees the set and its data.
+    const present_tlsa = try a.alloc(dns.TlsaRecord, 1);
+    present_tlsa[0] = .{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 1,
+        .association_data = try a.dupe(u8, &digest),
+    };
+    targets[2] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5224),
+        .host = try a.dupe(u8, "present.test"),
+        .tlsa = present_tlsa,
+        .tlsa_status = .present,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    // An authenticated absence of TLSA falls back to PKIX; it must never be
+    // read as DANE. The state is still built, because the PKIX fallback
+    // needs the module's reference identifiers.
+    s.tls_policy = .dane_first;
+    s.target_index = 0;
+    try std.testing.expectEqual(Session.DanePath.pkix, s.armDane(false));
+    try std.testing.expect(s.dane_state != null);
+    s.target_index = 2;
+    try std.testing.expectEqual(Session.DanePath.dane, s.armDane(false));
+    // pkix_only ignores the records but keeps the identifiers.
+    s.tls_policy = .pkix_only;
+    try std.testing.expectEqual(Session.DanePath.pkix, s.armDane(true));
+    try std.testing.expect(s.dane_state != null);
+}
+
+test "tls policy: an RRset past the module cap fails instead of truncating" {
+    // A matching record may sit past any local cap, so the whole set must
+    // reach the module: it rejects an oversized set, and a rejection fails
+    // the session rather than handshaking over a truncated one.
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .dane_first;
+
+    const n = ssl.dane_max_records + 1;
+    const tlsa = try a.alloc(dns.TlsaRecord, n);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("no-such-cert", &digest, .{});
+    for (tlsa) |*r| r.* = .{ .usage = 3, .selector = 0, .matching_type = 1, .association_data = try a.dupe(u8, &digest) };
+
+    const targets = try a.alloc(resolver_mod.Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", 5222),
+        .host = try a.dupe(u8, "present.test"),
+        .tlsa = tlsa,
+        .tlsa_status = .present,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    try std.testing.expectEqual(Session.DanePath.failed, s.armDane(false));
+    try std.testing.expect(s.dane_state == null);
+}
+
+test "connect: none dials a lookup_failed TLSA target" {
+    const a = std.testing.allocator;
+    var engine = try Engine.init(a);
+    defer engine.deinit();
+    var s = try Session.init(a);
+    s.engine = &engine;
+    defer s.destroy(a);
+    s.tls_policy = .none;
+
+    const l = try loopbackListener();
+    defer posix.close(l.fd);
+    const targets = try a.alloc(resolver_mod.Target, 1);
+    targets[0] = .{
+        .addr = try std.net.Address.parseIp("127.0.0.1", l.port),
+        .host = try a.dupe(u8, "t.test"),
+        .tlsa = &.{},
+        .tlsa_status = .lookup_failed,
+        .is_direct_tls = false,
+    };
+    s.resolution = .{ .targets = targets };
+
+    s.connectNextTarget(true);
+    try std.testing.expect(!s.isDead());
+    try std.testing.expect(s.fd >= 0);
 }

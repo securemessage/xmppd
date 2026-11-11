@@ -73,6 +73,9 @@ socket = /var/run/xmppd/auth.sock
 # protection, never use on a reachable deployment.
 # rate_limit = true
 
+# Maximum users keys checked for RFC 7622 prepared form at startup (default: 100000)
+# users_scan_limit = 100000
+
 # Rate limiting: max authentication attempts per account per window
 # (relaxed for agent fleets in v0.9.0; the consecutive-failure lockout below
 # remains the brute-force control)

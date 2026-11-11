@@ -18,7 +18,7 @@ const store_keys = @import("store_keys");
 
 const log = std.log.scoped(.block_store);
 
-const NAMESPACE = "blocklist";
+pub const NAMESPACE = backend_mod.registered("blocklist");
 
 pub fn BlockStore(comptime Backend: type) type {
     comptime backend_mod.assertBackend(Backend);
@@ -99,7 +99,6 @@ pub fn BlockStore(comptime Backend: type) type {
         }
     };
 }
-
 
 // ============================================================================
 // Tests
@@ -208,7 +207,6 @@ test "BlockStore: block is idempotent" {
     // Should still have exactly 1 entry (not duplicated)
     try std.testing.expectEqual(@as(usize, 1), list.len);
 }
-
 
 test "S4: oversized block keys fail with KeyTooLong" {
     var db = try MemoryBackend.open("", .{});
