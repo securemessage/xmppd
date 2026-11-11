@@ -2061,6 +2061,54 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ipc_server_tests.step);
     test_step.dependOn(&run_user_store_tests.step);
     test_step.dependOn(&run_auth_handler_tests.step);
+    // xmppd-bench: M3 microbenchmarks (T-61BC40BB). Always ReleaseFast;
+    // bench numbers from a Debug build are useless.
+    // The dependency modules get their own ReleaseFast instances: sharing
+    // xml_mod/sasl_mod etc. would bench Debug code under a plain build.
+    const bench_xml_mod = b.createModule(.{
+        .root_source_file = b.path("lib/xml/reader.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_unicode_mod = b.createModule(.{
+        .root_source_file = b.path("lib/unicode/normalize.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_sasl_mod = b.createModule(.{
+        .root_source_file = b.path("lib/sasl/sasl.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_sasl_mod.addImport("unicode", bench_unicode_mod);
+    const bench_session_map_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/session_map.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_delivery_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/delivery_queue.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addImport("xml", bench_xml_mod);
+    bench_mod.addImport("sasl", bench_sasl_mod);
+    bench_mod.addImport("session_map", bench_session_map_mod);
+    bench_mod.addImport("delivery_queue", bench_delivery_mod);
+    const bench_exe = b.addExecutable(.{
+        .name = "xmppd-bench",
+        .root_module = bench_mod,
+    });
+    const bench_install = b.addInstallArtifact(bench_exe, .{});
+    const bench_step = b.step("bench", "Run the M3 microbenchmarks (ReleaseFast)");
+    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+    bench_step.dependOn(&bench_install.step);
+
     test_step.dependOn(&run_ctl_tests.step);
     test_step.dependOn(&run_supervisor_tests.step);
     test_step.dependOn(&run_master_tests.step);
