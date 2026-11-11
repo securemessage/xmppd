@@ -18,12 +18,53 @@ const protocol = @import("ipc_protocol");
 
 const log = std.log.scoped(.ipc_server);
 
+// FreeBSD: absent from zig's std.c for this version.
+/// FreeBSD 15 maps neither geteuid nor getegid in this zig's std.c; declare
+/// both locally. getgroups backs the cr_groups test.
+extern "c" fn geteuid() std.c.uid_t;
+extern "c" fn getegid() std.c.gid_t;
+extern "c" fn getgroups(ngroups: c_int, grouplist: [*]std.c.gid_t) c_int;
+
+/// LOCAL_PEERCRED peer credentials (FreeBSD sys/un.h + sys/ucred.h):
+/// getpeereid exposes only the EFFECTIVE gid, so a peer carrying the
+/// daemon's group as a supplementary group passes the 0660 socket check
+/// yet fails the gate. cr_groups holds the effective gid first, then the
+/// supplementary groups (T258).
+const SOL_LOCAL: c_int = 0;
+const LOCAL_PEERCRED: c_int = 1;
+const XU_NGROUPS = 16;
+const Xucred = extern struct {
+    cr_version: c_uint,
+    cr_uid: std.c.uid_t,
+    cr_ngroups: c_short,
+    cr_groups: [XU_NGROUPS]std.c.gid_t,
+    cr_pid: std.c.pid_t,
+};
+
+/// Whether an IPC peer may connect: root, the daemon's own uid, or any
+/// peer group (effective or supplementary) equal to the daemon's gid.
+/// Fails closed when LOCAL_PEERCRED is unavailable.
+pub fn peerCredentialsAuthorized(fd: c_int, self_euid: std.c.uid_t, self_egid: std.c.gid_t) bool {
+    var cred: Xucred = undefined;
+    var len: posix.socklen_t = @sizeOf(Xucred);
+    if (std.c.getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, @ptrCast(&cred), &len) != 0) return false;
+    if (len < @sizeOf(Xucred)) return false;
+    if (cred.cr_uid == 0 or cred.cr_uid == self_euid) return true;
+    const n: usize = @intCast(@min(@max(cred.cr_ngroups, 0), XU_NGROUPS));
+    for (cred.cr_groups[0..n]) |g| {
+        if (g == self_egid) return true;
+    }
+    return false;
+}
+
 /// Maximum simultaneous IPC client connections.
 /// 64 worker cap + 16 headroom for xmppctl / s2s / monitoring.
 pub const MAX_IPC_CLIENTS = 80;
 
-/// Per-IPC-client receive buffer size.
-const CLIENT_BUF_SIZE = 8192;
+/// Per-IPC-client receive buffer: one full wire frame (T257: the
+/// 8 KiB buf silently closed the core-s2s lane on 9-16 KiB stanzas).
+/// Heap-allocated per client at accept time (80 slots * 64 KiB).
+const RECV_BUF_SIZE = protocol.MAX_FRAME_SIZE;
 
 /// Hard cap on a client's unsent response backlog. Login storms against
 /// xmppd-auth queue one SCRAM challenge plus one result per in-flight SASL
@@ -37,7 +78,9 @@ const CLIENT_SEND_CAP: usize = 4 << 20;
 /// A connected IPC client (one xmppd-core process).
 pub const IpcConn = struct {
     fd: posix.fd_t = -1,
-    recv_buf: [CLIENT_BUF_SIZE]u8 = undefined,
+    /// Receive buffer, heap-allocated by IpcServer.accept (or tests) with
+    /// RECV_BUF_SIZE bytes. Empty slice when inactive.
+    recv_buf: []u8 = &.{},
     recv_len: usize = 0,
     /// Bytes consumed by the last nextMessage() — compacted on the next call.
     recv_consumed: usize = 0,
@@ -52,7 +95,7 @@ pub const IpcConn = struct {
     /// Read data from the socket. Returns 0 on EOF.
     pub fn recv(self: *IpcConn) !usize {
         self.compactRecvBuf();
-        const space = CLIENT_BUF_SIZE - self.recv_len;
+        const space = self.recv_buf.len - self.recv_len;
         if (space == 0) return error.BufferFull;
 
         const n = posix.read(self.fd, self.recv_buf[self.recv_len .. self.recv_len + space]) catch |err| {
@@ -99,19 +142,27 @@ pub const IpcConn = struct {
     /// Queue a response message for sending. Grows the backlog buffer on
     /// demand; returns SendBufferFull only past CLIENT_SEND_CAP.
     pub fn queueSend(self: *IpcConn, msg: protocol.Message) !void {
-        var frame_buf: [4096]u8 = undefined;
-        const frame_len = try protocol.encode(msg, &frame_buf);
-
         const alloc = self.alloc orelse return error.NoAllocator;
-        const unsent = self.send_list.items.len - self.send_start;
-        if (unsent + frame_len > CLIENT_SEND_CAP) return error.SendBufferFull;
-        // Reclaim the consumed prefix before growing.
+
+        // Encode directly into the backlog: no 64 KiB stack scratch on an
+        // event-loop thread (T257). The cap overflow or encode error
+        // extends nothing (items.len is only bumped on success).
+        var unsent = self.send_list.items.len - self.send_start;
+        // Reclaim the consumed prefix FIRST so the new frame always lands
+        // immediately behind the unsent tail.
         if (self.send_start >= unsent or self.send_start >= 4096) {
             std.mem.copyForwards(u8, self.send_list.items, self.send_list.items[self.send_start..]);
             self.send_list.items.len = unsent;
             self.send_start = 0;
         }
-        try self.send_list.appendSlice(alloc, frame_buf[0..frame_len]);
+        try self.send_list.ensureUnusedCapacity(alloc, protocol.MAX_FRAME_SIZE);
+        const frame_len = protocol.encode(msg, self.send_list.unusedCapacitySlice()) catch |err| {
+            log.err("failed to encode a {s} frame for the wire ({}): dropping it", .{ @tagName(msg), err });
+            return err;
+        };
+        unsent = self.send_list.items.len;
+        if (unsent + frame_len > CLIENT_SEND_CAP) return error.SendBufferFull;
+        self.send_list.items.len += frame_len;
     }
 
     /// Flush the send buffer. Returns bytes written.
@@ -151,6 +202,8 @@ pub const IpcConn = struct {
         }
         if (self.alloc) |a| {
             self.send_list.deinit(a);
+            if (self.recv_buf.len > 0) a.free(self.recv_buf);
+            self.recv_buf = &.{};
             self.alloc = null;
         }
         self.active = false;
@@ -193,6 +246,15 @@ pub const IpcServer = struct {
         try posix.bind(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un));
         try posix.listen(sock, 8);
 
+        // The socket must not be world-writable (T258): group mode is the
+        // operator escape hatch; the directory perms narrow it further.
+        var path_z: [104]u8 = undefined;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+        if (std.c.chmod(@ptrCast(&path_z), 0o660) != 0) {
+            log.warn("chmod(0660) on {s} failed", .{path});
+        }
+
         self.listen_fd = sock;
         @memcpy(self.socket_path[0..path.len], path);
         self.path_len = path.len;
@@ -210,12 +272,30 @@ pub const IpcServer = struct {
             };
         };
 
+        // Peer credentials gate (T258): root, the daemon's own uid,
+        // OR membership in the daemon's group through ANY of the peer's
+        // groups (LOCAL_PEERCRED cr_groups; getpeereid's effective gid made
+        // the 0660 socket mode a silent no-op for supplementary members).
+        // The `ctl` sentinel for maintenance tooling remains for a
+        // follow-up.
+        if (!peerCredentialsAuthorized(client_fd, geteuid(), getegid())) {
+            log.warn("IPC connection rejected: peer is neither root, the daemon uid, nor a member of the daemon group", .{});
+            posix.close(client_fd);
+            return null;
+        }
+
         // Find a free slot
         for (&self.clients, 0..) |*slot, i| {
             if (!slot.active) {
+                const recv_buf = self.allocator.alloc(u8, RECV_BUF_SIZE) catch {
+                    log.err("IPC client rejected: recv buffer allocation failed", .{});
+                    posix.close(client_fd);
+                    return null;
+                };
                 slot.* = IpcConn{};
                 slot.fd = client_fd;
                 slot.alloc = self.allocator;
+                slot.recv_buf = recv_buf;
                 slot.active = true;
                 log.info("IPC client connected, slot={d} fd={d}", .{ i, client_fd });
                 return i;
@@ -343,6 +423,122 @@ test "IpcConn: queueSend buffers past the old 16KiB cap without dropping the cli
     }
     try std.testing.expect(conn.pendingSendBytes() > 16384);
     try std.testing.expect(conn.hasPendingSend());
+}
+
+test "IpcConn: a payload over the old 8 KiB receive buffer arrives through a real socket (T257)" {
+    // Regression: the receiver held an 8 KiB buffer, so a 9-16 KiB
+    // core-to-s2s stanza frame filled the lane and the caller closed it.
+    // This drives a real socketpair end to end.
+    const alloc = std.testing.allocator;
+
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    defer posix.close(fds[0]);
+
+    var conn = IpcConn{
+        .fd = fds[1],
+        .alloc = alloc,
+        .recv_buf = try alloc.alloc(u8, RECV_BUF_SIZE),
+    };
+    defer conn.close();
+
+    const big = try alloc.alloc(u8, 12000);
+    defer alloc.free(big);
+    @memset(big, 's');
+
+    // Encode into a heap scratch the size of one frame (the production
+    // path does this via send_list.unusedCapacitySlice).
+    const scratch = try alloc.alloc(u8, protocol.MAX_FRAME_SIZE);
+    defer alloc.free(scratch);
+    const frame_len = try protocol.encode(.{ .s2s_inbound = .{
+        .from_jid = "eve@them.example",
+        .to_jid = "bob@us.example",
+        .stanza_xml = big,
+    } }, scratch);
+    _ = try posix.write(fds[0], scratch[0..frame_len]);
+
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+
+    _ = try conn.recv();
+    const msg = try conn.nextMessage() orelse return error.NoMessage;
+    try std.testing.expectEqual(@as(usize, 12000), msg.s2s_inbound.stanza_xml.len);
+    try std.testing.expectEqualStrings("eve@them.example", msg.s2s_inbound.from_jid);
+}
+
+test "IpcConn: frames larger than the old 4 KiB encode buffer are deliverable (T257)" {
+    // Regression: encode used a 4096-byte scratch while the wire protocol
+    // allows 64 KiB; an 8 KiB s2s_inbound stanza failed encode and the
+    // caller's catch dropped it without a log.
+    var conn = IpcConn{};
+    conn.fd = -1;
+    conn.alloc = std.testing.allocator;
+    conn.active = true;
+    defer if (conn.alloc) |a| conn.send_list.deinit(a);
+
+    const big = try std.testing.allocator.alloc(u8, 8192);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+
+    try conn.queueSend(.{ .s2s_inbound = .{
+        .from_jid = "a@example.com",
+        .to_jid = "b@example.com",
+        .stanza_xml = big,
+    } });
+    try std.testing.expect(conn.hasPendingSend());
+}
+
+test "IpcServer: socket file lands with mode 0660 (T258)" {
+    const path = "/tmp/xmppd-test-ipc-mode.sock";
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var server = IpcServer.init(std.testing.allocator);
+    try server.listen(path);
+    defer server.deinit();
+
+    const st = try std.fs.cwd().statFile(path);
+    try std.testing.expectEqual(@as(u32, 0o660), @as(u32, @intCast(st.mode & 0o777)));
+}
+
+test "IpcServer: peer gate reads cr_groups, not just the effective gid (T258)" {
+    // AF_UNIX socketpair: both ends carry this process's credentials, so
+    // the gate sees our own uid and full group set.
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const euid = geteuid();
+    const egid = getegid();
+
+    // Same uid: authorized regardless of the daemon gid.
+    try std.testing.expect(peerCredentialsAuthorized(fds[0], euid, egid));
+
+    // The negative and supplementary-group cases need a non-root test
+    // process: root's uid short-circuits every check.
+    if (euid != 0) {
+        // Foreign uid AND foreign gid: rejected.
+        try std.testing.expect(!peerCredentialsAuthorized(fds[0], euid + 1, egid + 1));
+
+        // A daemon gid that is one of our SUPPLEMENTARY groups must
+        // authorize with a foreign uid: getpeereid's effective-gid view
+        // rejected exactly this peer, making the 0660 group bit useless.
+        var groups: [XU_NGROUPS]std.c.gid_t = undefined;
+        const ng = getgroups(XU_NGROUPS, &groups);
+        var supp: ?std.c.gid_t = null;
+        if (ng > 0) {
+            for (groups[0..@intCast(ng)]) |g| {
+                if (g != egid) {
+                    supp = g;
+                    break;
+                }
+            }
+        }
+        if (supp) |g| {
+            try std.testing.expect(peerCredentialsAuthorized(fds[0], euid + 1, g));
+        }
+    }
 }
 
 test "IpcServer: deinit cleans up socket file" {

@@ -244,6 +244,13 @@ pub fn main() !void {
         host, address, port, worker_count, per_worker_sessions,
     });
 
+    if (db_path) |db| {
+        if (try @import("backend").migrationPending(db)) {
+            log.err("an interrupted migrate-precis recovery is pending; rerun 'xmppctl migrate-precis --apply' before starting xmppd-core", .{});
+            return error.MigrationPending;
+        }
+    }
+
     // Open storage backends (shared across workers — backends are thread-safe)
     var op_backend: ?OpBackendType = null;
     var roster_store: ?GenericRosterStore = null;
@@ -538,19 +545,10 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
         server.room_store = ctx.room_store;
         server.muc_host = ctx.muc_host;
 
-        // Load persistent rooms from store (T105) — only rooms owned by this worker
+        // Load persistent rooms from store (T105), only rooms owned by
+        // this worker (S19).
         if (ctx.room_store) |store| {
-            var jid_buf: [256][]const u8 = undefined;
-            const room_count = store.listRooms(&jid_buf) catch 0;
-            const worker_count = server.getWorkerCount();
-            var loaded: usize = 0;
-            for (jid_buf[0..room_count]) |jid| {
-                defer ctx.allocator.free(jid);
-                if (room_registry_mod.roomOwner(jid, worker_count) != worker_id) continue;
-                const config = store.loadRoom(jid) catch continue orelse continue;
-                _ = reg.createRoom(jid, config) catch continue;
-                loaded += 1;
-            }
+            const loaded = room_registry_mod.loadPersistentRooms(reg, store, server.getWorkerCount(), worker_id);
             if (loaded > 0) {
                 log.info("worker {d}: loaded {d} persistent rooms", .{ worker_id, loaded });
             }

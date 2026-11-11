@@ -26,6 +26,10 @@ const log = std.log.scoped(.session_map);
 /// Maximum resource length stored inline in SessionEntry.
 /// Covers all practical resources (RFC allows 1023, but clients use ≤32).
 const MAX_RESOURCE_LEN: usize = 64;
+/// Full JIDs may contain a maximum-length RFC 7622 localpart plus domain and
+/// resource, so bare/full lookup buffers cannot cap at the old 320/384 bytes.
+/// Public so router can assert its stanza bound covers the bind cap.
+pub const MAX_JID_OCTETS: usize = 2112;
 
 /// Result of a session lookup — contains routing information for cross-thread delivery.
 pub const SessionEntry = struct {
@@ -170,7 +174,7 @@ pub const SessionMap = struct {
         @memcpy(entry.resource_buf[0..resource.len], resource);
 
         // Check for duplicate using stack buffer (no allocation)
-        var check_buf: [384]u8 = undefined;
+        var check_buf: [MAX_JID_OCTETS]u8 = undefined;
         const check_jid = buildJidBuf(&check_buf, local, domain, resource) orelse return error.JidTooLong;
         if (self.full_map.contains(check_jid)) {
             return error.AlreadyBound;
@@ -188,7 +192,17 @@ pub const SessionMap = struct {
         const gop = try self.bare_map.getOrPut(bare_key);
         if (!gop.found_existing) gop.value_ptr.* = EntryList{};
 
-        try gop.value_ptr.append(self.allocator, entry, self.max_resources);
+        gop.value_ptr.append(self.allocator, entry, self.max_resources) catch |err| {
+            // Roll back a fresh getOrPut entry so the map never holds a
+            // dangling key or an orphaned empty list (T254).
+            if (!gop.found_existing) {
+                var kv = self.bare_map.fetchRemove(bare_key).?;
+                kv.value.deinit(self.allocator);
+                self.allocator.free(kv.key);
+                bare_owned = false; // key freed above
+            }
+            return err;
+        };
         bare_owned = gop.found_existing;
 
         self.full_map.put(full_key, entry) catch |err| {
@@ -196,7 +210,8 @@ pub const SessionMap = struct {
             _ = gop.value_ptr.orderedRemove(gop.value_ptr.len - 1);
             if (!gop.found_existing) {
                 // fresh getOrPut entry that never housed a binding
-                const kv = self.bare_map.fetchRemove(bare_key).?;
+                var kv = self.bare_map.fetchRemove(bare_key).?;
+                kv.value.deinit(self.allocator);
                 self.allocator.free(kv.key);
                 bare_owned = false; // key freed above
             }
@@ -221,7 +236,7 @@ pub const SessionMap = struct {
         defer if (self.multi_worker) self.lock.unlock();
 
         // Build full JID for lookup
-        var full_buf: [384]u8 = undefined;
+        var full_buf: [MAX_JID_OCTETS]u8 = undefined;
         const full_jid = buildJidBuf(&full_buf, local, domain, resource) orelse return null;
 
         // Remove from full_map
@@ -231,7 +246,7 @@ pub const SessionMap = struct {
         const entry = removed.value;
 
         // Remove from bare_map
-        var bare_buf: [320]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return entry;
 
         if (self.bare_map.getPtr(bare_jid)) |list| {
@@ -271,7 +286,7 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var buf: [384]u8 = undefined;
+        var buf: [MAX_JID_OCTETS]u8 = undefined;
         const full_jid = buildJidBuf(&buf, local, domain, resource) orelse return null;
         return self.full_map.get(full_jid);
     }
@@ -287,7 +302,7 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var bare_buf: [320]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return 0;
 
         const list = self.bare_map.get(bare_jid) orelse return 0;
@@ -306,7 +321,7 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var bare_buf: [320]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return 0;
 
         const list = self.bare_map.get(bare_jid) orelse return 0;
@@ -338,7 +353,7 @@ pub const SessionMap = struct {
 
         var total: usize = 0;
         for (jids, 0..) |jid, jid_idx| {
-            var bare_buf: [320]u8 = undefined;
+            var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
             const bare_jid = buildBareBuf(&bare_buf, jid.local, jid.domain) orelse continue;
             const list = self.bare_map.get(bare_jid) orelse continue;
             for (list.constSlice()) |entry| {
@@ -357,7 +372,7 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var bare_buf: [320]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return false;
 
         const list = self.bare_map.get(bare_jid) orelse return false;
@@ -379,14 +394,14 @@ pub const SessionMap = struct {
         defer if (self.multi_worker) self.lock.unlock();
 
         // Update full_map entry
-        var full_buf: [384]u8 = undefined;
+        var full_buf: [MAX_JID_OCTETS]u8 = undefined;
         const full_jid = buildJidBuf(&full_buf, local, domain, resource) orelse return;
         if (self.full_map.getPtr(full_jid)) |entry| {
             entry.presence_available = available;
         }
 
         // Update bare_map entry
-        var bare_buf: [320]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return;
         if (self.bare_map.getPtr(bare_jid)) |list| {
             for (list.slice()) |*entry| {
@@ -413,13 +428,13 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lock();
         defer if (self.multi_worker) self.lock.unlock();
 
-        var full_buf: [384]u8 = undefined;
+        var full_buf: [MAX_JID_OCTETS]u8 = undefined;
         const full_jid = buildJidBuf(&full_buf, local, domain, resource) orelse return;
         if (self.full_map.getPtr(full_jid)) |entry| {
             entry.priority = prio;
         }
 
-        var bare_buf: [320]u8 = undefined;
+        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return;
         if (self.bare_map.getPtr(bare_jid)) |list| {
             if (self.full_map.get(full_jid)) |full_entry| {
@@ -444,7 +459,7 @@ pub const SessionMap = struct {
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var buf: [384]u8 = undefined;
+        var buf: [MAX_JID_OCTETS]u8 = undefined;
         const full_jid = buildJidBuf(&buf, local, domain, resource) orelse return null;
         const entry = self.full_map.get(full_jid) orelse return null;
         return entry.generation;
@@ -644,6 +659,38 @@ test "SessionMap: findAvailableByBareJidBatch resolves many JIDs in one hold" {
     try std.testing.expectEqual(@as(usize, 2), map.findAvailableByBareJidBatch(&jids, &small, null));
 }
 
+test "SessionMap: S18 batch over 512 entries does not truncate at the resource cap" {
+    var map = SessionMap.init(std.testing.allocator, false, 0);
+    defer map.deinit();
+
+    // 32 JIDs x 20 available resources = 640 entries, over the old
+    // 32x16 chunk cap.
+    var local_buf: [32][10]u8 = undefined;
+    var jid_storage: [32]JidParts = undefined;
+    var sid: u32 = 1;
+    for (0..32) |j| {
+        const local = std.fmt.bufPrint(&local_buf[j], "user{d:0>6}", .{j}) catch unreachable;
+        jid_storage[j] = .{ .local = local, .domain = "localhost" };
+        for (0..20) |r| {
+            var res_buf: [16]u8 = undefined;
+            const res = std.fmt.bufPrint(&res_buf, "res{d:0>2}", .{r}) catch unreachable;
+            _ = try map.bind(0, sid, local, "localhost", res);
+            map.setPresenceAvailable(local, "localhost", res, true);
+            sid += 1;
+        }
+    }
+
+    var buf: [32 * 256]SessionEntry = undefined;
+    var idxs: [32 * 256]u16 = undefined;
+    const total = map.findAvailableByBareJidBatch(&jid_storage, &buf, &idxs);
+    try std.testing.expectEqual(@as(usize, 640), total);
+    // Entries stay grouped by JID in request order.
+    try std.testing.expectEqual(@as(u16, 0), idxs[0]);
+    try std.testing.expectEqual(@as(u16, 0), idxs[19]);
+    try std.testing.expectEqual(@as(u16, 1), idxs[20]);
+    try std.testing.expectEqual(@as(u16, 31), idxs[639]);
+}
+
 test "SessionMap: duplicate bind fails" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
@@ -730,6 +777,46 @@ test "SessionMap: bare_map cleaned on last unbind" {
     try std.testing.expectEqual(@as(usize, 0), map.findByBareJid("alice", "localhost", &buf));
 }
 
+test "SessionMap: T254 resource cap rejection keeps maps consistent" {
+    var map = SessionMap.init(std.testing.allocator, false, 2);
+    defer map.deinit();
+
+    _ = try map.bind(0, 1, "alice", "localhost", "a");
+    _ = try map.bind(0, 2, "alice", "localhost", "b");
+    try std.testing.expectError(error.TooManyResources, map.bind(0, 3, "alice", "localhost", "c"));
+
+    var buf: [4]SessionEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "localhost", &buf));
+    try std.testing.expect(map.findByFullJid("alice", "localhost", "c") == null);
+
+    // The rejected bind consumed nothing: a freed slot is reusable.
+    _ = map.unbind("alice", "localhost", "a");
+    _ = try map.bind(0, 4, "alice", "localhost", "c");
+    try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "localhost", &buf));
+}
+
+test "SessionMap: T254 OOM rollback at every bind allocation point" {
+    // Fail each allocation in turn. A failed bind must leave both maps
+    // without the half-bound account and own no memory: deinit on the
+    // testing allocator reports any leak or double free.
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var map = SessionMap.init(failing.allocator(), false, 0);
+        if (map.bind(0, 1, "alice", "localhost", "mobile")) |_| {
+            map.deinit();
+            break;
+        } else |_| {
+            var buf: [4]SessionEntry = undefined;
+            try std.testing.expectEqual(@as(usize, 0), map.findByBareJid("alice", "localhost", &buf));
+            try std.testing.expect(map.findByFullJid("alice", "localhost", "mobile") == null);
+            map.deinit();
+        }
+    } else {
+        return error.TestUnexpectedResult; // bind never succeeded: test is stuck
+    }
+}
+
 test "SessionMap: workers on different threads" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
@@ -784,4 +871,20 @@ test "SessionMap: resource stored in entry" {
     }
     try std.testing.expect(found_mobile);
     try std.testing.expect(found_desktop);
+}
+
+test "SessionMap: a 320-octet localpart binds and resolves" {
+    var map = SessionMap.init(std.testing.allocator, false, 0);
+    defer map.deinit();
+
+    var local: [320]u8 = undefined;
+    @memset(&local, 'n');
+    _ = try map.bind(0, 42, &local, "localhost", "res");
+    map.setPresenceAvailable(&local, "localhost", "res", true);
+    const entry = map.findByFullJid(&local, "localhost", "res");
+    try std.testing.expect(entry != null);
+
+    var buf: [1]SessionEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 1), map.findAvailableByBareJid(&local, "localhost", &buf));
+    try std.testing.expect(map.unbind(&local, "localhost", "res") != null);
 }

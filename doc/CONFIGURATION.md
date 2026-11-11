@@ -38,10 +38,11 @@ in development mode.
 | `socket` | `/var/run/xmppd/auth.sock` | IPC socket path |
 | `rate_limit` | `true` | Authentication rate limiting master switch; `false` disables it entirely (testing/benchmarks only) |
 | `max_per_account` | `60` | Max auth attempts per account per window |
-| `max_per_ip` | `200` | Max auth attempts per IP per window (must stay below the internal ring size of 256) |
+| `max_per_ip` | `200` | Max auth attempts per IP per window |
 | `window_seconds` | `120` | Rate window size |
 | `lockout_duration` | `300` | Temporary lockout length in seconds |
-| `lockout_threshold` | `10` | Consecutive failures before temporary lockout |
+| `lockout_threshold` | `10` | Consecutive account failures before temporary lockout |
+| `ip_lockout_threshold` | `20` | Consecutive IP failures before that address is temporarily locked |
 | `registration` | `false` | In-band registration (XEP-0077) |
 | `require_invite` | `true` | Require invitation code for registration |
 
@@ -118,11 +119,11 @@ ca_file = /usr/local/etc/xmppd/ca-bundle.pem
 All binaries accept `--config PATH` to specify the config file location.
 The master additionally accepts:
 
-- `--background` / `-b` — daemonize (fork + setsid)
-- `--help` / `-h` — usage
+- `--background` / `-b` - daemonize (fork + setsid)
+- `--help` / `-h` - usage
 
 `xmppctl` accepts:
-- `--db PATH` — database directory
-- `--auth-socket PATH` — auth daemon IPC socket (tries IPC first, falls back to direct DB)
-- `--password VALUE` — non-interactive password
-- `--password-file PATH` — read password from file
+- `--db PATH` - database directory
+- `--auth-socket PATH` - auth daemon IPC socket (tries IPC first, falls back to direct DB)
+- `--password VALUE` - non-interactive password
+- `--password-file PATH` - read password from file

@@ -44,6 +44,8 @@ const ssl = @import("ssl");
 const SslContext = ssl.SslContext;
 const SslConn = ssl.SslConn;
 const dns = @import("dns");
+const dns_async = @import("dns_async");
+const test_support = @import("test_support");
 const connector_mod = @import("connector.zig");
 const ConnectionPool = connector_mod.ConnectionPool;
 const OutboundConnection = connector_mod.OutboundConnection;
@@ -53,6 +55,7 @@ const stream_mod = @import("stream.zig");
 const S2sStreamAction = stream_mod.S2sStreamAction;
 const StreamError = stream_mod.StreamError;
 const dialback = @import("dialback.zig");
+const xmpp = @import("xmpp");
 
 const log = std.log.scoped(.@"xmppd-s2s");
 
@@ -66,11 +69,33 @@ const IPC_CLIENT_UDATA_BASE: usize = LISTENER_UDATA - (ipc_server_mod.MAX_IPC_CL
 const INBOUND_UDATA_BASE: usize = 0x10000;
 /// Base udata for outbound S2S connections.
 const OUTBOUND_UDATA_BASE: usize = 0x20000;
+/// Udata for the resolver's own kqueue fd: it reads ready whenever the
+/// resolver has pending events (UDP replies, TCP legs, deadlines).
+const DNS_UDATA: usize = INBOUND_UDATA_BASE - 1;
 
 /// Maximum inbound S2S sessions.
 const MAX_INBOUND_SESSIONS = 256;
 /// Maximum outbound S2S connections.
 const MAX_OUTBOUND_CONNS = 128;
+/// Deadline for one connect attempt to a resolved target (X2b).
+const CONNECT_DEADLINE_MS: u32 = 10_000;
+
+/// Inbound DANE lookups that failed (SERVFAIL, timeout, refused). A lookup
+/// failure is not proof that the peer publishes no TLSA: the session falls
+/// back to dialback, but the count tells an operator the peer's DANE data
+/// was unreachable rather than absent. Process-wide; the M1 metrics task
+/// exports it later, as with the delivery-queue counters.
+pub var inbound_dane_lookup_failures = std.atomic.Value(u64).init(0);
+
+/// Base ident for EVFILT_TIMER connect deadlines, same pattern as the
+/// udata bases: the low range is reserved for X1's lifecycle timers and
+/// the .timer arm dispatches on the boundary.
+const CONNECT_DEADLINE_IDENT_BASE: usize = 0x100000;
+/// Changelist capacity: worst case per loop iteration is one connect
+/// attempt (write arm + deadline) per outbound conn plus one DANE
+/// completion (read enable, write arm) and a few stanza/IPC arms per
+/// inbound session, plus one accept arm each.
+const S2S_CHANGE_BUF: usize = 2 * MAX_OUTBOUND_CONNS + 8 * MAX_INBOUND_SESSIONS + 256;
 
 /// The S2S federation daemon.
 pub const S2sDaemon = struct {
@@ -104,17 +129,68 @@ pub const S2sDaemon = struct {
     /// TLS context for outbound connections (client-side).
     tls_client_ctx: ?SslContext = null,
 
+    /// TLS context for outbound connections that verify through DANE. Built
+    /// lazily; the TLSA match is the only accepted anchor and our own
+    /// certificate is still presented for SASL EXTERNAL.
+    tls_client_ctx_dane: ?SslContext = null,
+
+    /// PKIX-verifying client context, used when a target publishes an RRset
+    /// whose records are all unusable. Built on first use.
+    tls_client_ctx_ca: ?SslContext = null,
+
+    /// Paths of our own certificate and key, kept so the DANE client context
+    /// can be built on first use. Empty when none was configured.
+    cert_path: ?[:0]const u8 = null,
+    key_path: ?[:0]const u8 = null,
+
+    /// DANE verification context for inbound peers, whose domain is known
+    /// only after the TLS handshake. Built lazily; carries DANE settings and
+    /// an empty store, so it never falls back to traditional anchors.
+    dane_verify_ctx: ?SslContext = null,
+
     /// Inbound session table.
     inbound: [MAX_INBOUND_SESSIONS]?*S2sSession = [_]?*S2sSession{null} ** MAX_INBOUND_SESSIONS,
     /// Per-session XML readers (parallel to inbound table).
     readers: [MAX_INBOUND_SESSIONS]?*XmlReader = [_]?*XmlReader{null} ** MAX_INBOUND_SESSIONS,
+    /// Per-slot generation counters: bumped on closeInbound so a stale
+    /// dialback callback can never land on a reused slot (S2).
+    inbound_gens: [MAX_INBOUND_SESSIONS]u32 = [_]u32{0} ** MAX_INBOUND_SESSIONS,
     next_inbound_id: usize = 0,
+    /// Inbound sessions closed because a kevent change could not be
+    /// staged (L5): a lost EV_DISABLE spins the loop on a held read and
+    /// a lost EV_ENABLE strands the session with reads off, so each
+    /// failure closes rather than lies.
+    inbound_kevent_closes: usize = 0,
 
     /// Inbound listener fd (-1 if not listening).
     listener_fd: posix.fd_t = -1,
 
+    /// Served MUC host for the to= check on inbound stanzas (S2):
+    /// the master forwards [muc] host as --muc-host; conference traffic is
+    /// served locally even though it is a different domain.
+    muc_host: ?[]const u8 = null,
+
+    /// Test seam (T277 regression): when set, recordOutboundDane applies this
+    /// verdict instead of reading the handshake's, so the DANE-failed teardown
+    /// path can run without live DNS and TLS. Always null in production.
+    dane_verdict_override: ?connector_mod.DaneStatus = null,
+
     /// Inbound listener port.
     listener_port: u16 = 5269,
+
+    /// Async resolver driven by this loop (X2b). Owns its own kqueue,
+    /// opened eagerly in bindResolver and registered once on the event
+    /// loop at startup as DNS_UDATA.
+    resolver: dns_async.Resolver,
+    /// Monotonic session_key space shared by outbound resolve() and
+    /// inbound query() waiters.
+    next_dns_key: usize = 1,
+    /// Monotonic ident space for per-target connect deadlines.
+    next_deadline_ident: usize = 1,
+    /// The ChangeList currently being accumulated: resolver callbacks have
+    /// no batch parameter (they can fire inside resolver.step or inside a
+    /// synchronous resolve/query completion), so entry points stash it here.
+    batch: ?*ChangeList = null,
 
     pub fn init(allocator: std.mem.Allocator, local_domain: []const u8) !S2sDaemon {
         const ipc = try allocator.create(IpcServer);
@@ -124,9 +200,22 @@ pub const S2sDaemon = struct {
             .local_domain = local_domain,
             .ipc = ipc,
             .pool = ConnectionPool.init(allocator),
+            .resolver = dns_async.Resolver.init(allocator),
         };
         d.dialback_secret = dialback.generateSecret();
         return d;
+    }
+
+    /// Point the resolver's callbacks at this daemon. Called after init()
+    /// returns, once the daemon's address is stable. Also opens the
+    /// resolver kqueue eagerly so the loop can register kqFd() once at
+    /// startup; a failure here surfaces as a query error later.
+    pub fn bindResolver(self: *S2sDaemon) void {
+        self.resolver.setCallback(.{ .ctx = self, .fun = onResolveDone });
+        self.resolver.setQueryCallback(.{ .ctx = self, .fun = onQueryDone });
+        if (self.resolver.openKq()) |_| {} else |err| {
+            log.warn("dns: resolver kqueue unavailable: {}", .{err});
+        }
     }
 
     pub fn deinit(self: *S2sDaemon) void {
@@ -138,6 +227,7 @@ pub const S2sDaemon = struct {
                 reader_slot.* = null;
             }
             if (slot.*) |session| {
+                session.dropDaneTlsa(self.allocator);
                 session.deinit();
                 self.allocator.destroy(session);
                 slot.* = null;
@@ -154,9 +244,15 @@ pub const S2sDaemon = struct {
             ob_slot.* = null;
         }
 
+        // Connections hold SSL objects created from these contexts; free
+        // them first, as SslContext.deinit requires.
+        self.pool.deinit();
+        self.resolver.deinit();
         if (self.tls_ctx) |*ctx| ctx.deinit();
         if (self.tls_client_ctx) |*ctx| ctx.deinit();
-        self.pool.deinit();
+        if (self.tls_client_ctx_dane) |*ctx| ctx.deinit();
+        if (self.tls_client_ctx_ca) |*ctx| ctx.deinit();
+        if (self.dane_verify_ctx) |*ctx| ctx.deinit();
         self.ipc.deinit();
         self.allocator.destroy(self.ipc);
 
@@ -243,6 +339,7 @@ pub const S2sDaemon = struct {
             return null;
         };
         reader.* = XmlReader.init(self.allocator);
+        reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
         self.readers[slot] = reader;
 
         log.info("accepted inbound S2S connection id={d} fd={d}", .{ slot, client_fd });
@@ -287,127 +384,315 @@ pub const S2sDaemon = struct {
 
         if (conn.isEstablished()) {
             // Connection ready — flush queued stanzas
-            self.flushOutboundStanzas(conn);
+            self.flushOutboundStanzas(batch, conn);
         } else if (conn.isFailed()) {
             self.sendDeliveryFailed(from, to, conn.error_msg);
-        } else if (conn.state == .connecting and conn.fd < 0) {
+        } else if (conn.state == .connecting and conn.fd < 0 and conn.dns_key == 0) {
             // New connection — initiate DNS + TCP connect
             self.initiateOutbound(batch, conn, domain);
         }
         // else: connection is in progress (TLS, auth, etc.) — stanza is queued
     }
 
-    /// Initiate an outbound connection: DNS SRV → TCP connect → kqueue registration.
+    /// Initiate an outbound connection: async SRV/A/AAAA/TLSA resolution
+    /// on the shared resolver (X2b). While the resolve is in flight the
+    /// conn stays .connecting with fd < 0 and dns_key != 0; the completion
+    /// lands in deliverResolution and the connect iterator takes over.
+    /// The callback may fire synchronously inside resolve() (cache hit,
+    /// literal IP), so dns_key is assigned before the call.
     fn initiateOutbound(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, domain: []const u8) void {
-        // DNS SRV resolution (blocking — acceptable for initial impl)
-        const targets = dns.resolver.resolveXmpp(self.allocator, domain, true) catch {
-            log.err("DNS SRV resolution failed for {s}", .{domain});
-            conn.fail("dns-resolution-failed");
-            return;
-        };
-        defer {
-            // Free all target hosts except the one we kept (index 0)
-            for (targets[1..]) |t| self.allocator.free(t.host);
-            self.allocator.free(targets);
-        }
-
-        if (targets.len == 0) {
-            log.warn("no SRV targets for {s}", .{domain});
-            conn.fail("no-srv-records");
+        self.batch = batch;
+        // A name that cannot appear on the wire fails immediately rather
+        // than spending a resolver job on it (RFC 1035 length bounds).
+        if (!validDomainName(domain)) {
+            self.failOutboundInitiation(batch, conn, "dns-resolution-failed");
             return;
         }
-
-        // Try the first target — transfer ownership of host string to connection
-        const target = targets[0];
-        conn.target_host = target.host; // ownership transferred, not freed in defer
-        conn.target_port = target.port;
-        conn.is_direct_tls = target.is_direct_tls;
-
-        log.info("connecting to {s}:{d} for domain {s} (direct_tls={any})", .{
-            target.host, target.port, domain, target.is_direct_tls,
-        });
-
-        // Non-blocking TCP connect
-        const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch {
-            conn.fail("socket-creation-failed");
+        conn.dns_key = self.next_dns_key;
+        self.next_dns_key +%= 1;
+        self.resolver.resolve(domain, .server, 5269, conn.dns_key, true) catch {
+            conn.dns_key = 0;
+            self.failOutboundInitiation(batch, conn, "dns-resolution-failed");
             return;
         };
+    }
 
-        // Resolve hostname to IP (simple A record via getaddrinfo)
-        var addr = std.c.sockaddr.in{
-            .port = std.mem.nativeToBig(u16, target.port),
-            .addr = 0,
-        };
+    /// Resolver kq fd reported pending events: drain them. Completion
+    /// callbacks fire inside step and arm follow-up work through `batch`.
+    fn handleResolverEvent(self: *S2sDaemon, batch: *ChangeList) void {
+        self.batch = batch;
+        self.resolver.step(0);
+    }
 
-        // For test infrastructure, handle known addresses
-        if (parseIPv4(target.host)) |ip| {
-            addr.addr = ip;
-        } else {
-            // Use getaddrinfo for hostname resolution
-            const ip = resolveHostnameIPv4(target.host) catch {
+    /// Resolver completion demux: every outbound resolve carries the
+    /// conn's dns_key; the conn is found by scanning the pool (bounded by
+    /// MAX_OUTBOUND_CONNS). An unknown key means the waiter was cancelled
+    /// or the conn already tore down; the answer is freed and dropped.
+    fn onResolveDone(ctx: ?*anyopaque, session_key: usize, status: dns_async.Status, res: ?dns_async.Resolution) void {
+        const self: *S2sDaemon = @ptrCast(@alignCast(ctx));
+        var it = self.pool.connections.valueIterator();
+        while (it.next()) |conn_ptr| {
+            const conn = conn_ptr.*;
+            if (conn.dns_key == session_key) {
+                conn.dns_key = 0;
+                const batch = self.batch orelse {
+                    if (res) |*r| {
+                        var rr = r.*;
+                        rr.deinitOn(self.allocator);
+                    }
+                    conn.fail("internal-error");
+                    return;
+                };
+                self.deliverResolution(batch, conn, status, res);
+                return;
+            }
+        }
+        if (res) |*r| {
+            var rr = r.*;
+            rr.deinitOn(self.allocator);
+        }
+    }
+
+    /// Apply a finished resolution to an outbound conn. Also the test
+    /// seam: tests call it directly with a fabricated Resolution, which
+    /// exercises the same target adoption and connect iteration as a real
+    /// wire answer. `batch` arms connect write interest and deadlines.
+    pub fn deliverResolution(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, status: dns_async.Status, res: ?dns_async.Resolution) void {
+        self.batch = batch;
+        switch (status) {
+            .resolved => {
+                var r = res.?;
+                if (r.targets.len == 0) {
+                    r.deinitOn(self.allocator);
+                    self.failOutboundInitiation(batch, conn, "remote-server-not-found");
+                    return;
+                }
+                conn.adoptTargets(r.targets);
+                self.connectNextTarget(batch, conn);
+            },
+            .nxdomain, .service_unavailable => {
+                if (res) |*r| {
+                    var rr = r.*;
+                    rr.deinitOn(self.allocator);
+                }
+                self.failOutboundInitiation(batch, conn, "remote-server-not-found");
+            },
+            .failed => {
+                if (res) |*r| {
+                    var rr = r.*;
+                    rr.deinitOn(self.allocator);
+                }
+                // SERVFAIL, timeout, REFUSED, malformed: a wire failure is
+                // temporary per ADR-13, never proof of absence.
+                self.failOutboundInitiation(batch, conn, "remote-server-timeout");
+            },
+        }
+    }
+
+    /// The slot a conn's fd events dispatch through; allocated on the
+    /// first live connect attempt (the conn has no fd while resolving).
+    fn ensureOutboundSlot(self: *S2sDaemon, conn: *OutboundConnection) ?usize {
+        if (self.findOutboundSlot(conn)) |slot| return slot;
+        const slot = self.allocateOutboundSlot() orelse return null;
+        self.outbound[slot] = conn;
+        return slot;
+    }
+
+    /// Tear down the current connect attempt: disarm its deadline and
+    /// purge staged knote entries before closing the fd (a same-iteration
+    /// socket() can reuse the number).
+    fn abortConnectAttempt(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        self.clearConnectDeadline(batch, conn);
+        batch.purgeFd(conn.fd);
+        posix.close(conn.fd);
+        conn.fd = -1;
+    }
+
+    /// Give up on the current target for a reason found before its TLS
+    /// handshake began (a DANE lookup or state failure). The attempt is torn
+    /// down and the next target is tried; when the list is exhausted the
+    /// initiation fails with `reason`, which the caller chose to reflect
+    /// whether the failure is temporary.
+    fn advanceOrFailOutbound(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, reason: []const u8) void {
+        if (conn.fd >= 0) self.abortConnectAttempt(batch, conn);
+        self.clearConnectDeadline(batch, conn);
+        if (conn.next_idx < conn.targets.len) {
+            self.connectNextTarget(batch, conn);
+            return;
+        }
+        self.failOutboundInitiation(batch, conn, reason);
+    }
+
+    /// Disarm the per-target connect deadline if one is armed.
+    fn clearConnectDeadline(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        _ = self;
+        if (conn.deadline_ident == 0) return;
+        batch.removeTimer(conn.deadline_ident) catch {};
+        conn.deadline_ident = 0;
+    }
+
+    /// Walk the adopted target list in RFC 2782 order and start the next
+    /// connect attempt: a target whose TLSA lookup failed is a temporary
+    /// failure of that target and is skipped, never connected to (ADR-13).
+    /// Every attempt is nonblocking and carries a one-shot deadline; a
+    /// connect error or the deadline advances to the next target, and an
+    /// exhausted list fails the initiation as temporary.
+    fn connectNextTarget(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        while (conn.next_idx < conn.targets.len) {
+            const idx = conn.next_idx;
+            const t = &conn.targets[idx];
+            conn.next_idx += 1;
+            if (t.tlsa_status == .lookup_failed) {
+                log.warn("outbound {s}: skipping {s}:{d}: TLSA lookup failed (temporary)", .{ conn.remote_domain, t.host, t.addr.getPort() });
+                continue;
+            }
+
+            const sock = posix.socket(t.addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch {
+                continue;
+            };
+            const nodelay_one: c_int = 1;
+            posix.setsockopt(sock, 6, 1, std.mem.asBytes(&nodelay_one)) catch {};
+            posix.connect(sock, &t.addr.any, t.addr.getOsSockLen()) catch |err| {
+                switch (err) {
+                    error.WouldBlock => {},
+                    else => {
+                        posix.close(sock);
+                        continue;
+                    },
+                }
+            };
+
+            const slot = self.ensureOutboundSlot(conn) orelse {
                 posix.close(sock);
-                conn.fail("hostname-resolution-failed");
+                self.failOutboundInitiation(batch, conn, "outbound-slots-exhausted");
                 return;
             };
-            addr.addr = ip;
-        }
-
-        // Disable Nagle — S2S stanzas should be sent immediately.
-        // TCP_NODELAY = 1 (netinet/tcp.h), IPPROTO_TCP = 6
-        const nodelay_one: c_int = 1;
-        posix.setsockopt(sock, 6, 1, std.mem.asBytes(&nodelay_one)) catch {};
-
-        // Non-blocking connect
-        posix.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| {
-            switch (err) {
-                error.WouldBlock => {}, // Expected — connect in progress
-                else => {
-                    posix.close(sock);
-                    conn.fail("tcp-connect-failed");
+            if (self.outbound_readers[slot] == null) {
+                const reader = self.allocator.create(XmlReader) catch {
+                    self.abortSlotFd(batch, sock);
+                    self.failOutboundInitiation(batch, conn, "internal-error");
                     return;
-                },
+                };
+                reader.* = XmlReader.init(self.allocator);
+                self.outbound_readers[slot] = reader;
             }
-        };
 
-        conn.fd = sock;
+            conn.target_idx = idx;
+            conn.target_addr = t.addr;
+            conn.target_host = t.host;
+            conn.target_port = t.addr.getPort();
+            conn.is_direct_tls = t.is_direct_tls;
+            conn.fd = sock;
+            conn.deadline_ident = CONNECT_DEADLINE_IDENT_BASE + self.next_deadline_ident;
+            self.next_deadline_ident +%= 1;
 
-        // Allocate an outbound slot for kqueue dispatch
-        const slot = self.allocateOutboundSlot() orelse {
-            posix.close(sock);
-            conn.fd = -1;
-            conn.fail("outbound-slots-exhausted");
+            log.info("connecting to {s}:{d} for domain {s} (direct_tls={any})", .{
+                t.host, conn.target_port, conn.remote_domain, conn.is_direct_tls,
+            });
+
+            batch.addWriteOnce(sock, OUTBOUND_UDATA_BASE + slot) catch {
+                self.abortSlotFd(batch, sock);
+                conn.fd = -1;
+                self.failOutboundInitiation(batch, conn, "internal-error");
+                return;
+            };
+            batch.addTimer(conn.deadline_ident, CONNECT_DEADLINE_MS, true) catch {
+                self.abortConnectAttempt(batch, conn);
+                self.failOutboundInitiation(batch, conn, "internal-error");
+                return;
+            };
             return;
-        };
-        self.outbound[slot] = conn;
+        }
+        // Every target was consumed: connect errors, deadlines and
+        // lookup_failed targets are all temporary (ADR-13).
+        self.failOutboundInitiation(batch, conn, "remote-server-timeout");
+    }
 
-        // Create XML reader for this outbound connection
-        const reader = self.allocator.create(XmlReader) catch {
-            self.outbound[slot] = null;
-            posix.close(sock);
-            conn.fd = -1;
-            conn.fail("internal-error");
-            return;
-        };
-        reader.* = XmlReader.init(self.allocator);
-        self.outbound_readers[slot] = reader;
+    /// Free a connect fd that never reached the armed state.
+    fn abortSlotFd(self: *S2sDaemon, batch: *ChangeList, sock: posix.fd_t) void {
+        _ = self;
+        batch.purgeFd(sock);
+        posix.close(sock);
+    }
 
-        // Register for one-shot write event (connect completion signals writable)
-        batch.addWriteOnce(sock, OUTBOUND_UDATA_BASE + slot) catch {};
+    /// A one-shot connect deadline fired: the attempt was too slow, so it
+    /// is torn down and the next target is tried. The ident no longer
+    /// matches an armed timer (it already fired), only the conn record.
+    fn handleConnectDeadline(self: *S2sDaemon, batch: *ChangeList, ident: usize) void {
+        self.batch = batch;
+        for (&self.outbound) |*slot_conn| {
+            const conn = slot_conn.* orelse continue;
+            if (conn.deadline_ident == ident and conn.state == .connecting and conn.fd >= 0) {
+                conn.deadline_ident = 0;
+                log.warn("outbound connect deadline for {s}", .{conn.remote_domain});
+                self.abortConnectAttempt(batch, conn);
+                self.connectNextTarget(batch, conn);
+                return;
+            }
+        }
+        // Stale ident: the attempt already completed or was cancelled.
+    }
+
+    /// EVFILT_TIMER demux: idents at CONNECT_DEADLINE_IDENT_BASE and
+    /// above are per-target connect deadlines; lower idents belong to the
+    /// X1 lifecycle timers and must not reach the connect path.
+    fn handleTimerEvent(self: *S2sDaemon, batch: *ChangeList, ident: usize) void {
+        if (ident < CONNECT_DEADLINE_IDENT_BASE) return;
+        self.handleConnectDeadline(batch, ident);
     }
 
     /// Flush queued stanzas on an established outbound connection.
-    fn flushOutboundStanzas(self: *S2sDaemon, conn: *OutboundConnection) void {
-        for (conn.pending_stanzas.items) |stanza| {
-            conn.queueWrite(stanza.xml) catch {
-                log.err("outbound write buffer full for {s}", .{conn.remote_domain});
-                break;
-            };
-            self.allocator.free(stanza.xml);
+    /// Every flushed PendingStanza frees all three owned slices; a full
+    /// write buffer keeps the unconsumed tail queued and arms a one-shot
+    /// write event so the writable edge resumes it. The event is armed for
+    /// a kept tail OR unsent buffered bytes: a drain that empties the
+    /// write buffer into kernel sendspace leaves hasPendingWrite() false
+    /// and would strand the tail until the next stanza (T275). A stanza
+    /// that can never fit the write buffer is failed to the sender instead
+    /// of wedging the queue.
+    fn flushOutboundStanzas(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        // Stanzas never travel before TLS. A conn in .established without a
+        // TLS layer is a downgrade: keep the queue where it is.
+        if (conn.tls_conn == null) {
+            log.warn("outbound {s}: refusing to flush stanzas without TLS", .{conn.remote_domain});
+            return;
         }
-        conn.pending_stanzas.clearRetainingCapacity();
+        const items = conn.pending_stanzas.items;
+        var i: usize = 0;
+        var kept: usize = 0;
+        var stalled = false;
+        while (i < items.len) : (i += 1) {
+            const stanza = items[i];
+            if (stanza.xml.len > conn.write_buf.len) {
+                log.warn("outbound stanza too large for {s} ({d} bytes); delivery-failed", .{ conn.remote_domain, stanza.xml.len });
+                self.sendDeliveryFailed(stanza.from_jid, stanza.to_jid, "stanza-too-large");
+                stanza.deinit(self.allocator);
+                continue;
+            }
+            if (!stalled) {
+                if (conn.queueWrite(stanza.xml)) {
+                    stanza.deinit(self.allocator);
+                    continue;
+                } else |_| {
+                    // Backpressure, not a drop: the tail stays in order and
+                    // the writable edge retries it (the structural answer is
+                    // X1's bounded queue with delivery-failed, T278).
+                    log.warn("outbound write buffer full for {s}: {d} stanza(s) stay queued", .{ conn.remote_domain, items.len - i });
+                    stalled = true;
+                }
+            }
+            items[kept] = stanza;
+            kept += 1;
+        }
+        conn.pending_stanzas.items.len = kept;
         _ = conn.flushWrite() catch {
             log.err("outbound write failed for {s}", .{conn.remote_domain});
         };
+        if (kept > 0 or conn.hasPendingWrite()) {
+            if (self.findOutboundSlot(conn)) |slot| {
+                batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
+            }
+        }
     }
 
     /// Find the outbound slot for a given connection pointer.
@@ -420,19 +705,70 @@ pub const S2sDaemon = struct {
         return null;
     }
 
-    /// Close an outbound connection slot.
-    fn closeOutbound(self: *S2sDaemon, slot: usize) void {
-        if (slot >= MAX_OUTBOUND_CONNS) return;
+    /// Release the conn's slot-table entry when it owns one: the fd's
+    /// staged knote entries are purged (a same-iteration socket can
+    /// reuse the number, T238/T277), the reader is destroyed and the
+    /// slot becomes allocatable again. The one teardown every path that
+    /// destroys a conn must run: leaving the slot set after pool.remove
+    /// would dangle the conn pointer for every later slot scan.
+    fn releaseOutboundSlot(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        const slot = self.findOutboundSlot(conn) orelse return;
+        if (conn.fd >= 0) batch.purgeFd(conn.fd);
         if (self.outbound_readers[slot]) |reader| {
             reader.deinit();
             self.allocator.destroy(reader);
             self.outbound_readers[slot] = null;
         }
+        self.outbound[slot] = null;
+    }
+
+    /// Close an outbound connection slot. Purges its staged kevent entries
+    /// first: a same-iteration accept can reuse the fd number (T238/T277).
+    /// Every exchange the conn still carries is answered before teardown,
+    /// so a read error, EOF, parse error or write failure never leaves the
+    /// submitting stream waiting for a verdict that can no longer arrive.
+    fn closeOutbound(self: *S2sDaemon, batch: *ChangeList, slot: usize) void {
+        if (slot >= MAX_OUTBOUND_CONNS) return;
         if (self.outbound[slot]) |conn| {
+            for (0..conn.db_pending.len) |idx| {
+                if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, false);
+            }
+            self.cancelResolve(conn);
+            self.clearConnectDeadline(batch, conn);
+            self.releaseOutboundSlot(batch, conn);
             log.info("closing outbound S2S to {s}", .{conn.remote_domain});
             self.pool.remove(conn.remote_domain);
+        } else if (self.outbound_readers[slot]) |reader| {
+            reader.deinit();
+            self.allocator.destroy(reader);
+            self.outbound_readers[slot] = null;
         }
-        self.outbound[slot] = null;
+    }
+
+    /// Fail an outbound connection that never reached the wire. Every
+    /// stanza queued on it is failed back to the core with `reason`, every
+    /// pending db:verify is answered invalid, and the conn leaves the pool
+    /// so the next delivery starts a fresh attempt.
+    fn failOutboundInitiation(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, reason: []const u8) void {
+        self.cancelResolve(conn);
+        self.clearConnectDeadline(batch, conn);
+        conn.fail(reason);
+        for (conn.pending_stanzas.items) |*stanza| {
+            self.sendDeliveryFailed(stanza.from_jid, stanza.to_jid, reason);
+        }
+        for (0..conn.db_pending.len) |idx| {
+            if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, false);
+        }
+        self.releaseOutboundSlot(batch, conn);
+        self.pool.remove(conn.remote_domain);
+    }
+
+    /// Detach a conn's in-flight resolve from the resolver: no callback
+    /// fires for its key afterwards. Idempotent (dns_key 0 means none).
+    fn cancelResolve(self: *S2sDaemon, conn: *OutboundConnection) void {
+        if (conn.dns_key == 0) return;
+        self.resolver.cancel(conn.dns_key);
+        conn.dns_key = 0;
     }
 
     fn allocateOutboundSlot(self: *S2sDaemon) ?usize {
@@ -465,9 +801,13 @@ pub const S2sDaemon = struct {
         }
     }
 
-    /// Close an inbound session.
-    pub fn closeInbound(self: *S2sDaemon, slot: usize) void {
+    /// Close an inbound session. Purges its staged kevent entries first:
+    /// a same-iteration accept can reuse the fd number (T238/T277).
+    pub fn closeInbound(self: *S2sDaemon, batch: *ChangeList, slot: usize) void {
         if (slot >= MAX_INBOUND_SESSIONS) return;
+        if (self.inbound[slot]) |session| {
+            batch.purgeFd(session.fd);
+        }
         if (self.readers[slot]) |reader| {
             reader.deinit();
             self.allocator.destroy(reader);
@@ -475,9 +815,30 @@ pub const S2sDaemon = struct {
         }
         if (self.inbound[slot]) |session| {
             log.info("closing inbound S2S session id={d}", .{slot});
+            if (session.dane_key != 0) {
+                self.resolver.cancel(session.dane_key);
+                session.dane_key = 0;
+            }
+            session.dane_lookup_pending = false;
+            session.dropDaneTlsa(self.allocator);
             session.deinit();
             self.allocator.destroy(session);
             self.inbound[slot] = null;
+        }
+        self.inbound_gens[slot] +%= 1;
+    }
+
+    /// After the stream open response, send the features for the current
+    /// phase. Deferred while an inbound DANE lookup is in flight; the
+    /// completion calls this once the result is known.
+    fn sendInboundFeaturesTail(self: *S2sDaemon, batch: *ChangeList, session: *S2sSession) void {
+        if (session.stream.getFeatures()) |_| {
+            const features_action = S2sStreamAction{ .send_features = session.stream.getFeatures().? };
+            executeAction(self, session, features_action, batch);
+        } else if (session.stream.isEstablished()) {
+            // Post-auth stream: send empty features
+            session.queueWrite("<stream:features/>") catch {};
+            log.info("inbound S2S stream established: remote={s}", .{session.getRemoteDomain()});
         }
     }
 
@@ -485,6 +846,17 @@ pub const S2sDaemon = struct {
     pub fn getInbound(self: *S2sDaemon, slot: usize) ?*S2sSession {
         if (slot >= MAX_INBOUND_SESSIONS) return null;
         return self.inbound[slot];
+    }
+
+    /// Whether a host is one we serve: the local domain or the MUC host
+    /// (S2: conference.<host> is a valid dialback/stream target).
+    pub fn servesHost(self: *const S2sDaemon, host: []const u8) bool {
+        if (host.len == 0) return false;
+        if (std.ascii.eqlIgnoreCase(host, self.local_domain)) return true;
+        if (self.muc_host) |m| {
+            if (std.ascii.eqlIgnoreCase(host, m)) return true;
+        }
+        return false;
     }
 
     /// Count active inbound sessions.
@@ -547,6 +919,23 @@ fn extractDomain(jid: []const u8) []const u8 {
     return jid[domain_start..domain_end];
 }
 
+/// Whether a JID domainpart is a DNS name that can exist on the wire:
+/// 253 octets total, each label 1-63 octets (RFC 1035 3.1).
+fn validDomainName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 253) return false;
+    var label_len: usize = 0;
+    for (name) |ch| {
+        if (ch == '.') {
+            if (label_len == 0) return false;
+            label_len = 0;
+        } else {
+            label_len += 1;
+            if (label_len > 63) return false;
+        }
+    }
+    return label_len > 0;
+}
+
 /// Parse an IPv4 address string to network-order u32.
 fn parseIPv4(address: []const u8) ?u32 {
     if (address.len == 0 or std.mem.eql(u8, address, "0.0.0.0")) {
@@ -576,27 +965,6 @@ fn parseIPv4(address: []const u8) ?u32 {
     return @as(u32, octets[0]) | (@as(u32, octets[1]) << 8) | (@as(u32, octets[2]) << 16) | (@as(u32, octets[3]) << 24);
 }
 
-/// Resolve a hostname to an IPv4 address using getaddrinfo.
-fn resolveHostnameIPv4(hostname: []const u8) !u32 {
-    // Null-terminate the hostname for C API
-    var name_buf: [256]u8 = undefined;
-    if (hostname.len >= name_buf.len) return error.NameTooLong;
-    @memcpy(name_buf[0..hostname.len], hostname);
-    name_buf[hostname.len] = 0;
-
-    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
-    hints.family = posix.AF.INET;
-    hints.socktype = posix.SOCK.STREAM;
-
-    var result: ?*std.c.addrinfo = null;
-    const rc = std.c.getaddrinfo(@ptrCast(&name_buf), null, &hints, &result);
-    if (@intFromEnum(rc) != 0 or result == null) return error.ResolutionFailed;
-    defer std.c.freeaddrinfo(result.?);
-
-    const addr_in: *const std.c.sockaddr.in = @ptrCast(@alignCast(result.?.addr.?));
-    return addr_in.addr;
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -613,6 +981,7 @@ pub fn main() !void {
     var cert_path: ?[:0]const u8 = null;
     var key_path: ?[:0]const u8 = null;
     var listen_fd: ?posix.fd_t = null;
+    var muc_host: ?[]const u8 = null;
 
     _ = args.next(); // Skip argv[0]
 
@@ -651,6 +1020,11 @@ pub fn main() !void {
                 log.err("--key requires a value", .{});
                 return error.InvalidArgs;
             };
+        } else if (std.mem.eql(u8, arg, "--muc-host")) {
+            muc_host = args.next() orelse {
+                log.err("--muc-host requires a value", .{});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, arg, "--listen-fd")) {
             const val = args.next() orelse {
                 log.err("--listen-fd requires a value", .{});
@@ -675,6 +1049,8 @@ pub fn main() !void {
 
     var daemon = try S2sDaemon.init(allocator, host);
     defer daemon.deinit();
+    daemon.bindResolver();
+    daemon.muc_host = muc_host;
 
     // Configure TLS if cert and key are provided
     if (cert_path) |cert| {
@@ -695,6 +1071,25 @@ pub fn main() !void {
     const client_key: ?[*:0]const u8 = if (key_path) |p| p.ptr else null;
     daemon.tls_client_ctx = SslContext.initClientWithCert(client_cert, client_key) catch |err| {
         log.err("failed to initialize client TLS context: {}", .{err});
+        return err;
+    };
+    daemon.cert_path = cert_path;
+    daemon.key_path = key_path;
+
+    // The DANE and PKIX client contexts and the inbound verifier context are
+    // built here, not on first use: the certificate chain and key are read
+    // from disk now, so a bad path fails at startup instead of stalling the
+    // loop on the first DANE connection.
+    daemon.tls_client_ctx_dane = SslContext.initClientDaneWithCert(client_cert, client_key) catch |err| {
+        log.err("failed to initialize DANE client TLS context: {}", .{err});
+        return err;
+    };
+    daemon.tls_client_ctx_ca = SslContext.initClientVerified() catch |err| {
+        log.err("failed to initialize PKIX client TLS context: {}", .{err});
+        return err;
+    };
+    daemon.dane_verify_ctx = SslContext.initDaneVerifier() catch |err| {
+        log.err("failed to initialize inbound DANE verifier context: {}", .{err});
         return err;
     };
 
@@ -734,6 +1129,14 @@ pub fn main() !void {
         try loop.addFd(daemon.ipc.listen_fd, .read, IPC_LISTEN_UDATA);
     }
 
+    // Register the resolver's kqueue once, level-triggered: pending
+    // resolver events keep it readable until step(0) drains them. A
+    // registration lost to a full changelist would stall every pending
+    // resolve, so it cannot ride the per-iteration batch (X2b).
+    if (daemon.resolver.kqFd() >= 0) {
+        try loop.addFd(daemon.resolver.kqFd(), .read, DNS_UDATA);
+    }
+
     // Register signals (automatically blocked from default delivery)
     try loop.addSignal(posix.SIG.TERM);
     try loop.addSignal(posix.SIG.INT);
@@ -743,7 +1146,11 @@ pub fn main() !void {
     // Scratch buffer for batching kqueue changes across iterations.
     // Changes accumulated in iteration N are submitted at the top of iteration N+1
     // via submitAndPoll — one syscall both commits changes AND waits for events.
-    var scratch: [32]posix.Kevent = undefined;
+    // Sized for the worst case per iteration: every outbound conn can
+    // stage a write arm and a connect deadline, every inbound session a
+    // DANE completion (read enable, write arm) plus a few stanza writes,
+    // and the accept loop one read arm per session.
+    var scratch: [S2S_CHANGE_BUF]posix.Kevent = undefined;
     var batch = ChangeList.init(&scratch);
 
     // Main event loop
@@ -763,7 +1170,9 @@ pub fn main() !void {
                     }
                 },
                 .fd_readable => |e| {
-                    if (e.udata == LISTENER_UDATA) {
+                    if (e.udata == DNS_UDATA) {
+                        daemon.handleResolverEvent(&batch);
+                    } else if (e.udata == LISTENER_UDATA) {
                         // Accept inbound S2S connections
                         while (true) {
                             const slot = daemon.acceptInbound() catch break;
@@ -797,6 +1206,9 @@ pub fn main() !void {
                         handleInboundWritable(&daemon, &batch, slot);
                     }
                 },
+                .timer => |t| {
+                    daemon.handleTimerEvent(&batch, t.ident);
+                },
                 else => {},
             }
         }
@@ -814,50 +1226,96 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
         return;
     }
 
+    // An inbound DANE lookup in flight defers all stream work: the peer
+    // cannot lawfully send anything before our features go out, and the
+    // completion re-enters this function to drain (X2b).
+    if (session.dane_lookup_pending) return;
+
     const reader = daemon.readers[slot] orelse return;
 
-    const n = session.recv() catch |err| {
-        switch (err) {
-            error.WouldBlock => return,
-            else => {
-                daemon.closeInbound(slot);
-                return;
-            },
-        }
-    };
-
-    if (n == 0) {
-        daemon.closeInbound(slot);
-        return;
-    }
-
-    // Parse XML from the read buffer and drive the S2S stream FSM
-    const data = session.readableSlice();
-    var pos: usize = 0;
-
+    // Bytes left buffered by a mid-read DANE defer drain before any new
+    // socket data (X2b): the lookup's completion re-enters here and a
+    // WouldBlock recv must not strand them.
+    var recvd = false;
     while (true) {
-        const event = reader.next(data, &pos) catch |err| {
-            log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
-            sendStreamError(session, .not_well_formed);
-            if (session.hasPendingWrite()) {
-                batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {};
+        // T250: plaintext bytes on the wire while a <proceed/> is parked
+        // behind a partial flush are a protocol error, parsed or not.
+        if (session.tls_upgrade_pending and session.read_start < session.read_end) {
+            log.warn("inbound S2S id={d}: {d} plaintext bytes while TLS upgrade pending: stream policy-violation", .{ slot, session.read_end - session.read_start });
+            sendStreamError(session, .policy_violation);
+            _ = session.flushWrite() catch {};
+            daemon.closeInbound(batch, slot);
+            return;
+        }
+
+        // Parse XML from the read buffer and drive the S2S stream FSM
+        const data = session.readableSlice();
+        var pos: usize = 0;
+        var want_recv = data.len == 0;
+
+        while (!want_recv) {
+            // The item cap follows the stream's authentication state, checked
+            // before each item so a stanza that arrives in the same read as the
+            // auth that permits it is still accepted (H6).
+            reader.setMaxItemBytes(if (session.stream.isEstablished())
+                xml.max_item_bytes_authenticated
+            else
+                xml.max_item_bytes_pre_auth);
+            const event = reader.next(data, &pos) catch |err| {
+                log.warn("inbound S2S id={d} XML parse error: {}", .{ slot, err });
+                closeInboundWithStreamError(daemon, batch, slot, stream_mod.streamErrorForXmlError(err));
+                return;
+            };
+            if (event == null) {
+                want_recv = true;
+                break;
             }
-            // Close after flushing error
+
+            processInboundEvent(daemon, session, reader, event.?, batch);
+
+            // Session may have been closed by processInboundEvent
+            if (daemon.getInbound(slot) == null) return;
+
+            // After STARTTLS, stop processing pre-TLS buffer: also when the
+            // upgrade merely pends behind a partially-flushed <proceed/> (T250).
+            if (session.isTlsHandshaking() or session.tls_upgrade_pending) break;
+            // A DANE lookup that just started defers the rest of this read:
+            // the unparsed tail stays buffered for the completion (X2b).
+            if (session.dane_lookup_pending) break;
+        }
+
+        // Mark consumed bytes
+        if (pos > 0) session.consume(pos);
+
+        // STARTTLS read-ahead hygiene (T250): plaintext bytes beyond <proceed/>
+        // mean the peer spoke before receiving it; they are a protocol error,
+        // never silently discarded at handshake completion.
+        if ((session.isTlsHandshaking() or session.tls_upgrade_pending) and session.read_start < session.read_end) {
+            log.warn("inbound S2S id={d}: {d} plaintext bytes after <proceed/>: stream policy-violation", .{ slot, session.read_end - session.read_start });
+            sendStreamError(session, .policy_violation);
+            _ = session.flushWrite() catch {};
+            daemon.closeInbound(batch, slot);
+            return;
+        }
+
+        // A lookup or handshake that started mid-read leaves the tail for
+        // the completion. When this call already recvd, a parked
+        // <proceed/> breaks here instead; the next readable event starts
+        // with an empty slice and recvs, so plaintext arriving while
+        // pending still trips the T250 check above.
+        if (session.isTlsHandshaking() or session.dane_lookup_pending) break;
+        if (!want_recv or recvd) break;
+        recvd = true;
+        const n = session.recv() catch |err| {
+            if (err == error.WouldBlock) break;
+            daemon.closeInbound(batch, slot);
             return;
         };
-        if (event == null) break;
-
-        processInboundEvent(daemon, session, reader, event.?, batch);
-
-        // Session may have been closed by processInboundEvent
-        if (daemon.getInbound(slot) == null) return;
-
-        // After STARTTLS, stop processing pre-TLS buffer
-        if (session.isTlsHandshaking()) break;
+        if (n == 0) {
+            daemon.closeInbound(batch, slot);
+            return;
+        }
     }
-
-    // Mark consumed bytes
-    if (pos > 0) session.consume(pos);
 
     // After SASL success, flush <success/> and drain any OpenSSL-buffered
     // post-auth stream data. Same pattern as post-TLS handshake (line 843):
@@ -882,17 +1340,26 @@ fn handleInboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
 fn continueTlsHandshake(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, session: *S2sSession) void {
     const complete = session.continueHandshake() catch {
         log.err("inbound S2S id={d} TLS handshake failed", .{slot});
-        daemon.closeInbound(slot);
+        daemon.closeInbound(batch, slot);
         return;
     };
 
     if (complete) {
-        log.info("inbound S2S id={d} TLS handshake complete", .{slot});
+        // Q11: offload fallback is silent, so engagement, version and cipher
+        // are logged once per handshake (tokens: ktls, ktls-tx, ktls-rx, sw).
+        if (session.tls_conn) |*tls| {
+            const mode: []const u8 = if (tls.ktlsSend() and tls.ktlsRecv()) "ktls" else if (tls.ktlsSend()) "ktls-tx" else if (tls.ktlsRecv()) "ktls-rx" else "sw";
+            log.info("inbound S2S id={d} TLS handshake complete version={s} cipher={s} mode={s}", .{ slot, tls.versionName(), tls.cipherName(), mode });
+        } else {
+            log.info("inbound S2S id={d} TLS handshake complete mode=none", .{slot});
+        }
         // Notify the stream FSM that TLS is established
         session.stream.tlsEstablished();
         // Reset XML reader for stream restart after STARTTLS
         if (daemon.readers[slot]) |reader| reader.reset();
-        // Clear any stale pre-TLS data from the read buffer
+        // Invariant: no plaintext can outlive <proceed/> (T250 rejects any
+        // leftover with policy-violation); the zeroing stays as a start
+        // state guard.
         session.read_start = 0;
         session.read_end = 0;
 
@@ -911,7 +1378,9 @@ fn continueTlsHandshake(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, ses
         if (session.tls_state) |state| {
             switch (state) {
                 .handshake_want_read => batch.addRead(session.fd, INBOUND_UDATA_BASE + slot) catch {},
-                .handshake_want_write => batch.addWrite(session.fd, INBOUND_UDATA_BASE + slot) catch {},
+                // One-shot: a writable idle TLS socket is ALWAYS writable;
+                // a persistent arm would spin kevent at 100% CPU (S10).
+                .handshake_want_write => batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + slot) catch {},
                 .established => {},
             }
         }
@@ -932,29 +1401,61 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 if (std.mem.eql(u8, attr.local_name, "version")) version = attr.value;
             }
 
-            session.setRemoteDomain(from);
+            // S2: the peer may never re-identify on a restart. Post-auth the
+            // header from= must already be authenticated; pre-auth (post-TLS)
+            // it must not change from the pinned origin.
+            if (!session.stream_open_seen) {
+                session.stream_open_seen = true;
+                session.setRemoteDomain(from);
+            } else {
+                // A restart begins a new stream, so our header from the previous
+                // one does not cover it: an error must open this one first.
+                session.stream_header_sent = false;
+                if (!session.restartFromAllowed(from)) {
+                    log.warn("inbound S2S id={d} stream restart with unauthenticated from={s} (peer pinned {s})", .{ session.id, from, session.getRemoteDomain() });
+                    sendStreamError(session, .invalid_from);
+                    _ = session.flushWrite() catch {};
+                    daemon.closeInbound(batch, session.id);
+                    return;
+                } else if (session.auth_domain_count > 0) {
+                    // Authenticated domain may differ from the first open
+                    // (dialback multiplexing); the tracked identity follows it.
+                    session.setRemoteDomain(from);
+                }
+            }
+            // The header to= selects which served host this stream addresses;
+            // replies echo it as their from= (S2). An unserved host
+            // fails the stream.
+            if (to.len > 0) {
+                if (!daemon.servesHost(to)) {
+                    log.warn("inbound S2S id={d} stream addressed to unserved host {s}", .{ session.id, to });
+                    sendStreamError(session, .host_unknown);
+                    _ = session.flushWrite() catch {};
+                    daemon.closeInbound(batch, session.id);
+                    return;
+                }
+                session.setServedHost(to);
+            }
             const action = session.stream.handleStreamOpen(from, to, version);
-            executeAction(daemon, session, action);
+            executeAction(daemon, session, action, batch);
 
-            // After post-TLS stream open, perform DANE verification on peer cert
+            // After post-TLS stream open, start the async DANE chain on the
+            // peer cert (X2b). While it runs the features defer: the SASL
+            // EXTERNAL advertisement depends on the result.
+            var dane_pending = false;
             if (session.stream.state == .features_auth and session.tls_conn != null and from.len > 0) {
-                performInboundDane(daemon, session, from);
+                dane_pending = performInboundDane(daemon, batch, session, from);
             }
 
-            // After stream open response, send features
-            if (session.stream.getFeatures()) |_| {
-                const features_action = S2sStreamAction{ .send_features = session.stream.getFeatures().? };
-                executeAction(daemon, session, features_action);
-            } else if (session.stream.isEstablished()) {
-                // Post-auth stream: send empty features
-                session.queueWrite("<stream:features/>") catch {};
-                log.info("inbound S2S stream established: remote={s}", .{session.getRemoteDomain()});
-            }
+            if (!dane_pending) daemon.sendInboundFeaturesTail(batch, session);
         },
         .element_start => |elem| {
             // If accumulating a stanza, serialize child elements into inner buffer
             if (session.stanza_active) {
-                session.accumulateElement(elem);
+                session.accumulateElement(elem, reader);
+                // The stanza can no longer be forwarded whole. Keep parsing is
+                // pure cost: close now rather than at the end of the item.
+                if (session.stanzaBroken()) return closeBrokenStanza(daemon, batch, session);
                 return;
             }
 
@@ -977,7 +1478,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 std.mem.eql(u8, elem.local_name, "starttls"))
             {
                 const action = session.stream.handleStarttls();
-                executeAction(daemon, session, action);
+                executeAction(daemon, session, action, batch);
             }
             // Handle SASL auth
             else if (std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl) and
@@ -990,7 +1491,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 }
                 if (std.mem.eql(u8, mechanism, "EXTERNAL")) {
                     const action = session.stream.handleSaslExternal();
-                    executeAction(daemon, session, action);
+                    executeAction(daemon, session, action, batch);
                     // After successful SASL, the remote will restart the stream.
                     // State is awaiting_stream_open_tls (reused for post-SASL restart).
                     if (session.stream.state == .awaiting_stream_open_tls) {
@@ -1046,6 +1547,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             if (session.stanza_active) {
                 if (reader.depth > 1) {
                     session.accumulateClose(name);
+                    if (session.stanzaBroken()) closeBrokenStanza(daemon, batch, session);
                 } else {
                     dispatchInboundStanza(daemon, session, batch);
                 }
@@ -1064,6 +1566,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
             // Stanza content accumulation
             if (session.stanza_active) {
                 session.accumulateText(text_content);
+                if (session.stanzaBroken()) return closeBrokenStanza(daemon, batch, session);
                 return;
             }
             // Capture db:result key text (dialback key submission)
@@ -1084,6 +1587,16 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 const from = session.getDbVerifyFrom();
                 const to = session.getDbVerifyTo();
                 const verify_id = session.getDbVerifyId();
+                // The db:verify to= names the authoritative host; only a host
+                // we serve can answer, and the answer echoes it (S2).
+                if (!daemon.servesHost(to)) {
+                    log.warn("dialback verify: addressed to unserved host {s}; failing stream", .{to});
+                    session.db_verify_pending = false;
+                    sendStreamError(session, .host_unknown);
+                    _ = session.flushWrite() catch {};
+                    daemon.closeInbound(batch, session.id);
+                    return;
+                }
                 const valid = dialback.verifyKey(
                     &daemon.dialback_secret,
                     from,
@@ -1094,7 +1607,7 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
                 var resp_buf: [512]u8 = undefined;
                 const resp = dialback.buildDbVerifyResponse(
                     &resp_buf,
-                    session.stream.local_domain,
+                    to,
                     from,
                     verify_id,
                     valid,
@@ -1111,33 +1624,145 @@ fn processInboundEvent(daemon: *S2sDaemon, session: *S2sSession, reader: *XmlRea
     }
 }
 
-/// Forward a fully accumulated inbound stanza to xmppd-core via IPC.
-fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *ChangeList) void {
-    defer session.resetStanza();
+/// Domainpart of a JID (RFC 7622 section 3.1): cut at the resource separator
+/// FIRST, then split off the localpart. Cutting at '@' first would let
+/// "victim.example/x@them.example" resolve to "them.example" (S2).
+fn jidDomain(jid: []const u8) []const u8 {
+    const bare = if (std.mem.indexOfScalar(u8, jid, '/')) |slash| jid[0..slash] else jid;
+    if (std.mem.indexOfScalar(u8, bare, '@')) |at| return bare[at + 1 ..];
+    return bare;
+}
 
+/// RFC 6120 sections 4.9.3.9 and 4.9.3.6: an inbound stanza's from= domain must be
+/// authenticated for the session (dialback or EXTERNAL+DANE; auth_ok is the
+/// caller's set lookup), and to= must be a host we serve (bare domain or the
+/// MUC host).
+fn validateInboundAddress(local_domain: []const u8, muc_host: ?[]const u8, auth_ok: bool, from: []const u8, to: []const u8) ?StreamError {
+    const from_dom = jidDomain(from);
+    if (from_dom.len == 0 or !auth_ok) return .invalid_from;
+    const to_dom = jidDomain(to);
+    if (to_dom.len == 0) return .host_unknown;
+    if (std.ascii.eqlIgnoreCase(to_dom, local_domain)) return null;
+    if (muc_host) |m| {
+        if (std.ascii.eqlIgnoreCase(to_dom, m)) return null;
+    }
+    return .host_unknown;
+}
+
+/// Forward a fully accumulated inbound stanza to xmppd-core via IPC.
+///
+/// closeInbound frees the session; every reject path resets the stanza
+/// accumulator before closing, so no deferred reset can touch freed
+/// memory (S2).
+fn dispatchInboundStanza(daemon: *S2sDaemon, session: *S2sSession, batch: *ChangeList) void {
     const from = session.getStanzaFrom();
     const to = session.getStanzaTo();
 
-    if (from.len == 0 or to.len == 0) {
-        log.warn("inbound stanza missing from/to, dropping", .{});
+    // Never forward truncated XML. Reset before closing because closeInbound
+    // frees the session.
+    if (session.stanzaBroken()) {
+        const slot = session.id;
+        log.warn("inbound S2S id={d} stanza exceeds {d} bytes: policy-violation", .{ slot, session.stanza_inner_buf.len });
+        session.resetStanza();
+        closeInboundWithStreamError(daemon, batch, slot, .policy_violation);
         return;
     }
+
+    if (from.len == 0 or to.len == 0) {
+        // RFC 6120 section 4.9.3.10: missing from/to on an established stream.
+        log.warn("inbound stanza missing from/to (improper-addressing)", .{});
+        sendStreamError(session, .improper_addressing);
+        _ = session.flushWrite() catch {};
+        session.resetStanza();
+        daemon.closeInbound(batch, session.id);
+        return;
+    }
+
+    // An over-long from=/to= overflowed its buffer in startStanza; the
+    // truncated prefix must not reach validation or preparation. Same
+    // outcomes as a preparation failure: to= drops only this stanza,
+    // from= fails the stream invalid-from.
+    if (session.stanza_to_overflowed) {
+        log.warn("inbound S2S stanza dropped: to= exceeds {d} octets", .{session.stanza_to_buf.len});
+        session.resetStanza();
+        return;
+    }
+    if (session.stanza_from_overflowed) {
+        log.warn("inbound S2S stanza rejected: from= exceeds {d} octets", .{session.stanza_from_buf.len});
+        sendStreamError(session, .invalid_from);
+        _ = session.flushWrite() catch {};
+        session.resetStanza();
+        daemon.closeInbound(batch, session.id);
+        return;
+    }
+
+    // Authenticated-domain and served-host checks before anything is
+    // forwarded (T351/S2): without them any federated peer could speak as
+    // any local user. from= must name a domain the session authenticated
+    // for (DANE+EXTERNAL or dialback), not whatever the header claims.
+    if (validateInboundAddress(daemon.local_domain, daemon.muc_host, session.isAuthenticatedDomain(jidDomain(from)), from, to)) |err| {
+        log.warn("inbound S2S stanza rejected ({s}): from={s} to={s} (peer pinned {s})", .{ err.toString(), from, to, session.getRemoteDomain() });
+        sendStreamError(session, err);
+        _ = session.flushWrite() catch {};
+        session.resetStanza();
+        daemon.closeInbound(batch, session.id);
+        return;
+    }
+
+    // Ingress preparation (F6): a local-domain to= is rewritten to the
+    // configured spelling with its localpart folded, so IPC forwarding and
+    // every downstream compare see one spelling; remote-domain JIDs pass
+    // through unchanged. to= runs first: a malformed recipient drops only
+    // this stanza, while a malformed from= fails the stream invalid-from
+    // because the peer authenticated for that domain.
+    var prep_buf: [session.stanza_to_buf.len]u8 = undefined;
+    const prepared_to = xmpp.prepareLocalDomainJid(to, daemon.local_domain, &prep_buf) catch |err| {
+        log.warn("inbound S2S stanza dropped: cannot prepare to={s} ({s})", .{ to, @errorName(err) });
+        session.resetStanza();
+        return;
+    };
+    // A passthrough result aliases the session buffer itself; copying it
+    // over itself is illegal, so copy only when the result is in prep_buf.
+    if (prepared_to.ptr != to.ptr) @memcpy(session.stanza_to_buf[0..prepared_to.len], prepared_to);
+    session.stanza_to_len = prepared_to.len;
+
+    const prepared_from = xmpp.prepareLocalDomainJid(from, daemon.local_domain, &prep_buf) catch |err| {
+        log.warn("inbound S2S stanza rejected: cannot prepare from={s} ({s})", .{ from, @errorName(err) });
+        sendStreamError(session, .invalid_from);
+        _ = session.flushWrite() catch {};
+        session.resetStanza();
+        daemon.closeInbound(batch, session.id);
+        return;
+    };
+    // Unreachable by construction: validateInboundAddress already required
+    // from= to name an authenticated remote domain, so preparation always
+    // passes it through and the pointers are equal. The guard stays in case
+    // that invariant ever weakens.
+    if (prepared_from.ptr != from.ptr) @memcpy(session.stanza_from_buf[0..prepared_from.len], prepared_from);
+    session.stanza_from_len = prepared_from.len;
+
+    // buildStanzaXml reads the session buffers, so the forwarded XML and
+    // the IPC fields below both carry the prepared spellings.
+    const fwd_from = session.getStanzaFrom();
+    const fwd_to = session.getStanzaTo();
 
     // Build the complete stanza XML
     var stanza_buf: [20480]u8 = undefined;
     const stanza_xml = session.buildStanzaXml(&stanza_buf) catch {
         log.warn("inbound stanza too large, dropping", .{});
+        session.resetStanza();
         return;
     };
+    defer session.resetStanza();
 
-    log.info("forwarding inbound {s} from {s} to {s}", .{ session.getStanzaTag(), from, to });
+    log.info("forwarding inbound {s} from {s} to {s}", .{ session.getStanzaTag(), fwd_from, fwd_to });
 
     // Send to ONE core IPC client (round-robin). The receiving worker uses
     // the shared SessionMap to route — if the target is on a different worker,
     // it delivers via MPSC. Sending to all workers would cause N duplicates.
     const msg = protocol.Message{ .s2s_inbound = .{
-        .from_jid = from,
-        .to_jid = to,
+        .from_jid = fwd_from,
+        .to_jid = fwd_to,
         .stanza_xml = stanza_xml,
     } };
 
@@ -1170,6 +1795,24 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
         log.warn("dialback callback: missing origin or key", .{});
         return;
     }
+    // S2: the db:result to= must be a host we serve (the local domain or
+    // the MUC host); an unserved target would be verified on our account.
+    const target = session.getDbResultTo();
+    if (!daemon.servesHost(target)) {
+        log.warn("dialback callback: db:result to={s} is not a served host ({s})", .{ target, daemon.local_domain });
+        sendStreamError(session, .invalid_from);
+        _ = session.flushWrite() catch {};
+        daemon.closeInbound(batch, session.id);
+        return;
+    }
+    // S1: the captured key re-enters an outbound stream verbatim; only a
+    // HMAC hex shape can ever be legitimate (entity-decoded markup in a
+    // db:result is rejected, not forwarded).
+    if (!dialback.isValidKeyHex(key)) {
+        log.warn("dialback callback: invalid key shape from {s} ({d} bytes); answering type=invalid", .{ origin, key.len });
+        answerDbResultInvalid(daemon, batch, session, target, origin);
+        return;
+    }
 
     log.info("initiating dialback callback to {s} for stream {s}", .{ origin, stream_id });
 
@@ -1178,92 +1821,219 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
 
     // Get or create an outbound connection to the origin domain
     const conn = daemon.pool.getOrCreate(daemon.local_domain, origin) catch {
-        log.err("dialback callback: failed to create outbound connection to {s}", .{origin});
+        log.warn("dialback callback: failed to create outbound connection to {s}; answering type=invalid", .{origin});
+        answerDbResultInvalid(daemon, batch, session, target, origin);
         return;
     };
 
-    // Tag this connection as a dialback callback and store the key/stream_id
-    conn.db_callback_inbound_slot = session.id;
-    const kl = @min(key.len, conn.db_callback_key_buf.len);
-    @memcpy(conn.db_callback_key_buf[0..kl], key[0..kl]);
-    conn.db_callback_key_len = kl;
-    const sl = @min(stream_id.len, conn.db_callback_stream_id_buf.len);
-    @memcpy(conn.db_callback_stream_id_buf[0..sl], stream_id[0..sl]);
-    conn.db_callback_stream_id_len = sl;
+    // Register the callback keyed by (stream id, origin) with the slot
+    // generation: each concurrent db:result for the same origin keeps its
+    // own pending verify (S2).
+    if (conn.addPendingVerify(session.id, daemon.inbound_gens[session.id], stream_id, origin, target, key) == null) {
+        log.warn("dialback callback: pending-verify table full for {s}; answering type=invalid", .{origin});
+        answerDbResultInvalid(daemon, batch, session, target, origin);
+        return;
+    }
 
-    if (conn.isEstablished()) {
-        // Connection already established — send db:verify immediately
-        sendDbVerifyOnCallback(daemon, conn);
-    } else if (conn.state == .connecting and conn.fd < 0) {
-        // New connection — initiate DNS + TCP connect
+    if (conn.canSendDbVerify()) {
+        // Post-TLS auth phase already reached: send db:verify immediately
+        if (!sendDbVerifyOnCallback(daemon, batch, conn)) {
+            if (daemon.findOutboundSlot(conn)) |slot| daemon.closeOutbound(batch, slot);
+        }
+    } else if (conn.state == .connecting and conn.fd < 0 and conn.dns_key == 0) {
+        // New connection: initiate DNS + TCP connect
         daemon.initiateOutbound(batch, conn, origin);
     }
-    // else: connection is in progress — db:verify will be sent when established
+    // else: connection is in progress; db:verify goes out at the post-TLS
+    // features edge
 }
 
-/// Send a db:verify stanza on an outbound callback connection.
-fn sendDbVerifyOnCallback(daemon: *S2sDaemon, conn: *OutboundConnection) void {
-    const key = conn.db_callback_key_buf[0..conn.db_callback_key_len];
-    const sid = conn.db_callback_stream_id_buf[0..conn.db_callback_stream_id_len];
+/// Send db:verify stanzas for every registered callback that has not been
+/// sent yet on this outbound connection. Returns false when the write
+/// failed: the exchanges the connection carried are answered invalid and
+/// the caller tears it down, so a submitting stream is never left waiting
+/// for a verdict that can no longer arrive. Verifies that could not be
+/// queued (full write buffer) stay unsent and go out from the writable
+/// edge.
+fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) bool {
+    for (&conn.db_pending, 0..) |*p, idx| {
+        if (!p.in_use or p.verify_sent) continue;
+        const key = p.key();
+        const sid = p.streamId();
+        if (key.len == 0 or sid.len == 0) {
+            // An exchange without key or stream id can never produce a
+            // db:verify; leaving it would spin the writable re-arm.
+            log.warn("dialback callback: exchange without key or stream id; answering invalid", .{});
+            handleDbVerifyResponse(daemon, batch, conn, idx, false);
+            continue;
+        }
 
-    if (key.len == 0 or sid.len == 0) return;
+        var buf: [512]u8 = undefined;
+        const verify_xml = dialback.buildDbVerify(
+            &buf,
+            if (p.target().len > 0) p.target() else daemon.local_domain,
+            conn.remote_domain,
+            sid,
+            key,
+        ) catch {
+            // Unbuildable exchange: answered invalid and cleared like a
+            // write failure. An unsent entry would stay forever and re-arm
+            // the one-shot write on every edge.
+            log.warn("dialback callback: db:verify for stream {s} cannot be built; answering invalid", .{sid});
+            handleDbVerifyResponse(daemon, batch, conn, idx, false);
+            continue;
+        };
 
-    var buf: [512]u8 = undefined;
-    const verify_xml = dialback.buildDbVerify(
-        &buf,
-        daemon.local_domain,
-        conn.remote_domain,
-        sid,
-        key,
-    ) catch return;
-
-    conn.queueWrite(verify_xml) catch return;
-    _ = conn.flushWrite() catch return;
-    log.info("dialback callback: sent db:verify to {s} for stream {s}", .{ conn.remote_domain, sid });
+        conn.queueWrite(verify_xml) catch {
+            log.warn("dialback callback: write buffer full, db:verify for stream {s} waits for the writable edge", .{sid});
+            continue;
+        };
+        p.verify_sent = true;
+        log.info("dialback callback: sent db:verify to {s} for stream {s}", .{ conn.remote_domain, sid });
+    }
+    if (conn.hasPendingWrite()) {
+        _ = conn.flushWrite() catch {
+            log.warn("dialback callback: db:verify write to {s} failed; answering pending exchanges invalid", .{conn.remote_domain});
+            for (0..conn.db_pending.len) |idx| {
+                if (conn.db_pending[idx].in_use) handleDbVerifyResponse(daemon, batch, conn, idx, false);
+            }
+            conn.fail("write-failed");
+            return false;
+        };
+    }
+    // Buffered bytes under backpressure and verifies that could not be
+    // queued both resume from the writable edge.
+    if (conn.hasPendingWrite() or conn.hasUnsentVerify()) {
+        if (daemon.findOutboundSlot(conn)) |slot| {
+            batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {
+                // Nothing is armed: the queued verifies would never go
+                // out. Fail the exchanges instead of losing them.
+                log.warn("dialback callback: cannot arm the writable edge for {s}; answering pending exchanges invalid", .{conn.remote_domain});
+                for (0..conn.db_pending.len) |i| {
+                    if (conn.db_pending[i].in_use) handleDbVerifyResponse(daemon, batch, conn, i, false);
+                }
+                conn.fail("write-failed");
+                return false;
+            };
+        }
+    }
+    return true;
 }
 
-/// Handle a db:verify response on an outbound callback connection.
-/// Completes the inbound dialback by sending db:result on the original inbound session.
-fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, valid: bool) void {
-    const inbound_slot = conn.db_callback_inbound_slot orelse return;
+/// Answer a db:result submission with type=invalid. A response that cannot
+/// be built or queued fails the inbound session instead, so the submitter
+/// is never left waiting for a verdict (C6).
+fn answerDbResultInvalid(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSession, target: []const u8, origin: []const u8) void {
+    var resp_buf: [512]u8 = undefined;
+    const resp = dialback.buildDbResultResponse(&resp_buf, target, origin, false) catch {
+        failDbResultAnswer(daemon, batch, session, session.id, origin);
+        return;
+    };
+    session.queueWrite(resp) catch {
+        failDbResultAnswer(daemon, batch, session, session.id, origin);
+        return;
+    };
+    if (session.hasPendingWrite()) {
+        batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + session.id) catch {};
+    }
+}
+
+/// A db:result submission must always be answered: when the answer cannot
+/// be built or queued, fail and close the submitting stream instead of
+/// leaving the peer waiting for a verdict forever (C6).
+fn failDbResultAnswer(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSession, slot: usize, origin: []const u8) void {
+    log.warn("dialback callback: cannot answer the db:result verdict for {s}; failing inbound session {d}", .{ origin, slot });
+    // Flush first to make room for the stream error when the queue was
+    // what failed.
+    _ = session.flushWrite() catch {};
+    sendStreamError(session, .internal_server_error);
+    _ = session.flushWrite() catch {};
+    daemon.closeInbound(batch, slot);
+}
+
+/// Handle a db:verify verdict that matched a pending callback entry.
+/// Answers db:result on the original inbound session, addressed to the
+/// verified origin, and only while the slot still holds the session that
+/// submitted the key (generation check) (S2).
+fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, idx: usize, valid: bool) void {
+    const pending = &conn.db_pending[idx];
+    const inbound_slot = pending.inbound_slot;
+    const gen = pending.inbound_gen;
+    // Copy the origin and served target out before the entry is cleared.
+    var origin_buf: [256]u8 = undefined;
+    const origin_len = pending.origin_len;
+    @memcpy(origin_buf[0..origin_len], pending.origin_buf[0..origin_len]);
+    const origin = origin_buf[0..origin_len];
+    var target_buf: [256]u8 = undefined;
+    const target_len = pending.target_len;
+    @memcpy(target_buf[0..target_len], pending.target_buf[0..target_len]);
+    const target = target_buf[0..target_len];
+    conn.clearPendingVerify(idx);
+
     const session = daemon.getInbound(inbound_slot) orelse {
         log.warn("dialback callback: inbound session {d} gone", .{inbound_slot});
         return;
     };
+    if (daemon.inbound_gens[inbound_slot] != gen) {
+        log.warn("dialback callback: inbound slot {d} was reused since the db:result; discarding verdict for {s}", .{ inbound_slot, origin });
+        return;
+    }
 
-    // Send db:result response on the original inbound connection
+    // S2: bind the authenticated identity to the VERIFIED origin, not to
+    // whatever the header claimed at stream open. The record happens BEFORE
+    // the answer: a full domain set means the verdict cannot be honored and
+    // the answer must be invalid, never a valid the session will not accept.
+    var accepted = valid;
+    if (valid and !session.addAuthenticatedDomain(origin)) accepted = false;
+
+    // Send db:result response on the original inbound connection, from the
+    // host the db:result named and to the verified origin (not the
+    // header-claimed remote domain).
     var resp_buf: [512]u8 = undefined;
     const resp = dialback.buildDbResultResponse(
         &resp_buf,
-        session.stream.local_domain,
-        session.getRemoteDomain(),
-        valid,
-    ) catch return;
+        if (target.len > 0) target else daemon.local_domain,
+        origin,
+        accepted,
+    ) catch {
+        failDbResultAnswer(daemon, batch, session, inbound_slot, origin);
+        return;
+    };
 
-    session.queueWrite(resp) catch return;
+    session.queueWrite(resp) catch {
+        failDbResultAnswer(daemon, batch, session, inbound_slot, origin);
+        return;
+    };
     if (session.hasPendingWrite()) {
         batch.addWriteOnce(session.fd, INBOUND_UDATA_BASE + inbound_slot) catch {};
     }
 
-    if (valid) {
+    if (accepted) {
         session.inbound_dialback.setValid();
         session.stream.setAuthenticated();
-        log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{
-            session.getRemoteDomain(), inbound_slot,
-        });
+        log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{ origin, inbound_slot });
     } else {
         session.inbound_dialback.setInvalid();
-        log.warn("dialback callback: {s} invalid, inbound session {d} rejected", .{
-            session.getRemoteDomain(), inbound_slot,
-        });
+        log.warn("dialback callback: {s} rejected for inbound session {d}", .{ origin, inbound_slot });
     }
+}
 
-    // Clear the callback marker
-    conn.db_callback_inbound_slot = null;
+/// Build the SASL success answer, then record the verified domain and mark
+/// the stream authenticated. The answer must exist before any state change:
+/// a build failure leaves the session unauthenticated and records nothing
+/// (C6). S2: the FSM only reaches SASL success after DANE verified, so the
+/// verified domain joins the authenticated set; a full set means the
+/// identity cannot be recorded and the exchange fails instead of succeeding
+/// unrecorded.
+fn beginInboundSaslSuccess(session: *S2sSession, buf: []u8) ![]const u8 {
+    const success = try session.buildSaslSuccess(buf);
+    if (!session.promoteDaneCandidate()) return error.AuthenticatedDomainSetFull;
+    session.stream.completeSaslExternal();
+    return success;
 }
 
 /// Execute an S2sStreamAction by building and queuing the appropriate XML response.
-fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamAction) void {
+fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamAction, batch: ?*ChangeList) void {
     var buf: [2048]u8 = undefined;
 
     switch (action) {
@@ -1273,6 +2043,7 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
                 return;
             };
             session.queueWrite(response) catch {};
+            session.stream_header_sent = true;
         },
         .send_features => {
             const features = session.buildFeatures(&buf) catch {
@@ -1285,23 +2056,52 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
             const proceed = session.buildTlsProceed(&buf) catch return;
             session.queueWrite(proceed) catch {};
 
-            // Flush the proceed XML before upgrading to TLS
-            _ = session.flushWrite() catch {};
-
-            // Start TLS handshake
-            if (daemon.tls_ctx) |ctx| {
-                session.upgradeToTls(ctx) catch {
-                    log.err("inbound S2S id={d} TLS upgrade failed", .{session.id});
-                    return;
-                };
-                log.info("inbound S2S id={d} starting TLS handshake", .{session.id});
+            // Only upgrade once the plaintext buffer is fully flushed: a
+            // partially sent <proceed/> would otherwise leak into the TLS
+            // record stream (T250). A partial flush (no error) defers the
+            // upgrade to the writable handler; a write error closes.
+            const flushed = session.flushWrite() catch {
+                log.err("inbound S2S id={d} write error at STARTTLS proceed", .{session.id});
+                if (batch) |b| daemon.closeInbound(b, session.id);
+                return;
+            };
+            if (flushed) {
+                if (daemon.tls_ctx) |ctx| {
+                    session.upgradeToTls(ctx) catch {
+                        log.err("inbound S2S id={d} TLS upgrade failed", .{session.id});
+                        return;
+                    };
+                    log.info("inbound S2S id={d} starting TLS handshake", .{session.id});
+                } else {
+                    log.warn("inbound S2S id={d} STARTTLS requested but no TLS configured", .{session.id});
+                }
             } else {
-                log.warn("inbound S2S id={d} STARTTLS requested but no TLS configured", .{session.id});
+                if (daemon.tls_ctx) |ctx| {
+                    session.tls_upgrade_pending = true;
+                    session.pending_tls_ctx = ctx;
+                } else {
+                    log.warn("inbound S2S id={d} STARTTLS requested but no TLS configured", .{session.id});
+                }
             }
         },
         .send_sasl_success => {
-            const success = session.buildSaslSuccess(&buf) catch return;
-            session.queueWrite(success) catch {};
+            const success = beginInboundSaslSuccess(session, &buf) catch |err| {
+                if (err == error.AuthenticatedDomainSetFull) {
+                    log.warn("inbound S2S id={d}: authenticated-domain set full; SASL EXTERNAL rejected", .{session.id});
+                    const failure = session.buildSaslFailure(&buf, "policy") catch return;
+                    session.queueWrite(failure) catch {};
+                } else {
+                    log.err("inbound S2S id={d}: cannot build the SASL success", .{session.id});
+                    const failure = session.buildSaslFailure(&buf, "internal-server-error") catch return;
+                    session.queueWrite(failure) catch {};
+                }
+                return;
+            };
+            session.queueWrite(success) catch {
+                log.warn("inbound S2S id={d}: SASL success does not fit the write buffer; closing", .{session.id});
+                if (batch) |b| daemon.closeInbound(b, session.id);
+                return;
+            };
             _ = session.flushWrite() catch {};
             log.info("inbound S2S authenticated: remote={s}", .{session.getRemoteDomain()});
         },
@@ -1329,9 +2129,37 @@ fn executeAction(daemon: *S2sDaemon, session: *S2sSession, action: S2sStreamActi
 
 /// Send a stream error and close.
 fn sendStreamError(session: *S2sSession, err: StreamError) void {
+    // A peer whose header we never answered gets one first, as c2s does
+    // (RFC 6120 4.9.1). Queued separately and before the error so a host or
+    // domain at the buffer limit cannot stop the error from being sent:
+    // leaving the peer to wait is worse than an unopened error.
+    if (!session.stream_header_sent) {
+        var header_buf: [1024]u8 = undefined;
+        if (session.buildStreamOpenResponse(&header_buf)) |header| {
+            session.queueWrite(header) catch {};
+            session.stream_header_sent = true;
+        } else |_| {}
+    }
     var buf: [512]u8 = undefined;
     const error_xml = session.buildStreamError(&buf, err.toString()) catch return;
     session.queueWrite(error_xml) catch {};
+}
+
+fn closeInboundWithStreamError(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, err: StreamError) void {
+    const session = daemon.getInbound(slot) orelse return;
+    sendStreamError(session, err);
+    _ = session.flushWrite() catch {};
+    daemon.closeInbound(batch, slot);
+}
+
+/// Drop a stanza that overflowed the accumulator and fail the stream.
+/// A peer whose stanza we cannot relay is not a peer we can serve, and
+/// staying open would let it keep sending bytes we must parse and discard.
+fn closeBrokenStanza(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSession) void {
+    const slot = session.id;
+    log.warn("inbound S2S id={d} stanza exceeds {d} bytes: policy-violation", .{ slot, session.stanza_inner_buf.len });
+    session.resetStanza();
+    closeInboundWithStreamError(daemon, batch, slot, .policy_violation);
 }
 
 fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) void {
@@ -1344,9 +2172,26 @@ fn handleInboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) vo
     }
 
     _ = session.flushWrite() catch {
-        daemon.closeInbound(slot);
+        daemon.closeInbound(batch, slot);
         return;
     };
+
+    // A <proceed/> whose flush had fallen short now drained: run the
+    // deferred TLS upgrade (T250).
+    if (session.tls_upgrade_pending and !session.hasPendingWrite()) {
+        session.tls_upgrade_pending = false;
+        if (session.pending_tls_ctx) |ctx| {
+            session.pending_tls_ctx = null;
+            session.upgradeToTls(ctx) catch {
+                log.err("inbound S2S id={d} deferred TLS upgrade failed", .{session.id});
+                daemon.closeInbound(batch, slot);
+                return;
+            };
+            log.info("inbound S2S id={d} starting TLS handshake (deferred)", .{session.id});
+            batch.addRead(session.fd, INBOUND_UDATA_BASE + slot) catch {};
+        }
+        return;
+    }
 
     // If still more to write, re-register for another one-shot write event
     if (session.hasPendingWrite()) {
@@ -1371,13 +2216,14 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
             var optlen: posix.socklen_t = @sizeOf(c_int);
             const rc = std.c.getsockopt(conn.fd, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&err_opt), &optlen);
             if (rc != 0 or err_opt != 0) {
-                log.err("outbound TCP connect failed for {s}", .{conn.remote_domain});
-                conn.fail("tcp-connect-failed");
-                daemon.closeOutbound(slot);
+                log.warn("outbound TCP connect to {s}:{d} failed for {s}; trying next target", .{ conn.targetHost(), conn.target_port, conn.remote_domain });
+                daemon.abortConnectAttempt(batch, conn);
+                daemon.connectNextTarget(batch, conn);
                 return;
             }
 
-            log.info("outbound TCP connected to {s}:{d}", .{ conn.target_host, conn.target_port });
+            daemon.clearConnectDeadline(batch, conn);
+            log.info("outbound TCP connected to {s}:{d}", .{ conn.targetHost(), conn.target_port });
             conn.tcpConnected();
 
             if (conn.is_direct_tls) {
@@ -1389,12 +2235,12 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
                 const stream_open = conn.buildStreamOpen(&buf) catch return;
                 conn.queueWrite(stream_open) catch {
                     conn.fail("write-failed");
-                    daemon.closeOutbound(slot);
+                    daemon.closeOutbound(batch, slot);
                     return;
                 };
                 _ = conn.flushWrite() catch {
                     conn.fail("write-failed");
-                    daemon.closeOutbound(slot);
+                    daemon.closeOutbound(batch, slot);
                     return;
                 };
                 // Wait for remote stream open + features
@@ -1412,9 +2258,23 @@ fn handleOutboundWritable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
             // Flush pending write buffer
             _ = conn.flushWrite() catch {
                 conn.fail("write-failed");
-                daemon.closeOutbound(slot);
+                daemon.closeOutbound(batch, slot);
                 return;
             };
+            // db:verify stanzas that could not be queued earlier go out on
+            // this writable edge, but only once the stream is past the
+            // post-TLS features: earlier the key would travel in cleartext.
+            if (conn.hasUnsentVerify() and conn.canSendDbVerify() and
+                !sendDbVerifyOnCallback(daemon, batch, conn))
+            {
+                daemon.closeOutbound(batch, slot);
+                return;
+            }
+            // T275: resume a kept stanza tail on the writable edge
+            // even when no new stanza arrives; an idle link stranded it.
+            if (conn.state == .established and !conn.hasPendingWrite() and conn.pendingCount() > 0) {
+                daemon.flushOutboundStanzas(batch, conn);
+            }
             if (conn.hasPendingWrite()) {
                 batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {};
             }
@@ -1437,14 +2297,14 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
             error.WouldBlock => return,
             else => {
                 conn.fail("read-failed");
-                daemon.closeOutbound(slot);
+                daemon.closeOutbound(batch, slot);
                 return;
             },
         }
     };
     if (n == 0) {
         log.info("outbound connection to {s} closed by peer", .{conn.remote_domain});
-        daemon.closeOutbound(slot);
+        daemon.closeOutbound(batch, slot);
         return;
     }
 
@@ -1454,9 +2314,15 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
     var pos: usize = 0;
 
     while (true) {
+        // Pre-auth cap until the stream is established, then the federation
+        // cap; derived per item so an auth completed mid-read applies at once.
+        reader.setMaxItemBytes(if (conn.isEstablished())
+            xml.max_item_bytes_authenticated
+        else
+            xml.max_item_bytes_pre_auth);
         const event = reader.next(data, &pos) catch {
             conn.fail("xml-parse-error");
-            daemon.closeOutbound(slot);
+            daemon.closeOutbound(batch, slot);
             return;
         };
         if (event == null) break;
@@ -1466,12 +2332,21 @@ fn handleOutboundReadable(daemon: *S2sDaemon, batch: *ChangeList, slot: usize) v
         // Connection may have been closed
         if (daemon.outbound[slot] == null) return;
 
-        // After STARTTLS, stop processing pre-TLS buffer
+        // After STARTTLS, stop processing pre-TLS buffer (T250).
         if (conn.isTlsHandshaking()) break;
     }
 
     // Mark consumed bytes
     if (pos > 0) conn.consume(pos);
+
+    // STARTTLS read-ahead hygiene (T250): plaintext past <proceed/> means
+    // the remote spoke before we started TLS: protocol violation, close.
+    if (conn.isTlsHandshaking() and conn.read_start < conn.read_end) {
+        log.warn("outbound to {s}: {d} plaintext bytes after <proceed/>: policy violation, closing", .{ conn.remote_domain, conn.read_end - conn.read_start });
+        conn.fail("policy-violation");
+        daemon.closeOutbound(batch, slot);
+        return;
+    }
 
     // Request write notification if there's data to flush
     if (conn.hasPendingWrite()) {
@@ -1503,10 +2378,25 @@ fn processOutboundEvent(
             // <starttls> features
             if (std.mem.eql(u8, elem.namespace_uri, xml.ns.tls)) {
                 if (std.mem.eql(u8, elem.local_name, "proceed")) {
+                    // Only an answered <starttls/> may proceed; a peer that
+                    // sends it unsolicited is trying to skip negotiation.
+                    if (conn.state != .starttls_negotiation or conn.tls_conn != null) {
+                        log.warn("outbound {s}: unsolicited STARTTLS proceed (state={s}); failing the stream", .{ conn.remote_domain, @tagName(conn.state) });
+                        conn.fail("unsolicited-starttls-proceed");
+                        daemon.closeOutbound(batch, slot);
+                        return;
+                    }
                     log.info("outbound STARTTLS proceed from {s}", .{conn.remote_domain});
-                    conn.handleStarttlsProceed();
                     reader.reset();
-                    startOutboundTls(daemon, batch, slot, conn);
+                    if (conn.handleStarttlsProceed()) {
+                        startOutboundTls(daemon, batch, slot, conn);
+                    } else {
+                        // Pending local bytes at <proceed/>: they were queued
+                        // after <starttls/>, so sending them now would push
+                        // plaintext into the TLS record layer. Close (T250).
+                        log.warn("outbound {s}: plaintext queued after <starttls/> at <proceed/>", .{conn.remote_domain});
+                        daemon.closeOutbound(batch, slot);
+                    }
                 }
             }
             // <stream:features> children
@@ -1525,6 +2415,15 @@ fn processOutboundEvent(
             } else if (std.mem.eql(u8, elem.local_name, "success") and
                 std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl))
             {
+                // A SASL outcome is only meaningful after TLS and our
+                // <auth/>; accepting one earlier marks a cleartext conn
+                // established and lets keys and stanzas out unprotected.
+                if (!conn.canAcceptSaslOutcome()) {
+                    log.warn("outbound {s}: unsolicited SASL success (state={s}, tls={any}); failing the stream", .{ conn.remote_domain, @tagName(conn.state), conn.tls_conn != null });
+                    conn.fail("unsolicited-sasl-success");
+                    daemon.closeOutbound(batch, slot);
+                    return;
+                }
                 log.info("outbound SASL success from {s}", .{conn.remote_domain});
                 conn.handleAuthSuccess();
 
@@ -1537,41 +2436,89 @@ fn processOutboundEvent(
             } else if (std.mem.eql(u8, elem.local_name, "failure") and
                 std.mem.eql(u8, elem.namespace_uri, xml.ns.sasl))
             {
+                if (!conn.canAcceptSaslOutcome()) {
+                    log.warn("outbound {s}: unsolicited SASL failure (state={s}, tls={any}); failing the stream", .{ conn.remote_domain, @tagName(conn.state), conn.tls_conn != null });
+                    conn.fail("unsolicited-sasl-failure");
+                    daemon.closeOutbound(batch, slot);
+                    return;
+                }
                 log.warn("outbound SASL failure from {s}", .{conn.remote_domain});
                 conn.handleAuthFailure();
-                daemon.closeOutbound(slot);
+                daemon.closeOutbound(batch, slot);
             }
             // Handle dialback result response: <db:result type='valid'/>
             else if (std.mem.eql(u8, elem.local_name, "result") and
                 std.mem.eql(u8, elem.namespace_uri, xml.ns.dialback))
             {
                 var result_type: []const u8 = "";
+                var r_id: []const u8 = "";
+                var r_from: []const u8 = "";
+                var r_to: []const u8 = "";
                 for (elem.attributes) |attr| {
                     if (std.mem.eql(u8, attr.local_name, "type")) result_type = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "id")) r_id = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "from")) r_from = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "to")) r_to = attr.value;
                 }
-                if (std.mem.eql(u8, result_type, "valid")) {
-                    log.info("outbound dialback verified by {s}", .{conn.remote_domain});
-                    conn.handleAuthSuccess();
-                    daemon.flushOutboundStanzas(conn);
-                } else if (result_type.len > 0) {
-                    log.warn("outbound dialback rejected by {s}: type={s}", .{ conn.remote_domain, result_type });
-                    conn.handleAuthFailure();
-                    daemon.closeOutbound(slot);
+                // XEP-0185: the verdict on our db:verify is a typed db:result
+                // echoing the id. Complete the matching callback entry only.
+                // A db:result that answers no exchange we sent is a peer
+                // claiming an auth outcome out of state: fail the stream.
+                if (result_type.len == 0) {
+                    log.warn("dialback: db:result without type from {s}; failing the stream", .{conn.remote_domain});
+                    conn.fail("unexpected-db-result");
+                    daemon.closeOutbound(batch, slot);
+                    return;
                 }
+                if (conn.findPendingVerify(r_id, r_from, r_to)) |idx| {
+                    log.info("dialback callback: db:result verdict type={s} from {s}", .{ result_type, conn.remote_domain });
+                    handleDbVerifyResponse(daemon, batch, conn, idx, std.mem.eql(u8, result_type, "valid"));
+                    return;
+                }
+                // The verdict on the dialback key this connection sent:
+                // it authenticates the connection only while that
+                // exchange is outstanding.
+                if (conn.takePendingAssertion(r_from, r_to)) {
+                    if (std.mem.eql(u8, result_type, "valid")) {
+                        log.info("outbound dialback verified by {s}", .{conn.remote_domain});
+                        conn.handleAuthSuccess();
+                        daemon.flushOutboundStanzas(batch, conn);
+                    } else {
+                        log.warn("outbound dialback rejected by {s}: type={s}", .{ conn.remote_domain, result_type });
+                        conn.handleAuthFailure();
+                        daemon.closeOutbound(batch, slot);
+                    }
+                    return;
+                }
+                log.warn("dialback: unmatched db:result verdict type={s} from {s} (id={s} from={s} to={s}); failing the stream", .{ result_type, conn.remote_domain, r_id, r_from, r_to });
+                conn.fail("unmatched-db-result");
+                daemon.closeOutbound(batch, slot);
+                return;
             }
             // Handle db:verify response (dialback callback path)
             else if (std.mem.eql(u8, elem.local_name, "verify") and
                 std.mem.eql(u8, elem.namespace_uri, xml.ns.dialback))
             {
                 var verify_type: []const u8 = "";
+                var v_id: []const u8 = "";
+                var v_from: []const u8 = "";
+                var v_to: []const u8 = "";
                 for (elem.attributes) |attr| {
                     if (std.mem.eql(u8, attr.local_name, "type")) verify_type = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "id")) v_id = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "from")) v_from = attr.value;
+                    if (std.mem.eql(u8, attr.local_name, "to")) v_to = attr.value;
                 }
-                if (verify_type.len > 0 and conn.db_callback_inbound_slot != null) {
-                    const valid = std.mem.eql(u8, verify_type, "valid");
-                    log.info("dialback callback: db:verify response type={s} from {s}", .{ verify_type, conn.remote_domain });
-                    handleDbVerifyResponse(daemon, batch, conn, valid);
-                }
+                if (verify_type.len == 0) return;
+                // Correlate by id/from/to before acting (S2): a verdict
+                // that names no pending exchange is ignored.
+                const idx = conn.findPendingVerify(v_id, v_from, v_to) orelse {
+                    log.warn("dialback callback: unmatched db:verify verdict from {s} (id={s} from={s} to={s}); ignored", .{ conn.remote_domain, v_id, v_from, v_to });
+                    return;
+                };
+                const valid = std.mem.eql(u8, verify_type, "valid");
+                log.info("dialback callback: db:verify response type={s} from {s}", .{ verify_type, conn.remote_domain });
+                handleDbVerifyResponse(daemon, batch, conn, idx, valid);
             }
         },
         .element_end => |name| {
@@ -1580,13 +2527,17 @@ fn processOutboundEvent(
                 // Post-auth features: connection is established, flush queued stanzas
                 if (conn.state == .established) {
                     log.info("outbound S2S to {s} fully established", .{conn.remote_domain});
-                    daemon.flushOutboundStanzas(conn);
+                    daemon.flushOutboundStanzas(batch, conn);
                     return;
                 }
 
-                // Dialback callback: after TLS+features, send db:verify instead of auth
-                if (conn.db_callback_inbound_slot != null) {
-                    sendDbVerifyOnCallback(daemon, conn);
+                // Dialback callback: after TLS+features, send db:verify
+                // instead of auth. Pre-TLS features must fall through to
+                // STARTTLS first: the key never travels in cleartext.
+                if (conn.hasPendingVerify() and conn.canSendDbVerify()) {
+                    if (!sendDbVerifyOnCallback(daemon, batch, conn)) {
+                        daemon.closeOutbound(batch, slot);
+                    }
                     return;
                 }
 
@@ -1605,9 +2556,18 @@ fn processOutboundEvent(
                         var act_buf: [512]u8 = undefined;
                         const ext = conn.buildSaslExternal(&act_buf) catch return;
                         conn.queueWrite(ext) catch return;
+                        conn.sasl_auth_sent = true;
                         _ = conn.flushWrite() catch return;
                     },
                     .begin_dialback => {
+                        // The dialback key is authentication material: it
+                        // never travels before TLS, whatever the FSM says.
+                        if (conn.tls_conn == null) {
+                            log.warn("outbound {s}: dialback key requested before TLS; failing the stream", .{conn.remote_domain});
+                            conn.fail("dialback-key-before-tls");
+                            daemon.closeOutbound(batch, slot);
+                            return;
+                        }
                         const stream_id = conn.getRemoteStreamId();
                         if (stream_id.len == 0) {
                             log.err("outbound dialback for {s}: no remote stream ID", .{conn.remote_domain});
@@ -1628,6 +2588,7 @@ fn processOutboundEvent(
                         ) catch return;
                         conn.queueWrite(db_result) catch return;
                         _ = conn.flushWrite() catch return;
+                        conn.db_assertion_pending = true;
                         log.info("outbound dialback key sent to {s}", .{conn.remote_domain});
                     },
                     .none => {},
@@ -1636,7 +2597,7 @@ fn processOutboundEvent(
         },
         .stream_close => {
             log.info("outbound stream closed by {s}", .{conn.remote_domain});
-            daemon.closeOutbound(slot);
+            daemon.closeOutbound(batch, slot);
         },
         .xml_declaration => {},
         .text => {},
@@ -1644,59 +2605,239 @@ fn processOutboundEvent(
 }
 
 /// Start an outbound TLS handshake using the client context.
+///
+/// The TLSA outcome is already known from the async resolution (the target
+/// carries its records and status), so the context is chosen before the SSL
+/// object exists: with usable records the handshake itself verifies through
+/// DANE and fails closed, so there is no post-handshake window in which an
+/// unverified peer could be spoken to.
 fn startOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
-    const ctx = daemon.tls_client_ctx orelse {
-        conn.fail("no-client-tls-context");
-        daemon.closeOutbound(slot);
-        return;
-    };
-
-    conn.upgradeToTls(ctx) catch {
-        conn.fail("tls-init-failed");
-        daemon.closeOutbound(slot);
-        return;
-    };
+    const arm = armOutboundDane(daemon, conn);
+    switch (arm) {
+        .armed, .pkix => {},
+        // A target whose lookup failed, or whose state could not be built,
+        // is not a peer we may speak to unverified (ADR-13): move on to the
+        // next target, and fail the initiation as temporary once they run
+        // out. A transient allocation failure is retried the same way.
+        .temporary_failure => {
+            conn.dropDaneState();
+            daemon.advanceOrFailOutbound(batch, conn, "remote-server-timeout");
+            return;
+        },
+        .permanent_failure => {
+            conn.dropDaneState();
+            daemon.advanceOrFailOutbound(batch, conn, "policy-violation");
+            return;
+        },
+        .none => {
+            const ctx = daemon.tls_client_ctx orelse {
+                conn.fail("no-client-tls-context");
+                daemon.closeOutbound(batch, slot);
+                return;
+            };
+            conn.upgradeToTls(ctx) catch {
+                conn.fail("tls-init-failed");
+                daemon.closeOutbound(batch, slot);
+                return;
+            };
+        },
+    }
+    if (arm != .none) {
+        const use_dane = arm == .armed;
+        const ctx = if (use_dane)
+            daneClientCtx(daemon) orelse {
+                conn.fail("no-dane-tls-context");
+                daemon.closeOutbound(batch, slot);
+                return;
+            }
+        else
+            pkixClientCtx(daemon) orelse {
+                conn.fail("no-client-tls-context");
+                daemon.closeOutbound(batch, slot);
+                return;
+            };
+        conn.upgradeToTls(ctx) catch {
+            conn.fail("tls-init-failed");
+            daemon.closeOutbound(batch, slot);
+            return;
+        };
+        const state = if (conn.dane_state) |*s| s else unreachable;
+        const tls = if (conn.tls_conn) |*t| t else {
+            conn.fail("tls-init-failed");
+            daemon.closeOutbound(batch, slot);
+            return;
+        };
+        if (use_dane) {
+            // DANE must be armed before the first handshake step;
+            // SSL_dane_enable afterwards cannot influence this handshake.
+            conn.dane_prepared = tls.prepareDane(state) catch {
+                log.err("outbound {s}: cannot arm DANE", .{conn.remote_domain});
+                conn.fail("dane-arm-failed");
+                daemon.closeOutbound(batch, slot);
+                return;
+            };
+        } else {
+            // Published but unusable RRset: PKIX against the system store,
+            // with the module's identifiers so a subject CN never matches.
+            tls.applyPkixFallback(state) catch {
+                log.err("outbound {s}: cannot apply the PKIX fallback", .{conn.remote_domain});
+                conn.fail("dane-arm-failed");
+                daemon.closeOutbound(batch, slot);
+                return;
+            };
+            // The identifiers now live on the SSL; nothing asserts DANE for
+            // this peer, so the state is dropped and the post-handshake
+            // record reads as no-records (dialback decides).
+            conn.dropDaneState();
+        }
+    }
 
     conn.state = .tls_handshake;
     continueOutboundTls(daemon, batch, slot, conn);
 }
 
+/// The DANE-verifying client context built at startup. Returns a copy of the
+/// context handle: the daemon owns the pointer and frees it at deinit.
+fn daneClientCtx(daemon: *S2sDaemon) ?SslContext {
+    return daemon.tls_client_ctx_dane;
+}
+
+/// The PKIX-verifying client context built at startup.
+fn pkixClientCtx(daemon: *S2sDaemon) ?SslContext {
+    return daemon.tls_client_ctx_ca;
+}
+
+/// Outcome of trying to arm DANE for an outbound connection before its
+/// handshake.
+const OutboundDaneArm = enum {
+    /// At least one usable record survived: the handshake verifies via DANE.
+    armed,
+    /// No usable record survived for a target that published an RRset: the
+    /// module's PKIX fallback applies, so peer trust is the system store.
+    pkix,
+    /// Nothing to assert: no records, or a lab seam. Dialback decides.
+    none,
+    /// Building the state failed for a reason that will not clear by
+    /// retrying the same target: an oversized or malformed RRset.
+    permanent_failure,
+    /// Building the state failed transiently (allocation): the target may
+    /// still succeed on a later attempt.
+    temporary_failure,
+};
+
+/// Query the peer's TLSA records and build the connection's DANE state.
+///
+/// The status word from the async resolution is authoritative (ADR-13): a
+/// failed lookup is a temporary failure of that target and never proof of
+/// absence. A usable record set arms DANE; a set whose records are all
+/// unusable falls back to PKIX; nothing at all leaves the stream to dialback.
+fn armOutboundDane(daemon: *S2sDaemon, conn: *OutboundConnection) OutboundDaneArm {
+    // Test seam (T277 regression): the forced verdict stands in for the
+    // handshake result, so no live lookup and no DANE context is used.
+    if (daemon.dane_verdict_override != null) return .none;
+
+    const target = conn.curTarget() orelse return .none;
+    switch (target.tlsa_status) {
+        // Never fall back to dialback for a peer that publishes usable
+        // records: its identity would then rest on DNS alone.
+        .lookup_failed => {
+            log.warn("outbound {s}: TLSA lookup failed for {s} (temporary)", .{ conn.remote_domain, target.host });
+            return .temporary_failure;
+        },
+        .absent => {
+            log.info("no TLSA records for {s} — will use dialback", .{target.host});
+            return .none;
+        },
+        .present => {},
+    }
+    const tlsa_records = target.tlsa;
+    if (tlsa_records.len == 0) return .none;
+
+    // RFC 7673 section 4: the service domain and the SRV target it resolved
+    // to are both valid reference identifiers. The first entry is also the
+    // SNI value, so the service domain leads.
+    var names_buf: [2][]const u8 = undefined;
+    var names_len: usize = 0;
+    names_buf[names_len] = conn.remote_domain;
+    names_len += 1;
+    if (!std.mem.eql(u8, target.host, conn.remote_domain)) {
+        names_buf[names_len] = target.host;
+        names_len += 1;
+    }
+
+    // Pass the whole RRset: the module owns the per-set cap and rejects an
+    // oversized set, so a matching record is never dropped here.
+    const records = convertTlsaRecords(daemon.allocator, tlsa_records) catch {
+        log.warn("outbound {s}: cannot allocate {d} TLSA records", .{ conn.remote_domain, tlsa_records.len });
+        return .temporary_failure;
+    };
+    defer daemon.allocator.free(records);
+
+    conn.dane_state = ssl.initDane(daemon.allocator, .{ .names = names_buf[0..names_len] }, records) catch |err| {
+        log.warn("outbound {s}: cannot build DANE state: {}", .{ conn.remote_domain, err });
+        return switch (err) {
+            error.OutOfMemory => .temporary_failure,
+            else => .permanent_failure,
+        };
+    };
+    const state = if (conn.dane_state) |*s| s else return .permanent_failure;
+    return switch (state.mode()) {
+        .dane => .armed,
+        .pkix => .pkix,
+    };
+}
+
 /// Continue a non-blocking outbound TLS handshake.
 fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
     const complete = conn.continueHandshake() catch {
+        // A DANE-armed handshake fails at the certificate step; report which
+        // record or chain rule rejected the peer rather than a bare alert.
+        if (conn.dane_state != null) {
+            logDaneHandshakeFailure(conn);
+        }
         log.err("outbound TLS handshake failed for {s}", .{conn.remote_domain});
-        conn.fail("tls-handshake-failed");
-        daemon.closeOutbound(slot);
+        conn.fail(if (conn.dane_state != null) "dane-verification-failed" else "tls-handshake-failed");
+        daemon.closeOutbound(batch, slot);
         return;
     };
 
     if (complete) {
-        log.info("outbound TLS handshake complete for {s}", .{conn.remote_domain});
+        // Q11: offload fallback is silent, so engagement, version and cipher
+        // are logged once per handshake (tokens: ktls, ktls-tx, ktls-rx, sw).
+        if (conn.tls_conn) |*tls| {
+            const mode: []const u8 = if (tls.ktlsSend() and tls.ktlsRecv()) "ktls" else if (tls.ktlsSend()) "ktls-tx" else if (tls.ktlsRecv()) "ktls-rx" else "sw";
+            log.info("outbound TLS handshake complete for {s} version={s} cipher={s} mode={s}", .{ conn.remote_domain, tls.versionName(), tls.cipherName(), mode });
+        } else {
+            log.info("outbound TLS handshake complete for {s} mode=none", .{conn.remote_domain});
+        }
         conn.tlsHandshakeComplete();
 
         // Reset XML reader for post-TLS stream restart
         if (daemon.outbound_readers[slot]) |reader| reader.reset();
-        // Clear stale pre-TLS data from the read buffer
+        // Invariant per T250: no plaintext may outlive <proceed/>
+        // (leftovers are rejected with policy-violation); zero for safety.
         conn.read_start = 0;
         conn.read_end = 0;
 
-        // DANE verification
-        performOutboundDane(daemon, slot, conn);
+        // DANE verification. This may closeOutbound (frees conn and clears
+        // the slot): read the slot table afterwards, never the possibly-freed
+        // pointer (T277).
+        recordOutboundDane(daemon, batch, slot, conn);
 
         // If DANE failed, connection was closed
-        if (conn.isFailed()) return;
+        if (daemon.outbound[slot] == null) return;
 
         // Send post-TLS stream open
         var buf: [2048]u8 = undefined;
         const stream_open = conn.buildStreamOpen(&buf) catch return;
         conn.queueWrite(stream_open) catch {
             conn.fail("write-failed");
-            daemon.closeOutbound(slot);
+            daemon.closeOutbound(batch, slot);
             return;
         };
         _ = conn.flushWrite() catch {
             conn.fail("write-failed");
-            daemon.closeOutbound(slot);
+            daemon.closeOutbound(batch, slot);
             return;
         };
 
@@ -1710,172 +2851,370 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
         if (conn.tls_state) |state| {
             switch (state) {
                 .handshake_want_read => batch.addRead(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {},
-                .handshake_want_write => batch.addWrite(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {},
+                // One-shot: same persistent-write spin trap as the inbound
+                // hold (S10).
+                .handshake_want_write => batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {},
                 .established => {},
             }
         }
     }
 }
 
-/// Perform DANE verification after outbound TLS handshake.
-fn performOutboundDane(daemon: *S2sDaemon, slot: usize, conn: *OutboundConnection) void {
-    const dane_mod = @import("dane.zig");
+/// Log why a DANE handshake was rejected. OpenSSL leaves the verification
+/// result on the SSL after a failed handshake, so the named failure survives.
+fn logDaneHandshakeFailure(conn: *OutboundConnection) void {
+    const state = if (conn.dane_state) |*s| s else return;
+    const tls = if (conn.tls_conn) |*t| t else return;
+    const v = tls.daneVerdict(conn.dane_prepared, state);
+    log.warn("DANE rejected outbound handshake to {s}: {s}", .{
+        conn.remote_domain,
+        @tagName(v.failure orelse .backend_error),
+    });
+}
 
-    // Query TLSA records for the target host/port
-    const tlsa_records = dns.resolver.queryTlsa(daemon.allocator, conn.target_port, conn.target_host) catch |err| {
-        log.warn("TLSA query failed for {s}:{d}: {}", .{ conn.target_host, conn.target_port, err });
+/// Read the handshake's verification state and set the connection's DANE
+/// result. Nothing reaches the wire before this runs: the handshake already
+/// failed if a TLSA record did not match.
+fn recordOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *OutboundConnection) void {
+    // Test seam: a forced verdict stands in for the handshake result
+    // (T277 regression rig); production leaves it null.
+    if (daemon.dane_verdict_override) |verdict| {
+        conn.setDaneResult(verdict);
+        if (conn.isFailed()) {
+            daemon.closeOutbound(batch, slot);
+        }
+        return;
+    }
+
+    // The connected target carries its own TLSA result, fetched during
+    // resolution (X2b): no DNS runs at handshake time. A lookup_failed
+    // target never reaches this point (the connect iterator skips it).
+    const target = conn.curTarget() orelse {
         conn.setDaneResult(.no_records);
         return;
     };
-    defer {
-        for (tlsa_records) |rec| daemon.allocator.free(rec.association_data);
-        daemon.allocator.free(tlsa_records);
+    switch (target.tlsa_status) {
+        .lookup_failed => {
+            conn.fail("dane-lookup-failed");
+            daemon.closeOutbound(batch, slot);
+            return;
+        },
+        .absent => {
+            log.info("no TLSA records for {s}:{d} — will use dialback", .{ target.host, conn.target_port });
+            conn.setDaneResult(.no_records);
+            return;
+        },
+        .present => {},
     }
 
-    if (tlsa_records.len == 0) {
-        log.info("no TLSA records for {s}:{d} — will use dialback", .{ conn.target_host, conn.target_port });
+    const state = if (conn.dane_state) |*s| s else {
         conn.setDaneResult(.no_records);
         return;
-    }
-
-    // Extract peer certificate chain from TLS connection
-    if (conn.tls_conn) |*tls| {
-        const leaf_der = tls.getPeerCertDer(daemon.allocator) catch {
-            conn.setDaneResult(.no_records);
-            return;
-        };
-        if (leaf_der == null) {
-            log.warn("no peer certificate for {s}", .{conn.remote_domain});
-            conn.setDaneResult(.no_records);
-            return;
-        }
-        defer daemon.allocator.free(leaf_der.?);
-
-        const chain_der = tls.getPeerChainDer(daemon.allocator) catch {
-            conn.setDaneResult(.no_records);
-            return;
-        };
-        defer {
-            for (chain_der) |cert| daemon.allocator.free(cert);
-            daemon.allocator.free(chain_der);
-        }
-
-        // Convert dns.TlsaRecord → dane.DnsTlsaRecord for the bridge
-        var dane_records = daemon.allocator.alloc(dane_mod.DnsTlsaRecord, tlsa_records.len) catch {
-            conn.setDaneResult(.no_records);
-            return;
-        };
-        defer daemon.allocator.free(dane_records);
-        for (tlsa_records, 0..) |rec, i| {
-            dane_records[i] = .{
-                .usage = rec.usage,
-                .selector = rec.selector,
-                .matching_type = rec.matching_type,
-                .association_data = rec.association_data,
-            };
-        }
-
-        const status = dane_mod.verifyDane(daemon.allocator, leaf_der.?, chain_der, dane_records);
-        log.info("DANE result for {s}: {s}", .{
-            conn.remote_domain,
-            switch (status) {
-                .verified => "verified",
-                .no_records => "no-records",
-                .failed => "FAILED",
-                .pending => "pending",
-            },
-        });
-        conn.setDaneResult(status);
-
-        if (conn.isFailed()) {
-            daemon.closeOutbound(slot);
-        }
-    } else {
+    };
+    const tls = if (conn.tls_conn) |*t| t else {
         conn.setDaneResult(.no_records);
+        return;
+    };
+
+    const status: connector_mod.DaneStatus = switch (tls.daneVerdict(conn.dane_prepared, state).outcome) {
+        .verified => .verified,
+        .no_usable_records => .no_records,
+        .failed => blk: {
+            logDaneHandshakeFailure(conn);
+            break :blk .failed;
+        },
+    };
+    log.info("DANE result for {s}: {s}", .{
+        conn.remote_domain,
+        switch (status) {
+            .verified => "verified",
+            .no_records => "no-records",
+            .failed => "FAILED",
+            .pending => "pending",
+        },
+    });
+    conn.setDaneResult(status);
+    if (conn.isFailed()) {
+        daemon.closeOutbound(batch, slot);
     }
 }
 
-/// Perform DANE verification for an inbound S2S session.
-/// Called after post-TLS stream open reveals the remote domain.
-/// Queries TLSA for the standard S2S port of the remote domain and
-/// verifies against the presented peer certificate.
-fn performInboundDane(daemon: *S2sDaemon, session: *S2sSession, remote_domain: []const u8) void {
-    const dane_mod = @import("dane.zig");
-
-    // Resolve the remote's SRV to find their actual S2S port for TLSA query
-    const targets = dns.resolver.resolveXmpp(daemon.allocator, remote_domain, true) catch {
-        session.stream.setDaneVerified(false);
-        return;
-    };
-    defer {
-        for (targets) |t| daemon.allocator.free(t.host);
-        daemon.allocator.free(targets);
-    }
-    const tlsa_port: u16 = if (targets.len > 0) targets[0].port else 5269;
-    const tlsa_host = if (targets.len > 0) targets[0].host else remote_domain;
-
-    const tlsa_records = dns.resolver.queryTlsa(daemon.allocator, tlsa_port, tlsa_host) catch {
-        session.stream.setDaneVerified(false);
-        return;
-    };
-    defer {
-        for (tlsa_records) |rec| daemon.allocator.free(rec.association_data);
-        if (tlsa_records.len > 0) daemon.allocator.free(tlsa_records);
-    }
-
-    if (tlsa_records.len == 0) {
-        log.info("inbound DANE: no TLSA records for {s}", .{remote_domain});
-        session.stream.setDaneVerified(false);
-        return;
-    }
-
-    // Get peer cert from the TLS session
-    if (session.tls_conn) |*tls| {
-        const leaf_der = tls.getPeerCertDer(daemon.allocator) catch {
-            session.stream.setDaneVerified(false);
-            return;
+/// Convert transport TLSA records into `ssl.DaneRecord`. Both carry the raw
+/// wire fields, so this is a field copy; out-of-range values stay, and the
+/// module drops them in `RecordSet.init` through `Record.isUsable`.
+fn convertTlsaRecords(alloc: std.mem.Allocator, tlsa_records: []const dns.TlsaRecord) ![]ssl.DaneRecord {
+    const records = try alloc.alloc(ssl.DaneRecord, tlsa_records.len);
+    for (tlsa_records, 0..) |rec, i| {
+        records[i] = .{
+            .usage = rec.usage,
+            .selector = rec.selector,
+            .matching_type = rec.matching_type,
+            .data = rec.association_data,
         };
-        if (leaf_der == null) {
-            log.info("inbound DANE: no peer certificate from {s}", .{remote_domain});
-            session.stream.setDaneVerified(false);
+    }
+    return records;
+}
+
+/// Kick the async DANE lookup for an inbound S2S session after the
+/// post-TLS stream open revealed the remote domain (X2b). The SRV + TLSA
+/// chain mirrors the old blocking lookup: _xmpps-server then _xmpp-server,
+/// the top target by (priority, weight), then _port._tcp.target TLSA, with
+/// the bare-domain fallback on 5269. Returns true while the lookup is in
+/// flight: the caller defers the auth features until it lands, since the
+/// EXTERNAL advertisement depends on the result.
+fn performInboundDane(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSession, remote_domain: []const u8) bool {
+    // The candidate promotes into the session's authenticated set only if
+    // the SASL EXTERNAL exchange succeeds (S2).
+    session.setDaneCandidate(remote_domain);
+
+    session.dane_key = daemon.next_dns_key;
+    daemon.next_dns_key +%= 1;
+    session.dane_lookup_pending = true;
+    session.dane_phase = .srv_tls;
+    session.dane_tlsa_status = .absent;
+    daemon.batch = batch;
+    issueInboundDaneQuery(daemon, session) catch {
+        session.dane_lookup_pending = false;
+        session.dane_phase = .none;
+        session.dane_key = 0;
+        session.stream.setDaneVerified(false);
+        return false;
+    };
+    // A synchronous completion (cache hit) already landed through
+    // finishInboundDane; only an in-flight lookup holds the read.
+    // Inbound read interest is level-triggered: left armed while the
+    // lookup pends, any peer byte spins the loop until the chain lands.
+    if (session.dane_lookup_pending) {
+        batch.disableRead(session.fd) catch {
+            // A lost EV_DISABLE leaves the read armed on a lookup that
+            // refuses every byte: the loop spins (L5). Close rather
+            // than lie; returning true keeps the caller off the freed
+            // session exactly as a still-pending lookup would.
+            daemon.inbound_kevent_closes += 1;
+            log.warn("inbound S2S id={d}: kevent disable failed; closing session", .{session.id});
+            daemon.closeInbound(batch, session.id);
+            return true;
+        };
+    }
+    return true;
+}
+
+/// Send the current phase's record query for an inbound DANE lookup.
+/// srv_tls: _xmpps-server SRV; srv_plain: _xmpp-server SRV; tlsa:
+/// _port._tcp.target TLSA (or the _5269 fallback on the bare domain).
+fn issueInboundDaneQuery(self: *S2sDaemon, session: *S2sSession) !void {
+    var buf: [280]u8 = undefined;
+    const qname = switch (session.dane_phase) {
+        .srv_tls => try dns.srvQueryName(&buf, dns.xmpps_server_srv, session.daneDomain()),
+        .srv_plain => try dns.srvQueryName(&buf, dns.xmpp_server_srv, session.daneDomain()),
+        .tlsa => if (session.dane_target_len > 0)
+            try dns.tlsaQueryName(&buf, session.dane_target_port, session.daneTarget())
+        else
+            try dns.tlsaQueryName(&buf, 5269, session.daneDomain()),
+        .none => return error.NoPhase,
+    };
+    try self.resolver.query(qname, if (session.dane_phase == .tlsa) .tlsa else .srv, session.dane_key);
+}
+
+/// Raw record query completion demux: every inbound DANE hop carries the
+/// session's dane_key; the session is found by scanning the slot table
+/// (bounded by MAX_INBOUND_SESSIONS). An unknown key is a cancelled or
+/// closed session; the result is freed and dropped.
+fn onQueryDone(ctx: ?*anyopaque, session_key: usize, status: dns_async.Status, res: ?dns_async.RecordResult) void {
+    const self: *S2sDaemon = @ptrCast(@alignCast(ctx));
+    for (&self.inbound) |*slot| {
+        const session = slot.* orelse continue;
+        if (session.dane_key == session_key) {
+            applyInboundDaneResult(self, session, status, res);
             return;
         }
-        defer daemon.allocator.free(leaf_der.?);
+    }
+    if (res) |*r| {
+        var rr = r.*;
+        rr.deinitOn(self.allocator);
+    }
+}
 
-        const chain_der = tls.getPeerChainDer(daemon.allocator) catch {
-            session.stream.setDaneVerified(false);
-            return;
-        };
-        defer {
-            for (chain_der) |cert| daemon.allocator.free(cert);
-            daemon.allocator.free(chain_der);
-        }
-
-        // Convert and verify
-        var dane_records = daemon.allocator.alloc(dane_mod.DnsTlsaRecord, tlsa_records.len) catch {
-            session.stream.setDaneVerified(false);
-            return;
-        };
-        defer daemon.allocator.free(dane_records);
-        for (tlsa_records, 0..) |rec, i| {
-            dane_records[i] = .{
-                .usage = rec.usage,
-                .selector = rec.selector,
-                .matching_type = rec.matching_type,
-                .association_data = rec.association_data,
+/// Consume one hop of the inbound DANE chain. SRV answers are parsed and
+/// ordered (priority asc, weight desc, as resolver.querySrv sorted); the
+/// top target moves the chain to its TLSA query. NXDOMAIN/NODATA walks to
+/// the next phase; a wire failure on the TLSA hop is lookup_failed, never
+/// "no TLSA" (ADR-13).
+fn applyInboundDaneResult(self: *S2sDaemon, session: *S2sSession, status: dns_async.Status, res: ?dns_async.RecordResult) void {
+    switch (session.dane_phase) {
+        .srv_tls, .srv_plain => {
+            defer if (res) |*r| {
+                var rr = r.*;
+                rr.deinitOn(self.allocator);
             };
-        }
-
-        const status = dane_mod.verifyDane(daemon.allocator, leaf_der.?, chain_der, dane_records);
-        const verified = (status == .verified);
-        session.stream.setDaneVerified(verified);
-        log.info("inbound DANE for {s}: {s}", .{
-            remote_domain,
-            if (verified) "verified" else "not verified (will offer dialback)",
-        });
-    } else {
-        session.stream.setDaneVerified(false);
+            if (status == .resolved and res != null) {
+                var srvs: std.ArrayList(dns.SrvRecord) = .empty;
+                defer {
+                    for (srvs.items) |s| self.allocator.free(s.target);
+                    srvs.deinit(self.allocator);
+                }
+                for (res.?.rrs) |rr| {
+                    if (rr.rtype != @intFromEnum(dns_async.RType.srv)) continue;
+                    const rec = dns.parseSrvRdata(rr.rdata, self.allocator) catch continue;
+                    if (std.mem.eql(u8, rec.target, ".")) continue;
+                    srvs.append(self.allocator, rec) catch continue;
+                }
+                if (srvs.items.len > 0) {
+                    std.mem.sort(dns.SrvRecord, srvs.items, {}, dns.SrvRecord.lessThan);
+                    const top = srvs.items[0];
+                    // parseDnsName bounds the dotted form at 253, so a
+                    // target that still cannot be staged makes this SRV
+                    // set unusable and the chain walks on (H1).
+                    if (session.setDaneTarget(top.target, top.port)) |_| {
+                        session.dane_phase = .tlsa;
+                        if (issueInboundDaneQuery(self, session)) |_| return else |_| {}
+                    } else |_| {}
+                }
+            }
+            // Empty, absent or failed SRV: walk the chain. A failed
+            // _xmpps hop falls through to _xmpp like "." does; a failed
+            // _xmpp hop is a temporary failure, not proof of absence.
+            if (session.dane_phase == .srv_tls) {
+                session.dane_phase = .srv_plain;
+                if (issueInboundDaneQuery(self, session)) |_| return else |_| {}
+            } else if (status != .failed) {
+                // Both SRV names absent: the bare-domain fallback.
+                session.setDaneTarget("", 5269) catch unreachable;
+                session.dane_phase = .tlsa;
+                if (issueInboundDaneQuery(self, session)) |_| return else |_| {}
+            }
+            finishInboundDane(self, session, .lookup_failed);
+        },
+        .tlsa => {
+            if (status == .nxdomain) return finishInboundDane(self, session, .absent);
+            if (status != .resolved or res == null) return finishInboundDane(self, session, .lookup_failed);
+            defer {
+                var rr = res.?;
+                rr.deinitOn(self.allocator);
+            }
+            var recs: std.ArrayList(dns.TlsaRecord) = .empty;
+            errdefer {
+                for (recs.items) |r| self.allocator.free(r.association_data);
+                recs.deinit(self.allocator);
+            }
+            // The resolver's own rule (lib/dns/async.zig): parsed records
+            // are .present; an answer whose TLSA records all failed to
+            // parse or append is .lookup_failed (a temporary failure,
+            // never proof of absence); no TLSA records at all is .absent.
+            var saw = false;
+            for (res.?.rrs) |rr| {
+                if (rr.rtype != @intFromEnum(dns_async.RType.tlsa)) continue;
+                saw = true;
+                const rec = dns.parseTlsaRdata(rr.rdata, self.allocator) catch continue;
+                recs.append(self.allocator, rec) catch {
+                    self.allocator.free(rec.association_data);
+                    continue;
+                };
+            }
+            if (recs.items.len == 0) {
+                recs.deinit(self.allocator);
+                return finishInboundDane(self, session, if (saw) .lookup_failed else .absent);
+            }
+            session.adoptDaneTlsa(recs.items, self.allocator) catch {
+                // Adoption failed: the caller still owns the records, and
+                // an unpresentable set is a lookup failure, never "no
+                // TLSA" and never a present-but-empty adoption.
+                for (recs.items) |r| self.allocator.free(r.association_data);
+                recs.deinit(self.allocator);
+                return finishInboundDane(self, session, .lookup_failed);
+            };
+            recs.deinit(self.allocator); // items moved to the session
+            finishInboundDane(self, session, .present);
+        },
+        .none => {
+            if (res) |*r| {
+                var rr = r.*;
+                rr.deinitOn(self.allocator);
+            }
+        },
     }
+}
+
+/// Land the inbound DANE outcome: records + status stay on the session
+/// (the seam PR #49 consumes), the stream learns whether DANE verified,
+/// the deferred features go out, and buffered inbound data drains.
+fn finishInboundDane(self: *S2sDaemon, session: *S2sSession, status: dns_async.TlsaStatus) void {
+    const batch = self.batch orelse return;
+    session.dane_lookup_pending = false;
+    session.dane_phase = .none;
+    session.dane_key = 0;
+    session.dane_tlsa_status = status;
+    // Re-arm the read interest performInboundDane held for the wait.
+    batch.enableRead(session.fd) catch {
+        // A lost EV_ENABLE strands the session with reads held off
+        // forever (L5): close rather than lie.
+        self.inbound_kevent_closes += 1;
+        log.warn("inbound S2S id={d}: kevent re-enable failed; closing session", .{session.id});
+        self.closeInbound(batch, session.id);
+        return;
+    };
+
+    var verified = false;
+    if (status == .present) {
+        verified = verifyInboundDane(self, session);
+    }
+    session.stream.setDaneVerified(verified);
+    // A failed lookup is a temporary failure of the peer's DANE data, not
+    // proof of absence: it is logged as such (and never counted as verified)
+    // so an operator can tell it apart from a peer with no TLSA at all.
+    if (status == .lookup_failed) {
+        _ = inbound_dane_lookup_failures.fetchAdd(1, .monotonic);
+        log.warn("inbound DANE lookup failed for {s}: will offer dialback only", .{session.daneDomain()});
+    } else {
+        log.info("inbound DANE for {s}: {s} ({s})", .{
+            session.daneDomain(),
+            if (verified) "verified" else "not verified (will offer dialback)",
+            @tagName(status),
+        });
+    }
+
+    self.sendInboundFeaturesTail(batch, session);
+    handleInboundReadable(self, batch, session.id);
+}
+
+/// Verify an inbound peer against the TLSA records DANE resolved for its
+/// domain. Null means DANE could not run at all (no usable record, no
+/// verification context, no TLS connection); the caller keeps dialback.
+///
+/// The peer chain is already on the live connection, so the same
+/// `X509_verify_cert` path the outbound handshake uses runs in place. That
+/// work runs on the loop thread today; plan section 4 moves it to the
+/// handshake pool with ADR-11/F7.
+fn verifyInboundPeer(daemon: *S2sDaemon, session: *S2sSession, tlsa_records: []const dns.TlsaRecord) ?ssl.DaneVerdict {
+    // Built at startup with the other contexts; a missing one is a bug, not
+    // a runtime condition, but DANE stays unavailable rather than asserting.
+    const verify_ctx = if (daemon.dane_verify_ctx) |*c| c else {
+        log.err("inbound: DANE verifier context missing (not built at startup)", .{});
+        return null;
+    };
+    const tls = if (session.tls_conn) |*t| t else return null;
+
+    const records = convertTlsaRecords(daemon.allocator, tlsa_records) catch return null;
+    defer daemon.allocator.free(records);
+
+    // The stream's from-domain is the only identifier known before the
+    // session authenticates; the SRV target is not ours to assume inbound.
+    var names_buf: [1][]const u8 = undefined;
+    names_buf[0] = session.daneDomain();
+    var state = ssl.initDane(daemon.allocator, .{ .names = &names_buf }, records) catch |err| {
+        log.warn("inbound {s}: cannot build DANE state: {}", .{ session.daneDomain(), err });
+        return null;
+    };
+    defer state.deinit();
+    if (state.set.len() == 0) return null;
+
+    return tls.verifyPeerDane(verify_ctx, &state);
+}
+
+/// True only for a verified peer; every other outcome keeps dialback.
+fn verifyInboundDane(daemon: *S2sDaemon, session: *S2sSession) bool {
+    const verdict = verifyInboundPeer(daemon, session, session.dane_tlsa_records) orelse return false;
+    return verdict.outcome == .verified;
 }
 
 // ============================================================================
@@ -1892,18 +3231,27 @@ fn handleIpcAccept(daemon: *S2sDaemon, batch: *ChangeList) void {
     log.info("core connected via IPC slot={d}", .{slot.?});
 }
 
+/// Close an IPC client lane with full hygiene: purges its staged kevent
+/// entries first (T277). A same-iteration accept may reuse the fd number,
+/// and still-staged add/remove entries would attach to the new socket.
+fn closeIpcClientLane(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) void {
+    const client = daemon.ipc.getClient(ipc_slot) orelse return;
+    batch.purgeFd(client.fd);
+    daemon.ipc.closeClient(ipc_slot);
+}
+
 /// Handle readable data on an IPC client connection.
 fn handleIpcReadable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) void {
     const client = daemon.ipc.getClient(ipc_slot) orelse return;
 
     const n = client.recv() catch {
-        daemon.ipc.closeClient(ipc_slot);
+        closeIpcClientLane(daemon, batch, ipc_slot);
         return;
     };
     if (n == 0) {
         // EOF — core disconnected
         log.info("core disconnected from IPC slot={d}", .{ipc_slot});
-        daemon.ipc.closeClient(ipc_slot);
+        closeIpcClientLane(daemon, batch, ipc_slot);
         return;
     }
 
@@ -1911,7 +3259,7 @@ fn handleIpcReadable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) vo
     while (true) {
         const msg = client.nextMessage() catch {
             log.err("IPC decode error on slot={d}", .{ipc_slot});
-            daemon.ipc.closeClient(ipc_slot);
+            closeIpcClientLane(daemon, batch, ipc_slot);
             return;
         };
         if (msg == null) break;
@@ -1929,7 +3277,7 @@ fn handleIpcWritable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) vo
     const client = daemon.ipc.getClient(ipc_slot) orelse return;
 
     _ = client.flush() catch {
-        daemon.ipc.closeClient(ipc_slot);
+        closeIpcClientLane(daemon, batch, ipc_slot);
         return;
     };
 
@@ -1949,6 +3297,7 @@ fn printUsage() void {
         \\  --core-socket PATH  IPC socket for xmppd-core communication
         \\  --cert PATH         TLS certificate file (PEM)
         \\  --key PATH          TLS private key file (PEM)
+        \\  --muc-host HOST     Served MUC domain for the to= check (from master's [muc] host)
         \\  --help, -h          Show this help
         \\
     ;
@@ -1960,6 +3309,515 @@ fn printUsage() void {
 // ============================================================================
 // Tests
 // ============================================================================
+
+fn connectInboundForTest(daemon: *S2sDaemon) !posix.fd_t {
+    try daemon.listen("127.0.0.1", 0);
+    if (std.c.fcntl(daemon.listener_fd, std.c.F.SETFL, @as(c_int, 0)) != 0) {
+        return error.SetBlockingFailed;
+    }
+    var addr: std.c.sockaddr.in = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(daemon.listener_fd, @ptrCast(&addr), &addr_len) != 0) {
+        return error.GetSockNameFailed;
+    }
+
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer posix.close(client_fd);
+    var connect_addr = std.c.sockaddr.in{
+        .port = addr.port,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try posix.connect(client_fd, @ptrCast(&connect_addr), @sizeOf(std.c.sockaddr.in));
+    const slot = (try daemon.acceptInbound()) orelse return error.NoSlot;
+    try std.testing.expectEqual(@as(usize, 0), slot);
+    const session = daemon.getInbound(slot) orelse return error.NoSession;
+    if (std.c.fcntl(session.fd, std.c.F.SETFL, @as(c_int, 0)) != 0) {
+        return error.SetBlockingFailed;
+    }
+    return client_fd;
+}
+
+fn attachInboundSocketpairForTest(daemon: *S2sDaemon, slot: usize) !posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    var daemon_owns_fd = false;
+    errdefer if (!daemon_owns_fd) posix.close(fds[0]);
+    errdefer posix.close(fds[1]);
+
+    const session = try daemon.allocator.create(S2sSession);
+    session.* = S2sSession.init(fds[0], slot, daemon.local_domain);
+    daemon.inbound[slot] = session;
+    daemon_owns_fd = true;
+    const reader = try daemon.allocator.create(XmlReader);
+    reader.* = XmlReader.init(daemon.allocator);
+    reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
+    daemon.readers[slot] = reader;
+    return fds[1];
+}
+
+fn feedInboundForTest(daemon: *S2sDaemon, batch: *ChangeList, peer_fd: posix.fd_t, payload: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < payload.len) {
+        const end = @min(offset + 2048, payload.len);
+        try std.testing.expectEqual(end - offset, try posix.write(peer_fd, payload[offset..end]));
+        batch.reset();
+        handleInboundReadable(daemon, batch, 0);
+        offset = end;
+        if (daemon.getInbound(0) == null) break;
+    }
+}
+
+test "S2sDaemon: G5 an XML error is flushed once and closes the session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const client_fd = try connectInboundForTest(&daemon);
+    defer posix.close(client_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    _ = try posix.write(client_fd, "<foo/>");
+    handleInboundReadable(&daemon, &batch, 0);
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [2048]u8 = undefined;
+    const n = try posix.read(client_fd, &response);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, response[0..n], "<stream:error>"));
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "not-well-formed") != null);
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(client_fd, &response));
+}
+
+test "S2sDaemon: E6 an over-long token maps to policy-violation at the call site" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+
+    const payload = try alloc.alloc(u8, xml.scanner.max_token_bytes + 2);
+    defer alloc.free(payload);
+    payload[0] = '<';
+    @memset(payload[1..], 'a');
+    try feedInboundForTest(&daemon, &batch, peer_fd, payload);
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, response[0..n], "<stream:error>"));
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "not-well-formed") == null);
+}
+
+test "S2sDaemon: G5 a small pre-auth item cap closes an unterminated stanza" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const client_fd = try connectInboundForTest(&daemon);
+    defer posix.close(client_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    _ = try posix.write(client_fd, stream_open);
+    handleInboundReadable(&daemon, &batch, 0);
+    try std.testing.expect(daemon.getInbound(0) != null);
+
+    _ = try posix.write(client_fd, "<iq>");
+    handleInboundReadable(&daemon, &batch, 0);
+    // The synchronous test invokes the readable handler directly, so loopback
+    // readiness races must not block it.
+    const nb: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    if (std.c.fcntl(daemon.getInbound(0).?.fd, std.c.F.SETFL, nb) != 0) {
+        return error.SetNonblockingFailed;
+    }
+    for (0..20_000) |_| {
+        if (daemon.getInbound(0) == null) break;
+        batch.reset();
+        _ = try posix.write(client_fd, "<a/>");
+        handleInboundReadable(&daemon, &batch, 0);
+    }
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [16384]u8 = undefined;
+    const n = try posix.read(client_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: G5 the pre-auth cap covers an unterminated stream header" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const client_fd = try connectInboundForTest(&daemon);
+    defer posix.close(client_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    _ = try posix.write(client_fd, "<stream:stream xmlns='jabber:server' from='");
+    handleInboundReadable(&daemon, &batch, 0);
+    try std.testing.expect(daemon.getInbound(0) != null);
+
+    const nb: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    if (std.c.fcntl(daemon.getInbound(0).?.fd, std.c.F.SETFL, nb) != 0) {
+        return error.SetNonblockingFailed;
+    }
+    const chunk = [_]u8{'a'} ** 64;
+    for (0..2000) |_| {
+        if (daemon.getInbound(0) == null) break;
+        batch.reset();
+        _ = try posix.write(client_fd, &chunk);
+        handleInboundReadable(&daemon, &batch, 0);
+    }
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [2048]u8 = undefined;
+    const n = try posix.read(client_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: an overflowed stanza closes the stream before the item ends" {
+    // Closing at the end of an item is not enough on its own: the peer would
+    // still get to send, and the server to parse, everything up to the reader's
+    // item cap. This item is never terminated and stays under that cap, so only
+    // a close driven by the accumulator overflow closes the stream.
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("b.example"));
+
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='b.example' to='alice@a.example'>");
+
+    // Complete child elements, so each one is accumulated as it is parsed and
+    // the total crosses the 16 KiB accumulator while the item source stays
+    // under the reader's cap. The message is never closed.
+    var unit: [907]u8 = undefined;
+    const unit_open = "<b>";
+    const unit_close = "</b>";
+    @memcpy(unit[0..unit_open.len], unit_open);
+    @memset(unit[unit_open.len..][0 .. unit.len - unit_open.len - unit_close.len], 'x');
+    @memcpy(unit[unit.len - unit_close.len ..], unit_close);
+    var fed: usize = 0;
+    while (fed < xml.max_item_bytes_authenticated and daemon.getInbound(0) != null) : (fed += unit.len) {
+        try feedInboundForTest(&daemon, &batch, peer_fd, &unit);
+    }
+    // Closed before the reader's cap was reached, i.e. on the overflow and not
+    // on the end of an item that never came.
+    try std.testing.expect(fed < xml.max_item_bytes_authenticated);
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: G4 an oversized accumulated stanza is rejected whole" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+
+    const prefix = "<message from='b.example' to='alice@a.example'><body>";
+    const suffix = "</body></message>";
+    const payload = try alloc.alloc(u8, prefix.len + 20_000 + suffix.len);
+    defer alloc.free(payload);
+    @memcpy(payload[0..prefix.len], prefix);
+    @memset(payload[prefix.len..][0..20_000], 'x');
+    @memcpy(payload[prefix.len + 20_000 ..], suffix);
+    try feedInboundForTest(&daemon, &batch, peer_fd, payload);
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "policy-violation") != null);
+}
+
+test "S2sDaemon: G4 a 16 KiB stanza is forwarded whole through IPC" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='b.example' to='a.example' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("b.example"));
+
+    const prefix = "<message from='b.example' to='alice@a.example'><body>";
+    const suffix = "</body></message>";
+    const payload = try alloc.alloc(u8, 16_384);
+    defer alloc.free(payload);
+    @memcpy(payload[0..prefix.len], prefix);
+    @memset(payload[prefix.len..][0 .. payload.len - prefix.len - suffix.len], 'x');
+    @memcpy(payload[payload.len - suffix.len ..], suffix);
+    try feedInboundForTest(&daemon, &batch, peer_fd, payload);
+
+    try std.testing.expect(daemon.getInbound(0) != null);
+    const ipc = daemon.ipc.getClient(0).?;
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    const expected = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
+        "<message xmlns='jabber:server' from='b.example' to='alice@a.example'><body xmlns='jabber:server'>",
+        payload[prefix.len .. payload.len - suffix.len],
+        suffix,
+    });
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, msg.s2s_inbound.stanza_xml);
+}
+
+test "F6: inbound S2S stanza to= on the local domain is prepared before forwarding" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='Peer@Remote.Example' to='NaplesTB@LOCALHOST'><body>hi</body></message>");
+
+    try std.testing.expect(daemon.getInbound(0) != null);
+    const ipc = daemon.ipc.getClient(0).?;
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("naplestb@localhost", msg.s2s_inbound.to_jid);
+    try std.testing.expectEqualStrings("Peer@Remote.Example", msg.s2s_inbound.from_jid);
+    try std.testing.expect(std.mem.indexOf(u8, msg.s2s_inbound.stanza_xml, "to='naplestb@localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.s2s_inbound.stanza_xml, "from='Peer@Remote.Example'") != null);
+}
+
+test "F6: an unprepareable inbound to= drops only that stanza" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    // to='@localhost' passes address validation (its domain is served) but
+    // fails preparation on the empty localpart: drop the stanza only.
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='peer@remote.example' to='@localhost'><body>x</body></message>");
+    try std.testing.expect(daemon.getInbound(0) != null);
+    const ipc = daemon.ipc.getClient(0).?;
+    try std.testing.expectEqual(ipc.send_list.items.len, ipc.send_start);
+
+    // The stream still forwards a following valid stanza.
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='peer@remote.example' to='juliet@localhost'><body>y</body></message>");
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("juliet@localhost", msg.s2s_inbound.to_jid);
+}
+
+test "F6: an unprepareable inbound from= fails the stream invalid-from" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    // from='@remote.example' names an authenticated domain so validation
+    // passes, but the empty localpart fails preparation: invalid-from.
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='@remote.example' to='juliet@localhost'><body>x</body></message>");
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "invalid-from") != null);
+}
+
+test "F6: an over-long inbound to= drops only that stanza" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    // to= beyond the RFC 7622 wire cap: the truncated prefix must not be
+    // routed, the stanza drops, and the stream survives.
+    var stanza: [4600]u8 = undefined;
+    const prefix = "<message from='peer@remote.example' to='";
+    const suffix = "@localhost'><body>x</body></message>";
+    @memcpy(stanza[0..prefix.len], prefix);
+    @memset(stanza[prefix.len .. stanza.len - suffix.len], 'a');
+    @memcpy(stanza[stanza.len - suffix.len ..], suffix);
+    try feedInboundForTest(&daemon, &batch, peer_fd, &stanza);
+    try std.testing.expect(daemon.getInbound(0) != null);
+    const ipc = daemon.ipc.getClient(0).?;
+    try std.testing.expectEqual(ipc.send_list.items.len, ipc.send_start);
+
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='peer@remote.example' to='juliet@localhost'><body>y</body></message>");
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("juliet@localhost", msg.s2s_inbound.to_jid);
+}
+
+test "F6: a JID-length inbound to= forwards intact" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{
+        .fd = ipc_fds[0],
+        .alloc = alloc,
+        .active = true,
+    };
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    // A legal 1033-octet local JID (1023-octet localpart) is over the old
+    // 512 capture; it must forward whole, not drop or truncate.
+    var local: [1023]u8 = undefined;
+    @memset(&local, 'u');
+    var stanza: [1400]u8 = undefined;
+    const prefix = "<message from='peer@remote.example' to='";
+    const mid = "@localhost'><body>x</body></message>";
+    @memcpy(stanza[0..prefix.len], prefix);
+    @memcpy(stanza[prefix.len..][0..local.len], &local);
+    @memcpy(stanza[prefix.len + local.len ..][0..mid.len], mid);
+    const wire = stanza[0 .. prefix.len + local.len + mid.len];
+    try feedInboundForTest(&daemon, &batch, peer_fd, wire);
+
+    const ipc = daemon.ipc.getClient(0).?;
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    var want_buf: [1100]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "{s}@localhost", .{&local});
+    try std.testing.expectEqualStrings(want, msg.s2s_inbound.to_jid);
+}
+
+test "F6: an over-long inbound from= fails the stream invalid-from" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    const stream_open = "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>";
+    try feedInboundForTest(&daemon, &batch, peer_fd, stream_open);
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+
+    // from= beyond the wire cap: validation must never see the truncated
+    // prefix, so the stream fails invalid-from like any bad sender.
+    var stanza: [4600]u8 = undefined;
+    const prefix = "<message from='";
+    const suffix = "@remote.example' to='juliet@localhost'><body>x</body></message>";
+    @memcpy(stanza[0..prefix.len], prefix);
+    @memset(stanza[prefix.len .. stanza.len - suffix.len], 'b');
+    @memcpy(stanza[stanza.len - suffix.len ..], suffix);
+    try feedInboundForTest(&daemon, &batch, peer_fd, &stanza);
+
+    try std.testing.expect(daemon.getInbound(0) == null);
+    var response: [4096]u8 = undefined;
+    const n = try posix.read(peer_fd, &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..n], "invalid-from") != null);
+}
 
 test "extractDomain: user@domain" {
     try std.testing.expectEqualStrings("b.example", extractDomain("alice@b.example"));
@@ -2058,8 +3916,506 @@ test "S2sDaemon: closeInbound" {
     const slot = (try daemon.acceptInbound()) orelse return error.NoSlot;
     try std.testing.expectEqual(@as(usize, 1), daemon.inboundCount());
 
-    daemon.closeInbound(slot);
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.closeInbound(&cl, slot);
     try std.testing.expectEqual(@as(usize, 0), daemon.inboundCount());
+}
+
+/// Test allocator that poisons freed chunks, so a write-after-free is
+/// visible by reading through the old pointer (S2, reject path).
+const PoisonOnFreeAllocator = struct {
+    inner: std.mem.Allocator,
+    /// Freed chunks quarantined instead of handed back to the backing
+    /// allocator: the poison fill stays checkable while this allocator
+    /// still owns the bytes. Reading a chunk after the real free is
+    /// undefined, so tests check through here.
+    quarantine: [MAX_QUARANTINE]Quarantined = undefined,
+    quarantine_len: usize = 0,
+    /// Free-time snapshot of the frees seen so far: the first bytes of the
+    /// biggest chunk exactly as freeFn received them, copied before the
+    /// poison fill.
+    biggest_freed_len: usize = 0,
+    freed_prefix: [8]u8 = [_]u8{0} ** 8,
+    poisoned_bytes: usize = 0,
+
+    const MAX_QUARANTINE = 64;
+    const Quarantined = struct {
+        ptr: [*]u8,
+        len: usize,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    };
+
+    fn allocator(self: *PoisonOnFreeAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocFn,
+            .resize = resizeFn,
+            .remap = remapFn,
+            .free = freeFn,
+        } };
+    }
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PoisonOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *PoisonOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *PoisonOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PoisonOnFreeAllocator = @ptrCast(@alignCast(ctx));
+        if (memory.len >= self.biggest_freed_len) {
+            self.biggest_freed_len = memory.len;
+            const n = @min(memory.len, self.freed_prefix.len);
+            @memcpy(self.freed_prefix[0..n], memory[0..n]);
+        }
+        @memset(memory, 0xA5);
+        self.poisoned_bytes += memory.len;
+        if (self.quarantine_len == self.quarantine.len) {
+            self.inner.rawFree(memory, alignment, ret_addr);
+            return;
+        }
+        self.quarantine[self.quarantine_len] = .{
+            .ptr = memory.ptr,
+            .len = memory.len,
+            .alignment = alignment,
+            .ret_addr = ret_addr,
+        };
+        self.quarantine_len += 1;
+    }
+
+    /// Check every quarantined chunk is still poison-filled: a write
+    /// through a stale pointer after its free would show here.
+    fn checkQuarantine(self: *PoisonOnFreeAllocator) !void {
+        for (self.quarantine[0..self.quarantine_len]) |q| {
+            if (!std.mem.allEqual(u8, q.ptr[0..q.len], 0xA5)) return error.FreedMemoryWasWritten;
+        }
+    }
+
+    /// Return every quarantined chunk to the backing allocator.
+    fn releaseQuarantine(self: *PoisonOnFreeAllocator) void {
+        for (self.quarantine[0..self.quarantine_len]) |q| {
+            self.inner.rawFree(q.ptr[0..q.len], q.alignment, q.ret_addr);
+        }
+        self.quarantine_len = 0;
+    }
+};
+
+test "S2sDaemon: stanza reject path resets before closeInbound frees" {
+    // resetStanza must run BEFORE closeInbound destroys the session here:
+    // DebugAllocator re-poisons with its own magic, so wrap c_allocator to
+    // observe the right order on the chunk.
+    var pf = PoisonOnFreeAllocator{ .inner = std.heap.c_allocator };
+    const alloc = pf.allocator();
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer {
+        daemon.deinit();
+        pf.releaseQuarantine();
+    }
+
+    try daemon.listen("127.0.0.1", 0);
+    var addr: std.c.sockaddr.in = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    _ = std.c.getsockname(daemon.listener_fd, @ptrCast(&addr), &addr_len);
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer posix.close(client_fd);
+    const connect_addr = std.c.sockaddr.in{ .port = addr.port, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    posix.connect(client_fd, @ptrCast(&connect_addr), @sizeOf(std.c.sockaddr.in)) catch |err| {
+        if (err != error.WouldBlock) return err;
+    };
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    const slot = (try daemon.acceptInbound()) orelse return error.NoSlot;
+    const session = daemon.getInbound(slot).?;
+
+    // A from= with nothing authenticated rejects (invalid_from).
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &.{
+            .{ .name = "from", .local_name = "from", .prefix = "", .value = "eve@evil.example" },
+            .{ .name = "to", .local_name = "to", .prefix = "", .value = "juliet@us.example" },
+        },
+        .self_closing = true,
+    });
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    dispatchInboundStanza(&daemon, session, &cl);
+    try std.testing.expect(daemon.getInbound(slot) == null); // rejected and closed
+
+    // The session chunk is still poison-filled: if resetStanza had run
+    // after the free it would have written stanza_active to false through
+    // the stale pointer, and the quarantined fill would show it.
+    try std.testing.expect(pf.biggest_freed_len >= @sizeOf(S2sSession));
+    try pf.checkQuarantine();
+}
+
+test "S2sDaemon: flushOutboundStanzas frees from/to/xml and keeps the overflow tail (T275)" {
+    // std.testing.allocator reports any leak at teardown: flushed stanzas
+    // must free from_jid/to_jid, and a full write buffer must keep the
+    // tail queued in order.
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var link = try makeTestTlsLink(&daemon, "them.example");
+    defer link.deinit();
+
+    const conn = link.conn;
+    conn.handleAuthSuccess(); // mark established without the protocol dance
+
+    const pad = try alloc.alloc(u8, 9000);
+    defer alloc.free(pad);
+    @memset(pad, 'x');
+    const big = try std.fmt.allocPrint(alloc, "<message from='a@us.example' to='b@them.example'><body>{s}</body></message>", .{pad});
+    defer alloc.free(big);
+
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>small</body></message>");
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", big);
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", big); // third does not fit the 16 KiB buffer
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.flushOutboundStanzas(&cl, conn);
+    // One stanza must survive queued for the next flush, in order.
+    try std.testing.expectEqual(@as(usize, 1), conn.pendingCount());
+    try std.testing.expectEqualStrings("b@them.example", conn.pending_stanzas.items[0].to_jid);
+}
+
+test "S2sDaemon: a kept tail resumes on the writable edge of an idle link (T275)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var link = try makeTestTlsLink(&daemon, "them.example");
+    defer link.deinit();
+
+    const conn = link.conn;
+    conn.handleAuthSuccess();
+    daemon.outbound[0] = conn; // writable-edge dispatch finds it by slot
+
+    const pad = try alloc.alloc(u8, 9000);
+    defer alloc.free(pad);
+    @memset(pad, 'x');
+    const big = try std.fmt.allocPrint(alloc, "<message to='b@them.example'><body>{s}</body></message>", .{pad});
+    defer alloc.free(big);
+
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>small</body></message>");
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", big);
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", big);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.flushOutboundStanzas(&cl, conn);
+    try std.testing.expectEqual(@as(usize, 1), conn.pendingCount()); // tail kept
+
+    // The drained socket left hasPendingWrite() false, so the kept tail
+    // must arm its own one-shot write event: without the event the tail is
+    // stranded until the next stanza arrives (T275).
+    try std.testing.expect(!conn.hasPendingWrite());
+    try std.testing.expectEqual(@as(usize, 1), cl.count());
+    const ev = cl.slice()[0];
+    try std.testing.expect(ev.filter == std.c.EVFILT.WRITE);
+    try std.testing.expect(ev.flags & std.c.EV.ONESHOT != 0);
+    try std.testing.expectEqual(@as(@TypeOf(ev.ident), @intCast(conn.fd)), ev.ident);
+    try std.testing.expectEqual(@as(@TypeOf(ev.udata), OUTBOUND_UDATA_BASE), ev.udata);
+
+    // Drain the peer so the next flush has room, then fire the writable
+    // edge with NO new stanza arriving: the tail must resume by itself.
+    var rbuf: [20480]u8 = undefined;
+    _ = drainTlsPeer(&link.peer, &rbuf);
+    handleOutboundWritable(&daemon, &cl, 0);
+    try std.testing.expectEqual(@as(usize, 0), conn.pendingCount());
+    const got = rbuf[0..drainTlsPeer(&link.peer, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, got, "b@them.example") != null);
+}
+
+test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the queue (T275)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var link = try makeTestTlsLink(&daemon, "them.example");
+    defer link.deinit();
+
+    const conn = link.conn;
+    conn.handleAuthSuccess();
+
+    // A stanza that can never fit the 16 KiB write buffer, queued ahead of
+    // a deliverable one: it must fail delivery and let the follower out.
+    const huge_pad = try alloc.alloc(u8, 20000);
+    defer alloc.free(huge_pad);
+    @memset(huge_pad, 'y');
+    const huge = try std.fmt.allocPrint(alloc, "<message to='b@them.example'><body>{s}</body></message>", .{huge_pad});
+    defer alloc.free(huge);
+
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", huge);
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>after</body></message>");
+
+    // A connected core client makes the delivery-failure notice observable.
+    const client = &daemon.ipc.clients[0];
+    client.* = .{};
+    client.fd = -1; // buffer-only; never flushed
+    client.alloc = alloc;
+    client.active = true;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.flushOutboundStanzas(&cl, conn);
+
+    // The queue drains: oversize failed to the sender, the follower went out.
+    try std.testing.expectEqual(@as(usize, 0), conn.pendingCount());
+    var rbuf: [4096]u8 = undefined;
+    const got = rbuf[0..drainTlsPeer(&link.peer, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, got, "after") != null);
+
+    // The bounce reached the core client as a delivery-failed notice.
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("stanza-too-large", notice.s2s_delivery_failed.error_type);
+    try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
+    try std.testing.expectEqualStrings("b@them.example", notice.s2s_delivery_failed.to_jid);
+}
+
+test "S2sDaemon: an initiation failure answers every queued stanza" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A domain longer than the SRV query-name buffer fails resolution
+    // before any socket or network activity: a deterministic initiation
+    // failure.
+    const domain = try alloc.alloc(u8, 300);
+    defer alloc.free(domain);
+    @memset(domain, 'd');
+    const to = try std.fmt.allocPrint(alloc, "b@{s}.example", .{domain});
+    defer alloc.free(to);
+
+    // A connected core client makes the delivery-failure notice observable.
+    const client = &daemon.ipc.clients[0];
+    client.* = .{};
+    client.fd = -1; // buffer-only; never flushed
+    client.alloc = alloc;
+    client.active = true;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.handleDelivery(&cl, "a@us.example", to, "<message to='b@them.example'><body>x</body></message>");
+
+    // The queued stanza is failed back to its sender instead of vanishing
+    // with the connection.
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("dns-resolution-failed", notice.s2s_delivery_failed.error_type);
+    try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
+    try std.testing.expectEqualStrings(to, notice.s2s_delivery_failed.to_jid);
+
+    // The failed conn leaves the pool so the next delivery starts fresh.
+    try std.testing.expect(daemon.pool.connections.get(domain) == null);
+    try std.testing.expectEqual(@as(usize, 0), daemon.pool.count());
+}
+
+test "S2sDaemon: a dialback callback that cannot open its conn answers the submission" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    const key = "abababababababababababababababababababababababababababababababab";
+    in1.session.startDbResult("them.example", "us.example");
+    @memcpy(in1.session.db_result_key_buf[0..key.len], key);
+    in1.session.db_result_key_len = key.len;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // The next allocation is the pool's connection object: fail it.
+    failing.fail_index = failing.alloc_index;
+    initiateDialbackCallback(&daemon, &cl, in1.session);
+
+    // The submission is answered invalid instead of waiting for a verdict
+    // that no connection will ever produce.
+    if (daemon.getInbound(1)) |s| _ = try s.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(daemon.getInbound(1) != null);
+}
+
+test "S2sDaemon: a full pending-verify table answers the submission invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The callback reuses the pooled conn to the origin: fill every
+    // pending-verify slot with other exchanges first.
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var n: usize = 0;
+    while (n < conn.db_pending.len) : (n += 1) {
+        var sid_buf: [32]u8 = undefined;
+        const sid = try std.fmt.bufPrint(&sid_buf, "filler-{d}", .{n});
+        try std.testing.expect(conn.addPendingVerify(9, 0, sid, "other.example", "us.example", "aaaa") != null);
+    }
+    try std.testing.expect(conn.addPendingVerify(9, 0, "overflow", "other.example", "us.example", "aaaa") == null);
+
+    const key = "abababababababababababababababababababababababababababababababab";
+    in1.session.startDbResult("them.example", "us.example");
+    @memcpy(in1.session.db_result_key_buf[0..key.len], key);
+    in1.session.db_result_key_len = key.len;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    initiateDialbackCallback(&daemon, &cl, in1.session);
+
+    // No exchange can be registered, so the submission is answered invalid
+    // instead of waiting for a verdict that no slot can carry.
+    if (daemon.getInbound(1)) |s| _ = try s.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(daemon.getInbound(1) != null);
+}
+
+/// Two inbound sessions plus one pooled outbound conn carrying a pending
+/// dialback exchange. The submission is on slot 1; slot 2 must stay silent.
+fn makeVerifyRig(alloc: std.mem.Allocator, daemon: *S2sDaemon, origin: []const u8) !struct {
+    submitter: *S2sSession,
+    submitter_peer: posix.fd_t,
+    other_peer: posix.fd_t,
+    conn: *OutboundConnection,
+} {
+    const in1 = try makeTestInbound(alloc, daemon, 1);
+    errdefer posix.close(in1.peer_fd);
+    const in2 = try makeTestInbound(alloc, daemon, 2);
+    errdefer posix.close(in2.peer_fd);
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, origin);
+    if (conn.addPendingVerify(1, daemon.inbound_gens[1], "sid-1", origin, daemon.local_domain, "aaaa") == null)
+        return error.PendingVerifyNotRegistered;
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>x</body></message>");
+
+    return .{
+        .submitter = in1.session,
+        .submitter_peer = in1.peer_fd,
+        .other_peer = in2.peer_fd,
+        .conn = conn,
+    };
+}
+
+/// The failed initiation answered exactly one invalid db:result on the
+/// submitting peer, nothing on any other session, and the delivery-failed
+/// notice carries the failure reason.
+fn expectInitiationFailure(daemon: *S2sDaemon, rig: anytype, expected_to: ?[]const u8, reason: []const u8) !void {
+    if (daemon.getInbound(1)) |s| _ = try s.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(rig.submitter_peer, &rbuf)];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, resp, "type='invalid'"));
+    try std.testing.expect(std.mem.indexOf(u8, resp, "from='us.example'") != null);
+    if (expected_to) |to| {
+        try std.testing.expect(std.mem.indexOf(u8, resp, to) != null);
+    }
+
+    var other: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(rig.other_peer, &other));
+
+    const client = &daemon.ipc.clients[0];
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings(reason, notice.s2s_delivery_failed.error_type);
+    try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
+    try std.testing.expectEqualStrings("b@them.example", notice.s2s_delivery_failed.to_jid);
+}
+
+/// A connected core client makes the delivery-failure notice observable.
+fn makeBufferOnlyClient(daemon: *S2sDaemon, alloc: std.mem.Allocator) void {
+    const client = &daemon.ipc.clients[0];
+    client.* = .{};
+    client.fd = -1; // buffer-only; never flushed
+    client.alloc = alloc;
+    client.active = true;
+}
+
+test "S2sDaemon: an exhausted outbound slot table answers the pending verify invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    // Every outbound slot is taken: the loopback connect succeeds but the
+    // conn cannot be registered, so initiation fails after the connect.
+    var taken: OutboundConnection = undefined;
+    for (&daemon.outbound) |*slot| slot.* = &taken;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, rig.conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1" }}));
+
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "outbound-slots-exhausted");
+    // The failed conn leaves the pool so the next delivery starts fresh.
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+}
+
+test "S2sDaemon: a connect failure answers the pending verify invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    // connect(2) to the broadcast address fails synchronously (EACCES on
+    // FreeBSD): the single target is consumed, the list exhausts, and the
+    // initiation fails as temporary per ADR-13.
+    daemon.deliverResolution(&cl, rig.conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "255.255.255.255" }}));
+
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-timeout");
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+}
+
+test "S2sDaemon: a DNS failure answers the pending verify invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A domain longer than the SRV query-name buffer fails resolution
+    // before any socket or network activity.
+    const domain = try alloc.alloc(u8, 300);
+    defer alloc.free(domain);
+    @memset(domain, 'd');
+
+    const rig = try makeVerifyRig(alloc, &daemon, domain);
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.initiateOutbound(&cl, rig.conn, domain);
+
+    try expectInitiationFailure(&daemon, rig, null, "dns-resolution-failed");
+    try std.testing.expect(daemon.pool.connections.get(domain) == null);
 }
 
 test "S2sDaemon: stop" {
@@ -2070,4 +4426,3549 @@ test "S2sDaemon: stop" {
     try std.testing.expect(daemon.running);
     daemon.stop();
     try std.testing.expect(!daemon.running);
+}
+
+test "S2sDaemon: inbound address validation enforces authenticated domain and served host (T351)" {
+    const local = "us.example";
+    const muc = "conference.us.example";
+
+    // Happy: authenticated from= to our domain (full and bare forms).
+    try std.testing.expect(validateInboundAddress(local, muc, true, "romeo@them.example/orchard", "juliet@us.example/capulet") == null);
+    try std.testing.expect(validateInboundAddress(local, muc, true, "them.example", "us.example") == null);
+
+    // from= with a domain but the session has no authentication for any of
+    // it (auth_ok=false covers forging peers AND never-authenticated ones).
+    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, muc, false, "user@them.example", "juliet@us.example").?);
+    // A bare "from=naked" IS a valid domain JID; it is only rejected because
+    // nothing authenticates it (auth_ok=false comes from the session set).
+    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, muc, false, "naked", "juliet@us.example").?);
+    // Truly empty from= is a format rejection regardless.
+    try std.testing.expectEqual(StreamError.invalid_from, validateInboundAddress(local, muc, true, "", "juliet@us.example").?);
+
+    // Right sender, wrong destination domain (we do not serve it).
+    try std.testing.expectEqual(StreamError.host_unknown, validateInboundAddress(local, muc, true, "romeo@them.example", "someone@else.example").?);
+    try std.testing.expectEqual(StreamError.host_unknown, validateInboundAddress(local, muc, true, "romeo@them.example/c", "someone@else.example/x").?);
+
+    // The MUC host is served for federation (conference.<host>); without a
+    // muc_host configured it gets host-unknown.
+    try std.testing.expect(validateInboundAddress(local, muc, true, "romeo@them.example", "r@conference.us.example") == null);
+    try std.testing.expectEqual(StreamError.host_unknown, validateInboundAddress(local, null, true, "romeo@them.example", "r@conference.us.example").?);
+
+    // Compares are case-insensitive.
+    try std.testing.expect(validateInboundAddress(local, "CONFERENCE.us.example", true, "romeo@them.example", "r@Conference.US.example") == null);
+    try std.testing.expect(validateInboundAddress(local, muc, true, "romeo@them.example", "juliet@US.example") == null);
+}
+
+test "S2sDaemon: jidDomain cuts at the resource separator before the localpart" {
+    try std.testing.expectEqualStrings("them.example", jidDomain("user@them.example"));
+    try std.testing.expectEqualStrings("them.example", jidDomain("user@them.example/orchard"));
+    try std.testing.expectEqualStrings("them.example", jidDomain("them.example"));
+    try std.testing.expectEqualStrings("them.example", jidDomain("them.example/orchard"));
+    // Slash-first is the point: a forged domain must not survive inside the
+    // resourcepart.
+    try std.testing.expectEqualStrings("victim.example", jidDomain("victim.example/x@them.example"));
+    try std.testing.expectEqualStrings("", jidDomain("/x"));
+    try std.testing.expectEqualStrings("", jidDomain("user@/x"));
+    try std.testing.expectEqualStrings("", jidDomain(""));
+}
+
+test "S2sDaemon: IPC lane close purges staged kevent entries before closeClient (T277)" {
+    // Repro of the T238-class bug: closeClient on an IPC lane queued the fd
+    // at + IPC_CLIENT_UDATA_BASE in a staged changelist; the same iteration
+    // could then accept a fresh core connection reusing the fd number and
+    // fire these entries on it. The fix (closeIpcClientLane) calls purgeFd
+    // first; this test shows the outside-observable behavior: starting
+    // points are staged write events, end state is zero remaining entries
+    // for the dead fd.
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // Listen on a temp socket and connect an IPC client directly.
+    const path = "/tmp/xmppd-s2s-ipc-test.sock";
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
+    try daemon.ipc.listen(path);
+    defer daemon.ipc.deinit();
+
+    const cli = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer posix.close(cli);
+    var uaddr: std.c.sockaddr.un = std.mem.zeroes(std.c.sockaddr.un);
+    uaddr.family = posix.AF.UNIX;
+    @memcpy(uaddr.path[0..path.len], path);
+    posix.connect(cli, @ptrCast(&uaddr), @sizeOf(std.c.sockaddr.un)) catch |err| {
+        if (err != error.WouldBlock) return err;
+    };
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    const slot = (try daemon.ipc.accept()) orelse return error.NoClient;
+    const client = daemon.ipc.getClient(slot) orelse return error.NoClient;
+    const fd = client.fd;
+
+    // Recreate the staged-entries state the T277 report saw: EV_ADD for the
+    // IPC fd in the changelist while the lane is about to die.
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try cl.addWriteOnce(fd, IPC_CLIENT_UDATA_BASE + slot);
+    // entries.length is implementation-internal; only behavior matters.
+
+    closeIpcClientLane(&daemon, &cl, slot);
+
+    // The accepted client must be closed (no dangling IPC lane)...
+    try std.testing.expect(daemon.ipc.getClient(slot) == null);
+    // ...and no staged entries must remain pointing at its fd.
+    var i: usize = 0;
+    while (i < cl.len) : (i += 1) {
+        try std.testing.expect(cl.buf[i].ident != @as(usize, @intCast(fd)));
+    }
+}
+
+// --- Test rig: drive processInboundEvent / processOutboundEvent directly ----
+
+/// Create an inbound session in `slot` over a UNIX socketpair. Returns the
+/// session and the peer fd; the test speaks the peer side.
+fn makeTestInbound(alloc: std.mem.Allocator, daemon: *S2sDaemon, slot: usize) !struct { session: *S2sSession, peer_fd: posix.fd_t } {
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    errdefer posix.close(fds[0]);
+    errdefer posix.close(fds[1]);
+    const session = try alloc.create(S2sSession);
+    session.* = S2sSession.init(fds[0], slot, daemon.local_domain);
+    daemon.inbound[slot] = session;
+    const reader = try alloc.create(XmlReader);
+    errdefer alloc.destroy(reader);
+    reader.* = XmlReader.init(alloc);
+    daemon.readers[slot] = reader;
+    return .{ .session = session, .peer_fd = fds[1] };
+}
+
+/// Read what a non-blocking peer fd has sent. A write on loopback is not
+/// always visible to the reader in the same instant, so wait briefly for
+/// the first byte and stop once the stream stays idle.
+fn drainPeer(fd: posix.fd_t, buf: []u8) usize {
+    var total: usize = 0;
+    var idle_ms: usize = 0;
+    while (total < buf.len) {
+        const n = posix.read(fd, buf[total..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (total > 0 and idle_ms >= 20) return total;
+                if (idle_ms >= 200) return total;
+                std.Thread.sleep(std.time.ns_per_ms);
+                idle_ms += 1;
+                continue;
+            },
+            else => return total,
+        };
+        if (n == 0) return total;
+        total += n;
+        idle_ms = 0;
+    }
+    return total;
+}
+
+fn testAttr(name: []const u8, value: []const u8) xml.Attribute {
+    return .{ .name = name, .value = value, .prefix = "", .local_name = name };
+}
+
+/// Feed a db:result key submission through processInboundEvent the way the
+/// reader loop would (element_start, text, element_end). Every event can
+/// close and free the session, so each one reaches it and its reader
+/// through the slot table (B5).
+fn submitDbResult(daemon: *S2sDaemon, session: *S2sSession, cl: *ChangeList, from: []const u8, to: []const u8, key: []const u8) void {
+    const slot = session.id;
+    var attrs = [_]xml.Attribute{ testAttr("from", from), testAttr("to", to) };
+    const elem = xml.Element{
+        .name = "db:result",
+        .prefix = "db",
+        .local_name = "result",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = false,
+    };
+    const s1 = daemon.getInbound(slot) orelse return;
+    processInboundEvent(daemon, s1, daemon.readers[slot].?, .{ .element_start = elem }, cl);
+    const s2 = daemon.getInbound(slot) orelse return;
+    processInboundEvent(daemon, s2, daemon.readers[slot].?, .{ .text = key }, cl);
+    const s3 = daemon.getInbound(slot) orelse return;
+    processInboundEvent(daemon, s3, daemon.readers[slot].?, .{ .element_end = "db:result" }, cl);
+}
+
+/// Feed a db:verify verdict through processOutboundEvent on a callback conn.
+fn feedVerifyVerdict(daemon: *S2sDaemon, conn: *OutboundConnection, cl: *ChangeList, reader: *XmlReader, verdict: []const u8, id: []const u8, from: []const u8, to: []const u8) void {
+    var attrs = [_]xml.Attribute{ testAttr("type", verdict), testAttr("id", id), testAttr("from", from), testAttr("to", to) };
+    const elem = xml.Element{
+        .name = "db:verify",
+        .prefix = "db",
+        .local_name = "verify",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(daemon, cl, 0, conn, reader, .{ .element_start = elem });
+}
+
+// --- DANE handshake rigs: real TLS over loopback ---------------------
+
+/// Outcome of a driven outbound handshake: the connection (whose DANE state
+/// stays owned by the pool), whether the handshake finished, and the verdict
+/// read before that state is torn down.
+const TestDaneResult = struct {
+    conn: *OutboundConnection,
+    completed: bool,
+    verdict: ?ssl.DaneVerdict,
+};
+
+/// Drive a real outbound handshake with DANE armed from `records`, the way
+/// `startOutboundTls` does after its TLSA lookup. Returns whether the
+/// handshake completed; on completion the caller reads the DANE result.
+///
+/// The records come from the test, not from DNS, so the TLSA lookup itself is
+/// out of scope here; everything downstream of it (arming, the in-handshake
+/// verification, the verdict) is the production path. `cert_dir` holds the
+/// cert and key the loopback peer presents, so a test can build its TLSA
+/// record from the exact certificate the peer will send.
+fn runTestDaneHandshake(
+    daemon: *S2sDaemon,
+    cert_dir: std.fs.Dir,
+    records: []const ssl.DaneRecord,
+) !TestDaneResult {
+    return runTestDaneHandshakeNamed(daemon, cert_dir, &.{"us.example"}, records);
+}
+
+/// Give a test connection the target X2b would have adopted from a
+/// resolution: the TLSA records the test supplied, marked `.present`, so
+/// `curTarget().tlsa_status` reads as a peer that published an RRset.
+fn adoptTestTarget(conn: *OutboundConnection, records: []const ssl.DaneRecord) !void {
+    return adoptTestTargetNamed(conn, "localhost", 5269, records);
+}
+
+/// As `adoptTestTarget`, with the SRV target host and port spelled out: a
+/// DANE-TA match runs the name check, so the target name decides whether the
+/// reference identifier set can accept the peer.
+fn adoptTestTargetNamed(conn: *OutboundConnection, host: []const u8, port: u16, records: []const ssl.DaneRecord) !void {
+    const alloc = conn.alloc;
+    const tlsa = try alloc.alloc(dns.TlsaRecord, records.len);
+    for (records, 0..) |r, i| {
+        tlsa[i] = .{
+            .usage = r.usage,
+            .selector = r.selector,
+            .matching_type = r.matching_type,
+            .association_data = try alloc.dupe(u8, r.data),
+        };
+    }
+    const targets = try alloc.alloc(dns_async.Target, 1);
+    targets[0] = .{
+        .addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port),
+        .host = try alloc.dupe(u8, host),
+        .tlsa = tlsa,
+        .tlsa_status = .present,
+        .is_direct_tls = true,
+    };
+    conn.adoptTargets(targets);
+}
+
+/// As `runTestDaneHandshake`, with the reference identifiers spelled out so a
+/// test can name the peer certificate's own name (a DANE-TA match runs the
+/// name check, RFC 7671 section 5.1, unlike DANE-EE).
+fn runTestDaneHandshakeNamed(
+    daemon: *S2sDaemon,
+    cert_dir: std.fs.Dir,
+    names: []const []const u8,
+    records: []const ssl.DaneRecord,
+) !TestDaneResult {
+    const alloc = daemon.allocator;
+    try initTestTlsContextsFrom(daemon, cert_dir);
+
+    const fds = try makeS2sTestTcpPair();
+    errdefer posix.close(fds[0]);
+    errdefer posix.close(fds[1]);
+    var peer = try SslConn.init(daemon.tls_ctx.?, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+    }
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.target_port = 5269;
+    try adoptTestTarget(conn, records);
+    conn.tls_conn = try SslConn.initClient(daemon.tls_client_ctx_dane.?, fds[0], "localhost");
+
+    // DANE is armed from the connection's own state so there is exactly one
+    // owner of the arena: the connection frees it at deinit.
+    conn.dane_state = try ssl.initDane(alloc, .{ .names = names }, records);
+    conn.dane_prepared = try conn.tls_conn.?.prepareDane(&conn.dane_state.?);
+
+    var completed = false;
+    var peer_done = false;
+    var failed = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (!completed and !failed and std.time.milliTimestamp() < deadline) {
+        // Drive the peer first: the client's next step is usually a read the
+        // peer must satisfy.
+        if (!peer_done) {
+            peer_done = (peer.doHandshake() catch {
+                failed = true;
+                break;
+            }) == .complete;
+        }
+        completed = conn.continueHandshake() catch {
+            failed = true;
+            break;
+        };
+    }
+    // Read the verdict while the state is still alive: after a failed
+    // handshake it carries the named reason, and after a successful one it
+    // is what the production path records.
+    const verdict: ?ssl.DaneVerdict = if (conn.tls_conn) |*tls| tls.daneVerdict(conn.dane_prepared, &conn.dane_state.?) else null;
+    return .{ .conn = conn, .completed = completed, .verdict = verdict };
+}
+
+test "S2sDaemon: outbound DANE accepts a handshake matching the TLSA record" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // DANE-EE, Full selector: the association data is the certificate itself.
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 0,
+        .data = leaf_der,
+    }};
+    const result = try runTestDaneHandshake(&daemon, tmp.dir, &tlsa);
+    try std.testing.expect(result.completed);
+    // A completed DANE handshake names the record that authenticated the peer.
+    try std.testing.expectEqual(ssl.Outcome.verified, result.verdict.?.outcome);
+    try std.testing.expectEqual(ssl.Usage.dane_ee, result.verdict.?.matched.?.usage);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.outbound[0] = result.conn;
+    recordOutboundDane(&daemon, &cl, 0, result.conn);
+    try std.testing.expect(daemon.outbound[0] != null);
+    try std.testing.expectEqual(connector_mod.DaneStatus.verified, result.conn.dane_status);
+}
+
+test "S2sDaemon: startOutboundTls arms DANE from the adopted target" {
+    // Drives the real production entry point, not the rig: the arm decision,
+    // the context choice and the pre-handshake `prepareDane` are all inside
+    // startOutboundTls, so a regression that skips any of them shows up here
+    // as a handshake that completes without a DANE verdict.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+
+    const fds = try makeS2sTestTcpPair();
+    defer posix.close(fds[1]);
+    var peer = try SslConn.init(daemon.tls_ctx.?, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+    }
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.target_port = 5269;
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 0,
+        .data = leaf_der,
+    }};
+    try adoptTestTarget(conn, &tlsa);
+    daemon.outbound[0] = conn;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // A fresh conn is in .connecting: the STARTTLS path flips it to TLS.
+    startOutboundTls(&daemon, &cl, 0, conn);
+    // A failed arm closes the slot and frees the conn, so read the table
+    // before dereferencing anything (T277).
+    try std.testing.expect(daemon.outbound[0] == conn);
+    try std.testing.expect(conn.dane_state != null);
+    try std.testing.expectEqual(connector_mod.DaneStatus.pending, conn.dane_status);
+
+    // Drive both ends until the handshake settles. `startOutboundTls` has
+    // already run the first step, so the loop starts from there.
+    var peer_done = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (!peer_done and conn.tls_state != .established and !conn.isFailed() and std.time.milliTimestamp() < deadline) {
+        if (!peer_done) {
+            peer_done = (peer.doHandshake() catch break) == .complete;
+        }
+        if (conn.tls_state != .established and !conn.isFailed()) {
+            continueOutboundTls(&daemon, &cl, 0, conn);
+        }
+    }
+    if (conn.isFailed()) std.debug.print("startOutboundTls rig failed: {s}\n", .{conn.error_msg});
+    try std.testing.expect(conn.tls_state == .established);
+    try std.testing.expectEqual(connector_mod.DaneStatus.verified, conn.dane_status);
+}
+
+test "S2sDaemon: startOutboundTls refuses a peer the TLSA record does not match" {
+    // The negative half of the production-path test above, and the only way
+    // to tell the DANE context from the plain one: a `VERIFY_NONE` client
+    // context completes this handshake, so a regression that picks it shows
+    // up as a completed handshake instead of a refusal.
+    //
+    // The handshake is driven through `conn.continueHandshake` rather than
+    // `continueOutboundTls`: the latter closes and frees the conn on failure.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+
+    const fds = try makeS2sTestTcpPair();
+    defer posix.close(fds[1]);
+    var peer = try SslConn.init(daemon.tls_ctx.?, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+    }
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.target_port = 5269;
+    // Well-formed but wrong digest: the peer is not the one the record names.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(leaf_der, &digest, .{});
+    digest[0] ^= 0xFF;
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 1,
+        .data = &digest,
+    }};
+    try adoptTestTarget(conn, &tlsa);
+    daemon.outbound[0] = conn;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    startOutboundTls(&daemon, &cl, 0, conn);
+    try std.testing.expect(daemon.outbound[0] == conn);
+    try std.testing.expect(conn.dane_state != null);
+
+    var peer_done = false;
+    var refused = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (!peer_done and !refused and std.time.milliTimestamp() < deadline) {
+        if (!peer_done) {
+            peer_done = (peer.doHandshake() catch break) == .complete;
+        }
+        _ = conn.continueHandshake() catch {
+            refused = true;
+            break;
+        };
+    }
+    try std.testing.expect(refused);
+    try std.testing.expect(conn.tls_state != .established);
+}
+
+test "S2sDaemon: outbound DANE refuses a TLSA digest that fits no certificate" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // Well-formed but wrong: a usable SHA-256 record over different bytes.
+    // An unusable record would only exercise the fallback path.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(leaf_der, &digest, .{});
+    digest[0] ^= 0xFF;
+
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 1,
+        .data = &digest,
+    }};
+    const result = try runTestDaneHandshake(&daemon, tmp.dir, &tlsa);
+    try std.testing.expect(!result.completed);
+    try std.testing.expectEqual(ssl.DaneVerdict{ .outcome = .failed, .failure = .no_match }, result.verdict.?);
+}
+
+test "S2sDaemon: outbound DANE admits a DANE-TA record for the issuing CA" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRig(alloc, tmp.dir);
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // TLSA 2 0 0: DANE-TA over the full CA cert. The peer presents
+    // [leaf, CA], so the anchor sits at depth 1. Unlike DANE-EE, a DANE-TA
+    // match still runs the name check (RFC 7671 section 5.1), so the
+    // reference identifier has to be the leaf's own name.
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 2,
+        .selector = 0,
+        .matching_type = 0,
+        .data = ca_der,
+    }};
+    const result = try runTestDaneHandshakeNamed(&daemon, tmp.dir, &.{"localhost"}, &tlsa);
+    try std.testing.expect(result.completed);
+    try std.testing.expectEqual(ssl.Outcome.verified, result.verdict.?.outcome);
+    try std.testing.expectEqual(ssl.Usage.dane_ta, result.verdict.?.matched.?.usage);
+}
+
+test "S2sDaemon: outbound DANE refuses a forged anchor (case 6)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genForgedAnchorRig(alloc, tmp.dir);
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // The record names the real CA and is usable, so the only way to pass
+    // is for the chain to validate: the attacker leaf claims the real CA as
+    // its issuer but is signed by another key, so the signature check fails.
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 2,
+        .selector = 0,
+        .matching_type = 0,
+        .data = ca_der,
+    }};
+    const result = try runTestDaneHandshakeNamed(&daemon, tmp.dir, &.{"localhost"}, &tlsa);
+    try std.testing.expect(!result.completed);
+    // A matching anchor whose chain fails is a signature failure, never a
+    // silent fallback to traditional anchors.
+    try std.testing.expectEqual(ssl.Outcome.failed, result.verdict.?.outcome);
+    try std.testing.expectEqual(ssl.Failure.signature_invalid, result.verdict.?.failure.?);
+}
+
+test "S2sDaemon: a DANE-TA record never authenticates the leaf" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A DANE-TA record names an anchor above the leaf. The peer presents a
+    // self-signed leaf only, so nothing sits above it to match.
+    const tlsa = [_]ssl.DaneRecord{.{
+        .usage = 2,
+        .selector = 0,
+        .matching_type = 0,
+        .data = leaf_der,
+    }};
+    const result = try runTestDaneHandshake(&daemon, tmp.dir, &tlsa);
+    try std.testing.expect(!result.completed);
+    // The record is usable but matches nothing in the presented chain; that
+    // is a plain no-match, never a silent fallback to traditional anchors.
+    try std.testing.expectEqual(ssl.DaneVerdict{ .outcome = .failed, .failure = .no_match }, result.verdict.?);
+}
+
+test "S2sDaemon: outbound DANE-TA accepts a leaf named only for the SRV target" {
+    // RFC 7673 section 4: the SRV target is a reference identifier in its
+    // own right. The peer's leaf names only that target, so the handshake
+    // can pass only if the production path hands both names to the module.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRigNamed(alloc, tmp.dir, "srv.them.example");
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+
+    const fds = try makeS2sTestTcpPair();
+    defer posix.close(fds[1]);
+    var peer = try SslConn.init(daemon.tls_ctx.?, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+    }
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0];
+    conn.target_port = 5269;
+    const tlsa = [_]ssl.DaneRecord{.{ .usage = 2, .selector = 0, .matching_type = 0, .data = ca_der }};
+    try adoptTestTargetNamed(conn, "srv.them.example", 5269, &tlsa);
+    daemon.outbound[0] = conn;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    startOutboundTls(&daemon, &cl, 0, conn);
+    try std.testing.expect(daemon.outbound[0] == conn);
+    try std.testing.expect(conn.dane_state != null);
+    try std.testing.expectEqual(@as(usize, 2), conn.dane_state.?.names.len);
+
+    var peer_done = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while (!peer_done and conn.tls_state != .established and !conn.isFailed() and std.time.milliTimestamp() < deadline) {
+        if (!peer_done) {
+            peer_done = (peer.doHandshake() catch break) == .complete;
+        }
+        if (conn.tls_state != .established and !conn.isFailed()) {
+            continueOutboundTls(&daemon, &cl, 0, conn);
+        }
+    }
+    if (conn.isFailed()) std.debug.print("SRV-target rig failed: {s}\n", .{conn.error_msg});
+    try std.testing.expect(conn.tls_state == .established);
+    try std.testing.expectEqual(connector_mod.DaneStatus.verified, conn.dane_status);
+}
+
+test "S2sDaemon: DANE-TA refuses a leaf whose name no identifier covers" {
+    // Same rig, one name short: the leaf is valid for the SRV target and
+    // the lookup names only the service domain, so the name check fails.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRigNamed(alloc, tmp.dir, "srv.them.example");
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const tlsa = [_]ssl.DaneRecord{.{ .usage = 2, .selector = 0, .matching_type = 0, .data = ca_der }};
+    const result = try runTestDaneHandshakeNamed(&daemon, tmp.dir, &.{"them.example"}, &tlsa);
+    try std.testing.expect(!result.completed);
+    try std.testing.expectEqual(ssl.Outcome.failed, result.verdict.?.outcome);
+}
+
+test "S2sDaemon: armOutboundDane decides from the target's TLSA status" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A failed lookup is a temporary failure of that target: never a
+    // dialback fallback (ADR-13).
+    {
+        const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+        conn.adoptTargets((try fabricateResolution(alloc, &.{.{
+            .addr = "127.0.0.1",
+            .status = .lookup_failed,
+        }})).targets);
+        conn.alloc.free(conn.targets[0].host);
+        conn.targets[0].host = try alloc.dupe(u8, "them.example");
+        try std.testing.expectEqual(OutboundDaneArm.temporary_failure, armOutboundDane(&daemon, conn));
+        try std.testing.expect(conn.dane_state == null);
+    }
+    // Absent (NXDOMAIN/NODATA) permits dialback.
+    {
+        const conn = try daemon.pool.getOrCreate("us.example", "absent.example");
+        conn.adoptTargets((try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1" }})).targets);
+        try std.testing.expectEqual(OutboundDaneArm.none, armOutboundDane(&daemon, conn));
+    }
+}
+
+test "S2sDaemon: an RRset with no usable record arms PKIX, not DANE" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    // SHA-256 with 31 bytes is unusable, so nothing survives filtering.
+    var short_hash: [31]u8 = undefined;
+    @memset(&short_hash, 0x5a);
+    const records = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 1,
+        .data = &short_hash,
+    }};
+    try adoptTestTarget(conn, &records);
+
+    try std.testing.expectEqual(OutboundDaneArm.pkix, armOutboundDane(&daemon, conn));
+    // The state stays so the caller can install the identifiers; its mode is
+    // what told us to take the PKIX path.
+    try std.testing.expectEqual(ssl.DaneMode.pkix, conn.dane_state.?.mode());
+}
+
+test "S2sDaemon: a matching record past the 64-record cap is never truncated" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+
+    // 65 usable records: the module rejects the set instead of dropping the
+    // last one, which could be the only match. A permanent failure means no
+    // unverified handshake and no dialback.
+    const n = ssl.dane_max_records + 1;
+    const records = try alloc.alloc(ssl.DaneRecord, n);
+    defer alloc.free(records);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("no-such-cert", &digest, .{});
+    for (records) |*r| r.* = .{ .usage = 3, .selector = 0, .matching_type = 1, .data = &digest };
+    try adoptTestTarget(conn, records);
+
+    try std.testing.expectEqual(OutboundDaneArm.permanent_failure, armOutboundDane(&daemon, conn));
+    try std.testing.expect(conn.dane_state == null);
+}
+
+test "S2sDaemon: an inbound DANE lookup failure keeps EXTERNAL closed" {
+    // A failed TLSA query is a temporary failure of the peer's DANE data,
+    // never proof that the peer authenticated. The stream must reach the
+    // features tail with EXTERNAL closed and dialback offered.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    in1.session.dane_phase = .tlsa;
+
+    applyInboundDaneResult(&daemon, in1.session, .failed, null);
+
+    const features = in1.session.stream.getFeatures().?;
+    try std.testing.expect(!features.sasl_external);
+    try std.testing.expect(features.dialback);
+    try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
+}
+
+test "S2sDaemon: an inbound DANE failure keeps EXTERNAL closed and rejects it" {
+    // The production link the review asked for: the verdict landed by
+    // finishInboundDane decides whether the stream offers EXTERNAL, and an
+    // EXTERNAL attempt on an unverified stream is refused. A peer that
+    // presents a certificate the TLSA record does not name must not be able
+    // to authenticate with it.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+    // Same certificate, one flipped byte: verified only if the module
+    // compares the association data at all.
+    const forged = try alloc.dupe(u8, leaf_der);
+    defer alloc.free(forged);
+    forged[forged.len - 1] ^= 0xFF;
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    // A real TLS link on both ends: the inbound verifier reads the peer
+    // certificate off the session's connection, so the peer must present one.
+    var peer_ctx = try initTestPeerCtx(alloc, tmp.dir);
+    defer peer_ctx.deinit();
+    in1.session.tls_conn = try SslConn.init(daemon.tls_ctx.?, in1.session.fd);
+    var peer = try SslConn.initClient(peer_ctx, in1.peer_fd, "localhost");
+    defer peer.deinit();
+    try completeTestTlsHandshake(&in1.session.tls_conn.?, &peer);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+
+    // Land the TLSA hop directly: the DNSSEC chain is out of scope here.
+    in1.session.dane_phase = .tlsa;
+    const wire = @import("wire");
+    const rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_5269._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.tlsa),
+        .class = 1,
+        .ttl = 300,
+        // TLSA 3 0 0 over the forged bytes.
+        .rdata = try std.mem.concat(alloc, u8, &.{ &.{ 3, 0, 0 }, forged }),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+
+    // Unverified: EXTERNAL is not advertised, dialback is.
+    const features = in1.session.stream.getFeatures().?;
+    try std.testing.expect(!features.sasl_external);
+    try std.testing.expect(features.dialback);
+
+    // And an EXTERNAL attempt anyway is refused, not accepted.
+    var attrs = [_]xml.Attribute{testAttr("mechanism", "EXTERNAL")};
+    const auth = xml.Element{
+        .name = "auth",
+        .prefix = "",
+        .local_name = "auth",
+        .namespace_uri = xml.ns.sasl,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    _ = try in1.session.flushWrite();
+    var rbuf: [2048]u8 = undefined;
+    _ = drainTlsPeer(&peer, &rbuf);
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .element_start = auth }, &cl);
+    _ = try in1.session.flushWrite();
+    const resp = rbuf[0..drainTlsPeer(&peer, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<failure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "not-authorized") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<success") == null);
+    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: an inbound DANE match opens EXTERNAL to the verified domain" {
+    // Positive control for the gate above: with a record that names the
+    // presented certificate the same path offers EXTERNAL, and the exchange
+    // records the peer domain.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    try initTestTlsContextsFrom(&daemon, tmp.dir);
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var peer_ctx = try initTestPeerCtx(alloc, tmp.dir);
+    defer peer_ctx.deinit();
+    in1.session.tls_conn = try SslConn.init(daemon.tls_ctx.?, in1.session.fd);
+    var peer = try SslConn.initClient(peer_ctx, in1.peer_fd, "localhost");
+    defer peer.deinit();
+    try completeTestTlsHandshake(&in1.session.tls_conn.?, &peer);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+
+    in1.session.dane_phase = .tlsa;
+    const wire = @import("wire");
+    const rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_5269._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.tlsa),
+        .class = 1,
+        .ttl = 300,
+        .rdata = try std.mem.concat(alloc, u8, &.{ &.{ 3, 0, 0 }, leaf_der }),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+
+    const features = in1.session.stream.getFeatures().?;
+    try std.testing.expect(features.sasl_external);
+    try std.testing.expect(!features.dialback);
+
+    var attrs = [_]xml.Attribute{testAttr("mechanism", "EXTERNAL")};
+    const auth = xml.Element{
+        .name = "auth",
+        .prefix = "",
+        .local_name = "auth",
+        .namespace_uri = xml.ns.sasl,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    _ = try in1.session.flushWrite();
+    var rbuf: [2048]u8 = undefined;
+    _ = drainTlsPeer(&peer, &rbuf);
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .element_start = auth }, &cl);
+    _ = try in1.session.flushWrite();
+    const resp = rbuf[0..drainTlsPeer(&peer, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<success") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<failure") == null);
+    try std.testing.expect(in1.session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: outbound DANE reference identifiers name the SRV target" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("some-cert", &digest, .{});
+    const records = [_]ssl.DaneRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 1,
+        .data = &digest,
+    }};
+    try adoptTestTarget(conn, &records);
+    // The SRV target differs from the service domain (RFC 7673 section 4).
+    alloc.free(conn.targets[0].host);
+    conn.targets[0].host = try alloc.dupe(u8, "srv.them.example");
+
+    try std.testing.expectEqual(OutboundDaneArm.armed, armOutboundDane(&daemon, conn));
+    const names = conn.dane_state.?.names;
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("them.example", names[0]);
+    try std.testing.expectEqualStrings("srv.them.example", names[1]);
+}
+
+test "S2sDaemon: inbound DANE rejects a peer whose TLSA names another cert" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const forged = try alloc.dupe(u8, leaf_der);
+    defer alloc.free(forged);
+    forged[forged.len - 1] ^= 0xFF;
+
+    const tlsa = [_]dns.TlsaRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 0,
+        .association_data = forged,
+    }};
+
+    try std.testing.expectEqual(
+        ssl.DaneVerdict{ .outcome = .failed, .failure = .no_match },
+        (try runTestInboundDane(&daemon, tmp.dir, "them.example", &tlsa)).?,
+    );
+}
+
+test "S2sDaemon: inbound DANE accepts a peer whose TLSA matches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "cert.pem");
+    defer alloc.free(leaf_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const tlsa = [_]dns.TlsaRecord{.{
+        .usage = 3,
+        .selector = 0,
+        .matching_type = 0,
+        .association_data = leaf_der,
+    }};
+
+    const verdict = (try runTestInboundDane(&daemon, tmp.dir, "them.example", &tlsa)).?;
+    try std.testing.expectEqual(ssl.Outcome.verified, verdict.outcome);
+    try std.testing.expectEqual(ssl.Usage.dane_ee, verdict.matched.?.usage);
+}
+
+test "S2sDaemon: inbound DANE admits a chain anchored at the TLSA DANE-TA" {
+    // The inbound counterpart of the outbound DANE-TA case: a two-level
+    // chain whose trust root is the TLSA record itself, verified after the
+    // handshake because the peer domain arrives with the stream header.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genDaneTaRig(alloc, tmp.dir);
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const tlsa = [_]dns.TlsaRecord{.{
+        .usage = 2,
+        .selector = 0,
+        .matching_type = 0,
+        .association_data = ca_der,
+    }};
+
+    const verdict = (try runTestInboundDane(&daemon, tmp.dir, "localhost", &tlsa)).?;
+    try std.testing.expectEqual(ssl.Outcome.verified, verdict.outcome);
+    try std.testing.expectEqual(ssl.Usage.dane_ta, verdict.matched.?.usage);
+}
+
+test "S2sDaemon: inbound DANE refuses a forged anchor (case 6)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genForgedAnchorRig(alloc, tmp.dir);
+
+    const ca_der = try test_support.readCertDer(alloc, tmp.dir, "ca.pem");
+    defer alloc.free(ca_der);
+
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // Same rig as the outbound case: the peer's TLSA names the real CA and
+    // the presented chain claims it, but the leaf was signed by another key.
+    // Inbound verification has no handshake to fail, so the rejection is the
+    // only thing standing between the peer and the dialback fallback: it must
+    // be a signature failure, not a missing record.
+    const tlsa = [_]dns.TlsaRecord{.{
+        .usage = 2,
+        .selector = 0,
+        .matching_type = 0,
+        .association_data = ca_der,
+    }};
+    const verdict = (try runTestInboundDane(&daemon, tmp.dir, "localhost", &tlsa)).?;
+    try std.testing.expectEqual(ssl.Outcome.failed, verdict.outcome);
+    try std.testing.expectEqual(ssl.Failure.signature_invalid, verdict.failure.?);
+}
+
+test "S2sDaemon: the forged-anchor rig is otherwise a valid DANE peer" {
+    // Guard for the two forged-anchor tests: they must fail on the signature,
+    // not on a rig that presents the wrong bytes. Against a DANE-EE record
+    // over the leaf it actually sends, the same peer verifies in both
+    // directions.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genForgedAnchorRig(alloc, tmp.dir);
+
+    const leaf_der = try test_support.readCertDer(alloc, tmp.dir, "leaf.pem");
+    defer alloc.free(leaf_der);
+
+    // Outbound: the module's DANE-EE record over the presented leaf.
+    {
+        var daemon = try S2sDaemon.init(alloc, "us.example");
+        defer daemon.deinit();
+
+        const tlsa = [_]ssl.DaneRecord{.{ .usage = 3, .selector = 0, .matching_type = 0, .data = leaf_der }};
+        const result = try runTestDaneHandshake(&daemon, tmp.dir, &tlsa);
+        try std.testing.expect(result.completed);
+        try std.testing.expectEqual(ssl.Outcome.verified, result.verdict.?.outcome);
+    }
+
+    // Inbound: the same leaf as wire-format TLSA data.
+    {
+        var daemon = try S2sDaemon.init(alloc, "us.example");
+        defer daemon.deinit();
+
+        const tlsa = [_]dns.TlsaRecord{.{ .usage = 3, .selector = 0, .matching_type = 0, .association_data = leaf_der }};
+        const verdict = (try runTestInboundDane(&daemon, tmp.dir, "localhost", &tlsa)).?;
+        try std.testing.expectEqual(ssl.Outcome.verified, verdict.outcome);
+    }
+}
+
+/// Drive a real inbound handshake and run `verifyInboundPeer` on the
+/// resulting server-side connection, the way `performInboundDane` does once
+/// the stream header names the peer domain. `tlsa_records` stands in for the
+/// TLSA lookup, which is out of scope here. Null means DANE did not run.
+fn runTestInboundDane(
+    daemon: *S2sDaemon,
+    cert_dir: std.fs.Dir,
+    remote_domain: []const u8,
+    tlsa_records: []const dns.TlsaRecord,
+) !?ssl.DaneVerdict {
+    const alloc = std.testing.allocator;
+    try initTestTlsContextsFrom(daemon, cert_dir);
+
+    const base = try cert_dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(alloc, "{s}/cert.pem", .{base}, 0);
+    defer alloc.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(alloc, "{s}/key.pem", .{base}, 0);
+    defer alloc.free(key_path);
+
+    // The inbound side requests the peer's certificate (SSL_VERIFY_PEER in
+    // initServer), so the peer must present one.
+    var peer_ctx = try SslContext.initClientWithCert(cert_path, key_path);
+    defer peer_ctx.deinit();
+    peer_ctx.disableKtls();
+
+    const fds = try makeS2sTestTcpPair();
+    var peer = try SslConn.initClient(peer_ctx, fds[1], "localhost");
+    defer {
+        peer.shutdown();
+        peer.deinit();
+        posix.close(fds[1]);
+    }
+
+    var session = S2sSession.init(fds[0], 0, daemon.local_domain);
+    defer session.deinit();
+    session.tls_conn = SslConn.init(daemon.tls_ctx.?, fds[0]) catch |err| {
+        posix.close(fds[0]);
+        session.closed = true;
+        return err;
+    };
+    try completeTestTlsHandshake(&peer, &session.tls_conn.?);
+
+    session.setDaneCandidate(remote_domain);
+    return verifyInboundPeer(daemon, &session, tlsa_records);
+}
+
+/// Connected non-blocking TCP loopback pair (AF_UNIX socketpairs do not
+/// enforce SO_SNDBUF on FreeBSD).
+fn makeS2sTestTcpPair() ![2]posix.fd_t {
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return error.SocketFailed;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return error.BindFailed;
+    posix.listen(listen_fd, 1) catch return error.ListenFailed;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return error.GetSockNameFailed;
+
+    const client_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch return error.SocketFailed;
+    errdefer posix.close(client_fd);
+    posix.connect(client_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| switch (err) {
+        error.WouldBlock => {},
+        else => return error.ConnectFailed,
+    };
+    const server_fd = posix.accept(listen_fd, null, null, posix.SOCK.NONBLOCK) catch return error.AcceptFailed;
+    errdefer posix.close(server_fd);
+    // Small protocol writes must not wait on Nagle: tests read the peer
+    // immediately after a write and would race a delayed segment.
+    const nodelay_one: c_int = 1;
+    posix.setsockopt(client_fd, 6, 1, std.mem.asBytes(&nodelay_one)) catch {};
+    posix.setsockopt(server_fd, 6, 1, std.mem.asBytes(&nodelay_one)) catch {};
+    return .{ client_fd, server_fd };
+}
+
+test "S2sDaemon: a DANE-failed outbound conn is never read after teardown (T277)" {
+    // Poison-on-free makes any post-closeOutbound read of the conn visible.
+    // The caller must consult the slot table (daemon.outbound[slot]), never
+    // the conn pointer recordOutboundDane may have freed. The verdict
+    // override is the test seam; everything else is the real
+    // handshake-complete path.
+    var pf = PoisonOnFreeAllocator{ .inner = std.heap.c_allocator };
+    const alloc = pf.allocator();
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer {
+        daemon.deinit();
+        pf.releaseQuarantine();
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(alloc, tmp.dir);
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/cert.pem", .{base}, 0);
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/key.pem", .{base}, 0);
+    defer std.testing.allocator.free(key_path);
+
+    // kTLS stays off on both ends: two kTLS peers over lo0 hit FreeBSD
+    // PR 296498 (EBADMSG). This rig is entirely userland TLS.
+    var server_ctx = try SslContext.initServer(cert_path, key_path);
+    defer server_ctx.deinit();
+    server_ctx.disableKtls();
+    var client_ctx = try SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls();
+
+    const fds = try makeS2sTestTcpPair();
+    var peer = try SslConn.init(server_ctx, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+        posix.close(fds[1]);
+    }
+
+    const conn = try daemon.pool.getOrCreate("us.example", "them.example");
+    conn.fd = fds[0]; // conn.deinit closes it via closeOutbound below
+    conn.tls_conn = try SslConn.initClient(client_ctx, fds[0], "localhost");
+    conn.tls_state = .handshake_want_read;
+    conn.state = .tls_handshake;
+
+    const reader = try alloc.create(XmlReader);
+    reader.* = XmlReader.init(alloc);
+    daemon.outbound_readers[7] = reader; // closeOutbound frees it
+    daemon.outbound[7] = conn;
+
+    // Complete the handshake on both ends, then run the real post-handshake
+    // path with the DANE verdict forced to failed.
+    var c_done = false;
+    var p_done = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while ((!c_done or !p_done) and std.time.milliTimestamp() < deadline) {
+        if (!c_done) c_done = try conn.continueHandshake();
+        if (!p_done) p_done = (try peer.doHandshake()) == .complete;
+    }
+    try std.testing.expect(c_done and p_done);
+    try std.testing.expect(conn.tls_state == .established);
+
+    daemon.dane_verdict_override = .failed;
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    continueOutboundTls(&daemon, &cl, 7, conn);
+
+    // Teardown went through the slot table, and the conn chunk was freed
+    // poison-filled. The fill is checked inside the poisoning allocator
+    // while it still owns the bytes: reading a chunk after the real free
+    // is undefined. The free-time snapshot is the live object, not the
+    // fill read back: freeFn copies the prefix before it poisons (D9).
+    try std.testing.expect(daemon.outbound[7] == null);
+    try std.testing.expect(pf.biggest_freed_len >= @sizeOf(OutboundConnection));
+    try std.testing.expect(!std.mem.allEqual(u8, &pf.freed_prefix, 0xA5));
+    try pf.checkQuarantine();
+}
+
+/// Initialize the daemon's TLS contexts for a test link. The cert comes
+/// from the openssl CLI. kTLS is off on both ends: two kTLS peers over
+/// loopback hit FreeBSD PR 296498.
+fn ensureTestTlsContexts(daemon: *S2sDaemon) !void {
+    if (daemon.tls_ctx != null and daemon.tls_client_ctx != null) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try test_support.genSelfSigned(std.testing.allocator, tmp.dir);
+    try initTestTlsContextsFrom(daemon, tmp.dir);
+}
+
+/// Build the loopback rig's contexts: a server context from `cert_dir`, the
+/// plain client context, and the DANE client context the outbound path uses.
+fn initTestTlsContextsFrom(daemon: *S2sDaemon, cert_dir: std.fs.Dir) !void {
+    const alloc = std.testing.allocator;
+    const base = try cert_dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(alloc, "{s}/cert.pem", .{base}, 0);
+    defer alloc.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(alloc, "{s}/key.pem", .{base}, 0);
+    defer alloc.free(key_path);
+
+    if (daemon.tls_ctx == null) {
+        var server_ctx = try SslContext.initServer(cert_path, key_path);
+        errdefer server_ctx.deinit();
+        server_ctx.disableKtls();
+        daemon.tls_ctx = server_ctx;
+    }
+    if (daemon.tls_client_ctx == null) {
+        var client_ctx = try SslContext.initClient();
+        errdefer client_ctx.deinit();
+        client_ctx.disableKtls();
+        daemon.tls_client_ctx = client_ctx;
+    }
+    if (daemon.tls_client_ctx_dane == null) {
+        var dane_ctx = try SslContext.initClientDaneWithCert(null, null);
+        errdefer dane_ctx.deinit();
+        dane_ctx.disableKtls();
+        daemon.tls_client_ctx_dane = dane_ctx;
+    }
+    if (daemon.tls_client_ctx_ca == null) {
+        var ca_ctx = try SslContext.initClientVerified();
+        errdefer ca_ctx.deinit();
+        ca_ctx.disableKtls();
+        daemon.tls_client_ctx_ca = ca_ctx;
+    }
+    if (daemon.dane_verify_ctx == null) {
+        var verify_ctx = try SslContext.initDaneVerifier();
+        errdefer verify_ctx.deinit();
+        verify_ctx.disableKtls();
+        daemon.dane_verify_ctx = verify_ctx;
+    }
+}
+
+/// A client context for the test peer: it presents `cert_dir`'s certificate,
+/// which the inbound side requests (SSL_VERIFY_PEER in initServer).
+fn initTestPeerCtx(alloc: std.mem.Allocator, cert_dir: std.fs.Dir) !SslContext {
+    const base = try cert_dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(alloc, "{s}/cert.pem", .{base}, 0);
+    defer alloc.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(alloc, "{s}/key.pem", .{base}, 0);
+    defer alloc.free(key_path);
+    var ctx = try SslContext.initClientWithCert(cert_path, key_path);
+    ctx.disableKtls();
+    return ctx;
+}
+
+/// Drive both ends of a non-blocking TLS handshake to completion.
+fn completeTestTlsHandshake(client: *SslConn, server: *SslConn) !void {
+    var c_done = false;
+    var s_done = false;
+    const deadline = std.time.milliTimestamp() + 5000;
+    while ((!c_done or !s_done) and std.time.milliTimestamp() < deadline) {
+        if (!c_done) c_done = (try client.doHandshake()) == .complete;
+        if (!s_done) s_done = (try server.doHandshake()) == .complete;
+    }
+    if (!c_done or !s_done) return error.TlsHandshakeTimeout;
+}
+
+/// Read decrypted bytes the peer has sent. Stops at want_read once
+/// OpenSSL has nothing buffered.
+fn drainTlsPeer(peer: *SslConn, buf: []u8) usize {
+    var total: usize = 0;
+    var idle_ms: usize = 0;
+    while (total < buf.len) {
+        const r = peer.read(buf[total..]) catch return total;
+        switch (r) {
+            .ok => |n| {
+                if (n == 0) return total;
+                total += n;
+                idle_ms = 0;
+            },
+            .want_read, .want_write => {
+                if (peer.pending() > 0) continue;
+                // Give a slow loopback segment a moment before treating the
+                // peer as drained; return early once data has arrived and
+                // the stream stays idle.
+                if (total > 0 and idle_ms >= 20) return total;
+                if (idle_ms >= 200) return total;
+                std.Thread.sleep(std.time.ns_per_ms);
+                idle_ms += 1;
+            },
+        }
+    }
+    return total;
+}
+
+/// A TLS-protected outbound link to a test peer. The conn owns its fd;
+/// deinit frees the peer SSL object and closes the peer fd.
+const TestTlsLink = struct {
+    conn: *OutboundConnection,
+    peer: SslConn,
+    peer_fd: posix.fd_t,
+
+    fn deinit(self: *TestTlsLink) void {
+        if (self.peer_fd >= 0) {
+            self.peer.shutdown();
+            posix.close(self.peer_fd);
+            self.peer_fd = -1;
+        }
+        self.peer.deinit();
+    }
+};
+
+/// Connect a fresh outbound conn to a loopback TLS peer, complete the
+/// handshake, and return the link. The conn stays in its initial state so
+/// callers drive the protocol.
+fn makeTestTlsLink(daemon: *S2sDaemon, origin: []const u8) !TestTlsLink {
+    try ensureTestTlsContexts(daemon);
+    const fds = try makeS2sTestTcpPair();
+    errdefer posix.close(fds[0]);
+    errdefer posix.close(fds[1]);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, origin);
+    var client = try SslConn.initClient(daemon.tls_client_ctx.?, fds[0], "localhost");
+    errdefer client.deinit();
+    var peer = try SslConn.init(daemon.tls_ctx.?, fds[1]);
+    errdefer peer.deinit();
+    try completeTestTlsHandshake(&client, &peer);
+    conn.fd = fds[0]; // owned by the conn now; pool.deinit closes it
+    conn.tls_conn = client;
+    conn.tls_state = .established;
+    return .{ .conn = conn, .peer = peer, .peer_fd = fds[1] };
+}
+
+/// Start TLS on an already-connected conn and its test peer, completing
+/// the handshake. Returns the peer end.
+fn attachTestTls(daemon: *S2sDaemon, conn: *OutboundConnection, peer_fd: posix.fd_t) !SslConn {
+    try ensureTestTlsContexts(daemon);
+    var client = try SslConn.initClient(daemon.tls_client_ctx.?, conn.fd, "localhost");
+    errdefer client.deinit();
+    var peer = try SslConn.init(daemon.tls_ctx.?, peer_fd);
+    errdefer peer.deinit();
+    try completeTestTlsHandshake(&client, &peer);
+    conn.tls_conn = client;
+    conn.tls_state = .established;
+    return peer;
+}
+
+/// An established callback connection over TLS: db:verify is written to
+/// the returned peer instead of the network, so no DNS happens.
+fn makeTestCallbackConn(daemon: *S2sDaemon, origin: []const u8) !TestTlsLink {
+    var link = try makeTestTlsLink(daemon, origin);
+    link.conn.handleAuthSuccess(); // skip the protocol dance
+    return link;
+}
+
+/// A connected outbound conn with no TLS layer, for the pre-STARTTLS
+/// downgrade tests.
+fn makeTestCleartextConn(daemon: *S2sDaemon, origin: []const u8) !struct { conn: *OutboundConnection, peer_fd: posix.fd_t } {
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    errdefer posix.close(fds[1]);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, origin);
+    conn.fd = fds[0]; // owned by the conn now; pool.deinit closes it
+    return .{ .conn = conn, .peer_fd = fds[1] };
+}
+
+fn feedSaslOutcome(daemon: *S2sDaemon, conn: *OutboundConnection, cl: *ChangeList, reader: *XmlReader, name: []const u8) void {
+    var attrs = [_]xml.Attribute{};
+    const elem = xml.Element{
+        .name = name,
+        .prefix = "",
+        .local_name = name,
+        .namespace_uri = xml.ns.sasl,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(daemon, cl, 0, conn, reader, .{ .element_start = elem });
+}
+
+test "S2sDaemon: an unsolicited SASL success before STARTTLS fails the stream and writes nothing" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const t = try makeTestCleartextConn(&daemon, "them.example");
+    defer posix.close(t.peer_fd);
+    t.conn.state = .stream_open;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    feedSaslOutcome(&daemon, t.conn, &cl, &reader, "success");
+
+    // A cleartext peer cannot authenticate the link: no stream restart, no
+    // stanza flush, no established state.
+    try std.testing.expect(t.conn.isFailed());
+    try std.testing.expectEqualStrings("unsolicited-sasl-success", t.conn.error_msg);
+    try std.testing.expect(!t.conn.isEstablished());
+    try std.testing.expect(!t.conn.stream.authenticated);
+    var wire: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(t.peer_fd, &wire));
+}
+
+test "S2sDaemon: a SASL outcome is refused until our auth request went out" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var link = try makeTestTlsLink(&daemon, "them.example");
+    defer link.deinit();
+    const conn = link.conn;
+    conn.state = .authenticating;
+    conn.stream.state = .authenticating;
+    try std.testing.expect(!conn.sasl_auth_sent);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    feedSaslOutcome(&daemon, conn, &cl, &reader, "success");
+    try std.testing.expect(conn.isFailed());
+    try std.testing.expectEqualStrings("unsolicited-sasl-success", conn.error_msg);
+    var wire: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainTlsPeer(&link.peer, &wire));
+}
+
+test "S2sDaemon: a SASL success after our auth request establishes the stream" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var link = try makeTestTlsLink(&daemon, "them.example");
+    defer link.deinit();
+    const conn = link.conn;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // Post-TLS features with DANE verified select SASL EXTERNAL: the
+    // <auth/> goes out and the outcome becomes acceptable.
+    conn.stream.dane_verified = true;
+    conn.stream.state = .features_auth;
+    processOutboundEvent(&daemon, &cl, 0, conn, &reader, .{ .element_end = "features" });
+    try std.testing.expect(conn.sasl_auth_sent);
+    try std.testing.expectEqual(connector_mod.OutboundState.authenticating, conn.state);
+
+    feedSaslOutcome(&daemon, conn, &cl, &reader, "success");
+    try std.testing.expect(conn.isEstablished());
+    try std.testing.expect(conn.stream.authenticated);
+
+    var wire: [1024]u8 = undefined;
+    const sent = wire[0..drainTlsPeer(&link.peer, &wire)];
+    try std.testing.expect(std.mem.indexOf(u8, sent, "<auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "<stream:stream") != null);
+}
+
+test "S2sDaemon: an unsolicited SASL failure and STARTTLS proceed fail the stream" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    const f1 = try makeTestCleartextConn(&daemon, "one.example");
+    defer posix.close(f1.peer_fd);
+    f1.conn.state = .stream_open;
+    feedSaslOutcome(&daemon, f1.conn, &cl, &reader, "failure");
+    try std.testing.expect(f1.conn.isFailed());
+    try std.testing.expectEqualStrings("unsolicited-sasl-failure", f1.conn.error_msg);
+
+    const f2 = try makeTestCleartextConn(&daemon, "two.example");
+    defer posix.close(f2.peer_fd);
+    f2.conn.state = .stream_open;
+    var attrs = [_]xml.Attribute{};
+    const proceed = xml.Element{
+        .name = "proceed",
+        .prefix = "",
+        .local_name = "proceed",
+        .namespace_uri = xml.ns.tls,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(&daemon, &cl, 0, f2.conn, &reader, .{ .element_start = proceed });
+    try std.testing.expect(f2.conn.isFailed());
+    try std.testing.expectEqualStrings("unsolicited-starttls-proceed", f2.conn.error_msg);
+    try std.testing.expect(!f2.conn.isTlsHandshaking());
+}
+
+test "S2sDaemon: a db:result verdict for a verify that never went out authenticates nothing" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A cleartext callback conn cannot send the verify (no TLS), so a
+    // matching verdict must not stand in for one.
+    const t = try makeTestCleartextConn(&daemon, "them.example");
+    defer posix.close(t.peer_fd);
+    daemon.outbound[0] = t.conn; // the failure tears it out of the slot
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "abababababababababababababababababababababababababababababababab";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+    try std.testing.expect(t.conn.hasUnsentVerify());
+    try std.testing.expectEqual(@as(usize, 1), t.conn.pendingVerifyCount());
+    try std.testing.expect(daemon.getInbound(1) != null);
+    const sid = try alloc.dupe(u8, daemon.getInbound(1).?.getStreamId());
+    defer alloc.free(sid);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    var attrs = [_]xml.Attribute{ testAttr("type", "valid"), testAttr("id", sid), testAttr("from", "them.example"), testAttr("to", "us.example") };
+    const elem = xml.Element{
+        .name = "db:result",
+        .prefix = "db",
+        .local_name = "result",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(&daemon, &cl, 0, t.conn, &reader, .{ .element_start = elem });
+
+    // The unsent exchange is answered invalid and the stream fails; the
+    // inbound session never becomes authenticated.
+    try std.testing.expect(daemon.outbound[0] == null);
+    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+    _ = try session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+}
+
+test "S2sDaemon: a dialback key is never sent before TLS" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // A peer that advertises auth features before STARTTLS must not make
+    // us put the dialback key on a cleartext link.
+    const t = try makeTestCleartextConn(&daemon, "them.example");
+    defer posix.close(t.peer_fd);
+    t.conn.state = .stream_open;
+    t.conn.stream.state = .features_auth;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    processOutboundEvent(&daemon, &cl, 0, t.conn, &reader, .{ .element_end = "features" });
+
+    try std.testing.expect(t.conn.isFailed());
+    try std.testing.expectEqualStrings("dialback-key-before-tls", t.conn.error_msg);
+    try std.testing.expect(!t.conn.db_assertion_pending);
+    var wire: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(t.peer_fd, &wire));
+}
+
+test "S2sDaemon: a cleartext db:result verdict cannot answer our dialback key" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const t = try makeTestCleartextConn(&daemon, "them.example");
+    defer posix.close(t.peer_fd);
+    t.conn.db_assertion_pending = true; // key marked sent, but no TLS
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    feedDbResultVerdict(&daemon, t.conn, &cl, &reader, "valid", "them.example", "us.example");
+
+    try std.testing.expect(!t.conn.isEstablished());
+    try std.testing.expect(!t.conn.stream.authenticated);
+    try std.testing.expect(t.conn.isFailed());
+    try std.testing.expectEqualStrings("unmatched-db-result", t.conn.error_msg);
+}
+
+test "S2sDaemon: a db:result without a type fails the stream" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer ob.deinit();
+    // Mark the key outstanding: an untyped verdict must still not answer it.
+    ob.conn.db_assertion_pending = true;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    var attrs = [_]xml.Attribute{ testAttr("from", "them.example"), testAttr("to", "us.example") };
+    const elem = xml.Element{
+        .name = "db:result",
+        .prefix = "db",
+        .local_name = "result",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_start = elem });
+
+    try std.testing.expect(ob.conn.isFailed());
+    try std.testing.expectEqualStrings("unexpected-db-result", ob.conn.error_msg);
+    try std.testing.expect(!ob.conn.isEstablished());
+    try std.testing.expect(!ob.conn.stream.authenticated);
+}
+
+test "S2sDaemon: stanzas are never flushed on a cleartext outbound conn" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const t = try makeTestCleartextConn(&daemon, "them.example");
+    defer posix.close(t.peer_fd);
+    t.conn.handleAuthSuccess(); // established state without a TLS layer
+
+    try t.conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>secret</body></message>");
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.flushOutboundStanzas(&cl, t.conn);
+
+    try std.testing.expectEqual(@as(usize, 1), t.conn.pendingCount());
+    var wire: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(t.peer_fd, &wire));
+}
+
+test "S2sDaemon: dialback verdicts correlate by stream id and origin" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    const in2 = try makeTestInbound(alloc, &daemon, 2);
+    defer posix.close(in2.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    const key1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    const key2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    // Two sessions claim the same origin; the second submission must not
+    // overwrite the first one's callback state.
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key1);
+    submitDbResult(&daemon, in2.session, &cl, "them.example", "us.example", key2);
+    try std.testing.expectEqual(@as(usize, 2), cb.conn.pendingVerifyCount());
+
+    // One db:verify per pending entry, each naming its own stream id.
+    var vbuf: [2048]u8 = undefined;
+    const verifies = vbuf[0..drainTlsPeer(&cb.peer, &vbuf)];
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, verifies, "<db:verify"));
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(daemon.getInbound(2) != null);
+    try std.testing.expect(std.mem.indexOf(u8, verifies, daemon.getInbound(1).?.getStreamId()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, verifies, daemon.getInbound(2).?.getStreamId()) != null);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // A verdict naming no pending entry authenticates nobody. The verdict
+    // handling may close and free a session: everything after it reaches
+    // the sessions through the slot table, never the rig pointers (B5).
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", "no-such-stream", "them.example", "us.example");
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(daemon.getInbound(2) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(!daemon.getInbound(2).?.isAuthenticatedDomain("them.example"));
+
+    // Right id, wrong from=: still no match.
+    try std.testing.expect(daemon.getInbound(2) != null);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(2).?.getStreamId(), "other.example", "us.example");
+    try std.testing.expect(daemon.getInbound(2) != null);
+    try std.testing.expect(!daemon.getInbound(2).?.isAuthenticatedDomain("them.example"));
+
+    // Right id/from/to for session 2: only session 2 authenticates.
+    try std.testing.expect(daemon.getInbound(2) != null);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(2).?.getStreamId(), "them.example", "us.example");
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(daemon.getInbound(2) != null);
+    try std.testing.expect(daemon.getInbound(2).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+
+    // The db:result answer goes to session 2, addressed to the verified
+    // origin; session 1's socket stays silent. The rig has no kqueue, so
+    // flush the queued write like handleInboundWritable would.
+    try std.testing.expect(daemon.getInbound(2) != null);
+    _ = try daemon.getInbound(2).?.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in2.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "to='them.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='valid'") != null);
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(in1.peer_fd, &rbuf));
+
+    // Session 1's entry survived the other verdict and still resolves.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "invalid", daemon.getInbound(1).?.getStreamId(), "them.example", "us.example");
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(daemon.getInbound(1).?.inbound_dialback.isFailed());
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+}
+
+test "S2sDaemon: dialback verdict for a reused inbound slot is discarded" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    const key = "3333333333333333333333333333333333333333333333333333333333333333";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    const old_sid = try alloc.dupe(u8, daemon.getInbound(1).?.getStreamId());
+    defer alloc.free(old_sid);
+
+    // The submitter disconnects; its slot is reused by a different peer.
+    daemon.closeInbound(&cl, 1);
+    posix.close(in1.peer_fd);
+    const in2 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in2.peer_fd);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // The stale verdict must not land on the new occupant of slot 1.
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", old_sid, "them.example", "us.example");
+    // The stale verdict may close the new occupant: reach it through the
+    // slot table.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(!daemon.getInbound(1).?.isEstablished());
+    var rbuf: [512]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(in2.peer_fd, &rbuf));
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+}
+
+/// A connected, TLS-protected outbound connection, still unauthenticated:
+/// the test drives the dialback exchange directly, so no DNS happens. The
+/// conn fd is owned by the pool (daemon.deinit closes it).
+fn makeTestOutboundConn(daemon: *S2sDaemon, origin: []const u8) !TestTlsLink {
+    return makeTestTlsLink(daemon, origin);
+}
+
+/// Feed a typed db:result verdict through processOutboundEvent: the answer
+/// either to our own dialback key (from/to echo) or, with an id, to our
+/// db:verify.
+fn feedDbResultVerdict(daemon: *S2sDaemon, conn: *OutboundConnection, cl: *ChangeList, reader: *XmlReader, verdict: []const u8, from: []const u8, to: []const u8) void {
+    var attrs = [_]xml.Attribute{ testAttr("type", verdict), testAttr("from", from), testAttr("to", to) };
+    const elem = xml.Element{
+        .name = "db:result",
+        .prefix = "db",
+        .local_name = "result",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(daemon, cl, 0, conn, reader, .{ .element_start = elem });
+}
+
+test "S2sDaemon: a typed db:result verdict with no dialback key sent authenticates nothing" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer ob.deinit();
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // This connection never asserted a dialback key: no verdict, echoed
+    // from/to or bare, may stand in for one.
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "valid", "them.example", "us.example");
+    try std.testing.expect(!ob.conn.isEstablished());
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "valid", "", "");
+    try std.testing.expect(!ob.conn.isEstablished());
+    try std.testing.expect(!ob.conn.stream.authenticated);
+    try std.testing.expect(!ob.conn.db_assertion_pending);
+}
+
+test "S2sDaemon: a typed db:result verdict answers the dialback key this connection sent" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer ob.deinit();
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // Post-TLS stream restart: the features reply picks dialback (no DANE)
+    // and sends our key over this connection.
+    ob.conn.stream.state = .awaiting_stream_open_tls;
+    ob.conn.handleRemoteStreamOpen("them.example", "streamid-77");
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_end = "features" });
+    try std.testing.expect(ob.conn.db_assertion_pending);
+
+    var kbuf: [1024]u8 = undefined;
+    const key_xml = kbuf[0..drainTlsPeer(&ob.peer, &kbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, key_xml, "<db:result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key_xml, "from='us.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key_xml, "to='them.example'") != null);
+
+    // The verdict answering that key authenticates the connection and
+    // completes the exchange.
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "valid", "them.example", "us.example");
+    try std.testing.expect(ob.conn.isEstablished());
+    try std.testing.expect(!ob.conn.db_assertion_pending);
+
+    // The completed exchange stays complete: a replayed verdict is not a
+    // second exchange to answer.
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "valid", "them.example", "us.example");
+    try std.testing.expect(!ob.conn.db_assertion_pending);
+}
+
+test "S2sDaemon: a failed db:verify write answers the exchange invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The callback connection is dead before its db:verify can go out: the
+    // write fails, and the exchange is answered instead of leaving the
+    // submitting stream to wait for a verdict that can never arrive.
+    posix.close(cb.conn.fd);
+    cb.conn.fd = -1;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "4444444444444444444444444444444444444444444444444444444444444444";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    try std.testing.expect(cb.conn.isFailed());
+    try std.testing.expectEqualStrings("write-failed", cb.conn.error_msg);
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+    // The failed exchange may close and free the submitting stream: reach
+    // it through the slot table, never the rig pointer (B5).
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+
+    // The submitting stream is told the key did not verify.
+    _ = try daemon.getInbound(1).?.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+}
+
+test "S2sDaemon: a failed db:verify write tears the outbound conn out of its slot" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+    daemon.outbound[0] = cb.conn;
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    posix.close(cb.conn.fd);
+    cb.conn.fd = -1;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "abababababababababababababababababababababababababababababababab";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    // The conn failed AND left its slot: a stale pointer there would be
+    // freed by the next getOrCreate and read again by the next dispatch.
+    try std.testing.expect(daemon.outbound[0] == null);
+
+    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    _ = try session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+}
+
+test "S2sDaemon: a full changelist fails the pending exchanges instead of losing them" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+    daemon.outbound[0] = cb.conn;
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // Room for the whole write buffer to drain in one flush.
+    const big: c_int = 1 << 20;
+    try posix.setsockopt(cb.conn.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&big));
+
+    // Fill the conn write buffer: the verify cannot be queued when the
+    // submission arrives and needs the writable edge.
+    var filler: [8192]u8 = undefined;
+    @memset(&filler, 'x');
+    while (true) cb.conn.queueWrite(&filler) catch break;
+
+    // Fill the changelist too: the writable edge cannot be armed, and the
+    // exchange must fail loudly instead of waiting for an edge that never
+    // gets staged.
+    var scratch: [2]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try cl.addRead(9001, 0);
+    try cl.addRead(9002, 0);
+
+    const key = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    // The exchange is answered and the conn leaves its slot.
+    try std.testing.expect(daemon.outbound[0] == null);
+    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    _ = try session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: a db:verify that could not be queued goes out on the writable edge" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+    daemon.outbound[0] = cb.conn; // writable dispatch resolves the slot
+
+    // Room for the whole write buffer to drain in one flush.
+    const big: c_int = 1 << 20;
+    try posix.setsockopt(cb.conn.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&big));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // Fill the conn write buffer: the verify cannot be queued when the
+    // submission arrives and must survive until the writable edge.
+    var filler: [8192]u8 = undefined;
+    @memset(&filler, 'x');
+    while (true) cb.conn.queueWrite(&filler) catch break;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "5555555555555555555555555555555555555555555555555555555555555555";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+    try std.testing.expect(cb.conn.hasUnsentVerify());
+    try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
+
+    // The one-shot writable edge is armed for the conn, so the resume
+    // actually arrives even with nothing else to trigger it.
+    var armed = false;
+    for (cl.slice()) |ev| {
+        if (ev.filter == std.c.EVFILT.WRITE and
+            ev.ident == @as(@TypeOf(ev.ident), @intCast(cb.conn.fd)) and
+            (ev.flags & std.c.EV.ONESHOT) != 0) armed = true;
+    }
+    try std.testing.expect(armed);
+
+    // The writable edge drains the buffer and queues the verify.
+    handleOutboundWritable(&daemon, &cl, 0);
+    try std.testing.expect(!cb.conn.hasUnsentVerify());
+
+    var vbuf: [32768]u8 = undefined;
+    const out = vbuf[0..drainTlsPeer(&cb.peer, &vbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, out, "<db:verify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, key) != null);
+}
+
+test "S2sDaemon: a db:verify registered while connecting stays off the wire until the post-TLS features" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    // Callback conn with no protocol state yet: connecting, no TLS, no
+    // stream, no features.
+    const fds = try makeS2sTestTcpPair();
+    defer posix.close(fds[1]);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    conn.fd = fds[0]; // owned by the conn now; pool.deinit closes it
+    daemon.outbound[0] = conn;
+    try std.testing.expectEqual(connector_mod.OutboundState.connecting, conn.state);
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "7777777777777777777777777777777777777777777777777777777777777777";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+    try std.testing.expect(conn.hasUnsentVerify());
+    try std.testing.expectEqual(@as(usize, 1), conn.pendingVerifyCount());
+
+    var wire: [32768]u8 = undefined;
+    var total: usize = 0;
+
+    // Registered while connecting: nothing may be written yet. The key
+    // would travel in cleartext.
+    total += drainPeer(fds[1], wire[total..]);
+
+    // TCP completes and the stream opens in the clear. The writable edge
+    // here must not carry the verify either.
+    conn.tcpConnected();
+    handleOutboundWritable(&daemon, &cl, 0);
+    total += drainPeer(fds[1], wire[total..]);
+    try std.testing.expectEqual(@as(usize, 0), total);
+    try std.testing.expect(conn.hasUnsentVerify());
+
+    // Pre-TLS features: still no verify. STARTTLS is offered instead, so
+    // the exchange is not stalled waiting for an edge that never comes.
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    processOutboundEvent(&daemon, &cl, 0, conn, &reader, .{ .element_end = "features" });
+    total += drainPeer(fds[1], wire[total..]);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..total], "<starttls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..total], "<db:verify") == null);
+    try std.testing.expect(conn.hasUnsentVerify());
+
+    // The STARTTLS handshake completes; the post-TLS stream restart reaches
+    // the auth phase and the features edge sends the verify.
+    var peer = try attachTestTls(&daemon, conn, fds[1]);
+    defer {
+        peer.shutdown();
+        peer.deinit();
+    }
+    conn.tlsHandshakeComplete();
+    conn.setDaneResult(.no_records);
+    conn.handleRemoteStreamOpen("them.example", "remote-sid-1");
+    try std.testing.expectEqual(connector_mod.OutboundState.authenticating, conn.state);
+    processOutboundEvent(&daemon, &cl, 0, conn, &reader, .{ .element_end = "features" });
+    total += drainTlsPeer(&peer, wire[total..]);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..total], "<db:verify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..total], key) != null);
+    try std.testing.expect(!conn.hasUnsentVerify());
+}
+
+test "S2sDaemon: a callback conn torn down with pending exchanges answers them invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+    daemon.outbound[0] = cb.conn;
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "8888888888888888888888888888888888888888888888888888888888888888";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    var wire: [4096]u8 = undefined;
+    const sent = wire[0..drainTlsPeer(&cb.peer, &wire)];
+    try std.testing.expect(std.mem.indexOf(u8, sent, "<db:verify") != null);
+    try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
+
+    // The peer goes away while the verdict is still in flight: the conn is
+    // torn down and the exchange must be answered, not left waiting.
+    posix.close(cb.peer_fd);
+    cb.peer_fd = -1;
+    handleOutboundReadable(&daemon, &cl, 0);
+    try std.testing.expect(daemon.outbound[0] == null);
+
+    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    _ = try session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: an exchange whose db:verify cannot be built is answered invalid and cleared" {
+    // A long served host and a long origin overflow the fixed db:verify
+    // buffer: the exchange can never be sent, and must die immediately
+    // instead of spinning the writable re-arm forever.
+    var host_buf: [225]u8 = undefined;
+    @memset(host_buf[0..220], 'a');
+    @memcpy(host_buf[220..], ".test");
+    const long_host = host_buf[0..];
+    var origin_buf: [185]u8 = undefined;
+    @memset(origin_buf[0..180], 'b');
+    @memcpy(origin_buf[180..], ".test");
+    const long_origin = origin_buf[0..];
+
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, long_host);
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, long_origin);
+    defer cb.deinit();
+    daemon.outbound[0] = cb.conn;
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "9999999999999999999999999999999999999999999999999999999999999999";
+    submitDbResult(&daemon, in1.session, &cl, long_origin, long_host, key);
+
+    // The entry is answered invalid and cleared: nothing waits and nothing
+    // re-arms.
+    try std.testing.expect(!cb.conn.hasUnsentVerify());
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    _ = try session.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(!session.isAuthenticatedDomain(long_origin));
+}
+
+test "S2sDaemon: a db:result verdict whose answer cannot be built fails the inbound stream" {
+    // Origin and target at the buffer limit overflow the fixed db:result
+    // response buffer too: the verdict can never be answered, and the peer
+    // must not be left waiting for it forever (C6).
+    var host_buf: [256]u8 = undefined;
+    @memset(host_buf[0..251], 'a');
+    @memcpy(host_buf[251..], ".test");
+    const long_host = host_buf[0..];
+    var origin_buf: [256]u8 = undefined;
+    @memset(origin_buf[0..251], 'b');
+    @memcpy(origin_buf[251..], ".test");
+    const long_origin = origin_buf[0..];
+
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, long_host);
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, long_origin);
+    defer cb.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "9999999999999999999999999999999999999999999999999999999999999999";
+    submitDbResult(&daemon, in1.session, &cl, long_origin, long_host, key);
+
+    // The submitting stream is failed and closed instead of stalling.
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "internal-server-error") != null);
+}
+
+test "S2sDaemon: an invalid-key rejection whose answer cannot be built fails the submitting stream" {
+    // The same failure class at the invalid-key path: a huge origin and
+    // target overflow the rejection's answer buffer too, and the peer
+    // must not be left waiting for it forever (C6).
+    var host_buf: [256]u8 = undefined;
+    @memset(host_buf[0..251], 'a');
+    @memcpy(host_buf[251..], ".test");
+    const long_host = host_buf[0..];
+    var origin_buf: [256]u8 = undefined;
+    @memset(origin_buf[0..251], 'b');
+    @memcpy(origin_buf[251..], ".test");
+    const long_origin = origin_buf[0..];
+
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, long_host);
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    // Not 64 lowercase hex: the submission is rejected before any
+    // callback exists.
+    submitDbResult(&daemon, in1.session, &cl, long_origin, long_host, "zz");
+
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "internal-server-error") != null);
+}
+
+test "S2sDaemon: a db:result verdict whose answer cannot be queued fails the inbound stream" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "8888888888888888888888888888888888888888888888888888888888888888";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    // Fill the inbound write buffer: the verdict answer no longer fits.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    var filler: [16384]u8 = @splat(' ');
+    try daemon.getInbound(1).?.queueWrite(filler[0 .. 16384 - 64]);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(1).?.getStreamId(), "them.example", "us.example");
+
+    // The submitting stream is failed and closed instead of stalling.
+    try std.testing.expect(daemon.getInbound(1) == null);
+}
+
+test "S2sDaemon: a full domain set answers a valid dialback verdict invalid" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The authenticated-domain set holds 8: fill it before the verdict.
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        var dbuf: [32]u8 = undefined;
+        const d = try std.fmt.bufPrint(&dbuf, "d{d}.example", .{n});
+        try std.testing.expect(in1.session.addAuthenticatedDomain(d));
+    }
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "4444444444444444444444444444444444444444444444444444444444444444";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    // The verdict handling may close and free the session: everything
+    // after it reaches the session through the slot table, never the rig
+    // pointer (B5).
+    try std.testing.expect(daemon.getInbound(1) != null);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(1).?.getStreamId(), "them.example", "us.example");
+
+    // The verdict cannot be honored (the set has no room for the origin):
+    // the answer must be invalid, and nothing about the session turns
+    // authenticated.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(daemon.getInbound(1).?.inbound_dialback.isFailed());
+    _ = try daemon.getInbound(1).?.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='valid'") == null);
+}
+
+test "S2sDaemon: SASL EXTERNAL with a full domain set fails instead of succeeding" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        var dbuf: [32]u8 = undefined;
+        const d = try std.fmt.bufPrint(&dbuf, "d{d}.example", .{n});
+        try std.testing.expect(in1.session.addAuthenticatedDomain(d));
+    }
+    in1.session.setDaneCandidate("them.example");
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    // The action may close and free the session: reach it through the
+    // slot table, never the rig pointer (B5).
+    try std.testing.expect(daemon.getInbound(1) != null);
+    executeAction(&daemon, daemon.getInbound(1).?, .send_sasl_success, &cl);
+
+    // The identity cannot be recorded, so the exchange fails instead of
+    // succeeding unrecorded.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    _ = try daemon.getInbound(1).?.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<failure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "<success") == null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: the SASL success answer exists before the stream turns authenticated" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.setDaneCandidate("them.example");
+
+    // A buffer too small for the answer: nothing is recorded and the stream
+    // stays unauthenticated.
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, beginInboundSaslSuccess(in1.session, &tiny));
+    try std.testing.expect(!in1.session.stream.authenticated);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.auth_domain_count);
+    try std.testing.expect(!in1.session.isAuthenticatedDomain("them.example"));
+
+    // With room for the answer, the domain and the state are committed.
+    var buf: [2048]u8 = undefined;
+    const success = try beginInboundSaslSuccess(in1.session, &buf);
+    try std.testing.expectEqualStrings("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>", success);
+    try std.testing.expect(in1.session.stream.authenticated);
+    try std.testing.expect(in1.session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sDaemon: a SASL EXTERNAL that cannot record its domain leaves the stream unauthenticated" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The authenticated-domain set is full: the identity cannot be
+    // recorded and the exchange answers <failure/>.
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        var dbuf: [32]u8 = undefined;
+        const d = try std.fmt.bufPrint(&dbuf, "d{d}.example", .{n});
+        try std.testing.expect(in1.session.addAuthenticatedDomain(d));
+    }
+    in1.session.setDaneCandidate("them.example");
+    in1.session.stream.setDaneVerified(true);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    _ = in1.session.stream.handleSaslExternal();
+    // The action may close and free the session: everything after it
+    // reaches the session through the slot table, never the rig pointer
+    // (B5).
+    try std.testing.expect(daemon.getInbound(1) != null);
+    executeAction(&daemon, daemon.getInbound(1).?, .send_sasl_success, &cl);
+
+    // A failed exchange leaves nothing behind: the stream is not
+    // authenticated and not waiting for a post-auth restart.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.stream.authenticated);
+    try std.testing.expect(daemon.getInbound(1).?.stream.state != .awaiting_stream_open_tls);
+
+    // The stream restart after the failed exchange must not reach
+    // established.
+    _ = daemon.getInbound(1).?.stream.handleStreamOpen("them.example", "us.example", "1.0");
+    try std.testing.expect(!daemon.getInbound(1).?.stream.isEstablished());
+}
+
+test "S2sDaemon: a SASL success that cannot be queued closes the inbound session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.setDaneCandidate("them.example");
+
+    // Leave fewer bytes than the success answer needs: the domain is
+    // recorded and the stream is marked authenticated before the queue
+    // attempt, which then fails.
+    var filler: [16384 - 8]u8 = undefined;
+    @memset(filler[0..], ' ');
+    try in1.session.queueWrite(filler[0..]);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    executeAction(&daemon, in1.session, .send_sasl_success, &cl);
+
+    // The reply never reached the peer, so the authenticated stream must
+    // not survive without it.
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(in1.peer_fd, &rbuf));
+}
+
+test "S2sDaemon: stream restart with unauthenticated from= is rejected" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // First open pinned the origin.
+    in1.session.stream_open_seen = true;
+    in1.session.setRemoteDomain("them.example");
+
+    // A restart that re-identifies the peer as another domain must fail the
+    // stream with invalid-from and close it.
+    var attrs = [_]xml.Attribute{ testAttr("from", "victim.example"), testAttr("to", "us.example"), testAttr("version", "1.0") };
+    const elem = xml.Element{
+        .name = "stream:stream",
+        .prefix = "stream",
+        .local_name = "stream",
+        .namespace_uri = "http://etherx.jabber.org/streams",
+        .attributes = &attrs,
+        .self_closing = false,
+    };
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .stream_open = elem }, &cl);
+
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "invalid-from") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "</stream:stream>") != null);
+}
+
+test "S2sDaemon: stanza from unauthenticated domain on established session is rejected" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    in1.session.stream.setAuthenticated();
+
+    // from= names a domain this session never authenticated for.
+    var attrs = [_]xml.Attribute{ testAttr("from", "eve@evil.example"), testAttr("to", "juliet@us.example") };
+    const elem = xml.Element{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &attrs,
+        .self_closing = true,
+    };
+    processInboundEvent(&daemon, in1.session, daemon.readers[1].?, .{ .element_start = elem }, &cl);
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "invalid-from") != null);
+
+    // Positive control: an authenticated domain passes the set lookup and
+    // the session stays open.
+    const in2 = try makeTestInbound(alloc, &daemon, 2);
+    defer posix.close(in2.peer_fd);
+    in2.session.stream.setAuthenticated();
+    _ = in2.session.addAuthenticatedDomain("them.example");
+    var attrs2 = [_]xml.Attribute{ testAttr("from", "romeo@them.example/orchard"), testAttr("to", "juliet@us.example") };
+    const elem2 = xml.Element{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &attrs2,
+        .self_closing = true,
+    };
+    processInboundEvent(&daemon, in2.session, daemon.readers[2].?, .{ .element_start = elem2 }, &cl);
+    try std.testing.expect(daemon.getInbound(2) != null);
+}
+
+test "S2sDaemon: plaintext bytes while the inbound TLS upgrade pends fail the stream (T250)" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // A <proceed/> is parked behind a partial flush; the peer speaks anyway.
+    // Well-formed XML on purpose: without the guard it parses as an ignored
+    // event and the session stays open.
+    in1.session.tls_upgrade_pending = true;
+    _ = try posix.write(in1.peer_fd, "<message to='juliet@us.example'/>");
+
+    handleInboundReadable(&daemon, &cl, 1);
+
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "policy-violation") != null);
+}
+
+test "S2sDaemon: db:result addressed to a host we do not serve is rejected" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    const key = "4444444444444444444444444444444444444444444444444444444444444444";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "other.example", key);
+
+    // The to= check must fail the stream before any callback is registered.
+    try std.testing.expect(daemon.getInbound(1) == null);
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "invalid-from") != null);
+}
+
+fn testStreamOpenElem(from: []const u8, to: []const u8, attrs: []xml.Attribute) xml.Element {
+    attrs[0] = testAttr("from", from);
+    attrs[1] = testAttr("to", to);
+    attrs[2] = testAttr("version", "1.0");
+    return xml.Element{
+        .name = "stream:stream",
+        .prefix = "stream",
+        .local_name = "stream",
+        .namespace_uri = "http://etherx.jabber.org/streams",
+        .attributes = attrs,
+        .self_closing = false,
+    };
+}
+
+test "S2sDaemon: MUC host is served on stream open; replies echo the requested host" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.muc_host = "conference.us.example";
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // Stream open addressed to the MUC host is accepted and answered as it.
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var attrs1 = [_]xml.Attribute{ testAttr("from", ""), testAttr("to", ""), testAttr("version", "") };
+    const open1 = testStreamOpenElem("them.example", "conference.us.example", &attrs1);
+    const s1 = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    processInboundEvent(&daemon, s1, daemon.readers[1].?, .{ .stream_open = open1 }, &cl);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    _ = try daemon.getInbound(1).?.flushWrite();
+    var rbuf: [2048]u8 = undefined;
+    const resp1 = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp1, "from='conference.us.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp1, "to='them.example'") != null);
+
+    // A stream addressed to a host we do not serve fails with host-unknown.
+    const in2 = try makeTestInbound(alloc, &daemon, 2);
+    defer posix.close(in2.peer_fd);
+    var attrs2 = [_]xml.Attribute{ testAttr("from", ""), testAttr("to", ""), testAttr("version", "") };
+    const open2 = testStreamOpenElem("them.example", "other.example", &attrs2);
+    processInboundEvent(&daemon, in2.session, daemon.readers[2].?, .{ .stream_open = open2 }, &cl);
+    try std.testing.expect(daemon.getInbound(2) == null);
+    var rbuf2: [2048]u8 = undefined;
+    const resp2 = rbuf2[0..drainPeer(in2.peer_fd, &rbuf2)];
+    // RFC 6120 4.9.1: the error is preceded by the stream header we never sent,
+    // so the peer can parse it. Both must arrive.
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "<stream:stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "<stream:error>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "<stream:stream").? < std.mem.indexOf(u8, resp2, "<stream:error>").?);
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "host-unknown") != null);
+}
+
+test "S2sDaemon: db:result for the MUC host completes and answers as that host" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.muc_host = "conference.us.example";
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    const key = "5555555555555555555555555555555555555555555555555555555555555555";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "conference.us.example", key);
+    // Accepted and pending.
+    try std.testing.expect(daemon.getInbound(1) != null);
+
+    // The db:verify speaks as the MUC host.
+    var vbuf: [1024]u8 = undefined;
+    const verifies = vbuf[0..drainTlsPeer(&cb.peer, &vbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, verifies, "from='conference.us.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verifies, "to='them.example'") != null);
+
+    // The verdict echoes the MUC host as to= and completes the exchange.
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(1).?.getStreamId(), "them.example", "conference.us.example");
+    // The processing may close and free the session: reach it through the
+    // slot table, never the rig pointer.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    _ = try daemon.getInbound(1).?.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "from='conference.us.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "to='them.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='valid'") != null);
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+
+    // A verdict addressed to the local domain matches no MUC-host entry.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    submitDbResult(&daemon, daemon.getInbound(1).?, &cl, "them.example", "conference.us.example", key);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "valid", daemon.getInbound(1).?.getStreamId(), "them.example", "us.example");
+    try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
+}
+
+test "S2sDaemon: db:verify for the MUC host is answered as that host" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.muc_host = "conference.us.example";
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // We are the authoritative host; the key binds (verifier, MUC host, sid).
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    const sid = in1.session.getStreamId();
+    const key = dialback.computeKeyHex(&daemon.dialback_secret, "them.example", "conference.us.example", sid);
+
+    var attrs = [_]xml.Attribute{ testAttr("from", "them.example"), testAttr("to", "conference.us.example"), testAttr("id", sid) };
+    const elem = xml.Element{
+        .name = "db:verify",
+        .prefix = "db",
+        .local_name = "verify",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = false,
+    };
+    const v1 = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
+    processInboundEvent(&daemon, v1, daemon.readers[1].?, .{ .element_start = elem }, &cl);
+    // The processing may close and free the session: everything after it
+    // reaches the session through the slot table, never the rig pointer.
+    try std.testing.expect(daemon.getInbound(1) != null);
+    processInboundEvent(&daemon, daemon.getInbound(1).?, daemon.readers[1].?, .{ .text = &key }, &cl);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    _ = try daemon.getInbound(1).?.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "from='conference.us.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "to='them.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='valid'") != null);
+
+    // A db:verify for a host we do not serve fails the stream.
+    const in2 = try makeTestInbound(alloc, &daemon, 2);
+    defer posix.close(in2.peer_fd);
+    var attrs2 = [_]xml.Attribute{ testAttr("from", "them.example"), testAttr("to", "other.example"), testAttr("id", "x") };
+    const elem2 = xml.Element{
+        .name = "db:verify",
+        .prefix = "db",
+        .local_name = "verify",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs2,
+        .self_closing = false,
+    };
+    const v2 = daemon.getInbound(2) orelse return error.TestUnexpectedResult;
+    processInboundEvent(&daemon, v2, daemon.readers[2].?, .{ .element_start = elem2 }, &cl);
+    // The key text fails the stream and frees the session: re-fetch it from
+    // the slot table before feeding the text.
+    if (daemon.getInbound(2)) |live| {
+        processInboundEvent(&daemon, live, daemon.readers[2].?, .{ .text = "6666666666666666666666666666666666666666666666666666666666666666" }, &cl);
+    }
+    try std.testing.expect(daemon.getInbound(2) == null);
+    var rbuf2: [1024]u8 = undefined;
+    const resp2 = rbuf2[0..drainPeer(in2.peer_fd, &rbuf2)];
+    try std.testing.expect(std.mem.indexOf(u8, resp2, "host-unknown") != null);
+}
+
+test "F6: inbound S2S to= on the MUC host passes through unchanged" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "localhost");
+    defer daemon.deinit();
+    daemon.muc_host = "conference.localhost";
+    const peer_fd = try attachInboundSocketpairForTest(&daemon, 0);
+    defer posix.close(peer_fd);
+    var ipc_fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &ipc_fds) != 0) return error.SocketPairFailed;
+    defer posix.close(ipc_fds[1]);
+    daemon.ipc.clients[0] = .{ .fd = ipc_fds[0], .alloc = alloc, .active = true };
+    var scratch: [8]posix.Kevent = undefined;
+    var batch = ChangeList.init(&scratch);
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' from='remote.example' to='localhost' version='1.0'>");
+    daemon.getInbound(0).?.stream.setAuthenticated();
+    try std.testing.expect(daemon.getInbound(0).?.addAuthenticatedDomain("remote.example"));
+    // A remote-domain to= is a passthrough: the prepared slice aliases the
+    // session buffer, so nothing may be copied over itself (M17 would panic
+    // in @memcpy).
+    try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='Peer@remote.example' to='BigRoom@conference.localhost/Nick' type='groupchat'><body>hi</body></message>");
+    const ipc = daemon.ipc.getClient(0).?;
+    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const msg = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("BigRoom@conference.localhost/Nick", msg.s2s_inbound.to_jid);
+}
+
+// ============================================================================
+// X2b: async DNS resolution tests
+// ============================================================================
+
+const TargetSpec = struct {
+    addr: []const u8,
+    port: u16 = 5269,
+    status: dns_async.TlsaStatus = .absent,
+    direct_tls: bool = false,
+};
+
+/// A fabricated resolver answer with the given targets. Slices and hosts
+/// are allocator-owned like a wire answer, so deliverResolution runs the
+/// real adoption and connect iteration without live DNS.
+fn fabricateResolution(alloc: std.mem.Allocator, specs: []const TargetSpec) !dns_async.Resolution {
+    const targets = try alloc.alloc(dns_async.Target, specs.len);
+    for (specs, 0..) |s, i| {
+        targets[i] = .{
+            .addr = try std.net.Address.parseIp(s.addr, s.port),
+            .host = try alloc.dupe(u8, s.addr),
+            .tlsa = &.{},
+            .tlsa_status = s.status,
+            .is_direct_tls = s.direct_tls,
+        };
+    }
+    return .{ .targets = targets };
+}
+
+/// Encode "a.b.c" as a wire-format DNS name into out; returns bytes used.
+fn encodeDnsName(out: []u8, dotted: []const u8) usize {
+    var pos: usize = 0;
+    var start: usize = 0;
+    while (start <= dotted.len) {
+        var end = start;
+        while (end < dotted.len and dotted[end] != '.') : (end += 1) {}
+        out[pos] = @intCast(end - start);
+        pos += 1;
+        @memcpy(out[pos .. pos + end - start], dotted[start..end]);
+        pos += end - start;
+        if (end >= dotted.len) break;
+        start = end + 1;
+    }
+    out[pos] = 0;
+    return pos + 1;
+}
+
+/// Build a DNS reply in out: echo the question, set response flags and
+/// rcode, append the pre-built answer section ("" for NODATA).
+fn nsBuildReply(out: []u8, q: []const u8, rcode: u16, answers: []const u8) usize {
+    @memcpy(out[0..2], q[0..2]);
+    std.mem.writeInt(u16, out[2..4], 0x8180 | rcode, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    std.mem.writeInt(u16, out[6..8], if (answers.len > 0) 1 else 0, .big);
+    std.mem.writeInt(u16, out[8..10], 0, .big);
+    std.mem.writeInt(u16, out[10..12], 0, .big);
+    const qlen = q.len - 12;
+    @memcpy(out[12 .. 12 + qlen], q[12..]);
+    @memcpy(out[12 + qlen .. 12 + qlen + answers.len], answers);
+    return 12 + qlen + answers.len;
+}
+
+/// An SRV answer section for priority 10, weight 1, the given target.
+fn nsSrvAnswer(a: []u8, port: u16, target: []const u8) usize {
+    a[0] = 0xC0;
+    a[1] = 0x0C; // compressed name: the question owner
+    std.mem.writeInt(u16, a[2..4], 33, .big);
+    std.mem.writeInt(u16, a[4..6], 1, .big);
+    std.mem.writeInt(u32, a[6..10], 60, .big);
+    std.mem.writeInt(u16, a[12..14], 10, .big); // priority
+    std.mem.writeInt(u16, a[14..16], 1, .big); // weight
+    std.mem.writeInt(u16, a[16..18], port, .big);
+    const nlen = encodeDnsName(a[18..], target);
+    std.mem.writeInt(u16, a[10..12], @intCast(6 + nlen), .big);
+    return 12 + 6 + nlen;
+}
+
+/// An A answer section for one IPv4 address.
+fn nsAAnswer(a: []u8, ip: [4]u8) usize {
+    a[0] = 0xC0;
+    a[1] = 0x0C;
+    std.mem.writeInt(u16, a[2..4], 1, .big);
+    std.mem.writeInt(u16, a[4..6], 1, .big);
+    std.mem.writeInt(u32, a[6..10], 60, .big);
+    std.mem.writeInt(u16, a[10..12], 4, .big);
+    @memcpy(a[12..16], &ip);
+    return 16;
+}
+
+/// Serve one DNS reply on the fixture socket: wait up to 500 ms for one
+/// query and answer it per the test script; false when nothing arrived.
+/// Test-only: the posix.poll wait is fine here but must never be copied
+/// onto an event loop.
+fn nsServeOnce(fd: posix.fd_t) !bool {
+    var pkt: [512]u8 = undefined;
+    var pfd = [1]posix.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+    if (try posix.poll(&pfd, 500) == 0) return false;
+    var peer: posix.sockaddr = undefined;
+    var plen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    const n = posix.recvfrom(fd, &pkt, 0, &peer, &plen) catch return false;
+    const q = pkt[0..n];
+    if (q.len < 16) return false;
+    const qtype = std.mem.readInt(u16, q[q.len - 4 ..][0..2], .big);
+    var out: [512]u8 = undefined;
+    var an: [128]u8 = undefined;
+    var rcode: u16 = 0;
+    var answers: []const u8 = "";
+    switch (qtype) {
+        33 => {
+            if (std.mem.indexOf(u8, q, "_xmpps-server") != null) {
+                // NODATA: no direct TLS on this domain.
+            } else {
+                answers = an[0..nsSrvAnswer(&an, 5269, "srv.them.example")];
+            }
+        },
+        1 => answers = an[0..nsAAnswer(&an, .{ 127, 0, 0, 1 })],
+        52 => rcode = 2, // TLSA SERVFAIL: lookup_failed, never "no TLSA"
+        else => {},
+    }
+    const rlen = nsBuildReply(&out, q, rcode, answers);
+    _ = posix.sendto(fd, out[0..rlen], 0, &peer, plen) catch return false;
+    return true;
+}
+
+/// A UDP socket bound on loopback: the test's nameserver fixture, or a
+/// black hole when no replies are served.
+fn nsFixtureSocket() !struct { fd: posix.fd_t, port: u16 } {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK, 0);
+    errdefer posix.close(fd);
+    const any = try std.net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(fd, &any.any, any.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var alen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(fd, &actual, &alen);
+    return .{ .fd = fd, .port = std.net.Address.initPosix(@alignCast(&actual)).getPort() };
+}
+
+test "S2sDaemon: a resolution connects the first TLSA-usable target" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // Target 0's TLSA lookup failed: a temporary failure of that target,
+    // skipped outright. Target 1 is an IPv6 address: v6 connects too.
+    const res = try fabricateResolution(alloc, &.{
+        .{ .addr = "10.9.9.9", .status = .lookup_failed },
+        .{ .addr = "::1" },
+    });
+    daemon.deliverResolution(&cl, conn, .resolved, res);
+
+    try std.testing.expectEqual(@as(usize, 1), conn.target_idx);
+    try std.testing.expect(conn.fd >= 0);
+    try std.testing.expect(conn.deadline_ident != 0);
+    try std.testing.expectEqual(posix.AF.INET6, conn.target_addr.any.family);
+    try std.testing.expectEqualStrings("::1", conn.targetHost());
+    const slot = daemon.findOutboundSlot(conn).?;
+    try std.testing.expect(daemon.outbound_readers[slot] != null);
+}
+
+test "S2sDaemon: a connect deadline advances to the next target" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    const res = try fabricateResolution(alloc, &.{
+        .{ .addr = "127.0.0.1", .port = 5269 },
+        .{ .addr = "127.0.0.1", .port = 5270 },
+    });
+    daemon.deliverResolution(&cl, conn, .resolved, res);
+    try std.testing.expectEqual(@as(usize, 0), conn.target_idx);
+    const ident0 = conn.deadline_ident;
+    try std.testing.expect(conn.fd >= 0 and ident0 != 0);
+
+    daemon.handleConnectDeadline(&cl, ident0);
+
+    // The old fd was purged and closed; the kernel may recycle its number.
+    try std.testing.expectEqual(@as(usize, 1), conn.target_idx);
+    try std.testing.expect(conn.fd >= 0);
+    try std.testing.expect(conn.deadline_ident != 0 and conn.deadline_ident != ident0);
+    try std.testing.expectEqual(@as(u16, 5270), conn.target_port);
+}
+
+test "S2sDaemon: targets that all failed TLSA lookup bounce temporary" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message/>");
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const res = try fabricateResolution(alloc, &.{
+        .{ .addr = "10.9.9.9", .status = .lookup_failed },
+        .{ .addr = "10.9.9.8", .status = .lookup_failed },
+    });
+    daemon.deliverResolution(&cl, conn, .resolved, res);
+
+    // Every target's TLSA lookup failed: a temporary failure, never "no
+    // TLSA" and never a connect to an unverifiable target (ADR-13).
+    const client = &daemon.ipc.clients[0];
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+}
+
+test "S2sDaemon: a TLSA SERVFAIL skips the target and fails temporary" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    const ns = try nsFixtureSocket();
+    defer posix.close(ns.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", ns.port));
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "gone.example");
+    try conn.queueStanza(alloc, "a@us.example", "b@gone.example", "<message/>");
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.initiateOutbound(&cl, conn, "gone.example");
+    try std.testing.expect(conn.dns_key != 0);
+    try std.testing.expect(conn.fd < 0);
+
+    // Drive the real wire: the fixture answers SRV (one target), A, and
+    // serves TLSA SERVFAIL, which must mark the target lookup_failed.
+    var done = false;
+    for (0..64) |_| {
+        _ = nsServeOnce(ns.fd) catch false;
+        daemon.resolver.step(25);
+        // The conn leaves the pool on failure, so membership is checked
+        // before the pointer is touched.
+        if (daemon.pool.connections.get("gone.example") == null) {
+            done = true;
+            break;
+        }
+        if (conn.fd >= 0) {
+            done = true;
+            break;
+        }
+    }
+    try std.testing.expect(done);
+    try std.testing.expect(daemon.pool.connections.get("gone.example") == null);
+
+    const client = &daemon.ipc.clients[0];
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
+}
+
+test "S2sDaemon: a silent nameserver leaves the loop responsive" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    // Bound but never answered: queries land, nothing replies.
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+    daemon.resolver.chain_deadline_ms = 100;
+
+    const conn1 = try daemon.pool.getOrCreate(daemon.local_domain, "gone.example");
+    try conn1.queueStanza(alloc, "a@us.example", "b@gone.example", "<message/>");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.initiateOutbound(&cl, conn1, "gone.example");
+
+    // The resolve is genuinely in flight on the loop: the conn waits.
+    try std.testing.expect(conn1.dns_key != 0);
+    try std.testing.expect(conn1.fd < 0);
+
+    // The loop stays responsive: a synchronous literal-IP resolve for a
+    // second domain completes inside the same call path, no blocking.
+    const conn2 = try daemon.pool.getOrCreate(daemon.local_domain, "127.0.0.1");
+    daemon.initiateOutbound(&cl, conn2, "127.0.0.1");
+    try std.testing.expect(conn2.dns_key == 0);
+    try std.testing.expect(conn2.fd >= 0);
+
+    // The silent job dies on its chain deadline (temporary), not by
+    // blocking the loop.
+    daemon.resolver.step(200);
+    try std.testing.expect(daemon.pool.connections.get("gone.example") == null);
+
+    const client = &daemon.ipc.clients[0];
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
+}
+
+test "S2sDaemon: an inbound DANE lookup defers then releases features" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+    try std.testing.expectEqual(session_mod.InboundDanePhase.srv_tls, in1.session.dane_phase);
+    try std.testing.expectEqual(in1.session.write_start, in1.session.write_end);
+
+    // While the lookup pends, inbound reads defer entirely.
+    handleInboundReadable(&daemon, &cl, 1);
+    try std.testing.expectEqual(in1.session.write_start, in1.session.write_end);
+
+    // Both SRV hops come back absent; the fallback TLSA hop too.
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expectEqual(session_mod.InboundDanePhase.srv_plain, in1.session.dane_phase);
+    try std.testing.expect(in1.session.dane_lookup_pending);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expectEqual(session_mod.InboundDanePhase.tlsa, in1.session.dane_phase);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+
+    // Authenticated absence: unverified, the deferred features go out,
+    // and the seam carries the status.
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+    try std.testing.expectEqual(dns_async.TlsaStatus.absent, in1.session.dane_tlsa_status);
+    _ = try in1.session.flushWrite();
+    var rbuf: [2048]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "stream:features") != null);
+}
+
+test "S2sDaemon: SO_ERROR on the last target releases the outbound slot" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+    // A closed loopback port: nonblocking connect pends, then SO_ERROR=ECONNREFUSED.
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 1 }}));
+    if (daemon.pool.connections.get("them.example") == null) return error.SkipZigTest; // refused synchronously
+    const slot = daemon.findOutboundSlot(conn).?;
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    handleOutboundWritable(&daemon, &cl, slot);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+    try std.testing.expect(daemon.outbound[slot] == null);
+}
+
+test "S2sDaemon: a deadline on the last target releases the outbound slot" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 5269 }}));
+    const slot = daemon.findOutboundSlot(conn).?;
+    daemon.handleConnectDeadline(&cl, conn.deadline_ident);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+    try std.testing.expect(daemon.outbound[slot] == null);
+}
+
+test "S2sDaemon: the inbound DANE wait holds then releases read interest" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    // Bound but never answered: the lookup stays in flight for the whole
+    // window the read hold is checked.
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+
+    // Inbound reads are level-triggered: left armed, any peer byte spins
+    // the loop on reads handleInboundReadable refuses to take.
+    var saw_disable = false;
+    for (cl.slice()) |ev| {
+        if (ev.ident == @as(usize, @intCast(in1.session.fd)) and
+            ev.filter == std.c.EVFILT.READ and
+            (ev.flags & std.c.EV.DISABLE) != 0) saw_disable = true;
+    }
+    try std.testing.expect(saw_disable);
+
+    // Walk the chain to completion; the last hop lands the result.
+    cl.reset();
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+
+    var saw_enable = false;
+    for (cl.slice()) |ev| {
+        if (ev.ident == @as(usize, @intCast(in1.session.fd)) and
+            ev.filter == std.c.EVFILT.READ and
+            (ev.flags & std.c.EV.ENABLE) != 0 and
+            (ev.flags & std.c.EV.ADD) == 0) saw_enable = true;
+    }
+    try std.testing.expect(saw_enable);
+}
+
+test "S2sDaemon: bytes pipelined behind the post-TLS stream open wait for the DANE lookup" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    try ensureTestTlsContexts(&daemon);
+
+    // Bound but never answered: the chain stays in flight while the
+    // pipelined bytes must wait.
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    // The post-TLS stream open only kicks the chain when tls_conn is
+    // set, so the session needs a real link on both ends.
+    in1.session.tls_conn = try SslConn.init(daemon.tls_ctx.?, in1.session.fd);
+    var peer = try SslConn.initClient(daemon.tls_client_ctx.?, in1.peer_fd, "localhost");
+    defer peer.deinit();
+    try completeTestTlsHandshake(&in1.session.tls_conn.?, &peer);
+    in1.session.tls_state = .established;
+    in1.session.stream.state = .awaiting_stream_open_tls;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // One write carries the stream open and a db:verify behind it. The
+    // open starts the lookup; the verify must not parse while it runs.
+    const payload =
+        "<stream:stream xmlns='jabber:server' xmlns:db='jabber:server:dialback'" ++
+        " xmlns:stream='http://etherx.jabber.org/streams' from='them.example' to='us.example' version='1.0'>" ++
+        "<db:verify from='them.example' to='us.example' id='v1'>not-the-key</db:verify>";
+    const wr = try peer.write(payload);
+    try std.testing.expectEqual(@as(usize, payload.len), wr.ok);
+
+    handleInboundReadable(&daemon, &cl, 1);
+    try std.testing.expect(in1.session.dane_lookup_pending);
+    // The verify element is unparsed: only the stream-open reply was
+    // queued, and the pipelined bytes stay buffered for the completion.
+    const queued = in1.session.write_buf[in1.session.write_start..in1.session.write_end];
+    try std.testing.expect(std.mem.indexOf(u8, queued, "db:verify") == null);
+    try std.testing.expect(in1.session.read_end > in1.session.read_start);
+
+    // Land the chain as absent; the completion sends the features and
+    // then parses the buffered verify exactly once.
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+
+    _ = try in1.session.flushWrite();
+    var rbuf: [4096]u8 = undefined;
+    const resp = rbuf[0..drainTlsPeer(&peer, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "stream:features") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, resp, "type='invalid'"));
+}
+
+test "S2sDaemon: a TLSA answer with only unparsable records is lookup_failed" {
+    const alloc = std.testing.allocator;
+    const wire = @import("wire");
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    // Skip the SRV hops: the rule under test is the TLSA hop's.
+    in1.session.dane_phase = .tlsa;
+
+    // One TLSA RR whose rdata is too short to parse: the resolver's rule
+    // makes this lookup_failed (temporary), never proof of absence.
+    const rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_5269._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.tlsa),
+        .class = 3, // CH is wrong but harmless; only rtype gates the walk
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &.{ 0x03, 0x01 }),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
+}
+
+test "S2sDaemon: a TLSA adoption that cannot allocate is lookup_failed" {
+    const alloc = std.testing.allocator;
+    const wire = @import("wire");
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    in1.session.dane_phase = .tlsa;
+
+    // A well-formed record: the adoption alloc is what fails. Allocation
+    // order inside the hop: rdata dupe, list append, adoption slice.
+    const rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_5269._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.tlsa),
+        .class = 3,
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &.{ 0x03, 0x01, 0x01, 0xaa }),
+    };
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 2 });
+    daemon.allocator = failing.allocator();
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    daemon.allocator = alloc;
+
+    try std.testing.expectEqual(dns_async.TlsaStatus.lookup_failed, in1.session.dane_tlsa_status);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.dane_tlsa_records.len);
+}
+
+test "S2sDaemon: an oversized SRV target is skipped, not a panic" {
+    const alloc = std.testing.allocator;
+    const wire = @import("wire");
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+
+    // A peer-controlled SRV target of 383 dotted bytes: six 63-octet
+    // labels, which an unbounded parseDnsName accepted (H1's remote
+    // panic on the setDaneTarget assert).
+    var rdata: [6 + 6 * 64 + 1]u8 = undefined;
+    std.mem.writeInt(u16, rdata[0..2], 10, .big);
+    std.mem.writeInt(u16, rdata[2..4], 5, .big);
+    std.mem.writeInt(u16, rdata[4..6], 5269, .big);
+    var rp: usize = 6;
+    for (0..6) |_| {
+        rdata[rp] = 63;
+        @memset(rdata[rp + 1 .. rp + 64], 'a');
+        rp += 64;
+    }
+    rdata[rp] = 0;
+
+    // First hop: the bad record is skipped as a parse error and the
+    // chain walks to _xmpp-server instead of reaching setDaneTarget.
+    var rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_xmpps-server._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.srv),
+        .class = 1,
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &rdata),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(in1.session.dane_lookup_pending);
+    try std.testing.expectEqual(session_mod.InboundDanePhase.srv_plain, in1.session.dane_phase);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.daneTarget().len);
+
+    // Second hop the same: both SRV names unusable, so the chain takes
+    // the bare-domain TLSA fallback.
+    rrs = try alloc.alloc(wire.Rr, 1);
+    rrs[0] = .{
+        .name = try alloc.dupe(u8, "_xmpp-server._tcp.them.example"),
+        .rtype = @intFromEnum(dns_async.RType.srv),
+        .class = 1,
+        .ttl = 300,
+        .rdata = try alloc.dupe(u8, &rdata),
+    };
+    applyInboundDaneResult(&daemon, in1.session, .resolved, .{ .rrs = rrs, .ttl = 300 });
+    try std.testing.expectEqual(session_mod.InboundDanePhase.tlsa, in1.session.dane_phase);
+    try std.testing.expectEqual(@as(usize, 0), in1.session.daneTarget().len);
+
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    try std.testing.expect(!in1.session.dane_lookup_pending);
+    try std.testing.expectEqual(dns_async.TlsaStatus.absent, in1.session.dane_tlsa_status);
+}
+
+test "S2sDaemon: a failed read-hold on the DANE wait closes the session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    // A full changelist cannot stage the EV_DISABLE: the lookup would
+    // pend with reads still armed and spin the loop on every peer byte.
+    var scratch: [4]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var i: usize = 0;
+    while (true) {
+        cl.addTimer(4096 + i, 1, true) catch break;
+        i += 1;
+    }
+
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(daemon.getInbound(1) == null);
+    try std.testing.expectEqual(@as(usize, 1), daemon.inbound_kevent_closes);
+}
+
+test "S2sDaemon: a failed read re-arm on DANE completion closes the session" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    in1.session.stream.state = .features_auth;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    try std.testing.expect(performInboundDane(&daemon, &cl, in1.session, "them.example"));
+    try std.testing.expect(in1.session.dane_lookup_pending);
+
+    // The completion re-arms the read interest the wait held. A full
+    // changelist loses the EV_ENABLE and strands the session with reads
+    // off forever, so it closes instead.
+    var full_scratch: [4]posix.Kevent = undefined;
+    var full_cl = ChangeList.init(&full_scratch);
+    var i: usize = 0;
+    while (true) {
+        full_cl.addTimer(4096 + i, 1, true) catch break;
+        i += 1;
+    }
+    daemon.batch = &full_cl;
+
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+    applyInboundDaneResult(&daemon, in1.session, .nxdomain, null);
+
+    try std.testing.expect(daemon.getInbound(1) == null);
+    try std.testing.expectEqual(@as(usize, 1), daemon.inbound_kevent_closes);
+    daemon.batch = null;
+}
+
+test "S2sDaemon: a full changelist cannot stall a pending resolve" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    // The resolver kqueue exists before the first query so the loop can
+    // register it once at startup; nothing per-resolve rides the batch.
+    try std.testing.expect(daemon.resolver.kqFd() >= 0);
+
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+    daemon.resolver.chain_deadline_ms = 100;
+
+    // Fill the changelist completely: nothing further can be staged.
+    var scratch: [4]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var i: usize = 0;
+    while (true) {
+        cl.addTimer(4096 + i, 1, true) catch break;
+        i += 1;
+    }
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "gone.example");
+    try conn.queueStanza(alloc, "a@us.example", "b@gone.example", "<message/>");
+    daemon.initiateOutbound(&cl, conn, "gone.example");
+    try std.testing.expect(conn.dns_key != 0);
+
+    // The resolve still completes: it depends on the fd registered at
+    // startup, not on entries in this batch.
+    daemon.resolver.step(200);
+    try std.testing.expect(daemon.pool.connections.get("gone.example") == null);
+}
+
+test "S2sDaemon: a timer ident below the deadline base never reaches the connect path" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 5269 }}));
+    try std.testing.expect(conn.deadline_ident >= CONNECT_DEADLINE_IDENT_BASE);
+    try std.testing.expect(conn.fd >= 0);
+
+    // An ident in the lifecycle range must not touch the armed deadline.
+    daemon.handleTimerEvent(&cl, 1);
+    try std.testing.expect(conn.state == .connecting);
+    try std.testing.expect(conn.fd >= 0);
+    try std.testing.expect(conn.deadline_ident != 0);
+
+    // The real ident still fires.
+    daemon.handleTimerEvent(&cl, conn.deadline_ident);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null or conn.deadline_ident != 0);
 }

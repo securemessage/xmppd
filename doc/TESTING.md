@@ -11,7 +11,7 @@ Runs every module's test step (105 steps). Expected: all pass.
 ## Integration suites (slixmpp)
 
 The Python suites in `test/integration/` require slixmpp (1.17 verified). They
-target a **local throwaway instance** by default — never the shared test jail.
+target a **local throwaway instance** by default - never the shared test jail.
 
 ### Throwaway instance setup
 
@@ -59,7 +59,7 @@ openssl req -x509 -newkey rsa:2048 -keyout /tmp/xmppd-test-key.pem \
 The `rate_limit = false` line above is load-bearing for e2e and
 load/benchmark runs (the T32 harness needs it). It can equivalently come
 from `--no-rate-limit` on xmppd-auth when running the daemon standalone.
-Never set it on a reachable deployment — it removes brute-force protection.
+Never set it on a reachable deployment - it removes brute-force protection.
 
 ### Environment overrides
 
@@ -100,7 +100,7 @@ invite created up front and passed via `XMPP_INVITE_CODE`:
 XMPP_INVITE_CODE=INV-XXXXXXXXXXXX python3 test/integration/e2e-register-invite.py
 ```
 
-It uses a raw socket (STARTTLS via `ssl` module), not slixmpp — slixmpp's
+It uses a raw socket (STARTTLS via `ssl` module), not slixmpp - slixmpp's
 xep_0077 client flow only fires when the server advertises `<register/>`
 instead of SASL mechanisms, which xmppd does not do.
 
@@ -109,7 +109,7 @@ Notes:
 - The C2S port speaks STARTTLS, not direct TLS. Suites set
   `client.enable_direct_tls = False`; without that slixmpp sends a TLS
   ClientHello first, which the server logs as `error.InvalidEntityReference`
-  (T160) and drops — the reconnect then intermittently overruns test timeouts.
+  (T160) and drops - the reconnect then intermittently overruns test timeouts.
 - slixmpp `connect()` takes `(host, port)` as two arguments. Passing a tuple
   silently leaves `custom_address` unset and the client falls back to DNS SRV,
   connecting to whatever is on port 5222.
@@ -132,7 +132,7 @@ or across a real NIC (both ends kTLS over lo0 fails: FreeBSD PR 296498).
 
 ### Multi-worker lane
 
-`workers = 1` makes every route local — the whole cross-worker surface (room
+`workers = 1` makes every route local - the whole cross-worker surface (room
 sharding, actor messages, MPSC delivery with ABA generation validation) goes
 untested, which is how T173 slipped through. `test/integration/run-multiworker.sh`
 spins up a self-contained throwaway instance at N workers (default 4) on a
@@ -156,7 +156,7 @@ Notes:
   embed the owning worker id, and a `<resume/>` landing elsewhere triggers
   the state handoff (`cross-worker SM resume` lines in the server log). It
   lands randomly via SO_REUSEPORT, so a single run may or may not hit the
-  cross-worker path — run it a few times and grep the server log for
+  cross-worker path - run it a few times and grep the server log for
   `handed off` to confirm both same- and cross-worker resumes were covered.
 
 Known-good at workers=4 (post-T173): muc-test 12/12, e2e-quick-wins 12/12,
@@ -170,6 +170,6 @@ stanzas observed in all directions across workers).
 `/var/unbound/conf.d/s2s-test.conf` on freebsd-dev1 maps
 `_xmpp-client._tcp.xmppd.test` to port 15222, so SINT can run against a
 throwaway instance. SINT skips stream-management tests when
-`accountRegistration` is disabled — run the auth daemon with
+`accountRegistration` is disabled - run the auth daemon with
 `--enable-registration --no-require-invite` (or the `[auth]` equivalents) for
 the full XEP-0198 suite.
