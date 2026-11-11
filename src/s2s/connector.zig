@@ -26,6 +26,8 @@ const SslConn = ssl_mod.SslConn;
 const SslContext = ssl_mod.SslContext;
 const session_mod = @import("session.zig");
 const TlsState = session_mod.TlsState;
+const dns_async = @import("dns_async");
+const dns_mod = @import("dns");
 
 /// Outbound connection establishment state.
 pub const OutboundState = enum {
@@ -119,7 +121,8 @@ pub const OutboundConnection = struct {
     stream: S2sStream,
     /// Socket file descriptor (-1 if not yet connected).
     fd: posix.fd_t = -1,
-    /// Target host we connected to (from SRV resolution).
+    /// Target host we connected to (borrowed from the adopted target
+    /// list; empty before the first connect attempt).
     target_host: []const u8 = "",
     /// Target port.
     target_port: u16 = 0,
@@ -152,6 +155,12 @@ pub const OutboundConnection = struct {
     tls_conn: ?SslConn = null,
     /// TLS handshake state for kqueue integration.
     tls_state: ?TlsState = null,
+    /// DANE state armed before the handshake. Present only when the TLSA
+    /// lookup found usable records, in which case the handshake itself
+    /// fails unless a record matches; null means the dialback fallback.
+    dane_state: ?ssl_mod.DaneState = null,
+    /// What `prepareDane` installed, read back for the verdict.
+    dane_prepared: ssl_mod.DanePrepared = .dane,
     /// Persistent read buffer (survives across kqueue events).
     read_buf: [READ_BUF_SIZE]u8 = undefined,
     read_start: usize = 0,
@@ -165,6 +174,20 @@ pub const OutboundConnection = struct {
     /// buffer across WANT_READ/WANT_WRITE (AGENTS.md identical pointer and
     /// length rule), so bytes queued after the stall wait behind it (S23).
     pinned_tls_len: usize = 0,
+    /// Connect targets from the last completed resolution, in RFC 2782
+    /// try order (AAAA then A per SRV target). The conn owns every slice;
+    /// empty until a resolution arrives.
+    targets: []dns_async.Target = &.{},
+    /// Index of the target the live or in-flight connect is bound to.
+    target_idx: usize = 0,
+    /// Next untried target; advances on connect failure or deadline.
+    next_idx: usize = 0,
+    /// Socket address of the current target (IP:port already resolved).
+    target_addr: std.net.Address = undefined,
+    /// Resolver session_key while a resolve is in flight; 0 when none.
+    dns_key: usize = 0,
+    /// Ident of the armed per-target connect deadline; 0 when none.
+    deadline_ident: usize = 0,
 
     const READ_BUF_SIZE = 8192;
     const WRITE_BUF_SIZE = 16384;
@@ -194,10 +217,7 @@ pub const OutboundConnection = struct {
         }
         self.pending_stanzas.deinit(allocator);
         allocator.free(self.remote_domain);
-        if (self.target_host.len > 0) {
-            allocator.free(self.target_host);
-            self.target_host = "";
-        }
+        // dropTargets below frees the DANE state too (it borrows target data).
         if (self.tls_conn) |*tls| {
             tls.shutdown();
             tls.deinit();
@@ -207,6 +227,53 @@ pub const OutboundConnection = struct {
             posix.close(self.fd);
             self.fd = -1;
         }
+        self.dropTargets();
+    }
+
+    /// The target the live or in-flight connect is bound to: addr, host,
+    /// TLSA records and tlsa_status for that target alone. Null before the
+    /// first resolution completes; the TLSA result is the seam consumed by
+    /// the outbound DANE check (X2b, ADR-13).
+    pub fn curTarget(self: *const OutboundConnection) ?*const dns_async.Target {
+        if (self.target_idx >= self.targets.len) return null;
+        return &self.targets[self.target_idx];
+    }
+
+    /// Take ownership of a resolution's target list for this connection.
+    pub fn adoptTargets(self: *OutboundConnection, targets: []dns_async.Target) void {
+        self.dropTargets();
+        self.targets = targets;
+        self.target_idx = 0;
+        self.next_idx = 0;
+    }
+
+    /// Free the adopted targets and drop any DANE state built for them.
+    pub fn dropTargets(self: *OutboundConnection) void {
+        for (self.targets) |t| {
+            self.alloc.free(t.host);
+            for (t.tlsa) |r| self.alloc.free(r.association_data);
+            if (t.tlsa.len > 0) self.alloc.free(t.tlsa);
+        }
+        if (self.targets.len > 0) self.alloc.free(self.targets);
+        self.targets = &.{};
+        self.target_host = "";
+        self.dropDaneState();
+    }
+
+    /// Release the DANE state alone: it borrows the target's record data, so
+    /// it must never outlive the targets it was built from.
+    pub fn dropDaneState(self: *OutboundConnection) void {
+        if (self.dane_state) |*s| s.deinit();
+        self.dane_state = null;
+        self.dane_prepared = .dane;
+    }
+
+    /// Hostname of the current target, for logs and TLSA owner names.
+    /// Borrows from the adopted target list; "" before the first attempt.
+    pub fn targetHost(self: *const OutboundConnection) []const u8 {
+        if (self.target_host.len > 0) return self.target_host;
+        const t = self.curTarget() orelse return "";
+        return t.host;
     }
 
     /// Whether TLS handshake is in progress.

@@ -1,4 +1,5 @@
 const std = @import("std");
+const dane = @import("dane");
 pub const resolver = @import("resolver.zig");
 
 /// DNS record types relevant to XMPP.
@@ -23,7 +24,9 @@ pub const SrvRecord = struct {
     }
 };
 
-/// A parsed TLSA record (RFC 6698).
+/// A parsed TLSA record (RFC 6698). Field values are raw wire bytes: this is
+/// the transport representation. `pacyworld/dane-zig` owns the semantics
+/// (usability, digest agility, matching).
 pub const TlsaRecord = struct {
     /// Certificate usage (0-3)
     usage: u8,
@@ -83,36 +86,53 @@ pub fn parseSrvRdata(rdata: []const u8, alloc: std.mem.Allocator) !SrvRecord {
 }
 
 /// Parse a DNS TLSA record from wire format (RDATA section).
+///
+/// Delegates the field parsing to `pacyworld/dane-zig` so the wire rules are
+/// stated once; the association data is copied because the RDATA buffer is
+/// transient. A record whose fields are out of range is not a parse error:
+/// the module's `Record.isUsable` rejects it later.
+///
 /// Wire format: usage(1) + selector(1) + matching_type(1) + association_data(...)
 pub fn parseTlsaRdata(rdata: []const u8, alloc: std.mem.Allocator) !TlsaRecord {
-    if (rdata.len < 4) return error.InvalidTlsaRecord; // Minimum: 3 header bytes + 1 data byte
-
-    const usage = rdata[0];
-    const selector = rdata[1];
-    const matching_type = rdata[2];
-    const association_data = try alloc.dupe(u8, rdata[3..]);
+    const parsed = dane.parseRdata(rdata) catch |err| switch (err) {
+        error.Truncated => return error.InvalidTlsaRecord,
+        error.EmptyData => return error.InvalidTlsaRecord,
+    };
+    const association_data = try alloc.dupe(u8, parsed.data);
 
     return TlsaRecord{
-        .usage = usage,
-        .selector = selector,
-        .matching_type = matching_type,
+        .usage = @intFromEnum(parsed.usage),
+        .selector = @intFromEnum(parsed.selector),
+        .matching_type = @intFromEnum(parsed.matching_type),
         .association_data = association_data,
     };
 }
 
 /// Parse a DNS name from label format into a dotted string.
 /// Label format: len byte + label bytes, terminated by 0x00.
+/// The input is peer-controlled wire data, so the RFC 1035 2.3.4 bounds
+/// are enforced: labels are 1-63 octets (a length byte with either high
+/// bit set is a compression pointer or an extended label, neither of
+/// which an RDATA name carries: SRV targets stay uncompressed per
+/// RFC 2782 / RFC 3597 section 4), and the whole name is at most 255
+/// wire octets (253 dotted). Anything else is error.InvalidDnsName.
 fn parseDnsName(data: []const u8, alloc: std.mem.Allocator) ![]const u8 {
     var result = std.ArrayList(u8){};
     errdefer result.deinit(alloc);
     var pos: usize = 0;
+    // The root terminator octet is charged up front: a well-formed name
+    // always ends in it, so an unterminated tail is not under-bounded.
+    var wire_len: usize = 1;
 
     while (pos < data.len) {
         const label_len: usize = data[pos];
         if (label_len == 0) break; // Root label
+        if (label_len > 63) return error.InvalidDnsName;
         pos += 1;
+        wire_len += 1 + label_len;
 
         if (pos + label_len > data.len) return error.InvalidDnsName;
+        if (wire_len > 255) return error.InvalidDnsName;
 
         if (result.items.len > 0) {
             try result.append(alloc, '.');
@@ -305,6 +325,53 @@ test "parseDnsName" {
     const name = try parseDnsName(&data, alloc);
     defer alloc.free(name);
     try std.testing.expectEqualStrings("foo.bar", name);
+}
+
+test "parseDnsName rejects peer-oversized labels and names" {
+    const alloc = std.testing.allocator;
+
+    // A 64-octet label is out of range (H1: unbounded, this parsed).
+    var lbl64: [66]u8 = undefined;
+    lbl64[0] = 64;
+    @memset(lbl64[1..65], 'a');
+    lbl64[65] = 0;
+    try std.testing.expectError(error.InvalidDnsName, parseDnsName(&lbl64, alloc));
+
+    // 0xC0 is a compression-pointer tag byte, never a label length; the
+    // tail is sized so an unbounded parse would still succeed.
+    var ptr: [194]u8 = undefined;
+    ptr[0] = 0xC0;
+    @memset(ptr[1..193], 'a');
+    ptr[193] = 0;
+    try std.testing.expectError(error.InvalidDnsName, parseDnsName(&ptr, alloc));
+
+    // A name over 255 wire octets (here five 63-octet labels) is not a
+    // DNS name no matter how well formed the labels are.
+    var big: [5 * 64 + 1]u8 = undefined;
+    var pos: usize = 0;
+    for (0..5) |_| {
+        big[pos] = 63;
+        @memset(big[pos + 1 .. pos + 64], 'a');
+        pos += 64;
+    }
+    big[pos] = 0;
+    try std.testing.expectError(error.InvalidDnsName, parseDnsName(&big, alloc));
+}
+
+test "parseDnsName accepts the largest legal name" {
+    const alloc = std.testing.allocator;
+    // 255 wire octets: 63.63.63.61 plus the root terminator = 253 dotted.
+    var max: [255]u8 = undefined;
+    var pos: usize = 0;
+    for ([_]u8{ 63, 63, 63, 61 }) |l| {
+        max[pos] = l;
+        @memset(max[pos + 1 .. pos + 1 + l], 'a');
+        pos += 1 + l;
+    }
+    max[pos] = 0;
+    const name = try parseDnsName(max[0 .. pos + 1], alloc);
+    defer alloc.free(name);
+    try std.testing.expectEqual(@as(usize, 253), name.len);
 }
 
 test {

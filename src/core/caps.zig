@@ -11,6 +11,7 @@
 //! Each entry stores which +notify PEP nodes the client supports as a bitmap.
 
 const std = @import("std");
+const xml_mod = @import("xml");
 const Sha1 = std.crypto.hash.Sha1;
 
 const log = std.log.scoped(.caps);
@@ -182,18 +183,18 @@ pub fn buildCapsQuery(
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeAll("<iq type='get' from='") catch return null;
-    w.writeAll(server_host) catch return null;
+    xml_mod.escapeWrite(w, server_host) catch return null;
     w.writeAll("' to='") catch return null;
-    w.writeAll(to_jid) catch return null;
+    xml_mod.escapeWrite(w, to_jid) catch return null;
     w.writeAll("' id='caps-") catch return null;
     // Write query_id as decimal
     var id_buf: [10]u8 = undefined;
     const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{query_id}) catch return null;
-    w.writeAll(id_str) catch return null;
+    xml_mod.escapeWrite(w, id_str) catch return null;
     w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info' node='") catch return null;
-    w.writeAll(node) catch return null;
+    xml_mod.escapeWrite(w, node) catch return null;
     w.writeByte('#') catch return null;
-    w.writeAll(ver) catch return null;
+    xml_mod.escapeWrite(w, ver) catch return null;
     w.writeAll("'/></iq>") catch return null;
     return fbs.getWritten();
 }
@@ -249,7 +250,6 @@ pub const SERVER_FEATURES = [_][]const u8{
     "http://jabber.org/protocol/pubsub#persistent-items",
     "http://jabber.org/protocol/pubsub#publish",
     "http://jabber.org/protocol/pubsub#retrieve-items",
-    "http://jabber.org/protocol/pubsub#subscribe",
     "jabber:iq:last",
     "jabber:iq:register",
     "jabber:iq:roster",
@@ -277,7 +277,7 @@ pub const SERVER_FEATURES = [_][]const u8{
 pub fn writeDiscoFeatures(w: anytype) !void {
     for (SERVER_FEATURES) |feature| {
         try w.writeAll("<feature var='");
-        try w.writeAll(feature);
+        try xml_mod.escapeWrite(w, feature);
         try w.writeAll("'/>");
     }
 }
@@ -289,7 +289,7 @@ pub fn computeServerCaps() ServerCaps {
     var caps = ServerCaps{};
 
     // XEP-0115 §5.1:
-    // 1. Sort identities by category/type/lang/name (server has one identity)
+    // 1. Sort identities by category/type/lang/name (pubsub sorts before server)
     // 2. For each identity: S += "category/type/lang/name<"
     // 3. Sort features alphabetically (SERVER_FEATURES is already sorted)
     // 4. For each feature: S += "feature<"
@@ -297,7 +297,9 @@ pub fn computeServerCaps() ServerCaps {
 
     var hasher = Sha1.init(.{});
 
-    // Step 2: Server identity — category=server, type=im, lang=(empty), name=xmppd
+    // Step 2: identities advertised in disco#info (category/type/lang/name
+    // with empty lang, and empty name on the PEP service identity).
+    hasher.update("pubsub/pep//<");
     hasher.update("server/im//xmppd<");
 
     // Step 4: Features (already sorted)
@@ -318,9 +320,9 @@ pub fn computeServerCaps() ServerCaps {
     var fbs = std.io.fixedBufferStream(&caps.caps_xml);
     const w = fbs.writer();
     w.writeAll("<c xmlns='http://jabber.org/protocol/caps' hash='sha-1' node='") catch {};
-    w.writeAll(SERVER_NODE) catch {};
+    xml_mod.escapeWrite(w, SERVER_NODE) catch {};
     w.writeAll("' ver='") catch {};
-    w.writeAll(caps.getVer()) catch {};
+    xml_mod.escapeWrite(w, caps.getVer()) catch {};
     w.writeAll("'/>") catch {};
     caps.caps_xml_len = @intCast(fbs.pos);
 
@@ -428,6 +430,27 @@ test "computeServerCaps: produces valid base64 SHA-1 hash" {
                 ch == '+' or ch == '/' or ch == '=',
         );
     }
+}
+
+test "computeServerCaps: identities hash in XEP-0115 order" {
+    // disco#info advertises pubsub/pep plus server/im; the §5.1 string takes
+    // identities sorted by category, so pubsub hashes first. Recomputing S
+    // here catches an identity dropped from the hash input or added in the
+    // wrong order.
+    const identities = [_][]const u8{ "pubsub/pep//<", "server/im//xmppd<" };
+    var hasher = Sha1.init(.{});
+    for (identities) |ident| hasher.update(ident);
+    for (SERVER_FEATURES) |feature| {
+        hasher.update(feature);
+        hasher.update("<");
+    }
+    const digest = hasher.finalResult();
+    const encoder = std.base64.standard.Encoder;
+    var expected_buf: [64]u8 = undefined;
+    const expected = encoder.encode(&expected_buf, &digest);
+
+    const caps = computeServerCaps();
+    try std.testing.expectEqualStrings(expected, caps.getVer());
 }
 
 test "computeServerCaps: deterministic" {
