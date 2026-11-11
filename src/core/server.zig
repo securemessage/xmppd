@@ -7778,12 +7778,12 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         "conn.queue" ++ "SendWithFlush(",
     };
     const cases = .{
-        .{ "connection.zig", @embedFile("connection.zig"), 14 }, // Connection layer self-tests; no Session.
+        .{ "connection.zig", @embedFile("connection.zig"), 17 }, // Connection layer self-tests incl. the M1 counter test; no Session.
         .{ "fanout.zig", @embedFile("fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
         .{ "router.zig", @embedFile("router.zig"), 2 }, // one comment; queueSendWithFlush is tracked.
         .{ "session_lifecycle.zig", @embedFile("session_lifecycle.zig"), 0 },
-        .{ "server.zig", @embedFile("server.zig"), 26 }, // stream/SASL/SM nonzas + queueSendStanza itself.
+        .{ "server.zig", @embedFile("server.zig"), 27 }, // stream/SASL/SM nonzas + queueSendStanza itself + M1 counter self-test.
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), 0 },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig"), 0 },
         .{ "message.zig", @embedFile("message.zig"), 0 },
@@ -7793,8 +7793,10 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "archive_queue.zig", @embedFile("archive_queue.zig"), 0 },
         .{ "delivery_queue.zig", @embedFile("delivery_queue.zig"), 0 },
         .{ "event_loop.zig", @embedFile("event_loop.zig"), 0 },
+        .{ "jid_bounds.zig", @embedFile("jid_bounds.zig"), 0 },
         .{ "listener.zig", @embedFile("listener.zig"), 0 },
         .{ "main.zig", @embedFile("main.zig"), 0 },
+        .{ "metrics.zig", @embedFile("metrics.zig"), 0 },
         .{ "offline_store.zig", @embedFile("offline_store.zig"), 0 },
         .{ "room_mailbox.zig", @embedFile("room_mailbox.zig"), 0 },
         .{ "room_registry.zig", @embedFile("room_registry.zig"), 0 },
@@ -7804,8 +7806,8 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "sm_state.zig", @embedFile("sm_state.zig"), 0 },
         .{ "subscription_cache.zig", @embedFile("subscription_cache.zig"), 0 },
     };
-    if (cases.len != 23) {
-        log.err("S15 ratchet: covers {d} core files, expected 23", .{cases.len});
+    if (cases.len != 25) {
+        log.err("S15 ratchet: covers {d} core files, expected 25", .{cases.len});
         return error.RatchetCoverage;
     }
     inline for (cases) |case| {
