@@ -41,6 +41,13 @@ pub const proc_kind: u8 = 0x06;
 pub const max_signal = 128;
 var signal_owners = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_signal;
 
+/// Test seam for the signal-order windows: invoked between the knote
+/// attach and the pending read in watchSignal, and between the
+/// disposition restore and the knote delete in unwatchSignal. A test sets
+/// it around one call to post a signal into the gap the ordering
+/// protects; it is null everywhere else.
+pub var window_hook: ?*const fn () void = null;
+
 /// Ident and udata of the loop's EVFILT_USER knote.
 pub const wake_ident: usize = 0;
 pub const wake_token: Token = .{ .index = 0, .gen = 1, .kind = wake_kind };
@@ -542,6 +549,7 @@ pub const Loop = struct {
             .udata = (Token{ .index = signo, .gen = 1, .kind = signal_kind }).toUdata(),
         };
         try kev.applyNow(self.kq, &add, &self.stats_.last_errno);
+        if (window_hook) |f| f();
 
         // Installing SIG_IGN discards pending instances of the signal
         // (POSIX), so the pending check must read before it lands. Pending
@@ -584,6 +592,7 @@ pub const Loop = struct {
         // the gap is seen by the still-registered knote instead of being
         // dropped by the not-yet-restored disposition.
         posix.sigaction(signo, &self.saved_dispositions[signo], null);
+        if (window_hook) |f| f();
         kev.applyNow(self.kq, &del, &self.stats_.last_errno) catch |err| switch (err) {
             error.NotFound, error.BadDescriptor => {},
             else => |e| return e,
@@ -2318,6 +2327,71 @@ test "Loop: unwatchSignal restores the pre-watch disposition" {
 
 fn testSigHandler(signo: c_int) callconv(.c) void {
     _ = signo;
+}
+
+var usr2_hits: usize = 0;
+fn countUsr2(signo: c_int) callconv(.c) void {
+    _ = signo;
+    usr2_hits += 1;
+}
+fn postUsr2() void {
+    _ = std.c.kill(std.c.getpid(), posix.SIG.USR2);
+}
+
+test "Loop: a signal posted in the watch window is reported twice" {
+    // The watch order attaches the knote before reading the pending set
+    // and installing SIG_IGN: a blocked signal posted inside that window
+    // fires the knote once and still sits in the pending set, reported
+    // twice. The pending-before-attach order reports it once.
+    var set: posix.sigset_t = posix.sigemptyset();
+    posix.sigaddset(&set, posix.SIG.USR2);
+    var oldset: posix.sigset_t = undefined;
+    posix.sigprocmask(posix.SIG.BLOCK, &set, &oldset);
+    defer posix.sigprocmask(posix.SIG.SETMASK, &oldset, null);
+
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+    window_hook = postUsr2;
+    try loop.watchSignal(posix.SIG.USR2);
+    window_hook = null;
+
+    var reported: usize = 0;
+    for (0..3) |_| {
+        loop.requestImmediate();
+        try loop.wait();
+        while (loop.next()) |e| {
+            if (e == .signal) reported += @intCast(e.signal.count);
+        }
+    }
+    try loop.unwatchSignal(posix.SIG.USR2);
+    try std.testing.expectEqual(@as(usize, 2), reported);
+}
+
+test "Loop: a signal posted in the unwatch window reaches the restored disposition" {
+    var loop = try testLoop(null);
+    defer loop.deinit(std.testing.allocator);
+
+    // A counting handler is the saved disposition: a signal posted inside
+    // the restore-then-delete gap must reach it. A delete-then-restore
+    // order would drop it to the still-installed SIG_IGN.
+    usr2_hits = 0;
+    const h: posix.Sigaction = .{
+        .handler = .{ .handler = countUsr2 },
+        .flags = 0,
+        .mask = posix.sigemptyset(),
+    };
+    posix.sigaction(posix.SIG.USR2, &h, null);
+    try loop.watchSignal(posix.SIG.USR2);
+    window_hook = postUsr2;
+    try loop.unwatchSignal(posix.SIG.USR2);
+    window_hook = null;
+    try std.testing.expectEqual(@as(usize, 1), usr2_hits);
+    const dfl: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .flags = 0,
+        .mask = posix.sigemptyset(),
+    };
+    posix.sigaction(posix.SIG.USR2, &dfl, null);
 }
 
 test "Loop: watchProcess reports the child's exit" {
