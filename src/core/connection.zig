@@ -198,7 +198,7 @@ pub const Connection = struct {
             return switch (result) {
                 .ok => |n| blk: {
                     self.read_end += n;
-                    if (metrics.get()) |c| _ = c.bytes_in.fetchAdd(n, .monotonic);
+                    if (metrics.get()) |c| metrics.bump(&c.bytes_in, n);
                     break :blk n;
                 },
                 .want_read => error.WouldBlock,
@@ -219,7 +219,7 @@ pub const Connection = struct {
         if (n == 0) return 0; // EOF — peer closed
 
         self.read_end += n;
-        if (metrics.get()) |c| _ = c.bytes_in.fetchAdd(n, .monotonic);
+        if (metrics.get()) |c| metrics.bump(&c.bytes_in, n);
         return n;
     }
 
@@ -247,7 +247,7 @@ pub const Connection = struct {
         // lands in write_buf, hasPendingWrite() then reports true, and the
         // caller arms kqueue on a dead fd. Mirrors S2sSession.queueSend.
         if (self.closed) {
-            if (metrics.get()) |c| _ = c.drop_send_closed.fetchAdd(1, .monotonic);
+            if (metrics.get()) |c| metrics.bump(&c.drop_send_closed, 1);
             return error.ConnectionClosed;
         }
 
@@ -257,7 +257,7 @@ pub const Connection = struct {
             self.compactWriteBuf();
             const space_after = WRITE_BUF_SIZE - self.write_end;
             if (data.len > space_after) {
-                if (metrics.get()) |c| _ = c.drop_send_buffer_full.fetchAdd(1, .monotonic);
+                if (metrics.get()) |c| metrics.bump(&c.drop_send_buffer_full, 1);
                 return error.WriteBufferFull;
             }
         }
@@ -332,7 +332,7 @@ pub const Connection = struct {
                         self.write_start = 0;
                         self.write_end = 0;
                     }
-                    if (metrics.get()) |c| _ = c.bytes_out.fetchAdd(n, .monotonic);
+                    if (metrics.get()) |c| metrics.bump(&c.bytes_out, n);
                     break :blk n;
                 },
                 .want_read, .want_write => blk: {
@@ -363,7 +363,7 @@ pub const Connection = struct {
             self.write_end = 0;
         }
 
-        if (metrics.get()) |c| _ = c.bytes_out.fetchAdd(n, .monotonic);
+        if (metrics.get()) |c| metrics.bump(&c.bytes_out, n);
         return n;
     }
 

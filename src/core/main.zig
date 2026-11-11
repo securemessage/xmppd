@@ -353,6 +353,7 @@ pub fn main() !void {
             log.err("failed to allocate delivery system: {}", .{err});
             return error.DeliverySystemInitFailed;
         };
+        delivery_sys.?.envelope_hook = &metrics.noteEnvelope;
         log.info("delivery system allocated: {d} worker queues", .{worker_count});
     }
     defer if (delivery_sys) |*ds| ds.deinit();

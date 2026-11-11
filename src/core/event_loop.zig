@@ -337,7 +337,7 @@ pub const ChangeList = struct {
             self.buf.len - @min(self.reserved, self.buf.len);
         if (self.len >= limit) {
             // M1/App. C: a dropped change silently wedges a connection.
-            if (metrics.get()) |c| _ = c.drop_changelist_full.fetchAdd(1, .monotonic);
+            if (metrics.get()) |c| metrics.bump(&c.drop_changelist_full, 1);
             return error.ChangeListFull;
         }
         self.buf[self.len] = ev;

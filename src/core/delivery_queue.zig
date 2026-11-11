@@ -42,12 +42,14 @@ pub var offline_hold_bounces = std.atomic.Value(u64).init(0);
 /// parking the user's whole queue.
 pub var offline_drain_drops = std.atomic.Value(u64).init(0);
 
-/// M1 (App. C): cross-worker ring drops and envelopes. Module-global
-/// because this file is its own build module; the M1 SIGUSR1 dump reads
-/// them from the server side (same pattern as room_mailbox.mailbox_drops).
+/// M1 (App. C): cross-worker ring drops. Module-global because this file
+/// is its own build module; the M1 SIGUSR1 dump reads them from the
+/// server side (same pattern as room_mailbox.mailbox_drops). Drop paths
+/// only: a shared atomic here is cold. Envelopes are counted per
+/// producing worker through DeliverySystem.envelope_hook instead, so the
+/// hottest cross-worker path carries no process-wide atomic.
 pub var ring_drops_full = std.atomic.Value(u64).init(0);
 pub var ring_drops_payload = std.atomic.Value(u64).init(0);
-pub var envelopes_total = std.atomic.Value(u64).init(0);
 
 /// Sentinel value for target_session_id indicating a multicast delivery.
 /// When the consumer sees this, it interprets the payload as a MUC multicast
@@ -312,6 +314,10 @@ pub const DeliverySystem = struct {
     states: []WorkerState,
     worker_count: u16,
     allocator: std.mem.Allocator,
+    /// Optional hook invoked once per accepted envelope (M1). The server
+    /// sets it to count envelopes in the producing worker's own counter
+    /// block; this module cannot see src/core/metrics.zig itself.
+    envelope_hook: ?*const fn () void = null,
 
     /// Initialize the delivery system for N workers.
     pub fn init(allocator: std.mem.Allocator, worker_count: u16) !DeliverySystem {
@@ -418,7 +424,7 @@ pub const DeliverySystem = struct {
     ) !void {
         if (target_worker >= self.worker_count) return error.InvalidWorker;
         try self.queues[target_worker].enqueueDelivery(target_session_id, target_generation, payload, hold_token, receipt_ts, kind);
-        _ = envelopes_total.fetchAdd(1, .monotonic);
+        if (self.envelope_hook) |h| h();
     }
 
     /// Wake a worker after one or more enqueue() calls (T130). One pipe

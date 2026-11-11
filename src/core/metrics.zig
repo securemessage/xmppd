@@ -1,14 +1,18 @@
 //! M1 (doc §5.2): per-worker instrumentation for the core event loop.
 //!
-//! One Counters block per worker thread. The owning thread is the only
-//! writer and, because SIGUSR1 arrives as EVFILT_SIGNAL on its own kqueue,
-//! also the only reader; relaxed atomics cover the rest. Idle cost is
-//! zero: counters move only when work happens and the dump runs only on
-//! SIGUSR1.
+//! One Counters block per worker thread, padded to whole cache lines so
+//! two workers never share a line. The owning thread is the only writer
+//! and, because SIGUSR1 arrives as EVFILT_SIGNAL on its own kqueue, also
+//! the only reader: bumps are plain load+store (no lock prefix) and the
+//! dump reads with plain loads. Idle cost is zero: counters move only
+//! when work happens and the dump runs only on SIGUSR1.
 //!
 //! Counters that live behind build-module boundaries (delivery_queue,
 //! room_mailbox) keep module-local atomics of their own (the S16
 //! mailbox_drops pattern); the dump takes them as `Externals`.
+//! delivery_queue counts nothing per-envelope itself: the server hooks
+//! `DeliverySystem.envelope_hook` to `noteEnvelope` so each envelope lands
+//! in the producing worker's own block.
 
 const std = @import("std");
 const atomic = std.atomic;
@@ -32,7 +36,6 @@ pub const Externals = struct {
     room_mailbox_drops: u64 = 0,
     ring_drops_full: u64 = 0,
     ring_drops_payload: u64 = 0,
-    envelopes_cross_worker: u64 = 0,
     jid_overflow_drops: u64 = 0,
     cross_worker_drops: u64 = 0,
     s2s_bounces: u64 = 0,
@@ -51,6 +54,9 @@ pub const Counters = struct {
     loop_iterations: Counter = .init(0),
     kevent_events: Counter = .init(0),
     kevent_changes: Counter = .init(0),
+    /// Cross-worker envelopes this worker produced (hooked from
+    /// delivery_queue; see noteEnvelope).
+    envelopes_xworker: Counter = .init(0),
     // Appendix C drop reasons counted at their central choke points.
     drop_send_buffer_full: Counter = .init(0),
     drop_send_closed: Counter = .init(0),
@@ -59,14 +65,24 @@ pub const Counters = struct {
     loop_hist_us: [HIST_BUCKETS]Counter = @splat(.init(0)),
 };
 
-pub var workers: [MAX_WORKERS]Counters = @splat(.{});
+/// One worker block occupying whole cache lines: back-to-back Counters
+/// (~360 B) would put worker i's last line and worker i+1's first on the
+/// same line, so every bump would ping it between cores.
+const Slot = struct {
+    counters: Counters align(std.atomic.cache_line) = .{},
+    comptime {
+        std.debug.assert(@sizeOf(Slot) % std.atomic.cache_line == 0);
+    }
+};
+
+pub var workers: [MAX_WORKERS]Slot align(std.atomic.cache_line) = @splat(.{ .counters = .{} });
 
 /// Set once per worker thread at run() start; null elsewhere, so bumps
 /// from producer threads or tests without a bound worker are no-ops.
 pub threadlocal var current: ?*Counters = null;
 
 pub fn bind(worker_id: u16) void {
-    if (worker_id < MAX_WORKERS) current = &workers[worker_id];
+    if (worker_id < MAX_WORKERS) current = &workers[worker_id].counters;
 }
 
 /// Block SIGUSR1 on the calling thread. main() calls this before any
@@ -83,13 +99,30 @@ pub inline fn get() ?*Counters {
     return current;
 }
 
+/// Single-writer bump for the owning worker's block only: a monotonic
+/// load plus store compiles to mov/add/mov with no lock prefix, and no
+/// other thread writes the block so nothing can tear. Never use on a
+/// counter written by more than one thread (delivery_queue's module
+/// globals keep fetchAdd for that reason).
+pub inline fn bump(c: *Counter, n: u64) void {
+    c.store(c.load(.monotonic) + n, .monotonic);
+}
+
+/// DeliverySystem.envelope_hook target: counts one cross-worker envelope
+/// in the producing worker's block. Registered in main() because
+/// delivery_queue is its own build module and cannot see this file.
+pub fn noteEnvelope() void {
+    const c = current orelse return;
+    bump(&c.envelopes_xworker, 1);
+}
+
 /// Record one loop iteration's event-processing time (nanoseconds).
 pub fn recordIteration(ns: u64) void {
     const c = current orelse return;
-    _ = c.loop_iterations.fetchAdd(1, .monotonic);
+    bump(&c.loop_iterations, 1);
     const us = ns / 1000;
     const bucket: usize = if (us == 0) 0 else @min(63 - @clz(us), HIST_BUCKETS - 1);
-    _ = c.loop_hist_us[bucket].fetchAdd(1, .monotonic);
+    bump(&c.loop_hist_us[bucket], 1);
 }
 
 fn read(c: *const Counter) u64 {
@@ -100,13 +133,13 @@ fn read(c: *const Counter) u64 {
 /// worker's own EVFILT_SIGNAL handler, so plain relaxed loads suffice.
 pub fn dump(worker_id: u16, ext: Externals) void {
     if (worker_id >= MAX_WORKERS) return;
-    const c = &workers[worker_id];
+    const c = &workers[worker_id].counters;
     log.info("worker {d} counters: stanzas msg={d} pres={d} iq={d} bytes in={d} out={d} wakes={d}", .{
         worker_id,          read(&c.stanzas_message), read(&c.stanzas_presence), read(&c.stanzas_iq),
         read(&c.bytes_in),  read(&c.bytes_out),       read(&c.wakes),
     });
     log.info("worker {d} loop: iterations={d} kevent events={d} changes={d} envelopes xworker={d}", .{
-        worker_id, read(&c.loop_iterations), read(&c.kevent_events), read(&c.kevent_changes), ext.envelopes_cross_worker,
+        worker_id, read(&c.loop_iterations), read(&c.kevent_events), read(&c.kevent_changes), read(&c.envelopes_xworker),
     });
     log.info("worker {d} drops (App. C): send_buf_full={d} send_closed={d} changelist_full={d} no_route={d} ring_full={d} ring_payload={d} room_mailbox={d}", .{
         worker_id,           read(&c.drop_send_buffer_full), read(&c.drop_send_closed), read(&c.drop_changelist_full),
@@ -179,6 +212,20 @@ test "bind rejects out-of-range worker ids" {
     bind(MAX_WORKERS);
     try std.testing.expect(current == null);
     bind(3);
-    try std.testing.expect(get() == &workers[3]);
+    try std.testing.expect(get() == &workers[3].counters);
     current = null;
+}
+
+test "worker blocks are cache-line aligned and bump is single-writer" {
+    comptime {
+        std.debug.assert(@alignOf(@TypeOf(workers[0])) >= std.atomic.cache_line);
+        std.debug.assert(@sizeOf(@TypeOf(workers[0])) % std.atomic.cache_line == 0);
+    }
+    bind(MAX_WORKERS - 2);
+    defer current = null;
+    const c = get().?;
+    const base = read(&c.envelopes_xworker);
+    bump(&c.envelopes_xworker, 5);
+    noteEnvelope();
+    try std.testing.expectEqual(base + 6, read(&c.envelopes_xworker));
 }

@@ -1490,8 +1490,8 @@ pub const Server = struct {
 
             if (iter_timer) |*t| metrics.recordIteration(t.read());
             if (metrics.get()) |c| {
-                _ = c.kevent_events.fetchAdd(events.len, .monotonic);
-                _ = c.kevent_changes.fetchAdd(staged_changes, .monotonic);
+                metrics.bump(&c.kevent_events, events.len);
+                metrics.bump(&c.kevent_changes, staged_changes);
             }
         }
     }
@@ -1502,7 +1502,6 @@ pub const Server = struct {
             .room_mailbox_drops = room_mailbox_mod.mailbox_drops.load(.monotonic),
             .ring_drops_full = delivery_queue_mod.ring_drops_full.load(.monotonic),
             .ring_drops_payload = delivery_queue_mod.ring_drops_payload.load(.monotonic),
-            .envelopes_cross_worker = delivery_queue_mod.envelopes_total.load(.monotonic),
             .jid_overflow_drops = router.jid_overflow_drops.load(.monotonic),
             .cross_worker_drops = delivery_queue_mod.cross_worker_drops.load(.monotonic),
             .s2s_bounces = delivery_queue_mod.s2s_bounces.load(.monotonic),
@@ -4022,7 +4021,7 @@ pub const Server = struct {
     /// then drain per-room mailboxes.
     fn handleDeliveryWake(self: *Server, changes: *ChangeList) void {
         const ds = self.delivery_system orelse return;
-        if (metrics.get()) |c| _ = c.wakes.fetchAdd(1, .monotonic);
+        if (metrics.get()) |c| metrics.bump(&c.wakes, 1);
         ds.drainPipe(self.worker_id);
         self.drainDeliveryQueue(changes);
         _ = self.drainRoomMailboxes(changes);
@@ -7383,8 +7382,8 @@ test "Server: M1 SIGUSR1 dump runs against a live worker block" {
     metrics.bind(10);
     defer metrics.current = null;
     const c = metrics.get().?;
-    _ = c.stanzas_message.fetchAdd(3, .monotonic);
-    _ = c.wakes.fetchAdd(2, .monotonic);
+    metrics.bump(&c.stanzas_message, 3);
+    metrics.bump(&c.wakes, 2);
     metrics.recordIteration(500);
     // Exercises the dump formatting against a bound worker; output goes to
     // the test log.
@@ -7392,7 +7391,6 @@ test "Server: M1 SIGUSR1 dump runs against a live worker block" {
         .room_mailbox_drops = 1,
         .ring_drops_full = 2,
         .ring_drops_payload = 3,
-        .envelopes_cross_worker = 4,
     });
     try std.testing.expectEqual(@as(u64, 3), c.stanzas_message.load(.monotonic));
 }

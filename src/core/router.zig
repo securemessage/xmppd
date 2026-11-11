@@ -160,9 +160,9 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     defer session.resetStanza();
 
     if (metrics.get()) |c| switch (session.stanza_kind) {
-        .message => _ = c.stanzas_message.fetchAdd(1, .monotonic),
-        .presence => _ = c.stanzas_presence.fetchAdd(1, .monotonic),
-        .iq => _ = c.stanzas_iq.fetchAdd(1, .monotonic),
+        .message => metrics.bump(&c.stanzas_message, 1),
+        .presence => metrics.bump(&c.stanzas_presence, 1),
+        .iq => metrics.bump(&c.stanzas_iq, 1),
         .none => {},
     };
 
@@ -173,14 +173,14 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     // App. C: missing or invalid 'to' drops the stanza silently.
     if (to_str.len == 0) {
-        if (metrics.get()) |c| _ = c.drop_no_route.fetchAdd(1, .monotonic);
+        if (metrics.get()) |c| metrics.bump(&c.drop_no_route, 1);
         return;
     }
 
     // Parse target JID
     const to_jid = xmpp.Jid.parse(to_str) catch {
         noteDrop("connection {d} stanza with invalid 'to': {s}", .{ session.conn.id, to_str });
-        if (metrics.get()) |c| _ = c.drop_no_route.fetchAdd(1, .monotonic);
+        if (metrics.get()) |c| metrics.bump(&c.drop_no_route, 1);
         return;
     };
 
