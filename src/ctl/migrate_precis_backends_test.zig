@@ -255,7 +255,7 @@ test "migrate-precis uses production key models for every namespace" {
     try std.testing.expectEqual(room_store_mod.Affiliation.owner, try rooms.getAffiliation("room@conference.us.example", "naplestb@us.example"));
     try expectRow(&op, NS_PENDING_SUB, "naplestb@us.example\x00friend@us.example", "<presence from='NaplesTB@us.example'/>");
     try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "<message from='NaplesTB@us.example/res'/>");
-    try expectRow(&archive, NS_BY_CONTACT, "naplestb@us.example\x00Friend@remote.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id1");
+    try expectRow(&archive, NS_BY_CONTACT, "naplestb@us.example\x00Friend@remote.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "id1");
 
     try tmp.dir.access("migrate-precis.plan", .{});
     try tmp.dir.access("migrate-precis.journal", .{});
@@ -319,7 +319,7 @@ test "migrate-precis rewrites references without inventing collisions" {
     try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{});
     try std.testing.expect((try users.lookup(allocator, "naplestb")) != null);
     try std.testing.expect((try roster.getItem(allocator, "alice@us.example", "naplestb@us.example")) != null);
-    try expectRow(&archive, NS_BY_CONTACT, "alice@us.example\x00naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id1");
+    try expectRow(&archive, NS_BY_CONTACT, "alice@us.example\x00naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "id1");
 
     var second = try migrate.planMigration(allocator, &auth, &op, &archive, &domains, null);
     defer second.deinit();
@@ -553,7 +553,7 @@ test "migrate-precis merges same-second archive and duplicate subscription rows"
     try migrate.applyPlan(allocator, &auth, &op, &archive, &plan, .{ .journal_dir = journal_dir });
 
     try expectRow(&op, NS_PENDING_SUB, "naplestb@us.example\x00remote@remote.example", "<presence>two</presence>");
-    try expectRow(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id2");
+    try expectRow(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id2", "id2");
     try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1", "<message><body>one</body></message>");
     try expectRow(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id2", "<message><body>two</body></message>");
 }
@@ -810,14 +810,14 @@ test "deluser --raw on a data-only spelling touches only owned rows" {
     try std.testing.expect(contact != null);
     try std.testing.expectEqual(room_store_mod.Affiliation.admin, try rooms.getAffiliation("room@conference.us.example", "naplestb@us.example"));
     try expectRow(&auth, NS_LOCKS, "naplestb", "\x01\x00\x00\x00\x00");
-    try expectRow(&archive, NS_BY_CONTACT, "alice@us.example\x00naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01", "id2");
+    try expectRow(&archive, NS_BY_CONTACT, "alice@us.example\x00naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id2", "id2");
     try expectMissing(&op, NS_OFFLINE_SEQ, "naplestb@us.example");
     try expectMissing(&op, NS_OFFLINE_V2, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01");
     const pointers = try offline.getPointers("naplestb@us.example");
     defer offline.freePointers(pointers);
     try std.testing.expectEqual(@as(usize, 0), pointers.len);
     try expectMissing(&archive, NS_MESSAGES, "naplestb@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
-    try expectMissing(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01");
+    try expectMissing(&archive, NS_BY_CONTACT, "naplestb@us.example\x00alice@us.example\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00id1");
 }
 
 test "migrate-precis keeps account-owned data without a users row as a collision" {

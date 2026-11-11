@@ -287,6 +287,14 @@ pub const MemoryBackend = struct {
             }
         }
 
+        // Real backends iterate in byte order; the reference backend must
+        // model that or store tests verify an order the others never had.
+        std.mem.sort(Iterator.IterEntry, result[0..out], {}, struct {
+            fn before(_: void, a: Iterator.IterEntry, b: Iterator.IterEntry) bool {
+                return std.mem.order(u8, a.key, b.key) == .lt;
+            }
+        }.before);
+
         return .{ .entries = result[0..out], .pos = 0 };
     }
 

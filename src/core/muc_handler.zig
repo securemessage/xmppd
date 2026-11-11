@@ -283,7 +283,10 @@ pub fn handleMucGroupchat(
     // Store in archive for room history replay (T44)
     if (server.archive != null) {
         const timestamp: u64 = @intCast(std.time.timestamp());
-        const stanza_id = if (id_str.len > 0) id_str else "muc";
+        var sid_buf: [32]u8 = undefined;
+        // The stanza id keys both archive rows, so a fixed literal would
+        // keep the same-second overwrite alive for id-less groupchat.
+        const stanza_id = if (id_str.len > 0) id_str else server.generateStanzaId(&sid_buf);
         // Build full stanza XML: <message from='room/nick' type='groupchat' id='...'>inner</message>
         // The fan-out above has finished, so its buffer is given back first
         // rather than held across the archive build.
@@ -2267,7 +2270,10 @@ pub fn processRemoteGroupchat(
     // Archive
     if (server.archive != null) {
         const timestamp: u64 = @intCast(std.time.timestamp());
-        const stanza_id = if (ev.stanza_id.len > 0) ev.stanza_id else "muc";
+        var sid_buf: [32]u8 = undefined;
+        // The stanza id keys both archive rows, so a fixed literal would
+        // keep the same-second overwrite alive for id-less groupchat.
+        const stanza_id = if (ev.stanza_id.len > 0) ev.stanza_id else server.generateStanzaId(&sid_buf);
         // The fan-out above has finished and the stanza is rebuilt from
         // ev.inner_xml, so both of its buffers are given back first.
         deliver_lease.release();

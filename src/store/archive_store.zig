@@ -7,9 +7,17 @@
 //! ## Key Schema (per design doc §7)
 //!
 //! - `messages` namespace: `bare_jid\x00timestamp_be(8)\x00stanza_id` → stanza XML
-//! - `by_contact` namespace: `bare_jid\x00with_jid\x00timestamp_be(8)` → stanza_id
+//! - `by_contact` v2: `bare_jid\x00with_jid\x00timestamp_be(8)\x00stanza_id` → stanza_id
 //!
 //! Timestamps are big-endian u64 for lexicographic = chronological ordering.
+//! The v2 by_contact key appends the stanza id so two messages from one
+//! contact in the same second no longer overwrite each other (S32). Within
+//! a second the index orders by stanza id, the same order the `messages`
+//! namespace uses. v1 rows (`bare_jid\x00with_jid\x00timestamp_be(8)`) still
+//! answer `with` queries: the timestamp sits at the same offset and the
+//! stanza id lives in the value, so daemons read both formats; the
+//! `xmppctl migrate-archive` command rekeys survivors and rebuilds the
+//! index rows the v1 overwrite destroyed.
 
 const std = @import("std");
 const backend = @import("backend");
@@ -87,8 +95,8 @@ pub fn ArchiveStore(comptime Backend: type) type {
             const primary_key = try self.buildPrimaryKey(owner, timestamp, stanza_id);
             defer self.allocator.free(primary_key);
 
-            // Build contact index key: owner\x00with\x00timestamp_be(8)
-            const contact_key = try self.buildContactKey(owner, with, timestamp);
+            // Build contact index key: owner\x00with\x00timestamp_be(8)\x00stanza_id
+            const contact_key = try self.buildContactKey(owner, with, timestamp, stanza_id);
             defer self.allocator.free(contact_key);
 
             // Atomic write: message + contact index. A failed put (MAP_FULL)
@@ -119,7 +127,7 @@ pub fn ArchiveStore(comptime Backend: type) type {
                 for (items) |it| {
                     const primary_key = try self.buildPrimaryKey(it.owner, it.timestamp, it.stanza_id);
                     defer self.allocator.free(primary_key);
-                    const contact_key = try self.buildContactKey(it.owner, it.with, it.timestamp);
+                    const contact_key = try self.buildContactKey(it.owner, it.with, it.timestamp, it.stanza_id);
                     defer self.allocator.free(contact_key);
                     try batch.put(NS_MESSAGES, primary_key, it.stanza_xml);
                     try batch.put(NS_BY_CONTACT, contact_key, it.stanza_id);
@@ -215,63 +223,78 @@ pub fn ArchiveStore(comptime Backend: type) type {
             const prefix = try self.buildContactPrefix(owner, with);
             defer self.allocator.free(prefix);
 
-            var iter = try self.db.iterator(NS_BY_CONTACT, prefix);
-            defer iter.deinit();
+            const Hit = struct { ts: u64, stanza_id: []u8 };
+            var hits = std.ArrayListUnmanaged(Hit){};
+            defer {
+                for (hits.items) |hit| self.allocator.free(hit.stanza_id);
+                hits.deinit(self.allocator);
+            }
+            var complete = true;
 
-            // Collect stanza_ids from the index, then fetch messages
-            var messages = std.ArrayListUnmanaged(ArchivedMessage){};
-            var skipping = opts.after_id != null;
-            var count: u32 = 0;
+            // Collect stanza ids under the cursor, then fetch rows after
+            // the iterator closes: a get inside an open iterator is a
+            // nested read txn on the same thread, which LMDB refuses with
+            // MDB_BAD_RSLOT.
+            {
+                var iter = try self.db.iterator(NS_BY_CONTACT, prefix);
+                defer iter.deinit();
 
-            while (iter.next()) |entry| {
-                const ts = self.extractTimestamp(entry.key, owner.len + 1 + with.len + 1) orelse continue;
+                var skipping = opts.after_id != null;
+                while (iter.next()) |entry| {
+                    const ts = self.extractTimestamp(entry.key, owner.len + 1 + with.len + 1) orelse continue;
 
-                // Time range filter
-                if (opts.start) |start| {
-                    if (ts < start) continue;
-                }
-                if (opts.end) |end| {
-                    if (ts > end) continue;
-                }
+                    // Time range filter
+                    if (opts.start) |start| {
+                        if (ts < start) continue;
+                    }
+                    if (opts.end) |end| {
+                        if (ts > end) continue;
+                    }
 
-                const stanza_id = entry.value;
+                    const stanza_id = entry.value;
 
-                // RSM after_id: skip until we pass the target
-                if (skipping) {
-                    if (opts.after_id) |after| {
-                        if (std.mem.eql(u8, stanza_id, after)) {
-                            skipping = false;
+                    // RSM after_id: skip until we pass the target
+                    if (skipping) {
+                        if (opts.after_id) |after| {
+                            if (std.mem.eql(u8, stanza_id, after)) {
+                                skipping = false;
+                            }
                         }
+                        continue;
                     }
-                    continue;
-                }
 
-                // RSM before_id: stop when we hit it
-                if (opts.before_id) |before| {
-                    if (std.mem.eql(u8, stanza_id, before)) {
-                        return .{ .messages = try messages.toOwnedSlice(self.allocator), .complete = true };
+                    // RSM before_id: stop when we hit it
+                    if (opts.before_id) |before| {
+                        if (std.mem.eql(u8, stanza_id, before)) break;
                     }
-                }
 
-                if (count >= opts.max) {
-                    // More results exist
-                    return .{ .messages = try messages.toOwnedSlice(self.allocator), .complete = false };
-                }
+                    if (hits.items.len >= opts.max) {
+                        complete = false;
+                        break;
+                    }
 
-                // Fetch the actual stanza
-                const primary_key = try self.buildPrimaryKey(owner, ts, stanza_id);
+                    try hits.append(self.allocator, .{
+                        .ts = ts,
+                        .stanza_id = try self.allocator.dupe(u8, stanza_id),
+                    });
+                }
+            }
+
+            // Fetch the actual stanzas
+            var messages = std.ArrayListUnmanaged(ArchivedMessage){};
+            for (hits.items) |hit| {
+                const primary_key = try self.buildPrimaryKey(owner, hit.ts, hit.stanza_id);
                 defer self.allocator.free(primary_key);
                 const xml = try self.db.get(self.allocator, NS_MESSAGES, primary_key);
 
                 try messages.append(self.allocator, .{
-                    .stanza_id = try self.allocator.dupe(u8, stanza_id),
-                    .timestamp = ts,
+                    .stanza_id = try self.allocator.dupe(u8, hit.stanza_id),
+                    .timestamp = hit.ts,
                     .stanza_xml = xml orelse "",
                 });
-                count += 1;
             }
 
-            return .{ .messages = try messages.toOwnedSlice(self.allocator), .complete = true };
+            return .{ .messages = try messages.toOwnedSlice(self.allocator), .complete = complete };
         }
 
         fn collectResults(self: *Self, iter: *Backend.Iterator, owner: []const u8, opts: QueryOptions) !QueryResult {
@@ -365,9 +388,9 @@ pub fn ArchiveStore(comptime Backend: type) type {
             return key;
         }
 
-        fn buildContactKey(self: *Self, owner: []const u8, with: []const u8, timestamp: u64) ![]u8 {
-            // owner\x00with\x00timestamp_be(8)
-            const len = owner.len + 1 + with.len + 1 + 8;
+        fn buildContactKey(self: *Self, owner: []const u8, with: []const u8, timestamp: u64, stanza_id: []const u8) ![]u8 {
+            // owner\x00with\x00timestamp_be(8)\x00stanza_id
+            const len = owner.len + 1 + with.len + 1 + 8 + 1 + stanza_id.len;
             if (len > MAX_KEY_LEN) return error.KeyTooLong;
             const key = try self.allocator.alloc(u8, len);
             var pos: usize = 0;
@@ -380,6 +403,10 @@ pub fn ArchiveStore(comptime Backend: type) type {
             key[pos] = 0;
             pos += 1;
             std.mem.writeInt(u64, key[pos..][0..8], timestamp, .big);
+            pos += 8;
+            key[pos] = 0;
+            pos += 1;
+            @memcpy(key[pos..][0..stanza_id.len], stanza_id);
             return key;
         }
 
@@ -644,6 +671,61 @@ test "ArchiveStore: S4 over-long owner is rejected with KeyTooLong" {
     var long_owner: [600]u8 = undefined;
     @memset(&long_owner, 'a');
     try std.testing.expectError(error.KeyTooLong, store.store(&long_owner, "bob@localhost", "s1", 1, "<message/>"));
+}
+
+test "ArchiveStore: S32 same-second messages from one contact both return, in order" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    var store = ArchiveStore(MemoryBackend).init(&db, std.testing.allocator);
+
+    // One second granularity on the v1 contact key made the second put
+    // overwrite the first; the v2 key carries the stanza id.
+    try store.store("alice@example.com", "bob@example.com", "m-001", 1000, "<m>first</m>");
+    try store.store("alice@example.com", "bob@example.com", "m-002", 1000, "<m>second</m>");
+
+    var result = try store.query("alice@example.com", .{ .with = "bob@example.com" });
+    defer freeQueryResult(std.testing.allocator, &result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.messages.len);
+    try std.testing.expectEqualStrings("m-001", result.messages[0].stanza_id);
+    try std.testing.expectEqualStrings("m-002", result.messages[1].stanza_id);
+}
+
+test "ArchiveStore: S32 a v1 contact row still answers a with query" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    var store = ArchiveStore(MemoryBackend).init(&db, std.testing.allocator);
+
+    try store.store("alice@example.com", "bob@example.com", "m-002", 1000, "<m>new</m>");
+
+    // Seed a pre-migration row by hand: owner\x00with\x00ts_be(8) -> stanza_id.
+    const owner = "alice@example.com";
+    const with = "bob@example.com";
+    var v1_key: [128]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&v1_key);
+    const w = fbs.writer();
+    try w.writeAll(owner);
+    try w.writeByte(0);
+    try w.writeAll(with);
+    try w.writeByte(0);
+    var ts: [8]u8 = undefined;
+    std.mem.writeInt(u64, &ts, 999, .big);
+    try w.writeAll(&ts);
+    try db.put(NS_BY_CONTACT, fbs.getWritten(), "m-001");
+    // Its primary row survives independently of the index entry.
+    const primary = try store.buildPrimaryKey(owner, 999, "m-001");
+    defer std.testing.allocator.free(primary);
+    try db.put(NS_MESSAGES, primary, "<m>old</m>");
+
+    var result = try store.query(owner, .{ .with = with });
+    defer freeQueryResult(std.testing.allocator, &result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.messages.len);
+    try std.testing.expectEqualStrings("m-001", result.messages[0].stanza_id);
+    try std.testing.expectEqualStrings("<m>old</m>", result.messages[0].stanza_xml);
+    try std.testing.expectEqualStrings("m-002", result.messages[1].stanza_id);
 }
 
 /// Test backend whose write batch always fails inside commit. Counts
