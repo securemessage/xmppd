@@ -14,12 +14,16 @@
 # covered without a script edit.
 #
 # usage: stack_frames.sh [binary] [threshold_bytes]
+#
+# ALLOW overrides the allow-list path (Debug and ReleaseSafe builds carry
+# different caps: stack_frames_core.allow for Debug,
+# stack_frames_core_rs.allow for ReleaseSafe).
 set -u
 
 BIN=${1:-zig-out/bin/xmppd-core}
 THRESH=${2:-16384}
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-ALLOW="$SELF_DIR/stack_frames_core.allow"
+ALLOW=${ALLOW:-"$SELF_DIR/stack_frames_core.allow"}
 OBJDUMP=${OBJDUMP:-llvm-objdump}
 
 if [ ! -x "$BIN" ]; then

@@ -1,0 +1,12 @@
+# src/core stack-frame caps in bytes (name<TAB>cap), ReleaseSafe build.
+# Generated from the xmppd-core ReleaseSafe build on freebsd-dev1 at the
+# v091/measure-m4 merge of master 8086a6a. Caps record the probe immediate;
+# a function fails the check when its frame exceeds its cap or has no cap
+# at all; lower caps as frames shrink.
+fanout.longestEncodedRealJid	210536
+main.configureServer	173672
+main.main	2710528
+muc_handler.handleMucDiscoItems	176040
+room_registry.RoomRegistry.createRoom	214104
+server.Server.dispatchEvents	77784
+server.Server.run	70600

@@ -26,8 +26,12 @@ jobs:
       # archive-storage=lmdb keeps the build package-free (see multiworker).
       - name: Build xmppd-core
         run: zig build -Darchive-storage=lmdb
-      - name: Stack-frame report (no new frames over 16 KiB in src/core)
+      - name: Stack-frame report Debug (no new frames over 16 KiB in src/core)
         run: sh test/quality/stack_frames.sh zig-out/bin/xmppd-core
+      - name: Build xmppd-core (ReleaseSafe)
+        run: zig build -Darchive-storage=lmdb -Doptimize=ReleaseSafe
+      - name: Stack-frame report ReleaseSafe (no new frames over 16 KiB in src/core)
+        run: ALLOW=test/quality/stack_frames_core_rs.allow sh test/quality/stack_frames.sh zig-out/bin/xmppd-core
       - name: Silent-catch ratchet
         run: sh test/quality/catch_ratchet.sh
       - name: Counting-allocator 1:1 path check
