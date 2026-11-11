@@ -553,14 +553,44 @@ fn readJournal(allocator: std.mem.Allocator, dir: []const u8) !Plan {
     return plan;
 }
 
-fn clearJournal(allocator: std.mem.Allocator, dir: []const u8) void {
-    const pending = artifactPath(allocator, dir, pending_file) catch return;
+/// Fault hooks for tests; production keeps the real fs calls.
+var delete_journal_file: *const fn (path: []const u8) anyerror!void = deleteFileCwd;
+var sync_journal_dir: *const fn (path: []const u8) anyerror!void = syncDir;
+
+fn deleteFileCwd(path: []const u8) anyerror!void {
+    try std.fs.cwd().deleteFile(path);
+}
+
+/// Removes the pending marker and resume plan, then fsyncs the journal
+/// directory so the removals are durable. A marker left behind makes
+/// every later run replay the plan, so removal and fsync failures
+/// propagate; a delete that finds the artifact already gone is success.
+/// On error `failed_path` names the artifact that could not be removed,
+/// or the directory on an fsync failure; the caller owns the buffer.
+fn clearJournal(allocator: std.mem.Allocator, dir: []const u8, failed_path: ?*std.ArrayListUnmanaged(u8)) !void {
+    if (failed_path) |fp| fp.clearRetainingCapacity();
+    const pending = try artifactPath(allocator, dir, pending_file);
     defer allocator.free(pending);
-    std.fs.cwd().deleteFile(pending) catch {};
-    const journal = artifactPath(allocator, dir, resume_file) catch return;
+    delete_journal_file(pending) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            if (failed_path) |fp| try fp.appendSlice(allocator, pending);
+            return err;
+        },
+    };
+    const journal = try artifactPath(allocator, dir, resume_file);
     defer allocator.free(journal);
-    std.fs.cwd().deleteFile(journal) catch {};
-    syncDir(dir) catch {};
+    delete_journal_file(journal) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            if (failed_path) |fp| try fp.appendSlice(allocator, journal);
+            return err;
+        },
+    };
+    sync_journal_dir(dir) catch |err| {
+        if (failed_path) |fp| try fp.appendSlice(allocator, dir);
+        return err;
+    };
 }
 
 pub fn journalPending(allocator: std.mem.Allocator, dir: []const u8) !bool {
@@ -576,20 +606,23 @@ pub fn journalPending(allocator: std.mem.Allocator, dir: []const u8) !bool {
 /// Journal the plan, then apply it in bounded write batches. On a commit
 /// failure the journal stays; a rerun of --apply replays every op, which
 /// is safe because puts rewrite the same key and deletes ignore misses.
-pub fn applyPlan(allocator: std.mem.Allocator, db: anytype, plan: *const Plan, journal_dir: []const u8) !void {
+/// A non-empty `cleanup_path` on return means the ops committed but the
+/// journal cleanup failed; the buffer names the artifact left behind.
+pub fn applyPlan(allocator: std.mem.Allocator, db: anytype, plan: *const Plan, journal_dir: []const u8, cleanup_path: ?*std.ArrayListUnmanaged(u8)) !void {
     if (plan.ops.items.len == 0) return;
     const digest_hex = try writeJournal(allocator, journal_dir, plan);
     defer allocator.free(digest_hex);
     try applyOps(db, plan.ops.items);
-    clearJournal(allocator, journal_dir);
+    try clearJournal(allocator, journal_dir, cleanup_path);
 }
 
-/// Replay a journaled plan after an interrupted apply.
-pub fn resumeMigration(allocator: std.mem.Allocator, db: anytype, journal_dir: []const u8) !usize {
+/// Replay a journaled plan after an interrupted apply. `cleanup_path`
+/// has the same contract as in applyPlan.
+pub fn resumeMigration(allocator: std.mem.Allocator, db: anytype, journal_dir: []const u8, cleanup_path: ?*std.ArrayListUnmanaged(u8)) !usize {
     var plan = try readJournal(allocator, journal_dir);
     defer plan.deinit();
     try applyOps(db, plan.ops.items);
-    clearJournal(allocator, journal_dir);
+    try clearJournal(allocator, journal_dir, cleanup_path);
     return plan.ops.items.len;
 }
 
@@ -653,7 +686,7 @@ test "migrate-archive: v1 rows rekey, lost rows rebuild, v2 rows stay" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(dir);
-    try applyPlan(allocator, &db, &plan, dir);
+    try applyPlan(allocator, &db, &plan, dir, null);
 
     // bob's rekeyed row.
     const bob_key = try contactKeyV2(allocator, "bob@us.example", "alice@us.example", 1000, "m-001");
@@ -697,7 +730,7 @@ test "migrate-archive: groupchat rebuilds under the room/nick from" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(dir);
-    try applyPlan(allocator, &db, &plan, dir);
+    try applyPlan(allocator, &db, &plan, dir, null);
 
     const key = try contactKeyV2(allocator, "room@conf.example", "room@conf.example/alice", 2000, "g-1");
     defer allocator.free(key);
@@ -723,7 +756,7 @@ test "migrate-archive: s2s recipient copy rebuilds under the wire from" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(dir);
-    try applyPlan(allocator, &db, &plan, dir);
+    try applyPlan(allocator, &db, &plan, dir, null);
 
     const key = try contactKeyV2(allocator, "bob@us.example", "peer@remote.example/res", 3000, "s-1");
     defer allocator.free(key);
@@ -771,7 +804,7 @@ test "migrate-archive: journal survives a torn apply and replays" {
     allocator.free(digest);
     try std.testing.expect(try journalPending(allocator, dir));
 
-    const replayed = try resumeMigration(allocator, &db, dir);
+    const replayed = try resumeMigration(allocator, &db, dir, null);
     try std.testing.expectEqual(@as(usize, 1), replayed);
     try std.testing.expect(!try journalPending(allocator, dir));
 
@@ -785,4 +818,69 @@ test "migrate-archive: journal survives a torn apply and replays" {
     var plan2 = try planMigration(allocator, &db, &domains);
     defer plan2.deinit();
     try std.testing.expectEqual(@as(usize, 0), plan2.ops.items.len);
+}
+
+test "migrate-archive: a journal delete failure propagates with the artifact path" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+
+    const chat = "<message from='alice@us.example' to='bob@us.example' type='chat' id='c1'><body>x</body></message>";
+    try seedMessage(&db, "bob@us.example", 6000, "m-1", chat);
+    try seedV1Contact(&db, "bob@us.example", "alice@us.example", 6000, "m-1");
+
+    const domains = [_][]const u8{"us.example"};
+    var plan = try planMigration(allocator, &db, &domains);
+    defer plan.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    const saved_hook = delete_journal_file;
+    defer delete_journal_file = saved_hook;
+    delete_journal_file = struct {
+        fn refusePending(path: []const u8) anyerror!void {
+            if (std.mem.endsWith(u8, path, pending_file)) return error.InjectedDelete;
+            try std.fs.cwd().deleteFile(path);
+        }
+    }.refusePending;
+
+    var failed: std.ArrayListUnmanaged(u8) = .{};
+    defer failed.deinit(allocator);
+    try std.testing.expectError(error.InjectedDelete, applyPlan(allocator, &db, &plan, dir, &failed));
+    // The named artifact is the pending marker, and it really is left.
+    try std.testing.expect(std.mem.endsWith(u8, failed.items, pending_file));
+    try std.testing.expect(try journalPending(allocator, dir));
+
+    // The ops did commit: bob's row is v2 despite the cleanup failure.
+    const key = try contactKeyV2(allocator, "bob@us.example", "alice@us.example", 6000, "m-1");
+    defer allocator.free(key);
+    const got = try db.get(allocator, NS_BY_CONTACT, key);
+    defer if (got) |v| allocator.free(v);
+    try std.testing.expect(got != null);
+}
+
+test "migrate-archive: a journal dir fsync failure propagates with the dir path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+
+    const saved_hook = sync_journal_dir;
+    defer sync_journal_dir = saved_hook;
+    sync_journal_dir = struct {
+        fn refuseSync(path: []const u8) anyerror!void {
+            _ = path;
+            return error.InjectedSync;
+        }
+    }.refuseSync;
+
+    var failed: std.ArrayListUnmanaged(u8) = .{};
+    defer failed.deinit(allocator);
+    try std.testing.expectError(error.InjectedSync, clearJournal(allocator, dir, &failed));
+    try std.testing.expectEqualStrings(dir, failed.items);
 }

@@ -608,6 +608,15 @@ fn runMigratePrecis(
     printOut(line);
 }
 
+/// Reports a post-commit journal cleanup failure: the migration ops are
+/// durable, but the named journal artifact remains and a rerun replays.
+fn reportCleanupFailure(allocator: std.mem.Allocator, cleanup_path: *const std.ArrayListUnmanaged(u8), err: anyerror) !void {
+    if (cleanup_path.items.len == 0) return;
+    const msg = try std.fmt.allocPrint(allocator, "migration applied, cleanup failed: {s} ({s})\n", .{ cleanup_path.items, @errorName(err) });
+    defer allocator.free(msg);
+    printErr(msg);
+}
+
 fn runMigrateArchive(
     allocator: std.mem.Allocator,
     db_path: []const u8,
@@ -627,15 +636,19 @@ fn runMigrateArchive(
     var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
     defer archive.close();
 
+    var cleanup_path: std.ArrayListUnmanaged(u8) = .{};
+    defer cleanup_path.deinit(allocator);
+
     if (try migrate_archive.journalPending(allocator, db_path)) {
         if (!apply) {
             printErr("a migrate-archive recovery is pending; rerun with --apply to finish it\n");
             return error.RecoveryPending;
         }
-        const resumed = migrate_archive.resumeMigration(allocator, &archive, db_path) catch |err| {
+        const resumed = migrate_archive.resumeMigration(allocator, &archive, db_path, &cleanup_path) catch |err| {
             if (err == error.JournalDigestMismatch) {
                 printErr("migration journal is torn or does not match the marker; restore the archive from backup, or delete migrate-archive.pending and migrate-archive.resume and rerun the dry run\n");
             }
+            try reportCleanupFailure(allocator, &cleanup_path, err);
             return err;
         };
         var resumed_buf: [96]u8 = undefined;
@@ -656,7 +669,10 @@ fn runMigrateArchive(
         return;
     }
 
-    try migrate_archive.applyPlan(allocator, &archive, &plan, db_path);
+    migrate_archive.applyPlan(allocator, &archive, &plan, db_path, &cleanup_path) catch |err| {
+        try reportCleanupFailure(allocator, &cleanup_path, err);
+        return err;
+    };
     var count_buf: [96]u8 = undefined;
     const line = try std.fmt.bufPrint(&count_buf, "applied {d} ops\n", .{plan.ops.items.len});
     printOut(line);

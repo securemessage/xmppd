@@ -139,7 +139,7 @@ fn migrateCase(comptime Backend: type, comptime wants_file: bool) !void {
     // rekey bob m-001, rekey alice m-003, rebuild alice m-002.
     try std.testing.expectEqual(@as(usize, 3), plan.ops.items.len);
 
-    try migrate_archive.applyPlan(alloc, &be, &plan, journal);
+    try migrate_archive.applyPlan(alloc, &be, &plan, journal, null);
 
     // store() wrote alice m-003's index row with the new key already; the
     // v1 survivor key is gone and the lost m-002 row is back. The scan
