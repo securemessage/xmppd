@@ -40,7 +40,9 @@ oidc: refusing auto-claim of 'alice': existing account data found; use xmppctl o
   its subject IDs are handle-form, with `localpart_claim_prefix =
   user:`). Empty string disables auto-provisioning entirely.
 - `localpart_claim_prefix`: prefix stripped from the suggestion before
-  normalization.
+  preparation. The suggestion is prepared with the same RFC 7622
+  localpart function as account names, so spellings that fold together
+  collide and lose.
 - `localpart_auto_suffix` (default `false`): `true` allows `lp-2` ..
   `lp-99` when the suggestion is taken.
 - `email` is accepted only when the IdP reports `email_verified = true`

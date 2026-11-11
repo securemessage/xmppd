@@ -415,7 +415,10 @@ pub fn main() !void {
             printErr("oidc-link requires: <localpart> <issuer> <subject>\n");
             return error.InvalidArgs;
         }
-        const lp = remaining_args.items[1];
+        const lp = prepareAccountName(remaining_args.items[1]) catch {
+            printErr("invalid localpart\n");
+            return error.InvalidAccountName;
+        };
         const iss = remaining_args.items[2];
         const sub = remaining_args.items[3];
         const claimed = binding_store.bind(iss, sub, lp, .operator, std.time.timestamp()) catch |err| {
@@ -442,7 +445,11 @@ pub fn main() !void {
             printErr("oidc-unlink requires a localpart\n");
             return error.InvalidArgs;
         }
-        const removed = binding_store.unbind(allocator, remaining_args.items[1]) catch |err| {
+        const lp = prepareAccountName(remaining_args.items[1]) catch {
+            printErr("invalid localpart\n");
+            return error.InvalidAccountName;
+        };
+        const removed = binding_store.unbind(allocator, lp) catch |err| {
             printErr("oidc-unlink failed\n");
             return err;
         };
@@ -479,7 +486,7 @@ pub fn main() !void {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0 or trimmed[0] == '#') continue;
             var fields = std.mem.tokenizeAny(u8, trimmed, " \t");
-            const lp = fields.next() orelse {
+            const lp_raw = fields.next() orelse {
                 failed += 1;
                 continue;
             };
@@ -492,6 +499,13 @@ pub fn main() !void {
                 failed += 1;
                 continue;
             }
+            const lp = prepareAccountName(lp_raw) catch {
+                failed += 1;
+                printErr("invalid localpart in import: ");
+                printErr(lp_raw);
+                printErr("\n");
+                continue;
+            };
             const claimed = binding_store.bind(iss, sub, lp, .operator, std.time.timestamp()) catch {
                 failed += 1;
                 continue;

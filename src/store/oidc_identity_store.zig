@@ -16,13 +16,14 @@
 //! enumerate bindings.
 //!
 //! Resolver drives first-login resolution on IdP worker threads: bind
-//! first, and only for unmapped subjects walk suggestion -> normalization
-//! -> reverse check -> users row check -> account-data probe -> atomic
-//! claim. Anything present blocks auto-claim and points the operator at
-//! `xmppctl oidc-link`.
+//! first, and only for unmapped subjects walk suggestion -> PRECIS
+//! preparation -> reverse check -> users row check -> account-data probe
+//! -> atomic claim. Anything present blocks auto-claim and points the
+//! operator at `xmppctl oidc-link`.
 
 const std = @import("std");
 const backend_mod = @import("backend");
+const precis = @import("precis_username");
 
 const log = std.log.scoped(.oidc_identity_store);
 
@@ -281,25 +282,22 @@ pub fn Store(comptime Backend: type) type {
     };
 }
 
-/// Interim localpart normalization seam: ASCII-lowercase plus a
-/// conservative allowlist, valid until the PRECIS work lands (PR #30),
-/// when this becomes precis.xmppLocalpart() with the RFC 7622 exclusions.
-/// Returns the normalized length written to out, or null when the raw
-/// value cannot form a localpart at all.
+/// Prepared-localpart scratch: precis.Scratch is one slot per thread and
+/// the prepared slice is copied out of it immediately.
+threadlocal var precis_scratch: precis.Scratch = undefined;
+
+/// Localpart preparation: the same RFC 7622 UsernameCaseMapped plus
+/// section 3.3.1 exclusion function registration, SASL, the lock store
+/// and ingress use (precis.xmppLocalpart). Returns the prepared length
+/// written to out, or null when the raw value cannot form a localpart at
+/// all. A prepared form over max_localpart_len cannot be a store key, so
+/// it fails the same way.
 pub fn normalizeLocalpart(raw: []const u8, out: *[max_localpart_len]u8) ?usize {
-    if (raw.len == 0 or raw.len > max_localpart_len) return null;
-    var len: usize = 0;
-    for (raw) |ch| {
-        const lower = std.ascii.toLower(ch);
-        const ok = switch (lower) {
-            'a'...'z', '0'...'9', '.', '_', '-' => true,
-            else => false,
-        };
-        if (!ok) return null;
-        out[len] = lower;
-        len += 1;
-    }
-    return len;
+    if (raw.len == 0) return null;
+    const prepared = precis_scratch.localpart(raw) catch return null;
+    if (prepared.len > max_localpart_len) return null;
+    @memcpy(out[0..prepared.len], prepared);
+    return prepared.len;
 }
 
 /// First-login and operator-binding resolution. Generic over the
@@ -560,24 +558,21 @@ fn hasPrefixRow(backend: anytype, ns: []const u8, prefix: []const u8) !bool {
     return it.next() != null;
 }
 
-/// Suffix candidate "base-N" for N in 2..99, bounded by the localpart cap.
+/// Suffix candidate "base-N" for N in 2..99. The whole candidate is
+/// prepared as one string: an ASCII tail on a prepared base can still
+/// break the profile (the Bidi Rule on RTL input), and a suffix past the
+/// localpart cap is refused rather than merged elsewhere.
 fn suffixCandidate(base: []const u8, buf: *[max_localpart_len]u8, n: usize) ?usize {
     var nb: [8]u8 = undefined;
     const num = std.fmt.bufPrint(&nb, "-{d}", .{n}) catch return null;
-    if (base.len + num.len > max_localpart_len) return null;
-    var len: usize = 0;
-    for (base) |ch| {
-        const lower = std.ascii.toLower(ch);
-        const ok = switch (lower) {
-            'a'...'z', '0'...'9', '.', '_', '-' => true,
-            else => false,
-        };
-        if (!ok) return null;
-        buf[len] = lower;
-        len += 1;
-    }
-    @memcpy(buf[len..][0..num.len], num);
-    return len + num.len;
+    var input: [precis.max_input_octets + 8]u8 = undefined;
+    if (base.len + num.len > input.len) return null;
+    @memcpy(input[0..base.len], base);
+    @memcpy(input[base.len..][0..num.len], num);
+    const prepared = precis_scratch.localpart(input[0 .. base.len + num.len]) catch return null;
+    if (prepared.len > max_localpart_len) return null;
+    @memcpy(buf[0..prepared.len], prepared);
+    return prepared.len;
 }
 
 // ============================================================================
@@ -663,6 +658,37 @@ test "Resolver: second subject with a taken suggestion is refused" {
     _ = try r.resolve(testing.allocator, "https://idp.example", "sub-1", "alice", &lp, &len);
     const out = try r.resolve(testing.allocator, "https://idp.example", "sub-2", "alice", &lp, &len);
     try testing.expectEqual(out, Resolution{ .refused = .localpart_taken });
+}
+
+test "Resolver: claims that prepare to the same localpart do not share an account" {
+    var auth = try backend_mod.MemoryBackend.open("", .{});
+    defer auth.close();
+    var op = try backend_mod.MemoryBackend.open("", .{});
+    defer op.close();
+    var arch = try backend_mod.MemoryBackend.open("", .{});
+    defer arch.close();
+    var r = memResolver(&auth, &op, &arch);
+
+    var lp: [max_localpart_len]u8 = undefined;
+    var len: usize = 0;
+    // Fullwidth "Ａｌｉｃｅ" (U+FF21 U+FF4C U+FF49 U+FF43 U+FF45) width- and
+    // case-folds to "alice" under precis.xmppLocalpart.
+    const out1 = try r.resolve(testing.allocator, "https://idp.example", "sub-1", "\u{FF21}\u{FF4C}\u{FF49}\u{FF43}\u{FF45}", &lp, &len);
+    try testing.expectEqual(out1, Resolution{ .bound = 5 });
+    try testing.expectEqualStrings("alice", lp[0..len]);
+
+    // A second subject whose claim prepares onto the bound localpart is
+    // refused, not merged and not suffixed (auto_suffix is off).
+    const out2 = try r.resolve(testing.allocator, "https://idp.example", "sub-2", "ALICE", &lp, &len);
+    try testing.expectEqual(out2, Resolution{ .refused = .localpart_taken });
+
+    // sub-2 gained no forward binding; "alice" still names sub-1 only.
+    const s2 = try r.store.lookupSubject(testing.allocator, "https://idp.example", "sub-2");
+    defer if (s2) |v| testing.allocator.free(v);
+    try testing.expect(s2 == null);
+    const rev = (try r.store.lookupLocalpart(testing.allocator, "alice")).?;
+    defer testing.allocator.free(rev.value);
+    try testing.expectEqualStrings("sub-1", rev.sub);
 }
 
 test "Resolver: existing users row blocks auto-claim" {

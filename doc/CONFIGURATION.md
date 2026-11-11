@@ -74,7 +74,7 @@ in development mode.
 | `user_domain` | no | Domain appended to bare usernames for ROPC (e.g., `morante.dev`) |
 | `import_avatar` | no | Import IdP `picture` claim into vCard on first login (`true`/`false`, default `false`) |
 | `localpart_claim` | no | Claim supplying the first-login localpart suggestion: `preferred_username` (default), `email`, `sub`, or empty string to disable auto-provisioning |
-| `localpart_claim_prefix` | no | Prefix stripped from the suggestion claim before normalization (e.g., `user:` for identity-oidc handle-form subjects) |
+| `localpart_claim_prefix` | no | Prefix stripped from the suggestion claim before PRECIS preparation (e.g., `user:` for identity-oidc handle-form subjects) |
 | `localpart_auto_suffix` | no | When the suggested localpart is taken, try `lp-2` .. `lp-99` (`true`/`false`, default `false`: a taken suggestion is refused, never silently suffixed) |
 
 #### Account binding
@@ -83,8 +83,11 @@ XMPP accounts bind permanently to the `(iss, sub)` pair (OIDC Core 5.7):
 once a subject logs in, its mapping in `{db}/auth` (`oidc_identities`
 namespace) decides the account forever, and renamed IdP claims cannot
 re-map it. The `localpart_claim` value is only a first-login
-*suggestion*: it never binds identity, and it is refused when the
-localpart is already bound to another subject, when a provisioned
+*suggestion*: it never binds identity. The suggestion is prepared with
+the same RFC 7622 UsernameCaseMapped localpart function as registration
+(`NaplesTB` suggests `naplestb`), so two different claims that prepare to
+one localpart collide and the second is refused. A suggestion is refused
+when the localpart is already bound to another subject, when a provisioned
 `users` row exists, or when the account already owns roster, archive or
 MUC data (upgrade installs must run `xmppctl oidc-unclaimed` and
 `oidc-link` first; see UPGRADING.md). `localpart_claim = email` is
