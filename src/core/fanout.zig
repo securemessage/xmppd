@@ -20,7 +20,9 @@
 //! falling back to per-occupant stanza construction.
 
 const std = @import("std");
+const xml = @import("xml");
 const room_registry = @import("room_registry");
+const jid_bounds = @import("jid_bounds.zig");
 const Room = room_registry.Room;
 const Occupant = room_registry.Occupant;
 const RoomRegistry = room_registry.RoomRegistry;
@@ -34,6 +36,13 @@ pub const DEFAULT_BATCH_SIZE: u8 = 32;
 /// Maximum concurrent pending fan-out operations.
 pub const MAX_PENDING: usize = 4;
 
+/// Capacity of a queued pre-built stanza prefix. The prefix is
+/// "<message|presence from='" plus an occupant JID (a maximum-length room
+/// bare JID, '/', and a nick) plus "' to='", so it must hold a full JID in
+/// the worst case rather than truncate the stanza mid-attribute.
+pub const PREFIX_CAPACITY: usize = jid_bounds.FULL_JID_MAX;
+pub const SUFFIX_CAPACITY: usize = 16500;
+
 /// A pending fan-out operation that delivers a pre-built stanza to room
 /// occupants across multiple event loop ticks (bounded continuation).
 pub const PendingFanout = struct {
@@ -43,21 +52,27 @@ pub const PendingFanout = struct {
     next_slot: u8 = 0,
 
     /// Room JID for safe re-lookup (room may have been destroyed between ticks).
-    room_jid_buf: [320]u8 = undefined,
+    room_jid_buf: [jid_bounds.BARE_JID_MAX]u8 = undefined,
     room_jid_len: u16 = 0,
 
     /// Pre-built stanza prefix: everything up to and including " to='"
     /// Example: "<message from='room@conf/nick' to='"
-    prefix_buf: [512]u8 = undefined,
+    prefix_buf: [PREFIX_CAPACITY]u8 = undefined,
     prefix_len: u16 = 0,
 
     /// Pre-built stanza suffix: everything after the recipient JID value
     /// Example: "' type='groupchat' id='abc'><body>hello</body></message>"
-    suffix_buf: [16500]u8 = undefined,
+    suffix_buf: [SUFFIX_CAPACITY]u8 = undefined,
     suffix_len: u16 = 0,
 
     pub fn getRoomJid(self: *const PendingFanout) []const u8 {
         return self.room_jid_buf[0..self.room_jid_len];
+    }
+
+    // The queue's room JID copy assumes this buffer holds any JID the room
+    // registry can store.
+    comptime {
+        std.debug.assert(@sizeOf(@FieldType(@This(), "room_jid_buf")) >= @sizeOf(@FieldType(Room, "jid_buf")));
     }
 
     pub fn getPrefix(self: *const PendingFanout) []const u8 {
@@ -106,15 +121,15 @@ pub const FanoutQueue = struct {
 ///
 /// Output: `<message from='room@conf/nick' to='`
 pub fn buildPrefix(
-    buf: *[512]u8,
+    buf: []u8,
     from_str: []const u8,
-) ?u16 {
+) ?usize {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeAll("<message from='") catch return null;
-    w.writeAll(from_str) catch return null;
+    xml.escapeWrite(w, from_str) catch return null;
     w.writeAll("' to='") catch return null;
-    return @intCast(fbs.pos);
+    return fbs.pos;
 }
 
 /// Build a pre-built stanza suffix for a MUC groupchat message.
@@ -123,16 +138,16 @@ pub fn buildPrefix(
 /// Output: `' type='groupchat' id='abc'><body>hello</body></message>`
 ///     or: `' type='groupchat' id='abc'/>`  (no inner XML)
 pub fn buildSuffix(
-    buf: *[16500]u8,
+    buf: []u8,
     id_str: []const u8,
     inner_xml: []const u8,
-) ?u16 {
+) ?usize {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeAll("' type='groupchat'") catch return null;
     if (id_str.len > 0) {
         w.writeAll(" id='") catch return null;
-        w.writeAll(id_str) catch return null;
+        xml.escapeWrite(w, id_str) catch return null;
         w.writeByte('\'') catch return null;
     }
     if (inner_xml.len == 0) {
@@ -142,25 +157,64 @@ pub fn buildSuffix(
         w.writeAll(inner_xml) catch return null;
         w.writeAll("</message>") catch return null;
     }
-    return @intCast(fbs.pos);
+    return fbs.pos;
 }
 
 /// Build a complete stanza from pre-built prefix + recipient JID + suffix into a buffer.
 /// Returns the total length, or null if the buffer would overflow.
 /// Used for cross-thread MPSC delivery where we need the full stanza as contiguous bytes.
+/// The recipient JID lands inside the prefix's `to='...'` attribute, so it is
+/// XML-escaped here (S1); prefix and suffix are already serialized XML.
 pub fn buildComplete(
     buf: []u8,
     prefix: []const u8,
     recipient_jid: []const u8,
     suffix: []const u8,
 ) ?usize {
-    const total = prefix.len + recipient_jid.len + suffix.len;
-    if (total > buf.len) return null;
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    w.writeAll(prefix) catch return null;
+    xml.escapeWrite(w, recipient_jid) catch return null;
+    w.writeAll(suffix) catch return null;
+    return fbs.pos;
+}
 
-    @memcpy(buf[0..prefix.len], prefix);
-    @memcpy(buf[prefix.len .. prefix.len + recipient_jid.len], recipient_jid);
-    @memcpy(buf[prefix.len + recipient_jid.len .. total], suffix);
+/// Bytes `xml.escapeWrite` emits for `value`. The five escaped characters
+/// expand, everything else is copied verbatim.
+pub fn escapedLen(value: []const u8) usize {
+    var total: usize = 0;
+    for (value) |c| {
+        total += switch (c) {
+            '&' => "&amp;".len,
+            '<', '>' => "&lt;".len,
+            '\'' => "&apos;".len,
+            '"' => "&quot;".len,
+            else => 1,
+        };
+    }
     return total;
+}
+
+/// Longest escaped real JID of any occupant, which is the widest stanza the
+/// room's fan-out has to build. Sizing on the actual occupants keeps the
+/// rejection from firing on a stanza some recipient could still receive.
+pub fn longestEncodedRealJid(room: *const Room) usize {
+    var longest: usize = 0;
+    for (room.occupants) |slot| {
+        const occ = slot orelse continue;
+        longest = @max(longest, escapedLen(occ.getRealJid()));
+    }
+    return longest;
+}
+
+/// True when a groupchat stanza cannot be queued whole for a recipient whose
+/// escaped JID is `encoded_recipient_len` bytes. Such a stanza fails
+/// `queueSend` with `WriteBufferFull` for that occupant, and the failure path
+/// marks the session for the slow-reader teardown: the whole room disconnects,
+/// the sender included, for a message nobody could receive (H5). Callers
+/// reject it at MUC ingress instead.
+pub fn exceedsWriteBuffer(prefix_len: usize, suffix_len: usize, encoded_recipient_len: usize, limit: usize) bool {
+    return prefix_len + encoded_recipient_len + suffix_len > limit;
 }
 
 // ============================================================================
@@ -175,11 +229,8 @@ pub fn buildComplete(
 /// misrouting future events onto this session slot (T153). Such stanzas are
 /// tracked for replay on resume instead of being delivered live.
 ///
-/// This also keeps `sm_out_seq` accurate. XEP-0198 counts *every* outbound
-/// stanza; fan-out paths that bypassed `smTrackOutbound` used to leave the
-/// server's counter behind the client's, which makes `SmUnackedQueue.ack()`
-/// take its "client acked more than we have buffered" branch and discard the
-/// whole replay queue.
+/// Every live or detached delivery updates XEP-0198 tracking so the server and
+/// client acknowledgment windows stay aligned with the replay queue.
 ///
 /// `session` is a `*Session` and `changes` a `*ChangeList`; both are taken as
 /// `anytype` because `Session` lives in server.zig, which imports this module.
@@ -193,7 +244,13 @@ pub fn deliverToSession(
         session.smTrackOutbound(data);
         return;
     }
-    session.conn.queueSend(data) catch return;
+    session.conn.queueSend(data) catch |err| {
+        if (err == error.WriteBufferFull) {
+            session.sm_overflow = true;
+            log.warn("local delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
+        }
+        return;
+    };
     session.smTrackOutbound(data);
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session_id) catch {};
@@ -201,19 +258,21 @@ pub fn deliverToSession(
 }
 
 /// Pre-built variant of `deliverToSession`: assembles `prefix + recipient_jid +
-/// suffix` into a scratch buffer, then delivers it. Replaces the
-/// `queueSend()` + `hasPendingWrite()`/`addWrite()` pair at fan-out sites.
+/// suffix` into `buf`, then delivers the assembled stanza.
+///
+/// `buf` is caller-supplied so a fan-out loop can lease one scratch bank and
+/// reuse it for every recipient without a per-delivery stack buffer (S18).
 pub fn deliverPrebuiltToSession(
     session: anytype,
+    buf: []u8,
     prefix: []const u8,
     recipient_jid: []const u8,
     suffix: []const u8,
     session_id: usize,
     changes: anytype,
 ) void {
-    var msg_buf: [20480]u8 = undefined;
-    const total = buildComplete(&msg_buf, prefix, recipient_jid, suffix) orelse return;
-    deliverToSession(session, msg_buf[0..total], session_id, changes);
+    const total = buildComplete(buf, prefix, recipient_jid, suffix) orelse return;
+    deliverToSession(session, buf[0..total], session_id, changes);
 }
 
 // ============================================================================
@@ -302,6 +361,28 @@ test "buildPrefix produces correct output" {
     const len = buildPrefix(&buf, "room@conference.example.com/alice").?;
     const result = buf[0..len];
     try std.testing.expectEqualStrings("<message from='room@conference.example.com/alice' to='", result);
+}
+
+test "buildPrefix escapes decoded entities in from JID (S1)" {
+    // The scanner decodes entities on read; a nick of "a&apos;b" arrives here
+    // as "a'b" and must be re-encoded or it breaks out of the attribute.
+    var buf: [512]u8 = undefined;
+    const len = buildPrefix(&buf, "room@conference.example.com/a'b<c\"d").?;
+    const result = buf[0..len];
+    try std.testing.expectEqualStrings("<message from='room@conference.example.com/a&apos;b&lt;c&quot;d' to='", result);
+}
+
+test "buildSuffix escapes decoded entities in id (S1)" {
+    var buf: [16500]u8 = undefined;
+    const len = buildSuffix(&buf, "x'><message from='evil", "<body>hi</body>").?;
+    const result = buf[0..len];
+    try std.testing.expectEqualStrings("' type='groupchat' id='x&apos;&gt;&lt;message from=&apos;evil'><body>hi</body></message>", result);
+}
+
+test "buildComplete escapes decoded entities in recipient JID (S1)" {
+    var buf: [1024]u8 = undefined;
+    const total = buildComplete(&buf, "<message from='r@c/a' to='", "u'1@d/res'2", "' type='groupchat'/>").?;
+    try std.testing.expectEqualStrings("<message from='r@c/a' to='u&apos;1@d/res&apos;2' type='groupchat'/>", buf[0..total]);
 }
 
 test "buildSuffix with body" {
@@ -401,6 +482,7 @@ const MockConn = struct {
 
 const MockSession = struct {
     sm_detached: bool = false,
+    sm_overflow: bool = false,
     conn: MockConn = .{},
     tracked: [1024]u8 = undefined,
     tracked_len: usize = 0,
@@ -456,8 +538,9 @@ test "deliverToSession: detached session tracks for replay, never touches the fd
 test "deliverPrebuiltToSession: assembles prefix + JID + suffix" {
     var session = MockSession{};
     var changes = MockChanges{};
+    var buf: [2048]u8 = undefined;
 
-    deliverPrebuiltToSession(&session, "<message to='", "bob@example.com", "'/>", 1, &changes);
+    deliverPrebuiltToSession(&session, &buf, "<message to='", "bob@example.com", "'/>", 1, &changes);
 
     try std.testing.expectEqualStrings(
         "<message to='bob@example.com'/>",
@@ -471,8 +554,9 @@ test "deliverPrebuiltToSession: detached occupant is not delivered live" {
     session.conn.closed = true;
     session.conn.fd = -1;
     var changes = MockChanges{};
+    var buf: [2048]u8 = undefined;
 
-    deliverPrebuiltToSession(&session, "<message to='", "bob@example.com", "'/>", 1, &changes);
+    deliverPrebuiltToSession(&session, &buf, "<message to='", "bob@example.com", "'/>", 1, &changes);
 
     try std.testing.expectEqual(@as(usize, 0), session.conn.sent_len);
     try std.testing.expectEqual(@as(usize, 0), changes.add_write_calls);

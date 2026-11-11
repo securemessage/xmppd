@@ -2,6 +2,10 @@
     .name = .xmppd,
     .version = "0.15.2",
     .dependencies = .{
+        .dane = .{
+            .url = "https://git.morante.net/pacyworld/dane-zig/archive/79469b549f340f164d2c44daa472d5d45b197de3.tar.gz",
+            .hash = "dane-0.0.0-AzKYs1C7CAC8qi4EzYsp5IDnjOcQq73Lo4Ta5oi0a86B",
+        },
         .lmdb = .{
             .url = "https://github.com/nDimensional/zig-lmdb/archive/refs/tags/v0.3.2.tar.gz",
             .hash = "lmdb-0.3.2-6TpzoHE_AAAk2TZyIMXLiBTiGoCDd4ykSqHE91QzBE2L",

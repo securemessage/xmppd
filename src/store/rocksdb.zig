@@ -10,7 +10,7 @@ const c = @cImport(@cInclude("rocksdb/c.h"));
 
 const log = std.log.scoped(.rocksdb_store);
 
-const MAX_COLUMN_FAMILIES = 16;
+const MAX_COLUMN_FAMILIES = 24;
 
 const CfCacheEntry = struct {
     name_buf: [64]u8,
@@ -29,9 +29,13 @@ pub const RocksDbBackend = struct {
     cf_count: u32,
     path_buf: [4096]u8,
     path_len: usize,
+    compound_mutex: std.Thread.Mutex = .{},
     /// Guards cf_cache lookups/appends (S9): canonical column families are
     /// created at open(); the lock covers only test/unknown names.
     cf_lock: std.Thread.Mutex = .{},
+    /// RocksDB reads are MVCC snapshots and cannot observe a half-applied
+    /// write, so they do not need the store's compound lock (S9).
+    pub const reads_are_snapshot = true;
 
     comptime {
         backend.assertBackend(RocksDbBackend);
@@ -287,6 +291,7 @@ pub const RocksDbBackend = struct {
     }
 
     pub fn iterator(self: *RocksDbBackend, ns: []const u8, prefix: []const u8) !Iterator {
+        if (prefix.len > backend.MAX_PREFIX_LEN) return error.PrefixTooLong;
         const cf = try self.getOrCreateCf(ns);
 
         const iter = c.rocksdb_create_iterator_cf(
@@ -298,10 +303,10 @@ pub const RocksDbBackend = struct {
         var it = Iterator{
             .iter = iter,
             .prefix = undefined,
-            .prefix_len = @min(prefix.len, 256),
+            .prefix_len = prefix.len,
             .started = false,
         };
-        @memcpy(it.prefix[0..it.prefix_len], prefix[0..it.prefix_len]);
+        @memcpy(it.prefix[0..it.prefix_len], prefix);
         return it;
     }
 
@@ -317,7 +322,7 @@ pub const RocksDbBackend = struct {
 
     pub const Iterator = struct {
         iter: *c.rocksdb_iterator_t,
-        prefix: [256]u8,
+        prefix: [backend.MAX_PREFIX_LEN]u8,
         prefix_len: usize,
         started: bool,
 
@@ -370,8 +375,15 @@ pub const RocksDbBackend = struct {
     // -- WriteBatch --
 
     pub const WriteBatch = struct {
-        batch: *c.rocksdb_writebatch_t,
+        batch: ?*c.rocksdb_writebatch_t,
         backend: *RocksDbBackend,
+        /// End attempts so far (commit or abort). abort() after a commit
+        /// attempt is a no-op (S9); the count keeps a guard violation
+        /// observable instead of a silent double destroy.
+        ends: u8 = 0,
+        /// Test-only fault hook (S9): the commit fails the way a RocksDB
+        /// write error does, without driving the C layer.
+        fail_commit: bool = false,
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
             const cf = try self.backend.getOrCreateCf(ns);
@@ -396,6 +408,13 @@ pub const RocksDbBackend = struct {
         }
 
         pub fn commit(self: *WriteBatch) !void {
+            // A write is atomic and the C batch is destroyed once either
+            // way: abort() after a commit attempt is a no-op (S9).
+            self.ends += 1;
+            if (self.fail_commit) {
+                self.destroyBatch();
+                return error.RocksDbWriteFailed;
+            }
             var err: [*c]u8 = null;
             c.rocksdb_write(
                 self.backend.db,
@@ -403,7 +422,7 @@ pub const RocksDbBackend = struct {
                 self.batch,
                 &err,
             );
-            c.rocksdb_writebatch_destroy(self.batch);
+            self.destroyBatch();
 
             if (err != null) {
                 log.err("rocksdb_write: {s}", .{std.mem.span(err)});
@@ -413,7 +432,16 @@ pub const RocksDbBackend = struct {
         }
 
         pub fn abort(self: *WriteBatch) void {
-            c.rocksdb_writebatch_destroy(self.batch);
+            if (self.ends > 0) return;
+            self.ends += 1;
+            self.destroyBatch();
+        }
+
+        fn destroyBatch(self: *WriteBatch) void {
+            if (self.batch) |b| {
+                c.rocksdb_writebatch_destroy(b);
+                self.batch = null;
+            }
         }
     };
 
@@ -468,21 +496,26 @@ pub const RocksDbBackend = struct {
 // Tests
 // ============================================================================
 
-fn freshTestDir() []const u8 {
-    const path = "/tmp/xmppd-test-rocksdb";
-    std.fs.cwd().deleteTree(path) catch {};
-    return path;
+/// A path unique to this process and call, so two suites running at once do
+/// not open and delete each other's database.
+fn freshTestDir(buf: []u8) []const u8 {
+    test_dir_seq += 1;
+    return std.fmt.bufPrint(buf, "/tmp/xmppd-test-rocksdb-{d}-{d}", .{ std.c.getpid(), test_dir_seq }) catch unreachable;
 }
 
+var test_dir_seq: u32 = 0;
+
 test "RocksDbBackend: open and close" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     db.close();
 }
 
 test "RocksDbBackend: put and get" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -499,7 +532,8 @@ test "RocksDbBackend: put and get" {
 }
 
 test "RocksDbBackend: delete" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -515,7 +549,8 @@ test "RocksDbBackend: delete" {
 }
 
 test "RocksDbBackend: overwrite value" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -529,7 +564,8 @@ test "RocksDbBackend: overwrite value" {
 }
 
 test "RocksDbBackend: separate namespaces" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -547,7 +583,8 @@ test "RocksDbBackend: separate namespaces" {
 }
 
 test "RocksDbBackend: iterator prefix-bounded" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -567,8 +604,57 @@ test "RocksDbBackend: iterator prefix-bounded" {
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
+test "RocksDbBackend: iterator honors a prefix past 256 bytes and rejects over-cap" {
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
+    defer std.fs.cwd().deleteTree(path) catch {};
+    var db = try RocksDbBackend.open(path, .{});
+    defer db.close();
+
+    // Two owners whose scan prefixes share the first 290 bytes: any
+    // fixed-size clip shorter than the prefix merges their rows.
+    const owner_a = ("a" ** 290) ++ "-first";
+    const owner_b = ("a" ** 290) ++ "-other";
+    comptime std.debug.assert(std.mem.eql(u8, owner_a[0..290], owner_b[0..290]));
+
+    const ns = comptime backend.registered("rosters");
+    const key_a = owner_a ++ "\x00item1";
+    const key_b = owner_b ++ "\x00item2";
+    try db.put(ns, key_a, "a");
+    try db.put(ns, key_b, "b");
+
+    const prefix = owner_a ++ "\x00";
+
+    // Collect-then-delete, the pattern removeAll/destroyRoom callers use.
+    var keys: [4][backend.MAX_PREFIX_LEN]u8 = undefined;
+    var key_lens: [4]usize = undefined;
+    var scanned: usize = 0;
+    {
+        var iter = try db.iterator(ns, prefix);
+        defer iter.deinit();
+        while (iter.next()) |entry| {
+            if (scanned == keys.len) return error.TooManyEntries;
+            @memcpy(keys[scanned][0..entry.key.len], entry.key);
+            key_lens[scanned] = entry.key.len;
+            scanned += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), scanned);
+    try std.testing.expectEqualStrings(key_a, keys[0][0..key_lens[0]]);
+
+    for (key_lens[0..scanned], 0..) |len, i| {
+        try db.delete(ns, keys[i][0..len]);
+    }
+    const b_val = try db.get(std.testing.allocator, ns, key_b);
+    defer if (b_val) |v| std.testing.allocator.free(v);
+    try std.testing.expectEqualStrings("b", b_val.?);
+
+    try std.testing.expectError(error.PrefixTooLong, db.iterator(ns, "x" ** (backend.MAX_PREFIX_LEN + 1)));
+}
+
 test "RocksDbBackend: iterator returns key and value" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -584,7 +670,8 @@ test "RocksDbBackend: iterator returns key and value" {
 }
 
 test "RocksDbBackend: writeBatch commit" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -604,7 +691,8 @@ test "RocksDbBackend: writeBatch commit" {
 }
 
 test "RocksDbBackend: writeBatch abort" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     var db = try RocksDbBackend.open(path, .{});
     defer db.close();
@@ -617,8 +705,53 @@ test "RocksDbBackend: writeBatch abort" {
     try std.testing.expect(val == null);
 }
 
+test "RocksDbBackend: abort after a commit attempt is a no-op" {
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
+    defer std.fs.cwd().deleteTree(path) catch {};
+    var db = try RocksDbBackend.open(path, .{});
+    defer db.close();
+
+    var batch = try db.writeBatch();
+    try batch.put("users", "alice", "a");
+    try batch.commit();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    try std.testing.expect(batch.batch == null);
+
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+}
+
+test "RocksDbBackend: a failed write ends the batch" {
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
+    defer std.fs.cwd().deleteTree(path) catch {};
+    var db = try RocksDbBackend.open(path, .{});
+    defer db.close();
+
+    var batch = try db.writeBatch();
+    try batch.put("users", "alice", "a");
+    // Fault hook: the commit fails the way a RocksDB write error does.
+    batch.fail_commit = true;
+    try std.testing.expectError(error.RocksDbWriteFailed, batch.commit());
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+    try std.testing.expect(batch.batch == null);
+
+    // abort() after the commit attempt is a no-op.
+    batch.abort();
+    try std.testing.expectEqual(@as(u8, 1), batch.ends);
+
+    // Nothing was written.
+    const val = try db.get(std.testing.allocator, "users", "alice");
+    defer if (val) |v| std.testing.allocator.free(v);
+    try std.testing.expect(val == null);
+}
+
 test "RocksDbBackend: reopen preserves data" {
-    const path = freshTestDir();
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
     defer std.fs.cwd().deleteTree(path) catch {};
     {
         var db = try RocksDbBackend.open(path, .{});
@@ -632,4 +765,50 @@ test "RocksDbBackend: reopen preserves data" {
         defer if (val) |v| std.testing.allocator.free(v);
         try std.testing.expectEqualStrings("persisted", val.?);
     }
+}
+
+fn expectPrefixScan(db: anytype, ns: []const u8, prefix: []const u8, want: usize) !void {
+    var iter = try db.iterator(ns, prefix);
+    defer iter.deinit();
+    var n: usize = 0;
+    while (iter.next()) |e| {
+        try std.testing.expect(std.mem.startsWith(u8, e.key, prefix));
+        n += 1;
+    }
+    try std.testing.expectEqual(want, n);
+}
+
+test "RocksDbBackend: iterator scan over 0xFF tails, empty prefix, a shared-head owner and the exact cap" {
+    var path_buf: [64]u8 = undefined;
+    const path = freshTestDir(&path_buf);
+    defer std.fs.cwd().deleteTree(path) catch {};
+    var db = try RocksDbBackend.open(path, .{});
+    defer db.close();
+    const ns = comptime backend.registered("rosters");
+
+    // Keys that stress the lexicographic edges of a prefix scan: trailing
+    // 0xFF bytes, a key sitting on the computed upper bound, and all-0xFF
+    // prefixes. The counts pin the sorted order the scan must honor.
+    const ks = [_][]const u8{ "ab\xFE\xFF", "ab\xFF", "ab\xFF\x00x", "ab\xFF\xFF", "ac", "\xFF\xFE", "\xFF\xFF", "\xFF\xFF\x01" };
+    for (ks) |k| try db.put(ns, k, "v");
+    try expectPrefixScan(&db, ns, "ab\xFF", 3);
+    try expectPrefixScan(&db, ns, "ab\xFE", 1);
+    try expectPrefixScan(&db, ns, "\xFF\xFF", 2);
+    try expectPrefixScan(&db, ns, "\xFF", 3);
+    try expectPrefixScan(&db, ns, "", 8);
+
+    // Two owners sharing a 296-byte head: a clipped seek or compare merges
+    // their rows.
+    const owner_a = ("a" ** 290) ++ "-first\x00";
+    const owner_b = ("a" ** 290) ++ "-other\x00";
+    try db.put(ns, owner_a ++ "i", "a");
+    try db.put(ns, owner_b ++ "i", "b");
+    try expectPrefixScan(&db, ns, owner_b, 1);
+    try expectPrefixScan(&db, ns, owner_a, 1);
+
+    // An exact-cap prefix must be accepted and matched, not rejected.
+    const cap = "c" ** backend.MAX_PREFIX_LEN;
+    try db.put(ns, cap, "c");
+    try expectPrefixScan(&db, ns, cap, 1);
+    try expectPrefixScan(&db, ns, cap[0 .. backend.MAX_PREFIX_LEN - 1], 1);
 }

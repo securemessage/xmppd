@@ -26,6 +26,8 @@ const SslConn = ssl_mod.SslConn;
 const SslContext = ssl_mod.SslContext;
 const session_mod = @import("session.zig");
 const TlsState = session_mod.TlsState;
+const dns_async = @import("dns_async");
+const dns_mod = @import("dns");
 
 /// Outbound connection establishment state.
 pub const OutboundState = enum {
@@ -59,6 +61,54 @@ pub const DaneStatus = enum {
     pending,
 };
 
+/// Maximum concurrent dialback callbacks on one outbound connection.
+pub const MAX_PENDING_VERIFY = 8;
+
+/// One pending dialback verification exchange on an outbound connection:
+/// an inbound session submitted a db:result and we are waiting for the
+/// origin's verdict on our db:verify. Entries are keyed by (stream id,
+/// origin); a verdict only completes the entry whose id, from and to match,
+/// and only while the inbound slot still holds the same session
+/// (generation check) (S2).
+pub const PendingVerify = struct {
+    in_use: bool = false,
+    /// Inbound session slot that submitted the db:result.
+    inbound_slot: usize = 0,
+    /// Slot generation when the callback was registered.
+    inbound_gen: u32 = 0,
+    /// Inbound session stream id (the id= of our db:verify).
+    stream_id_buf: [64]u8 = undefined,
+    stream_id_len: usize = 0,
+    /// Claimed origin (from= of the db:result).
+    origin_buf: [256]u8 = undefined,
+    origin_len: usize = 0,
+    /// Host the db:result was addressed to (local domain or MUC host); our
+    /// db:verify and the final db:result answer speak as this host.
+    target_buf: [256]u8 = undefined,
+    target_len: usize = 0,
+    /// Dialback key to be verified.
+    key_buf: [128]u8 = undefined,
+    key_len: usize = 0,
+    /// db:verify was written to the peer.
+    verify_sent: bool = false,
+
+    pub fn streamId(self: *const PendingVerify) []const u8 {
+        return self.stream_id_buf[0..self.stream_id_len];
+    }
+
+    pub fn origin(self: *const PendingVerify) []const u8 {
+        return self.origin_buf[0..self.origin_len];
+    }
+
+    pub fn target(self: *const PendingVerify) []const u8 {
+        return self.target_buf[0..self.target_len];
+    }
+
+    pub fn key(self: *const PendingVerify) []const u8 {
+        return self.key_buf[0..self.key_len];
+    }
+};
+
 /// An outbound S2S connection to a remote domain.
 pub const OutboundConnection = struct {
     /// Remote domain we're connecting to.
@@ -71,7 +121,8 @@ pub const OutboundConnection = struct {
     stream: S2sStream,
     /// Socket file descriptor (-1 if not yet connected).
     fd: posix.fd_t = -1,
-    /// Target host we connected to (from SRV resolution).
+    /// Target host we connected to (borrowed from the adopted target
+    /// list; empty before the first connect attempt).
     target_host: []const u8 = "",
     /// Target port.
     target_port: u16 = 0,
@@ -88,23 +139,28 @@ pub const OutboundConnection = struct {
     remote_stream_id_len: usize = 0,
     /// Error message if state == .failed.
     error_msg: []const u8 = "",
-    /// STARTTLS proceed received but our own write buffer had not drained:
-    /// the handshake starts when handleOutboundWritable finishes flushing
-    /// (T250).
-    tls_upgrade_pending: bool = false,
-    /// If set, this outbound connection is a dialback verification callback.
-    /// The value is the inbound session slot that initiated the callback.
-    /// After db:verify response, the result is sent back on that inbound session.
-    db_callback_inbound_slot: ?usize = null,
-    /// The key and stream ID for the pending db:verify request.
-    db_callback_key_buf: [128]u8 = undefined,
-    db_callback_key_len: usize = 0,
-    db_callback_stream_id_buf: [64]u8 = undefined,
-    db_callback_stream_id_len: usize = 0,
+    /// Pending dialback callbacks awaiting a verdict (S2). One entry
+    /// per (stream id, origin, target): a later db:result for a different
+    /// target must not overwrite another session's callback.
+    db_pending: [MAX_PENDING_VERIFY]PendingVerify = [_]PendingVerify{.{}} ** MAX_PENDING_VERIFY,
+    /// Our own outbound dialback key awaiting its verdict: set when the key
+    /// is written on this connection, cleared by the typed db:result that
+    /// answers it. A verdict can only authenticate this connection while
+    /// that exchange is outstanding.
+    db_assertion_pending: bool = false,
+    /// A SASL <auth/> element was written on this connection. A SASL
+    /// outcome is only meaningful after the peer has seen our auth request.
+    sasl_auth_sent: bool = false,
     /// TLS connection — null for plain TCP, set after STARTTLS or direct TLS.
     tls_conn: ?SslConn = null,
     /// TLS handshake state for kqueue integration.
     tls_state: ?TlsState = null,
+    /// DANE state armed before the handshake. Present only when the TLSA
+    /// lookup found usable records, in which case the handshake itself
+    /// fails unless a record matches; null means the dialback fallback.
+    dane_state: ?ssl_mod.DaneState = null,
+    /// What `prepareDane` installed, read back for the verdict.
+    dane_prepared: ssl_mod.DanePrepared = .dane,
     /// Persistent read buffer (survives across kqueue events).
     read_buf: [READ_BUF_SIZE]u8 = undefined,
     read_start: usize = 0,
@@ -118,6 +174,20 @@ pub const OutboundConnection = struct {
     /// buffer across WANT_READ/WANT_WRITE (AGENTS.md identical pointer and
     /// length rule), so bytes queued after the stall wait behind it (S23).
     pinned_tls_len: usize = 0,
+    /// Connect targets from the last completed resolution, in RFC 2782
+    /// try order (AAAA then A per SRV target). The conn owns every slice;
+    /// empty until a resolution arrives.
+    targets: []dns_async.Target = &.{},
+    /// Index of the target the live or in-flight connect is bound to.
+    target_idx: usize = 0,
+    /// Next untried target; advances on connect failure or deadline.
+    next_idx: usize = 0,
+    /// Socket address of the current target (IP:port already resolved).
+    target_addr: std.net.Address = undefined,
+    /// Resolver session_key while a resolve is in flight; 0 when none.
+    dns_key: usize = 0,
+    /// Ident of the armed per-target connect deadline; 0 when none.
+    deadline_ident: usize = 0,
 
     const READ_BUF_SIZE = 8192;
     const WRITE_BUF_SIZE = 16384;
@@ -128,7 +198,7 @@ pub const OutboundConnection = struct {
         local_domain: []const u8,
         remote_domain: []const u8,
     ) !OutboundConnection {
-        // Copy the domain — callers hand slices that borrow the IPC recv
+        // Copy the domain: callers hand slices that borrow the IPC recv
         // buffer; the pool key depends on it being stable (T275).
         const domain = try allocator.dupe(u8, remote_domain);
         return .{
@@ -143,16 +213,11 @@ pub const OutboundConnection = struct {
 
     pub fn deinit(self: *OutboundConnection, allocator: std.mem.Allocator) void {
         for (self.pending_stanzas.items) |stanza| {
-            allocator.free(stanza.from_jid);
-            allocator.free(stanza.to_jid);
-            allocator.free(stanza.xml);
+            stanza.deinit(allocator);
         }
         self.pending_stanzas.deinit(allocator);
         allocator.free(self.remote_domain);
-        if (self.target_host.len > 0) {
-            allocator.free(self.target_host);
-            self.target_host = "";
-        }
+        // dropTargets below frees the DANE state too (it borrows target data).
         if (self.tls_conn) |*tls| {
             tls.shutdown();
             tls.deinit();
@@ -162,6 +227,53 @@ pub const OutboundConnection = struct {
             posix.close(self.fd);
             self.fd = -1;
         }
+        self.dropTargets();
+    }
+
+    /// The target the live or in-flight connect is bound to: addr, host,
+    /// TLSA records and tlsa_status for that target alone. Null before the
+    /// first resolution completes; the TLSA result is the seam consumed by
+    /// the outbound DANE check (X2b, ADR-13).
+    pub fn curTarget(self: *const OutboundConnection) ?*const dns_async.Target {
+        if (self.target_idx >= self.targets.len) return null;
+        return &self.targets[self.target_idx];
+    }
+
+    /// Take ownership of a resolution's target list for this connection.
+    pub fn adoptTargets(self: *OutboundConnection, targets: []dns_async.Target) void {
+        self.dropTargets();
+        self.targets = targets;
+        self.target_idx = 0;
+        self.next_idx = 0;
+    }
+
+    /// Free the adopted targets and drop any DANE state built for them.
+    pub fn dropTargets(self: *OutboundConnection) void {
+        for (self.targets) |t| {
+            self.alloc.free(t.host);
+            for (t.tlsa) |r| self.alloc.free(r.association_data);
+            if (t.tlsa.len > 0) self.alloc.free(t.tlsa);
+        }
+        if (self.targets.len > 0) self.alloc.free(self.targets);
+        self.targets = &.{};
+        self.target_host = "";
+        self.dropDaneState();
+    }
+
+    /// Release the DANE state alone: it borrows the target's record data, so
+    /// it must never outlive the targets it was built from.
+    pub fn dropDaneState(self: *OutboundConnection) void {
+        if (self.dane_state) |*s| s.deinit();
+        self.dane_state = null;
+        self.dane_prepared = .dane;
+    }
+
+    /// Hostname of the current target, for logs and TLSA owner names.
+    /// Borrows from the adopted target list; "" before the first attempt.
+    pub fn targetHost(self: *const OutboundConnection) []const u8 {
+        if (self.target_host.len > 0) return self.target_host;
+        const t = self.curTarget() orelse return "";
+        return t.host;
     }
 
     /// Whether TLS handshake is in progress.
@@ -356,6 +468,26 @@ pub const OutboundConnection = struct {
         return self.state == .failed;
     }
 
+    /// Whether a db:verify may be written on this connection. Only the
+    /// post-TLS auth phase or an established stream may carry the dialback
+    /// key: earlier the key would go out in cleartext.
+    pub fn canSendDbVerify(self: *const OutboundConnection) bool {
+        if (self.tls_conn == null) return false;
+        return self.state == .authenticating or
+            self.state == .established or
+            self.stream.state == .features_auth;
+    }
+
+    /// Whether a SASL <success/> or <failure/> may be accepted now: TLS is
+    /// up, the auth phase is open, and our <auth/> went out. Any other
+    /// outcome means the peer skipped a negotiation step.
+    pub fn canAcceptSaslOutcome(self: *const OutboundConnection) bool {
+        return self.tls_conn != null and
+            self.state == .authenticating and
+            self.stream.state == .authenticating and
+            self.sasl_auth_sent;
+    }
+
     /// Transition to the TLS handshake phase after TCP connect completes.
     pub fn tcpConnected(self: *OutboundConnection) void {
         if (self.is_direct_tls) {
@@ -432,23 +564,135 @@ pub const OutboundConnection = struct {
         return .none;
     }
 
-    /// STARTTLS proceed received — flush our side first; the caller upgrades
-    /// when this returns true, or parks us via tls_upgrade_pending on false
-    /// (T250: a partially-written plaintext tail must never enter TLS).
+    /// STARTTLS proceed received: by the time <proceed/> arrives, all bytes
+    /// through the <starttls/> request are by definition on the wire (the
+    /// peer could not have seen it otherwise; T250). Anything left in
+    /// the local write buffer was queued after <starttls/>; flushing it now
+    /// would push plaintext into the TLS record layer, so fail instead.
     pub fn handleStarttlsProceed(self: *OutboundConnection) bool {
-        const drained = self.flushWrite() catch false;
-        if (drained) {
-            self.state = .tls_handshake;
-            return true;
+        if (self.hasPendingWrite()) {
+            self.fail("plaintext-after-starttls");
+            return false;
         }
-        self.tls_upgrade_pending = true;
-        return false;
+        self.state = .tls_handshake;
+        return true;
     }
 
     /// SASL success received — connection is authenticated.
     pub fn handleAuthSuccess(self: *OutboundConnection) void {
         self.stream.setAuthenticated();
         self.state = .established;
+    }
+
+    /// Register a dialback callback. A repeated db:result for the same
+    /// (stream id, origin, target) replaces that entry; returns null when
+    /// the table is full.
+    pub fn addPendingVerify(
+        self: *OutboundConnection,
+        inbound_slot: usize,
+        inbound_gen: u32,
+        stream_id: []const u8,
+        origin: []const u8,
+        target: []const u8,
+        key: []const u8,
+    ) ?usize {
+        var idx: ?usize = null;
+        for (&self.db_pending, 0..) |*p, i| {
+            if (p.in_use) {
+                if (std.mem.eql(u8, p.streamId(), stream_id) and
+                    std.ascii.eqlIgnoreCase(p.origin(), origin) and
+                    std.ascii.eqlIgnoreCase(p.target(), target))
+                {
+                    idx = i; // same exchange resubmitted: replace it
+                    break;
+                }
+            } else if (idx == null) {
+                idx = i;
+            }
+        }
+        const slot = idx orelse return null;
+        var p = &self.db_pending[slot];
+        p.* = .{
+            .in_use = true,
+            .inbound_slot = inbound_slot,
+            .inbound_gen = inbound_gen,
+        };
+        const sl = @min(stream_id.len, p.stream_id_buf.len);
+        @memcpy(p.stream_id_buf[0..sl], stream_id[0..sl]);
+        p.stream_id_len = sl;
+        const ol = @min(origin.len, p.origin_buf.len);
+        @memcpy(p.origin_buf[0..ol], origin[0..ol]);
+        p.origin_len = ol;
+        const tl = @min(target.len, p.target_buf.len);
+        @memcpy(p.target_buf[0..tl], target[0..tl]);
+        p.target_len = tl;
+        const kl = @min(key.len, p.key_buf.len);
+        @memcpy(p.key_buf[0..kl], key[0..kl]);
+        p.key_len = kl;
+        return slot;
+    }
+
+    /// Find the pending entry a verdict refers to: id must equal the entry's
+    /// stream id, from the claimed origin, to the host the db:result named
+    /// (S2 correlation).
+    pub fn findPendingVerify(
+        self: *const OutboundConnection,
+        id: []const u8,
+        from: []const u8,
+        to: []const u8,
+    ) ?usize {
+        if (id.len == 0 or from.len == 0) return null;
+        for (self.db_pending, 0..) |p, i| {
+            // A verdict can only answer a db:verify that reached the peer.
+            if (!p.in_use or !p.verify_sent) continue;
+            if (std.mem.eql(u8, p.streamId(), id) and
+                std.ascii.eqlIgnoreCase(p.origin(), from) and
+                std.ascii.eqlIgnoreCase(p.target(), to)) return i;
+        }
+        return null;
+    }
+
+    pub fn clearPendingVerify(self: *OutboundConnection, idx: usize) void {
+        if (idx < self.db_pending.len) self.db_pending[idx] = .{};
+    }
+
+    /// Complete the outstanding dialback key this connection sent, if the
+    /// verdict answers it. The responder echoes from and to swapped
+    /// (from=peer, to=us); a missing attribute is not a mismatch. Returns
+    /// false, leaving the exchange outstanding, for anything else.
+    pub fn takePendingAssertion(self: *OutboundConnection, from: []const u8, to: []const u8) bool {
+        // The dialback key only leaves the connection after TLS, so a
+        // verdict arriving in cleartext cannot answer it.
+        if (self.tls_conn == null) return false;
+        if (!self.db_assertion_pending) return false;
+        if (from.len > 0 and !std.ascii.eqlIgnoreCase(from, self.remote_domain)) return false;
+        if (to.len > 0 and !std.ascii.eqlIgnoreCase(to, self.local_domain)) return false;
+        self.db_assertion_pending = false;
+        return true;
+    }
+
+    /// Any registered callback (sent or not).
+    pub fn hasPendingVerify(self: *const OutboundConnection) bool {
+        for (self.db_pending) |p| {
+            if (p.in_use) return true;
+        }
+        return false;
+    }
+
+    /// Any registered callback whose db:verify has not been written yet.
+    pub fn hasUnsentVerify(self: *const OutboundConnection) bool {
+        for (self.db_pending) |p| {
+            if (p.in_use and !p.verify_sent) return true;
+        }
+        return false;
+    }
+
+    pub fn pendingVerifyCount(self: *const OutboundConnection) usize {
+        var n: usize = 0;
+        for (self.db_pending) |p| {
+            if (p.in_use) n += 1;
+        }
+        return n;
     }
 
     /// SASL failure or auth rejected.
@@ -465,7 +709,7 @@ pub const OutboundConnection = struct {
 
     /// Get the stream open XML to send to the remote server.
     /// remote_domain was peer-supplied at queue time (T275 duped it, but the
-    /// incoming bytes may still be entity-decoded specials — escape (S1).
+    /// incoming bytes may still be entity-decoded specials: escape (S1).
     pub fn buildStreamOpen(self: *const OutboundConnection, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
@@ -513,11 +757,17 @@ pub const OutboundConnection = struct {
     }
 };
 
-/// A stanza queued for delivery.
+/// A stanza queued for delivery. Owns all three slices.
 pub const PendingStanza = struct {
     from_jid: []const u8,
     to_jid: []const u8,
     xml: []const u8,
+
+    pub fn deinit(self: PendingStanza, allocator: std.mem.Allocator) void {
+        allocator.free(self.from_jid);
+        allocator.free(self.to_jid);
+        allocator.free(self.xml);
+    }
 };
 
 /// Actions the connector tells the event loop to perform.
@@ -623,6 +873,26 @@ test "OutboundConnection: init and basic state" {
     try std.testing.expect(!conn.isFailed());
 }
 
+test "OutboundConnection: canSendDbVerify requires a TLS layer" {
+    const alloc = std.testing.allocator;
+    var ctx = try SslContext.initClient();
+    defer ctx.deinit();
+
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc);
+
+    conn.state = .established;
+    try std.testing.expect(!conn.canSendDbVerify());
+
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    defer posix.close(fds[1]);
+    conn.fd = fds[0]; // owned by the conn now; deinit closes it
+    conn.tls_conn = try SslConn.initClient(ctx, fds[0], null);
+    try std.testing.expect(conn.canSendDbVerify());
+}
+
 test "OutboundConnection: TCP connected → stream open (STARTTLS path)" {
     const alloc = std.testing.allocator;
     var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
@@ -672,6 +942,51 @@ test "OutboundConnection: full DANE-verified lifecycle" {
     // Auth success
     conn.handleAuthSuccess();
     try std.testing.expect(conn.isEstablished());
+}
+
+test "OutboundConnection: <proceed/> with plaintext beyond <starttls/> fails the connection (T250)" {
+    const alloc = std.testing.allocator;
+
+    // TCP loopback pair with a tiny send buffer (unix socketpairs ignore
+    // SO_SNDBUF on FreeBSD): queue the <starttls/> request plus a tail.
+    const fds = try makeTestTcpPair();
+    defer posix.close(fds[1]); // fds[0] goes out via conn.deinit below
+
+    const sndbuf: c_int = 2048;
+    var actual_sndbuf: c_int = 0;
+    var optlen: posix.socklen_t = @sizeOf(c_int);
+    try posix.setsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+    if (std.c.getsockopt(fds[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&actual_sndbuf), &optlen) != 0)
+        return error.SkipZigTest;
+
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc);
+    conn.fd = fds[0];
+    conn.tcpConnected();
+    conn.state = .starttls_negotiation;
+
+    // Queue the <starttls/> request...
+    var buf: [2048]u8 = undefined;
+    const msg = try conn.buildStarttls(&buf);
+    try conn.queueWrite(msg);
+
+    // ...and a tail queued AFTER <starttls/> (the protocol error), big
+    // enough that the flush below cannot drain it into the tiny send
+    // buffer: the guard must catch bytes a real flush left behind (T250).
+    const tail = try alloc.alloc(u8, 8192);
+    defer alloc.free(tail);
+    @memset(tail, 'x');
+    try conn.queueWrite(tail);
+
+    // A real flush under backpressure: part goes out, the tail lingers.
+    const flushed_all = try conn.flushWrite();
+    try std.testing.expect(!flushed_all);
+    try std.testing.expect(conn.hasPendingWrite());
+
+    // <proceed/> arrives: the connection must fail, no upgrade begins.
+    try std.testing.expect(!conn.handleStarttlsProceed());
+    try std.testing.expect(conn.isFailed());
+    try std.testing.expectEqualStrings("plaintext-after-starttls", conn.error_msg);
 }
 
 test "OutboundConnection: STARTTLS lifecycle with no DANE" {
@@ -731,6 +1046,34 @@ test "OutboundConnection: queue and count pending stanzas" {
     try conn.queueStanza(alloc, "alice@a.example", "bob@b.example", "<message><body>hi</body></message>");
     try conn.queueStanza(alloc, "carol@a.example", "dave@b.example", "<message><body>hey</body></message>");
     try std.testing.expectEqual(@as(usize, 2), conn.pendingCount());
+}
+
+test "OutboundConnection: one pending verify per (stream id, origin, target)" {
+    const alloc = std.testing.allocator;
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc);
+
+    // One socket to the remote host carries verifies for several origin or
+    // target pairs sharing a stream id: each is its own entry.
+    const s1 = conn.addPendingVerify(1, 10, "stream1", "a.example", "one.example", "key1") orelse return error.NoSlot;
+    const s2 = conn.addPendingVerify(2, 11, "stream1", "a.example", "two.example", "key2") orelse return error.NoSlot;
+    try std.testing.expect(s1 != s2);
+    try std.testing.expectEqual(@as(usize, 2), conn.pendingVerifyCount());
+
+    // A verdict only answers a verify that reached the peer.
+    try std.testing.expect(conn.findPendingVerify("stream1", "a.example", "one.example") == null);
+    conn.db_pending[s1].verify_sent = true;
+    conn.db_pending[s2].verify_sent = true;
+
+    // A verdict correlates to its own entry (S2).
+    try std.testing.expectEqual(s1, conn.findPendingVerify("stream1", "a.example", "one.example").?);
+    try std.testing.expectEqual(s2, conn.findPendingVerify("stream1", "a.example", "two.example").?);
+
+    // The same triple resubmitted replaces its entry in place.
+    const s3 = conn.addPendingVerify(3, 12, "stream1", "a.example", "one.example", "key3") orelse return error.NoSlot;
+    try std.testing.expectEqual(s1, s3);
+    try std.testing.expectEqual(@as(usize, 2), conn.pendingVerifyCount());
+    try std.testing.expectEqualStrings("key3", conn.db_pending[s1].key());
 }
 
 test "OutboundConnection: buildStreamOpen" {
@@ -823,12 +1166,14 @@ test "ConnectionPool: remove" {
 
 /// Self-signed throwaway cert+key for "localhost" via the openssl CLI (no
 /// key material in the tree). error.SkipZigTest when the tool is missing.
+/// openssl writes key-generation progress to stderr, which can exceed a
+/// small output cap under load, so allow generous room for it.
 fn genTestTlsCert(dir: std.fs.Dir) !void {
     const r = std.process.Child.run(.{
         .allocator = std.testing.allocator,
         .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
         .cwd_dir = dir,
-        .max_output_bytes = 4096,
+        .max_output_bytes = 64 * 1024,
     }) catch return error.SkipZigTest;
     defer std.testing.allocator.free(r.stdout);
     defer std.testing.allocator.free(r.stderr);
@@ -884,7 +1229,7 @@ fn makeTestTcpPair() ![2]posix.fd_t {
     return .{ client_fd, server_fd };
 }
 
-test "OutboundConnection: stalled TLS write pins its slice; bytes queued behind it still arrive (S23)" {
+test "OutboundConnection: stalled TLS write pins its slice; bytes queued behind it still arrive" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

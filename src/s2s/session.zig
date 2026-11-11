@@ -9,6 +9,7 @@
 const std = @import("std");
 const posix = std.posix;
 const xml = @import("xml");
+const xmpp = @import("xmpp");
 const stream_mod = @import("stream.zig");
 const S2sStream = stream_mod.S2sStream;
 const S2sStreamState = stream_mod.S2sStreamState;
@@ -17,10 +18,18 @@ const S2sFeatureSet = stream_mod.S2sFeatureSet;
 const Role = stream_mod.Role;
 const connector_mod = @import("connector.zig");
 const DaneStatus = connector_mod.DaneStatus;
+const dns = @import("dns");
+const dns_async = @import("dns_async");
 const ssl = @import("ssl");
 const SslConn = ssl.SslConn;
 const SslContext = ssl.SslContext;
 const dialback_mod = @import("dialback.zig");
+
+const log = std.log.scoped(.s2s_session);
+
+/// Phase of the async inbound DANE chain (X2b): which record query the
+/// pending dane_key refers to.
+pub const InboundDanePhase = enum { none, srv_tls, srv_plain, tlsa };
 
 /// TLS handshake state for non-blocking integration with kqueue.
 pub const TlsState = enum {
@@ -63,7 +72,7 @@ pub const S2sSession = struct {
     /// length rule), so bytes queued after the stall wait behind it (S23).
     pinned_tls_len: usize = 0,
     /// <proceed/> queued but not fully flushed: the TLS upgrade waits for
-    /// the drain (T250 — a partially sent proceed must never reach the
+    /// the drain (T250: a partially sent proceed must never reach the
     /// peer through the TLS record layer).
     tls_upgrade_pending: bool = false,
     pending_tls_ctx: ?SslContext = null,
@@ -96,14 +105,54 @@ pub const S2sSession = struct {
     /// Inbound dialback state tracker.
     inbound_dialback: dialback_mod.InboundDialback = .{},
 
+    /// Domains this session is authenticated for (S2). Written only by a
+    /// DANE-verified SASL EXTERNAL success or a dialback callback that
+    /// returned valid for that origin. A stanza's from= must be in the set
+    /// once the session is established; a restart header from= must never
+    /// re-identify the peer.
+    auth_domain_buf: [8][256]u8 = undefined,
+    auth_domain_len: [8]u16 = @splat(0),
+    auth_domain_count: usize = 0,
+    /// Domain pending DANE verification on the current TLS stream. Promoted
+    /// into the authenticated set only when the SASL EXTERNAL exchange for
+    /// it succeeds (executeAction .send_sasl_success).
+    dane_domain_buf: [256]u8 = undefined,
+    dane_domain_len: usize = 0,
+    /// Async inbound DANE lookup state (X2b): resolver session_key, the
+    /// chain phase it refers to, and whether the auth features wait on it.
+    dane_key: usize = 0,
+    dane_lookup_pending: bool = false,
+    dane_phase: InboundDanePhase = .none,
+    /// SRV target chosen for the TLSA owner name (empty = _5269 fallback
+    /// on the bare domain).
+    dane_target_buf: [256]u8 = undefined,
+    dane_target_len: usize = 0,
+    dane_target_port: u16 = 0,
+    /// TLSA outcome for this TLS stream (records + status per ADR-13):
+    /// the seam the handshake-side DANE check consumes. Records are owned
+    /// and freed at deinit; tlsa_status is authoritative over record count.
+    dane_tlsa_records: []dns.TlsaRecord = &.{},
+    dane_tlsa_status: dns_async.TlsaStatus = .absent,
+    /// Whether a stream open was already processed; any later open on this
+    /// socket is a restart (post-TLS, post-SASL, post-dialback).
+    stream_open_seen: bool = false,
+    /// Whether our own <stream:stream> has been written on the current stream.
+    /// A stream error for a peer whose header we never answered must open the
+    /// stream first (RFC 6120 4.9.1), as c2s does.
+    stream_header_sent: bool = false,
+    /// Host this stream is addressed to (to= of the stream header: the local
+    /// domain or the MUC host). Replies echo it as their from= (S2).
+    served_host_buf: [256]u8 = undefined,
+    served_host_len: usize = 0,
+
     /// Inbound stanza accumulation — buffers child XML content for stanzas
     /// received on an established session, to be forwarded to xmppd-core via IPC.
     stanza_active: bool = false,
     stanza_tag_buf: [32]u8 = undefined,
     stanza_tag_len: usize = 0,
-    stanza_from_buf: [512]u8 = undefined,
+    stanza_from_buf: [xmpp.max_jid_octets]u8 = undefined,
     stanza_from_len: usize = 0,
-    stanza_to_buf: [512]u8 = undefined,
+    stanza_to_buf: [xmpp.max_jid_octets]u8 = undefined,
     stanza_to_len: usize = 0,
     stanza_type_buf: [32]u8 = undefined,
     stanza_type_len: usize = 0,
@@ -111,6 +160,109 @@ pub const S2sSession = struct {
     stanza_id_len: usize = 0,
     stanza_inner_buf: [16384]u8 = undefined,
     stanza_inner_len: usize = 0,
+    /// Namespace prefix/URI re-emitted by accumulateElement (S1).
+    /// Prefix of the stanza ROOT for buildStanzaXml's root xmlns emission.
+    stanza_root_ns_prefix_buf: [64]u8 = undefined,
+    stanza_root_ns_prefix_len: usize = 0,
+    stanza_root_ns_uri_buf: [256]u8 = undefined,
+    stanza_root_ns_uri_len: usize = 0,
+    /// True once any accumulate* call overflowed stanza_inner_buf; polite
+    /// dropping of a stanza whose inner buffer can't fit it (not forward).
+    stanza_accum_overflowed: bool = false,
+    /// A from=/to= longer than its buffer is an overflow, not a JID: the
+    /// truncated prefix must never reach address validation or
+    /// preparation. dispatch drops the stanza (to=) or fails the stream
+    /// invalid-from (from=).
+    stanza_from_overflowed: bool = false,
+    stanza_to_overflowed: bool = false,
+
+    /// Record a domain as authenticated for this session (dedup,
+    /// case-insensitive). Returns false when the set is full and the domain
+    /// was NOT recorded, loudly: a silent drop would let a peer believe
+    /// multiplexing succeeded. A restart with an unrecorded from= is
+    /// rejected upstream by the from= check before FSM transitions.
+    pub fn addAuthenticatedDomain(self: *S2sSession, domain: []const u8) bool {
+        if (domain.len == 0 or domain.len > 256) return false;
+        if (self.isAuthenticatedDomain(domain)) return true;
+        if (self.auth_domain_count >= 8) {
+            log.warn("inbound S2S id={d}: authenticated-domain set full (8); {s} NOT recorded", .{ self.id, domain });
+            return false;
+        }
+        const i = self.auth_domain_count;
+        @memcpy(self.auth_domain_buf[i][0..domain.len], domain);
+        self.auth_domain_len[i] = @intCast(domain.len);
+        self.auth_domain_count += 1;
+        return true;
+    }
+
+    pub fn isAuthenticatedDomain(self: *const S2sSession, domain: []const u8) bool {
+        for (self.auth_domain_buf[0..self.auth_domain_count], self.auth_domain_len[0..self.auth_domain_count]) |*buf, len| {
+            if (std.ascii.eqlIgnoreCase(buf[0..len], domain)) return true;
+        }
+        return false;
+    }
+
+    /// Stash the domain DANE is asked to verify (performInboundDane).
+    pub fn setDaneCandidate(self: *S2sSession, domain: []const u8) void {
+        const n = @min(domain.len, self.dane_domain_buf.len);
+        @memcpy(self.dane_domain_buf[0..n], domain[0..n]);
+        self.dane_domain_len = n;
+    }
+
+    /// Promote the DANE candidate into the authenticated set. Called from
+    /// the SASL-EXTERNAL success action; a no-op without a candidate.
+    /// Returns false when a candidate exists but the domain set is full and
+    /// it was NOT recorded: the identity must not be accepted then.
+    pub fn promoteDaneCandidate(self: *S2sSession) bool {
+        if (self.dane_domain_len == 0) return true;
+        return self.addAuthenticatedDomain(self.dane_domain_buf[0..self.dane_domain_len]);
+    }
+
+    /// The domain under DANE verification (the candidate).
+    pub fn daneDomain(self: *const S2sSession) []const u8 {
+        return self.dane_domain_buf[0..self.dane_domain_len];
+    }
+
+    /// Record the SRV target the TLSA owner name is built from; an empty
+    /// target selects the _5269 fallback on the bare domain. The target is
+    /// peer-controlled wire data, so an oversized name is an error the
+    /// caller drops the record on, never an assert (H1).
+    pub fn setDaneTarget(self: *S2sSession, target: []const u8, port: u16) !void {
+        if (target.len > self.dane_target_buf.len) return error.InvalidDnsName;
+        @memcpy(self.dane_target_buf[0..target.len], target);
+        self.dane_target_len = target.len;
+        self.dane_target_port = port;
+    }
+
+    pub fn daneTarget(self: *const S2sSession) []const u8 {
+        return self.dane_target_buf[0..self.dane_target_len];
+    }
+
+    /// Move parsed TLSA records onto the session (the inbound DANE seam);
+    /// the caller's list storage is released but the record contents are
+    /// adopted. Frees any previously adopted set first. On allocation
+    /// failure the caller still owns `recs` and must finish the lookup as
+    /// failed rather than present.
+    pub fn adoptDaneTlsa(self: *S2sSession, recs: []dns.TlsaRecord, alloc: std.mem.Allocator) !void {
+        self.dropDaneTlsa(alloc);
+        const owned = try alloc.alloc(dns.TlsaRecord, recs.len);
+        @memcpy(owned, recs);
+        self.dane_tlsa_records = owned;
+    }
+
+    /// Free the adopted TLSA set.
+    pub fn dropDaneTlsa(self: *S2sSession, alloc: std.mem.Allocator) void {
+        for (self.dane_tlsa_records) |r| alloc.free(r.association_data);
+        if (self.dane_tlsa_records.len > 0) alloc.free(self.dane_tlsa_records);
+        self.dane_tlsa_records = &.{};
+    }
+
+    /// Whether a stream-restart from= is lawful: post-auth it must already
+    /// be authenticated; pre-auth (post-TLS) it must not change origin.
+    pub fn restartFromAllowed(self: *const S2sSession, from: []const u8) bool {
+        if (self.auth_domain_count > 0) return self.isAuthenticatedDomain(from);
+        return std.ascii.eqlIgnoreCase(from, self.getRemoteDomain());
+    }
 
     pub fn init(fd: posix.fd_t, id: usize, local_domain: []const u8) S2sSession {
         var session = S2sSession{
@@ -204,6 +356,20 @@ pub const S2sSession = struct {
         const copy_len = @min(domain.len, self.remote_domain_buf.len);
         @memcpy(self.remote_domain_buf[0..copy_len], domain[0..copy_len]);
         self.remote_domain_len = copy_len;
+    }
+
+    /// Set the host this stream is addressed to (validated by the caller
+    /// against the served hosts).
+    pub fn setServedHost(self: *S2sSession, host: []const u8) void {
+        const n = @min(host.len, self.served_host_buf.len);
+        @memcpy(self.served_host_buf[0..n], host[0..n]);
+        self.served_host_len = n;
+    }
+
+    /// The host replies speak as: the requested host, or the local domain
+    /// when the stream header carried no to=.
+    pub fn getServedHost(self: *const S2sSession) []const u8 {
+        return if (self.served_host_len > 0) self.served_host_buf[0..self.served_host_len] else self.stream.local_domain;
     }
 
     /// Whether the session is authenticated and established.
@@ -392,13 +558,14 @@ pub const S2sSession = struct {
     }
 
     /// Build the stream open response XML for an inbound connection.
-    /// id/from are our own bytes, but `to` is the peer-supplied stream-open
-    /// from= value — escaped like any client/peer-controlled attribute (S1).
+    /// id/from are our own bytes (from= echoes the requested served host),
+    /// but `to` is the peer-supplied stream-open from= value: escaped like
+    /// any client/peer-controlled attribute (S1).
     pub fn buildStreamOpenResponse(self: *const S2sSession, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
         try writer.writeAll("<?xml version='1.0'?><stream:stream xmlns='jabber:server' xmlns:stream='http://etherx.jabber.org/streams' xmlns:db='jabber:server:dialback' from='");
-        try xmlEscapeWrite(writer, self.stream.local_domain);
+        try xmlEscapeWrite(writer, self.getServedHost());
         try writer.writeAll("' to='");
         try xmlEscapeWrite(writer, self.getRemoteDomain());
         try writer.writeAll("' id='");
@@ -419,9 +586,11 @@ pub const S2sSession = struct {
         if (features.sasl_external) {
             try writer.writeAll("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms>");
         }
-        if (features.dialback) {
-            try writer.writeAll("<db:features><db:dialback/></db:features>");
-        }
+        // No dialback stream feature: <db:features><db:dialback/> exists in no
+        // spec, and the standard XEP-0220 2.4.2 dialback-errors feature is
+        // only advertised once dialback error handling is implemented (X1).
+        // Traditional dialback support stays signaled by xmlns:db in the
+        // stream header.
         try writer.writeAll("</stream:features>");
         return fbs.getWritten();
     }
@@ -452,7 +621,9 @@ pub const S2sSession = struct {
         return fbs.getWritten();
     }
 
-    /// Build a stream error response.
+    /// Build a stream error response. The stream header is a separate write so
+    /// an oversized host or domain cannot stop the error itself (RFC 6120
+    /// 4.9.1); see sendStreamError.
     pub fn buildStreamError(_: *const S2sSession, buf: []u8, error_name: []const u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const writer = fbs.writer();
@@ -471,24 +642,32 @@ pub const S2sSession = struct {
     pub fn startStanza(self: *S2sSession, elem: xml.Element) void {
         self.stanza_active = true;
         self.stanza_inner_len = 0;
+        self.stanza_accum_overflowed = false;
+        self.startStanzaCaptureNs(elem.prefix, elem.namespace_uri);
         // Tag name
         const tl = @min(elem.local_name.len, self.stanza_tag_buf.len);
         @memcpy(self.stanza_tag_buf[0..tl], elem.local_name[0..tl]);
         self.stanza_tag_len = tl;
-        // Extract from/to/type/id attributes
+        // Extract from/to/type/id attributes. An over-long from= or to=
+        // keeps its truncated prefix for logging but flags the overflow so
+        // dispatch rejects the stanza instead of preparing a clipped JID.
         self.stanza_from_len = 0;
         self.stanza_to_len = 0;
         self.stanza_type_len = 0;
         self.stanza_id_len = 0;
+        self.stanza_from_overflowed = false;
+        self.stanza_to_overflowed = false;
         for (elem.attributes) |attr| {
             if (std.mem.eql(u8, attr.local_name, "from")) {
                 const fl = @min(attr.value.len, self.stanza_from_buf.len);
                 @memcpy(self.stanza_from_buf[0..fl], attr.value[0..fl]);
                 self.stanza_from_len = fl;
+                self.stanza_from_overflowed = attr.value.len > self.stanza_from_buf.len;
             } else if (std.mem.eql(u8, attr.local_name, "to")) {
                 const tol = @min(attr.value.len, self.stanza_to_buf.len);
                 @memcpy(self.stanza_to_buf[0..tol], attr.value[0..tol]);
                 self.stanza_to_len = tol;
+                self.stanza_to_overflowed = attr.value.len > self.stanza_to_buf.len;
             } else if (std.mem.eql(u8, attr.local_name, "type")) {
                 const tyl = @min(attr.value.len, self.stanza_type_buf.len);
                 @memcpy(self.stanza_type_buf[0..tyl], attr.value[0..tyl]);
@@ -501,41 +680,108 @@ pub const S2sSession = struct {
         }
     }
 
+    pub fn stanzaRootNsPrefix(self: *const S2sSession) []const u8 {
+        return self.stanza_root_ns_prefix_buf[0..self.stanza_root_ns_prefix_len];
+    }
+
+    pub fn stanzaRootNsUri(self: *const S2sSession) []const u8 {
+        return self.stanza_root_ns_uri_buf[0..self.stanza_root_ns_uri_len];
+    }
+
+    pub fn startStanzaCaptureNs(self: *S2sSession, prefix: []const u8, uri: []const u8) void {
+        const pl = @min(prefix.len, self.stanza_root_ns_prefix_buf.len);
+        @memcpy(self.stanza_root_ns_prefix_buf[0..pl], prefix[0..pl]);
+        self.stanza_root_ns_prefix_len = pl;
+        const ul = @min(uri.len, self.stanza_root_ns_uri_buf.len);
+        @memcpy(self.stanza_root_ns_uri_buf[0..ul], uri[0..ul]);
+        self.stanza_root_ns_uri_len = ul;
+    }
+
+    pub fn stanzaBroken(self: *const S2sSession) bool {
+        return self.stanza_accum_overflowed;
+    }
+
+    fn markOverflow(self: *S2sSession) void {
+        self.stanza_accum_overflowed = true;
+    }
+
     /// Accumulate a child element opening tag into the stanza inner buffer.
-    pub fn accumulateElement(self: *S2sSession, elem: xml.Element) void {
+    /// Namespace declarations carry peer-owned syntax like any other attr:
+    /// they are re-emitted, so `<received xmlns='urn:xmpp:receipts'/>`
+    /// keeps its xmlns (S1). A prefixed attribute re-emits its prefix
+    /// binding too, resolved through the reader's namespace stack; without
+    /// it the forwarded element references an undeclared prefix.
+    /// `reader` may be null in unit rigs, which then skips prefix bindings.
+    pub fn accumulateElement(self: *S2sSession, elem: xml.Element, reader: ?*const xml.Reader) void {
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
         const w = fbs.writer();
-        w.writeByte('<') catch return;
-        w.writeAll(elem.name) catch return;
-        for (elem.attributes) |attr| {
-            w.writeByte(' ') catch return;
-            w.writeAll(attr.name) catch return;
-            w.writeAll("='") catch return;
-            xmlEscapeWrite(w, attr.value) catch return;
-            w.writeByte('\'') catch return;
+        w.writeByte('<') catch return self.markOverflow();
+        w.writeAll(elem.name) catch return self.markOverflow();
+        if (elem.namespace_uri.len > 0) {
+            if (elem.prefix.len > 0) {
+                w.writeAll(" xmlns:") catch return self.markOverflow();
+                w.writeAll(elem.prefix) catch return self.markOverflow();
+            } else {
+                w.writeAll(" xmlns") catch return self.markOverflow();
+            }
+            w.writeAll("='") catch return self.markOverflow();
+            xmlEscapeWrite(w, elem.namespace_uri) catch return self.markOverflow();
+            w.writeByte('\'') catch return self.markOverflow();
+        }
+        // Attribute prefixes declared once per element: duplicate xmlns:p on
+        // one tag would be a duplicate XML attribute. The dedupe scans the
+        // attributes already written on this tag, so any number of distinct
+        // prefixes re-emits its binding exactly once.
+        for (elem.attributes, 0..) |attr, ai| {
+            if (attr.prefix.len > 0 and
+                !std.mem.eql(u8, attr.prefix, "xml") and
+                !std.mem.eql(u8, attr.prefix, "xmlns"))
+            {
+                var seen = elem.prefix.len > 0 and std.mem.eql(u8, elem.prefix, attr.prefix);
+                for (elem.attributes[0..ai]) |prev| {
+                    if (std.mem.eql(u8, prev.prefix, attr.prefix)) seen = true;
+                }
+                const uri = if (reader) |r| r.resolveNamespace(attr.prefix) else "";
+                if (!seen and uri.len > 0) {
+                    w.writeAll(" xmlns:") catch return self.markOverflow();
+                    w.writeAll(attr.prefix) catch return self.markOverflow();
+                    w.writeAll("='") catch return self.markOverflow();
+                    xmlEscapeWrite(w, uri) catch return self.markOverflow();
+                    w.writeByte('\'') catch return self.markOverflow();
+                }
+            }
+            w.writeByte(' ') catch return self.markOverflow();
+            w.writeAll(attr.name) catch return self.markOverflow();
+            w.writeAll("='") catch return self.markOverflow();
+            xmlEscapeWrite(w, attr.value) catch return self.markOverflow();
+            w.writeByte('\'') catch return self.markOverflow();
         }
         if (elem.self_closing) {
-            w.writeAll("/>") catch return;
+            w.writeAll("/>") catch return self.markOverflow();
         } else {
-            w.writeByte('>') catch return;
+            w.writeByte('>') catch return self.markOverflow();
         }
         self.stanza_inner_len += fbs.pos;
     }
 
     /// Accumulate text content (XML-escaped) into the stanza inner buffer.
     pub fn accumulateText(self: *S2sSession, text: []const u8) void {
+        if (self.stanza_accum_overflowed) return;
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
-        xmlEscapeWrite(fbs.writer(), text) catch return;
+        xmlEscapeWrite(fbs.writer(), text) catch return self.markOverflow();
         self.stanza_inner_len += fbs.pos;
     }
 
     /// Accumulate a child element close tag into the stanza inner buffer.
+    /// An overflow marks the stanza broken so it is dropped, never forwarded
+    /// unbalanced (S1).
     pub fn accumulateClose(self: *S2sSession, name: []const u8) void {
+        if (self.stanza_accum_overflowed) return;
         var fbs = std.io.fixedBufferStream(self.stanza_inner_buf[self.stanza_inner_len..]);
         const w = fbs.writer();
-        w.writeAll("</") catch return;
-        w.writeAll(name) catch return;
-        w.writeByte('>') catch return;
+        w.writeAll("</") catch return self.markOverflow();
+        w.writeAll(name) catch return self.markOverflow();
+        w.writeByte('>') catch return self.markOverflow();
         self.stanza_inner_len += fbs.pos;
     }
 
@@ -548,6 +794,11 @@ pub const S2sSession = struct {
         self.stanza_to_len = 0;
         self.stanza_type_len = 0;
         self.stanza_id_len = 0;
+        self.stanza_root_ns_prefix_len = 0;
+        self.stanza_root_ns_uri_len = 0;
+        self.stanza_accum_overflowed = false;
+        self.stanza_from_overflowed = false;
+        self.stanza_to_overflowed = false;
     }
 
     /// Get the accumulated stanza tag name.
@@ -581,12 +832,25 @@ pub const S2sSession = struct {
     }
 
     /// Build the complete stanza XML from accumulated parts.
+    /// The root element's namespace binding is preserved (S1).
     pub fn buildStanzaXml(self: *const S2sSession, buf: []u8) ![]const u8 {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
         try w.writeByte('<');
         try w.writeAll(self.getStanzaTag());
-        // from/to/type/id carry peer input — entity-decoded by the parser, so
+        // Root namespace: re-emit it the way the peer declared it.
+        if (self.stanza_root_ns_uri_len > 0) {
+            if (self.stanza_root_ns_prefix_len > 0) {
+                try w.writeAll(" xmlns:");
+                try w.writeAll(self.stanzaRootNsPrefix());
+            } else {
+                try w.writeAll(" xmlns");
+            }
+            try w.writeAll("='");
+            try xmlEscapeWrite(w, self.stanzaRootNsUri());
+            try w.writeByte('\'');
+        }
+        // from/to/type/id carry peer input: entity-decoded by the parser, so
         // they must be re-escaped on the way out (S1 injection guard).
         if (self.stanza_from_len > 0) {
             try w.writeAll(" from='");
@@ -704,8 +968,13 @@ test "S2sSession: buildFeatures — auth without DANE" {
     _ = session.stream.handleStreamOpen("b.example", "a.example", "1.0");
     var buf: [1024]u8 = undefined;
     const out = try session.buildFeatures(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, out, "dialback") != null);
+    // Neither auth mechanism advertises a feature element: the non-standard
+    // <db:features><db:dialback/> is gone and EXTERNAL needs DANE. Dialback
+    // support remains visible via the xmlns:db stream header declaration.
+    try std.testing.expect(std.mem.indexOf(u8, out, "dialback") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "db:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "EXTERNAL") == null);
+    try std.testing.expectEqualStrings("<stream:features></stream:features>", out);
 }
 
 test "S2sSession: buildSaslSuccess" {
@@ -732,9 +1001,9 @@ test "S2sSession: buildTlsProceed" {
     try std.testing.expect(std.mem.indexOf(u8, out, "<proceed") != null);
 }
 
-test "S2sSession: stream-open response escapes peer-controlled and local attrs (S1)" {
+test "S2sSession: stream-open response escapes peer-controlled and local attrs" {
     var session = S2sSession.init(-1, 1, "a.example");
-    session.closed = true; // no real fd — nothing to close on teardown
+    session.closed = true; // no real fd: nothing to close on teardown
     session.setRemoteDomain("bad' to='injected.attacker.example' x='");
     var buf: [512]u8 = undefined;
     const out = try session.buildStreamOpenResponse(&buf);
@@ -742,7 +1011,7 @@ test "S2sSession: stream-open response escapes peer-controlled and local attrs (
     try std.testing.expect(std.mem.indexOf(u8, out, "injected.attacker.example' x='") == null);
 }
 
-test "S2sSession: stanza from/to/type/id attrs are re-escaped (S1)" {
+test "S2sSession: stanza from/to/type/id attrs are re-escaped" {
     var session = S2sSession.init(-1, 1, "a.example");
     session.closed = true; // no real fd
     session.startStanza(.{
@@ -809,12 +1078,14 @@ test "S2sSession: recv into read buffer" {
 
 /// Self-signed throwaway cert+key for "localhost" via the openssl CLI (no
 /// key material in the tree). error.SkipZigTest when the tool is missing.
+/// openssl writes key-generation progress to stderr, which can exceed a
+/// small output cap under load, so allow generous room for it.
 fn genTestTlsCert(dir: std.fs.Dir) !void {
     const r = std.process.Child.run(.{
         .allocator = std.testing.allocator,
         .argv = &.{ "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-days", "1", "-keyout", "key.pem", "-out", "cert.pem" },
         .cwd_dir = dir,
-        .max_output_bytes = 4096,
+        .max_output_bytes = 64 * 1024,
     }) catch return error.SkipZigTest;
     defer std.testing.allocator.free(r.stdout);
     defer std.testing.allocator.free(r.stderr);
@@ -870,7 +1141,7 @@ fn makeTestTcpPair() ![2]posix.fd_t {
     return .{ client_fd, server_fd };
 }
 
-test "S2sSession: stalled TLS write pins its slice; bytes queued behind it still arrive (S23)" {
+test "S2sSession: stalled TLS write pins its slice; bytes queued behind it still arrive" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     genTestTlsCert(tmp.dir) catch return error.SkipZigTest;
@@ -960,6 +1231,86 @@ test "S2sSession: stalled TLS write pins its slice; bytes queued behind it still
     try std.testing.expect(!session.hasPendingWrite());
 }
 
+test "S2sSession: authenticated-domain set" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    session.closed = true; // no real fd
+
+    try std.testing.expectEqual(@as(usize, 0), session.auth_domain_count);
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+
+    _ = session.addAuthenticatedDomain("them.example");
+    _ = session.addAuthenticatedDomain("OTHER.example");
+    try std.testing.expect(session.addAuthenticatedDomain("them.example")); // dedup: already recorded
+    try std.testing.expectEqual(@as(usize, 2), session.auth_domain_count);
+    try std.testing.expect(session.isAuthenticatedDomain("THEM.example")); // case-insensitive
+    try std.testing.expect(session.isAuthenticatedDomain("other.example"));
+    try std.testing.expect(!session.isAuthenticatedDomain("stranger.example"));
+}
+
+test "S2sSession: the 9th authenticated domain is refused loudly, not dropped silently" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    session.closed = true; // no real fd
+
+    var name: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const n = std.fmt.bufPrint(&name, "d{d}.example", .{i}) catch unreachable;
+        try std.testing.expect(session.addAuthenticatedDomain(n));
+    }
+    try std.testing.expectEqual(@as(usize, 8), session.auth_domain_count);
+
+    // The set is full: the 9th must report refusal (and log), never pretend
+    // to record.
+    try std.testing.expect(!session.addAuthenticatedDomain("ninth.example"));
+    try std.testing.expectEqual(@as(usize, 8), session.auth_domain_count);
+    try std.testing.expect(!session.isAuthenticatedDomain("ninth.example"));
+    // Already-recorded and invalid inputs keep their contracts.
+    try std.testing.expect(session.addAuthenticatedDomain("d0.example")); // dedup true
+    try std.testing.expect(!session.addAuthenticatedDomain("")); // invalid false
+}
+
+test "S2sSession: DANE candidate promotes only on demand" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    session.closed = true;
+
+    session.setDaneCandidate("them.example");
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+    try std.testing.expect(session.promoteDaneCandidate());
+    try std.testing.expect(session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sSession: a full domain set rejects the DANE promotion" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    session.closed = true;
+
+    // The set holds 8 domains: the candidate is the 9th.
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        var buf: [32]u8 = undefined;
+        const d = try std.fmt.bufPrint(&buf, "d{d}.example", .{n});
+        try std.testing.expect(session.addAuthenticatedDomain(d));
+    }
+    session.setDaneCandidate("them.example");
+    try std.testing.expect(!session.promoteDaneCandidate());
+    try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
+}
+
+test "S2sSession: restart from= pins origin until auth, then uses the set" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    session.closed = true;
+
+    session.setRemoteDomain("them.example");
+    // Pre-auth restart must not change origin.
+    try std.testing.expect(session.restartFromAllowed("THEM.example"));
+    try std.testing.expect(!session.restartFromAllowed("victim.example"));
+
+    // Post-auth: only authenticated domains pass, including the victim one.
+    _ = session.addAuthenticatedDomain("them.example");
+    try std.testing.expect(session.restartFromAllowed("them.example"));
+    try std.testing.expect(!session.restartFromAllowed("victim.example"));
+    try std.testing.expect(!session.restartFromAllowed(""));
+}
+
 test "S2sSession: isTlsHandshaking" {
     var session = S2sSession.init(-1, 1, "a.example");
     session.closed = true;
@@ -970,4 +1321,312 @@ test "S2sSession: isTlsHandshaking" {
 
     session.tls_state = .established;
     try std.testing.expect(!session.isTlsHandshaking());
+}
+
+test "S2sSession: xmlns declarations on nested elements are preserved" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &.{
+            .{ .name = "from", .local_name = "from", .prefix = "", .value = "eve@them.example" },
+            .{ .name = "to", .local_name = "to", .prefix = "", .value = "bob@us.example" },
+        },
+        .self_closing = false,
+    });
+    session.accumulateElement(.{
+        .name = "received",
+        .prefix = "",
+        .local_name = "received",
+        .namespace_uri = "urn:xmpp:receipts",
+        .attributes = &.{},
+        .self_closing = true,
+    }, null);
+    session.accumulateClose("message");
+    const inner = session.getStanzaInner();
+    try std.testing.expect(std.mem.indexOf(u8, inner, "xmlns='urn:xmpp:receipts'") != null);
+
+    var buf: [2048]u8 = undefined;
+    const out = try session.buildStanzaXml(&buf);
+    // Root element gets its xmlns='jabber:server' re-emitted.
+    try std.testing.expect(std.mem.indexOf(u8, out, "xmlns='jabber:server'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<received xmlns='urn:xmpp:receipts'/>") != null);
+}
+
+test "S2sSession: inner buffer overflow marks stanza broken, not truncated" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &.{},
+        .self_closing = false,
+    });
+    // One giant text payload to exceed the 16 KiB inner buffer.
+    var huge: [20000]u8 = undefined;
+    @memset(&huge, 'x');
+    session.accumulateText(&huge);
+    try std.testing.expect(session.stanzaBroken());
+    session.accumulateText("&amp;");
+    try std.testing.expect(session.stanzaBroken());
+
+    session.resetStanza();
+    try std.testing.expect(!session.stanzaBroken());
+}
+
+test "S2sSession: an over-long from=/to= flags overflow instead of truncating" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    var big: [xmpp.max_jid_octets + 1]u8 = undefined;
+    @memset(&big, 'a');
+    var exact: [xmpp.max_jid_octets]u8 = undefined;
+    @memset(&exact, 'b');
+
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &.{
+            .{ .name = "from", .local_name = "from", .prefix = "", .value = &big },
+            .{ .name = "to", .local_name = "to", .prefix = "", .value = &exact },
+        },
+        .self_closing = false,
+    });
+    try std.testing.expect(session.stanza_from_overflowed);
+    try std.testing.expect(!session.stanza_to_overflowed);
+    // The stored prefix is still capped at the buffer for logging only.
+    try std.testing.expectEqual(xmpp.max_jid_octets, session.getStanzaFrom().len);
+    try std.testing.expectEqual(xmpp.max_jid_octets, session.getStanzaTo().len);
+
+    session.resetStanza();
+    try std.testing.expect(!session.stanza_from_overflowed);
+    try std.testing.expect(!session.stanza_to_overflowed);
+}
+
+test "S2sSession: accumulateClose overflow marks the stanza broken" {
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    session.startStanza(.{
+        .name = "message",
+        .prefix = "",
+        .local_name = "message",
+        .namespace_uri = "jabber:server",
+        .attributes = &.{},
+        .self_closing = false,
+    });
+    // Fill the inner buffer so only one byte of headroom is left: the close
+    // tag cannot fit and must mark the stanza broken; a silent return would
+    // forward unbalanced XML. 'x' does not escape, so the fill is
+    // byte-exact.
+    const fill = session.stanza_inner_buf.len - session.stanza_inner_len - 1;
+    var body: [16384]u8 = undefined;
+    @memset(body[0..fill], 'x');
+    session.accumulateText(body[0..fill]);
+    try std.testing.expectEqual(fill, session.stanza_inner_len);
+    try std.testing.expect(!session.stanzaBroken());
+    session.accumulateClose("message");
+    try std.testing.expect(session.stanzaBroken());
+}
+
+const test_stream_header =
+    "<stream:stream xmlns='jabber:server' " ++
+    "xmlns:stream='http://etherx.jabber.org/streams'>";
+
+test "S2sSession: prefixed attributes keep their prefix declaration" {
+    const alloc = std.testing.allocator;
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    // Drive a real reader so the namespace stack holds the binding.
+    var reader = xml.Reader.init(alloc);
+    defer reader.deinit();
+    const input = test_stream_header ++
+        "<message xmlns='jabber:server' xmlns:ext='urn:ext'><child ext:a='b' plain='c'/></message>";
+    var pos: usize = 0;
+
+    const stream_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expect(stream_ev == .stream_open);
+
+    // Root element: the stanza start.
+    const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.startStanza(root_ev.element_start);
+
+    // Child with the prefixed attribute.
+    const child_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.accumulateElement(child_ev.element_start, &reader);
+
+    const inner = session.getStanzaInner();
+    // The prefix declaration is re-emitted next to the prefixed attribute.
+    try std.testing.expect(std.mem.indexOf(u8, inner, "xmlns:ext='urn:ext'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "ext:a='b'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "plain='c'") != null);
+
+    var buf: [2048]u8 = undefined;
+    const out = try session.buildStanzaXml(&buf);
+    // The forwarded stanza is self-contained: the declaration is inside it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "xmlns:ext='urn:ext'") != null);
+}
+
+test "S2sSession: a self-closing child keeps the prefix it declares on itself" {
+    const alloc = std.testing.allocator;
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    var reader = xml.Reader.init(alloc);
+    defer reader.deinit();
+    const input = test_stream_header ++
+        "<message xmlns='jabber:server'><child xmlns:ext='urn:ext' ext:a='b'/></message>";
+    var pos: usize = 0;
+
+    const stream_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expect(stream_ev == .stream_open);
+    const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.startStanza(root_ev.element_start);
+
+    const child_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    // The child declared its own prefix on itself: the binding must still
+    // resolve while its event is being handled.
+    try std.testing.expectEqualStrings("urn:ext", reader.resolveNamespace("ext"));
+    session.accumulateElement(child_ev.element_start, &reader);
+
+    const inner = session.getStanzaInner();
+    // The declaration is re-emitted before the attribute that uses it, so
+    // the forwarded fragment is well-formed on its own.
+    try std.testing.expect(std.mem.indexOf(u8, inner, "xmlns:ext='urn:ext'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "ext:a='b'") != null);
+    const decl_at = std.mem.indexOf(u8, inner, "xmlns:ext=").?;
+    const use_at = std.mem.indexOf(u8, inner, "ext:a=").?;
+    try std.testing.expect(decl_at < use_at);
+
+    // The scope dies with the element: the next event retires it.
+    _ = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expectEqualStrings("", reader.resolveNamespace("ext"));
+}
+
+test "S2sSession: any number of attribute prefixes re-emits each binding once" {
+    const alloc = std.testing.allocator;
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    // Ten distinct attribute prefixes on one child, the tenth used twice:
+    // every binding must be written exactly once (a second xmlns:ns9 on the
+    // same tag would be a duplicate XML attribute).
+    var decl_buf: [512]u8 = undefined;
+    var decl_len: usize = 0;
+    var attrs_buf: [512]u8 = undefined;
+    var attrs_len: usize = 0;
+    var n: usize = 0;
+    while (n < 10) : (n += 1) {
+        decl_len += (std.fmt.bufPrint(decl_buf[decl_len..], " xmlns:ns{d}='urn:ns{d}'", .{ n, n }) catch return error.Buffer).len;
+        attrs_len += (std.fmt.bufPrint(attrs_buf[attrs_len..], " ns{d}:a='v{d}'", .{ n, n }) catch return error.Buffer).len;
+    }
+    attrs_len += (std.fmt.bufPrint(attrs_buf[attrs_len..], " ns9:b='again'", .{}) catch return error.Buffer).len;
+    const input = try std.fmt.allocPrint(
+        alloc,
+        test_stream_header ++ "<message xmlns='jabber:server'{s}><child{s}/></message>",
+        .{ decl_buf[0..decl_len], attrs_buf[0..attrs_len] },
+    );
+    defer alloc.free(input);
+    var pos: usize = 0;
+
+    var reader = xml.Reader.init(alloc);
+    defer reader.deinit();
+    const stream_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expect(stream_ev == .stream_open);
+    const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.startStanza(root_ev.element_start);
+
+    const child_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.accumulateElement(child_ev.element_start, &reader);
+
+    const inner = session.getStanzaInner();
+    try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, inner, "xmlns:ns"));
+    n = 0;
+    while (n < 10) : (n += 1) {
+        var decl: [32]u8 = undefined;
+        const d = try std.fmt.bufPrint(&decl, "xmlns:ns{d}=", .{n});
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, inner, d));
+        var use: [32]u8 = undefined;
+        const u = try std.fmt.bufPrint(&use, "ns{d}:a=", .{n});
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, inner, u));
+    }
+    // The repeated prefix's attribute is there too.
+    try std.testing.expect(std.mem.indexOf(u8, inner, "ns9:b='again'") != null);
+}
+
+test "S2sSession: the element's own prefix is declared once for its prefixed attributes" {
+    const alloc = std.testing.allocator;
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    // The child carries prefix e and two attributes bound to e, plus one
+    // bound to f: exactly one xmlns:e and one xmlns:f may be written (a
+    // second xmlns:e on the same tag is a duplicate XML attribute).
+    const input = test_stream_header ++
+        "<message xmlns='jabber:server' xmlns:e='urn:e' xmlns:f='urn:f'>" ++
+        "<e:child e:a='1' e:b='2' f:c='3'/></message>";
+    var pos: usize = 0;
+
+    var reader = xml.Reader.init(alloc);
+    defer reader.deinit();
+    const stream_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expect(stream_ev == .stream_open);
+    const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.startStanza(root_ev.element_start);
+
+    const child_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.accumulateElement(child_ev.element_start, &reader);
+
+    const inner = session.getStanzaInner();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, inner, "xmlns:e="));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, inner, "xmlns:f="));
+    try std.testing.expect(std.mem.indexOf(u8, inner, "e:a='1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "e:b='2'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "f:c='3'") != null);
+}
+
+test "S2sSession: an attribute-prefix declaration escapes its URI" {
+    const alloc = std.testing.allocator;
+    var session = S2sSession.init(-1, 1, "us.example");
+    defer session.close();
+    session.closed = true; // no real fd
+
+    // The resolved URI holds an apostrophe and the declaration quotes with
+    // single quotes: the URI must be escaped or it closes the value early.
+    const input = test_stream_header ++
+        "<message xmlns='jabber:server' xmlns:ext=\"urn:a'b\"><child ext:x='1'/></message>";
+    var pos: usize = 0;
+
+    var reader = xml.Reader.init(alloc);
+    defer reader.deinit();
+    const stream_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    try std.testing.expect(stream_ev == .stream_open);
+    const root_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.startStanza(root_ev.element_start);
+
+    const child_ev = (try reader.next(input, &pos)) orelse return error.NoEvent;
+    session.accumulateElement(child_ev.element_start, &reader);
+
+    const inner = session.getStanzaInner();
+    try std.testing.expect(std.mem.indexOf(u8, inner, "xmlns:ext='urn:a&apos;b'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "urn:a'b'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, inner, "ext:x='1'") != null);
 }

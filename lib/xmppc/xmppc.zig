@@ -33,9 +33,13 @@
 //! SECURITY (T202/T-B5D56AD3): server authentication is DANE-first.
 //! `Session.tls_policy` (seeded from `Engine.default_tls_policy`) selects:
 //!   * dane_first (default) — the resolution's TLSA records authenticate the
-//!     peer chain (DANE-EE or DANE-TA; fail closed on mismatch); only when no
-//!     TLSA exists does it fall back to PKIX (system CA store + hostname
-//!     check against the stream domain, which is also the SNI).
+//!     peer chain (DANE-EE or DANE-TA; fail closed on mismatch). Each target
+//!     carries a tlsa_status: .present uses DANE; .absent (authenticated
+//!     NXDOMAIN/NODATA) falls back to PKIX (system CA store + hostname check
+//!     against the stream domain, which is also the SNI); .lookup_failed
+//!     (SERVFAIL, REFUSED, timeout, or a chain deadline with TLSA pending)
+//!     is a temporary failure of the target and never falls back to PKIX.
+//!   * pkix_only - always PKIX, TLSA is never consulted.
 //!   * none — lab rigs only: SSL_VERIFY_NONE, no hostname check. Never use
 //!     against untrusted networks.
 

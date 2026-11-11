@@ -22,6 +22,10 @@ const delivery_queue = @import("delivery_queue");
 /// Number of mailbox slots per room.
 pub const MAILBOX_SLOTS: u8 = 16;
 
+/// Actor messages dropped because a room mailbox was full (S16). The owning
+/// worker increments it; the M1 metrics task exports it later.
+pub var mailbox_drops = std.atomic.Value(u64).init(0);
+
 /// Maximum payload size per message (matches MPSC slot payload).
 pub const MAX_PAYLOAD_SIZE = delivery_queue.MAX_PAYLOAD_SIZE;
 
