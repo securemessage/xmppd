@@ -87,10 +87,25 @@ const CONNECT_DEADLINE_MS: u32 = 10_000;
 /// exports it later, as with the delivery-queue counters.
 pub var inbound_dane_lookup_failures = std.atomic.Value(u64).init(0);
 
+/// Outbound stanzas bounced because the domain's pending queue was full
+/// (X1 bound, ADR-13). Process-wide like the counter above; the M1
+/// metrics task exports it later.
+pub var outbound_queue_overflows = std.atomic.Value(u64).init(0);
+
 /// Base ident for EVFILT_TIMER connect deadlines, same pattern as the
-/// udata bases: the low range is reserved for X1's lifecycle timers and
-/// the .timer arm dispatches on the boundary.
+/// udata bases: the low range is the lifecycle range (retry backoff
+/// deadlines, ADR-13) and the .timer arm dispatches on the boundary.
 const CONNECT_DEADLINE_IDENT_BASE: usize = 0x100000;
+
+/// Backoff schedule for a temporary outbound failure (ADR-13): the
+/// domain's queue survives the attempt and a lifecycle deadline retries
+/// it; entries past the end repeat the last delay.
+const RETRY_DELAYS_MS = [_]u32{ 5_000, 15_000, 45_000 };
+
+/// How long a domain's pending queue lives across retries, counted from
+/// the first queued stanza; every queued stanza bounces
+/// remote-server-timeout once it ends (ADR-13).
+const QUEUE_LIFETIME_MS: i64 = 120_000;
 /// Changelist capacity: worst case per loop iteration is one connect
 /// attempt (write arm + deadline) per outbound conn plus one DANE
 /// completion (read enable, write arm) and a few stanza/IPC arms per
@@ -187,6 +202,12 @@ pub const S2sDaemon = struct {
     next_dns_key: usize = 1,
     /// Monotonic ident space for per-target connect deadlines.
     next_deadline_ident: usize = 1,
+    /// Monotonic ident space for retry backoff deadlines (ADR-13): the
+    /// lifecycle range below CONNECT_DEADLINE_IDENT_BASE.
+    next_lifecycle_ident: usize = 1,
+    /// Clock seam: tests substitute a controlled clock for the queue
+    /// lifetime. Production reads the wall clock.
+    now_ms: *const fn () i64 = std.time.milliTimestamp,
     /// The ChangeList currently being accumulated: resolver callbacks have
     /// no batch parameter (they can fire inside resolver.step or inside a
     /// synchronous resolve/query completion), so entry points stash it here.
@@ -377,18 +398,27 @@ pub const S2sDaemon = struct {
         };
 
         // Queue the stanza first (delivery happens when connection is established)
-        conn.queueStanza(self.allocator, from, to, stanza_xml) catch {
-            self.sendDeliveryFailed(from, to, "internal-error");
+        conn.queueStanza(self.allocator, from, to, stanza_xml) catch |err| {
+            switch (err) {
+                error.QueueFull => {
+                    _ = outbound_queue_overflows.fetchAdd(1, .monotonic);
+                    self.sendDeliveryFailed(from, to, "resource-constraint");
+                },
+                else => self.sendDeliveryFailed(from, to, "internal-error"),
+            }
             return;
         };
+        if (conn.queue_started_ms == 0) conn.queue_started_ms = self.now_ms();
 
         if (conn.isEstablished()) {
             // Connection ready — flush queued stanzas
             self.flushOutboundStanzas(batch, conn);
         } else if (conn.isFailed()) {
             self.sendDeliveryFailed(from, to, conn.error_msg);
-        } else if (conn.state == .connecting and conn.fd < 0 and conn.dns_key == 0) {
-            // New connection — initiate DNS + TCP connect
+        } else if (conn.state == .connecting and conn.fd < 0 and conn.dns_key == 0 and conn.retry_ident == 0) {
+            // New connection — initiate DNS + TCP connect. A conn in
+            // backoff (retry_ident armed) only queues: its deadline
+            // starts the next attempt (ADR-13).
             self.initiateOutbound(batch, conn, domain);
         }
         // else: connection is in progress (TLS, auth, etc.) — stanza is queued
@@ -405,14 +435,14 @@ pub const S2sDaemon = struct {
         // A name that cannot appear on the wire fails immediately rather
         // than spending a resolver job on it (RFC 1035 length bounds).
         if (!validDomainName(domain)) {
-            self.failOutboundInitiation(batch, conn, "dns-resolution-failed");
+            self.failOutboundInitiation(batch, conn, "remote-server-not-found");
             return;
         }
         conn.dns_key = self.next_dns_key;
         self.next_dns_key +%= 1;
         self.resolver.resolve(domain, .server, 5269, conn.dns_key, true) catch {
             conn.dns_key = 0;
-            self.failOutboundInitiation(batch, conn, "dns-resolution-failed");
+            self.failOutboundAttempt(batch, conn, "dns-resolution-failed");
             return;
         };
     }
@@ -483,8 +513,9 @@ pub const S2sDaemon = struct {
                     rr.deinitOn(self.allocator);
                 }
                 // SERVFAIL, timeout, REFUSED, malformed: a wire failure is
-                // temporary per ADR-13, never proof of absence.
-                self.failOutboundInitiation(batch, conn, "remote-server-timeout");
+                // temporary per ADR-13, never proof of absence. The queue
+                // survives and a backoff deadline retries.
+                self.failOutboundAttempt(batch, conn, "remote-server-timeout");
             },
         }
     }
@@ -508,19 +539,26 @@ pub const S2sDaemon = struct {
         conn.fd = -1;
     }
 
+    /// Whether an exhausted target list fails the initiation outright or
+    /// keeps the queue and retries on a backoff deadline (ADR-13).
+    const OutboundFailureKind = enum { temporary, permanent };
+
     /// Give up on the current target for a reason found before its TLS
     /// handshake began (a DANE lookup or state failure). The attempt is torn
-    /// down and the next target is tried; when the list is exhausted the
-    /// initiation fails with `reason`, which the caller chose to reflect
-    /// whether the failure is temporary.
-    fn advanceOrFailOutbound(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, reason: []const u8) void {
+    /// down and the next target is tried; when the list is exhausted `kind`
+    /// decides whether the initiation fails with `reason` or the queue
+    /// survives for a backoff retry.
+    fn advanceOrFailOutbound(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, reason: []const u8, kind: OutboundFailureKind) void {
         if (conn.fd >= 0) self.abortConnectAttempt(batch, conn);
         self.clearConnectDeadline(batch, conn);
         if (conn.next_idx < conn.targets.len) {
             self.connectNextTarget(batch, conn);
             return;
         }
-        self.failOutboundInitiation(batch, conn, reason);
+        switch (kind) {
+            .temporary => self.failOutboundAttempt(batch, conn, reason),
+            .permanent => self.failOutboundInitiation(batch, conn, reason),
+        }
     }
 
     /// Disarm the per-target connect deadline if one is armed.
@@ -604,8 +642,9 @@ pub const S2sDaemon = struct {
             return;
         }
         // Every target was consumed: connect errors, deadlines and
-        // lookup_failed targets are all temporary (ADR-13).
-        self.failOutboundInitiation(batch, conn, "remote-server-timeout");
+        // lookup_failed targets are all temporary (ADR-13). The queue
+        // survives and a backoff deadline retries the initiation.
+        self.failOutboundAttempt(batch, conn, "remote-server-timeout");
     }
 
     /// Free a connect fd that never reached the armed state.
@@ -634,11 +673,36 @@ pub const S2sDaemon = struct {
     }
 
     /// EVFILT_TIMER demux: idents at CONNECT_DEADLINE_IDENT_BASE and
-    /// above are per-target connect deadlines; lower idents belong to the
-    /// X1 lifecycle timers and must not reach the connect path.
+    /// above are per-target connect deadlines; lower idents are lifecycle
+    /// timers (retry backoff, ADR-13) and must not reach the connect path.
     fn handleTimerEvent(self: *S2sDaemon, batch: *ChangeList, ident: usize) void {
-        if (ident < CONNECT_DEADLINE_IDENT_BASE) return;
-        self.handleConnectDeadline(batch, ident);
+        if (ident >= CONNECT_DEADLINE_IDENT_BASE) {
+            self.handleConnectDeadline(batch, ident);
+            return;
+        }
+        self.handleRetryDeadline(batch, ident);
+    }
+
+    /// A retry backoff deadline fired: re-initiate the domain's outbound
+    /// unless its queue lifetime has ended, in which case the queued
+    /// stanzas bounce remote-server-timeout (ADR-13). An ident that matches
+    /// no conn's armed retry is stale (the conn left the pool or the timer
+    /// was disarmed) and is ignored.
+    fn handleRetryDeadline(self: *S2sDaemon, batch: *ChangeList, ident: usize) void {
+        self.batch = batch;
+        var it = self.pool.connections.valueIterator();
+        while (it.next()) |conn_ptr| {
+            const conn = conn_ptr.*;
+            if (conn.retry_ident != ident) continue;
+            conn.retry_ident = 0;
+            if (self.now_ms() - conn.queue_started_ms >= QUEUE_LIFETIME_MS) {
+                self.failOutboundInitiation(batch, conn, "remote-server-timeout");
+                return;
+            }
+            log.info("outbound {s}: retrying after temporary failure", .{conn.remote_domain});
+            self.initiateOutbound(batch, conn, conn.remote_domain);
+            return;
+        }
     }
 
     /// Flush queued stanzas on an established outbound connection.
@@ -685,6 +749,7 @@ pub const S2sDaemon = struct {
             kept += 1;
         }
         conn.pending_stanzas.items.len = kept;
+        if (kept == 0) conn.queue_started_ms = 0;
         _ = conn.flushWrite() catch {
             log.err("outbound write failed for {s}", .{conn.remote_domain});
         };
@@ -735,6 +800,7 @@ pub const S2sDaemon = struct {
             }
             self.cancelResolve(conn);
             self.clearConnectDeadline(batch, conn);
+            self.clearRetryDeadline(batch, conn);
             self.releaseOutboundSlot(batch, conn);
             log.info("closing outbound S2S to {s}", .{conn.remote_domain});
             self.pool.remove(conn.remote_domain);
@@ -752,6 +818,7 @@ pub const S2sDaemon = struct {
     fn failOutboundInitiation(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, reason: []const u8) void {
         self.cancelResolve(conn);
         self.clearConnectDeadline(batch, conn);
+        self.clearRetryDeadline(batch, conn);
         conn.fail(reason);
         for (conn.pending_stanzas.items) |*stanza| {
             self.sendDeliveryFailed(stanza.from_jid, stanza.to_jid, reason);
@@ -761,6 +828,77 @@ pub const S2sDaemon = struct {
         }
         self.releaseOutboundSlot(batch, conn);
         self.pool.remove(conn.remote_domain);
+    }
+
+    /// A temporary failure of the initiation (ADR-13): the live attempt is
+    /// torn down but the domain's queue survives, and a lifecycle deadline
+    /// retries on the backoff schedule (5 s, 15 s, then 45 s). A queue that
+    /// has already outlived its lifetime fails the initiation instead, and
+    /// a changelist that cannot arm the deadline fails it as internal.
+    fn failOutboundAttempt(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, reason: []const u8) void {
+        self.cancelResolve(conn);
+        if (conn.fd >= 0) self.abortConnectAttempt(batch, conn);
+        self.clearConnectDeadline(batch, conn);
+        self.clearRetryDeadline(batch, conn);
+        // A conn that failed after TCP connect carries no transport state
+        // into the retry: the TLS layer, stream FSM, parser and buffers go
+        // back to the .connecting baseline. All no-ops for the common case.
+        if (conn.tls_conn) |*tls| {
+            tls.shutdown();
+            tls.deinit();
+            conn.tls_conn = null;
+        }
+        conn.tls_state = null;
+        conn.dropDaneState();
+        conn.state = .connecting;
+        conn.stream = stream_mod.S2sStream.init(.initiating, conn.local_domain);
+        conn.read_start = 0;
+        conn.read_end = 0;
+        conn.write_start = 0;
+        conn.write_end = 0;
+        conn.pinned_tls_len = 0;
+        if (self.findOutboundSlot(conn)) |slot| {
+            if (self.outbound_readers[slot]) |reader| reader.reset();
+        }
+        const now = self.now_ms();
+        // Callback-only conns carry no stanza: stamp the queue so its
+        // lifetime is still bounded.
+        if (conn.queue_started_ms == 0) conn.queue_started_ms = now;
+        const remaining = QUEUE_LIFETIME_MS - (now - conn.queue_started_ms);
+        if (remaining <= 0) {
+            self.failOutboundInitiation(batch, conn, "remote-server-timeout");
+            return;
+        }
+        const backoff = RETRY_DELAYS_MS[@min(conn.retry_attempt, RETRY_DELAYS_MS.len - 1)];
+        const delay: u32 = @intCast(@min(@as(i64, backoff), remaining));
+        conn.retry_attempt +|= 1;
+        const ident = self.nextLifecycleIdent();
+        batch.addTimer(ident, delay, true) catch {
+            self.failOutboundInitiation(batch, conn, "internal-error");
+            return;
+        };
+        conn.retry_ident = ident;
+        log.warn("outbound {s}: temporary failure ({s}); retry {d} in {d} ms", .{
+            conn.remote_domain, reason, conn.retry_attempt, delay,
+        });
+    }
+
+    /// Disarm the conn's retry backoff deadline if one is armed.
+    fn clearRetryDeadline(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
+        _ = self;
+        if (conn.retry_ident == 0) return;
+        batch.removeTimer(conn.retry_ident) catch {};
+        conn.retry_ident = 0;
+    }
+
+    /// Next ident in the lifecycle range. Armed idents are unique per conn
+    /// and bounded by MAX_OUTBOUND_CONNS, so the wrap cannot collide with
+    /// a live one in practice.
+    fn nextLifecycleIdent(self: *S2sDaemon) usize {
+        const ident = self.next_lifecycle_ident;
+        self.next_lifecycle_ident += 1;
+        if (self.next_lifecycle_ident >= CONNECT_DEADLINE_IDENT_BASE) self.next_lifecycle_ident = 1;
+        return ident;
     }
 
     /// Detach a conn's in-flight resolve from the resolver: no callback
@@ -1840,8 +1978,9 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
         if (!sendDbVerifyOnCallback(daemon, batch, conn)) {
             if (daemon.findOutboundSlot(conn)) |slot| daemon.closeOutbound(batch, slot);
         }
-    } else if (conn.state == .connecting and conn.fd < 0 and conn.dns_key == 0) {
-        // New connection: initiate DNS + TCP connect
+    } else if (conn.state == .connecting and conn.fd < 0 and conn.dns_key == 0 and conn.retry_ident == 0) {
+        // New connection: initiate DNS + TCP connect. A conn in backoff
+        // only registers the exchange: its deadline starts the retry.
         daemon.initiateOutbound(batch, conn, origin);
     }
     // else: connection is in progress; db:verify goes out at the post-TLS
@@ -2621,12 +2760,12 @@ fn startOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn: *
         // out. A transient allocation failure is retried the same way.
         .temporary_failure => {
             conn.dropDaneState();
-            daemon.advanceOrFailOutbound(batch, conn, "remote-server-timeout");
+            daemon.advanceOrFailOutbound(batch, conn, "remote-server-timeout", .temporary);
             return;
         },
         .permanent_failure => {
             conn.dropDaneState();
-            daemon.advanceOrFailOutbound(batch, conn, "policy-violation");
+            daemon.advanceOrFailOutbound(batch, conn, "remote-server-not-found", .permanent);
             return;
         },
         .none => {
@@ -2796,8 +2935,15 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
             logDaneHandshakeFailure(conn);
         }
         log.err("outbound TLS handshake failed for {s}", .{conn.remote_domain});
-        conn.fail(if (conn.dane_state != null) "dane-verification-failed" else "tls-handshake-failed");
-        daemon.closeOutbound(batch, slot);
+        if (conn.dane_state != null) {
+            // A TLSA-present peer the handshake rejected is a permanent
+            // failure (ADR-13): the queued stanzas bounce at once instead
+            // of dying silently with the conn.
+            daemon.failOutboundInitiation(batch, conn, "remote-server-not-found");
+        } else {
+            conn.fail("tls-handshake-failed");
+            daemon.closeOutbound(batch, slot);
+        }
         return;
     };
 
@@ -2824,8 +2970,10 @@ fn continueOutboundTls(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn
         // pointer (T277).
         recordOutboundDane(daemon, batch, slot, conn);
 
-        // If DANE failed, connection was closed
-        if (daemon.outbound[slot] == null) return;
+        // If DANE failed, connection was closed; a temporary failure put
+        // the conn in backoff and it holds no fd either (ADR-13).
+        const live = daemon.outbound[slot] orelse return;
+        if (live.fd < 0) return;
 
         // Send post-TLS stream open
         var buf: [2048]u8 = undefined;
@@ -2895,8 +3043,8 @@ fn recordOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn:
     };
     switch (target.tlsa_status) {
         .lookup_failed => {
-            conn.fail("dane-lookup-failed");
-            daemon.closeOutbound(batch, slot);
+            // Temporary (ADR-13): the queue survives for a backoff retry.
+            daemon.failOutboundAttempt(batch, conn, "remote-server-timeout");
             return;
         },
         .absent => {
@@ -2935,7 +3083,9 @@ fn recordOutboundDane(daemon: *S2sDaemon, batch: *ChangeList, slot: usize, conn:
     });
     conn.setDaneResult(status);
     if (conn.isFailed()) {
-        daemon.closeOutbound(batch, slot);
+        // DANE rejected the peer: permanent (ADR-13), so the queued
+        // stanzas bounce remote-server-not-found at once.
+        daemon.failOutboundInitiation(batch, conn, "remote-server-not-found");
     }
 }
 
@@ -4214,7 +4364,7 @@ test "S2sDaemon: an initiation failure answers every queued stanza" {
     // with the connection.
     const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
     const notice = try protocol.decode(frame.payload);
-    try std.testing.expectEqualStrings("dns-resolution-failed", notice.s2s_delivery_failed.error_type);
+    try std.testing.expectEqualStrings("remote-server-not-found", notice.s2s_delivery_failed.error_type);
     try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
     try std.testing.expectEqualStrings(to, notice.s2s_delivery_failed.to_jid);
 
@@ -4373,7 +4523,7 @@ test "S2sDaemon: an exhausted outbound slot table answers the pending verify inv
     try std.testing.expect(daemon.pool.connections.get("them.example") == null);
 }
 
-test "S2sDaemon: a connect failure answers the pending verify invalid" {
+test "S2sDaemon: a connect failure keeps the queue and arms a retry" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -4390,8 +4540,19 @@ test "S2sDaemon: a connect failure answers the pending verify invalid" {
     // initiation fails as temporary per ADR-13.
     daemon.deliverResolution(&cl, rig.conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "255.255.255.255" }}));
 
-    try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-timeout");
-    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+    // Temporary: the conn stays in backoff with its queue and pending
+    // verify; nothing is bounced yet.
+    try std.testing.expect(daemon.pool.connections.get("them.example") == rig.conn);
+    try std.testing.expectEqual(@as(usize, 1), rig.conn.pendingCount());
+    try std.testing.expect(rig.conn.hasPendingVerify());
+    try std.testing.expect(rig.conn.retry_ident != 0);
+    try std.testing.expect(rig.conn.retry_ident < CONNECT_DEADLINE_IDENT_BASE);
+
+    if (daemon.getInbound(1)) |s| _ = try s.flushWrite();
+    var rbuf: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(rig.submitter_peer, &rbuf));
+    const client = &daemon.ipc.clients[0];
+    try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
 }
 
 test "S2sDaemon: a DNS failure answers the pending verify invalid" {
@@ -4414,8 +4575,179 @@ test "S2sDaemon: a DNS failure answers the pending verify invalid" {
     var cl = ChangeList.init(&scratch);
     daemon.initiateOutbound(&cl, rig.conn, domain);
 
-    try expectInitiationFailure(&daemon, rig, null, "dns-resolution-failed");
+    try expectInitiationFailure(&daemon, rig, null, "remote-server-not-found");
     try std.testing.expect(daemon.pool.connections.get(domain) == null);
+}
+
+test "S2sDaemon: a temporary resolution failure keeps the queue and arms a retry" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    // SERVFAIL/timeout/REFUSED reach the conn as .failed: temporary (ADR-13).
+    daemon.deliverResolution(&cl, rig.conn, .failed, null);
+
+    // The conn stays pooled in backoff: the queued stanza and the pending
+    // verify wait for the retry; nothing is bounced yet.
+    try std.testing.expect(daemon.pool.connections.get("them.example") == rig.conn);
+    try std.testing.expectEqual(@as(usize, 1), rig.conn.pendingCount());
+    try std.testing.expect(rig.conn.hasPendingVerify());
+    try std.testing.expect(rig.conn.retry_ident != 0);
+    try std.testing.expect(rig.conn.retry_ident < CONNECT_DEADLINE_IDENT_BASE);
+    try std.testing.expect(rig.conn.queue_started_ms != 0);
+
+    if (daemon.getInbound(1)) |s| _ = try s.flushWrite();
+    var rbuf: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainPeer(rig.submitter_peer, &rbuf));
+    const client = &daemon.ipc.clients[0];
+    try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
+}
+
+test "S2sDaemon: a stanza for a domain in backoff joins the queue" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, rig.conn, .failed, null);
+    try std.testing.expect(rig.conn.retry_ident != 0);
+
+    // A backoff conn only queues: no fresh resolve, no early bounce.
+    daemon.handleDelivery(&cl, "a@us.example", "c@them.example", "<presence/>");
+    try std.testing.expect(daemon.pool.count() == 1);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == rig.conn);
+    try std.testing.expectEqual(@as(usize, 2), rig.conn.pendingCount());
+    try std.testing.expect(rig.conn.retry_ident != 0);
+    try std.testing.expect(rig.conn.dns_key == 0);
+    try std.testing.expect(rig.conn.fd < 0);
+}
+
+test "S2sDaemon: a retry deadline re-initiates the outbound resolve" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    // Bound but never answered: the re-initiated resolve stays in flight.
+    const dead = try nsFixtureSocket();
+    defer posix.close(dead.fd);
+    daemon.resolver.setServer(try std.net.Address.parseIp("127.0.0.1", dead.port));
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, rig.conn, .failed, null);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == rig.conn);
+    const ident = rig.conn.retry_ident;
+    try std.testing.expect(ident != 0);
+
+    daemon.handleTimerEvent(&cl, ident);
+    try std.testing.expect(rig.conn.retry_ident == 0);
+    try std.testing.expect(rig.conn.dns_key != 0);
+    try std.testing.expectEqual(@as(usize, 1), rig.conn.pendingCount());
+}
+
+test "S2sDaemon: a permanent resolution failure bounces at once" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    // NXDOMAIN is proof of absence (ADR-13): the queue dies immediately.
+    daemon.deliverResolution(&cl, rig.conn, .nxdomain, null);
+
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-not-found");
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+}
+
+var test_now_ms = std.atomic.Value(i64).init(0);
+
+fn testNowMs() i64 {
+    return test_now_ms.load(.monotonic);
+}
+
+test "S2sDaemon: a queue that outlives its lifetime bounces remote-server-timeout" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.now_ms = testNowMs;
+    test_now_ms.store(1_000_000, .monotonic);
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // t0: first temporary failure stamps the queue and arms the backoff.
+    daemon.deliverResolution(&cl, rig.conn, .failed, null);
+    try std.testing.expect(rig.conn.retry_ident != 0);
+
+    // t0+119 s: still inside the lifetime; the failure re-arms, capped by
+    // the remaining budget.
+    test_now_ms.store(1_000_000 + 119_000, .monotonic);
+    daemon.deliverResolution(&cl, rig.conn, .failed, null);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == rig.conn);
+    try std.testing.expect(rig.conn.retry_ident != 0);
+
+    // t0+121 s: past the lifetime; the queue and the pending verify are
+    // answered and the conn leaves the pool.
+    test_now_ms.store(1_000_000 + 121_000, .monotonic);
+    daemon.deliverResolution(&cl, rig.conn, .failed, null);
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-timeout");
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+}
+
+test "S2sDaemon: a full pending queue bounces the overflow stanza" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    makeBufferOnlyClient(&daemon, alloc);
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var i: usize = 0;
+    while (i < OutboundConnection.MAX_PENDING_STANZAS) : (i += 1) {
+        try conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message/>");
+    }
+
+    const before = outbound_queue_overflows.load(.monotonic);
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.handleDelivery(&cl, "a@us.example", "b@them.example", "<message><body>overflow</body></message>");
+
+    // The overflowing stanza is failed back, counted, and the queue is
+    // otherwise untouched.
+    try std.testing.expectEqual(before + 1, outbound_queue_overflows.load(.monotonic));
+    try std.testing.expectEqual(OutboundConnection.MAX_PENDING_STANZAS, conn.pendingCount());
+    const client = &daemon.ipc.clients[0];
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("resource-constraint", notice.s2s_delivery_failed.error_type);
 }
 
 test "S2sDaemon: stop" {
@@ -7421,12 +7753,13 @@ test "S2sDaemon: targets that all failed TLSA lookup bounce temporary" {
     daemon.deliverResolution(&cl, conn, .resolved, res);
 
     // Every target's TLSA lookup failed: a temporary failure, never "no
-    // TLSA" and never a connect to an unverifiable target (ADR-13).
+    // TLSA" and never a connect to an unverifiable target (ADR-13). The
+    // queue survives and a backoff deadline is armed instead of a bounce.
+    try std.testing.expect(daemon.pool.connections.get("them.example") == conn);
+    try std.testing.expectEqual(@as(usize, 1), conn.pendingCount());
+    try std.testing.expect(conn.retry_ident != 0);
     const client = &daemon.ipc.clients[0];
-    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
-    const notice = try protocol.decode(frame.payload);
-    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
-    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+    try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
 }
 
 test "S2sDaemon: a TLSA SERVFAIL skips the target and fails temporary" {
@@ -7450,29 +7783,27 @@ test "S2sDaemon: a TLSA SERVFAIL skips the target and fails temporary" {
     try std.testing.expect(conn.fd < 0);
 
     // Drive the real wire: the fixture answers SRV (one target), A, and
-    // serves TLSA SERVFAIL, which must mark the target lookup_failed.
+    // serves TLSA SERVFAIL, which must mark the target lookup_failed. The
+    // conn stays pooled through the temporary failure, so membership is
+    // checked before the pointer is touched.
     var done = false;
     for (0..64) |_| {
         _ = nsServeOnce(ns.fd) catch false;
         daemon.resolver.step(25);
-        // The conn leaves the pool on failure, so membership is checked
-        // before the pointer is touched.
-        if (daemon.pool.connections.get("gone.example") == null) {
-            done = true;
-            break;
-        }
-        if (conn.fd >= 0) {
+        if (daemon.pool.connections.get("gone.example") == null) break;
+        if (conn.retry_ident != 0 or conn.fd >= 0) {
             done = true;
             break;
         }
     }
     try std.testing.expect(done);
-    try std.testing.expect(daemon.pool.connections.get("gone.example") == null);
+    try std.testing.expect(daemon.pool.connections.get("gone.example") == conn);
+    try std.testing.expect(conn.fd < 0);
+    try std.testing.expect(conn.retry_ident != 0);
+    try std.testing.expectEqual(@as(usize, 1), conn.pendingCount());
 
     const client = &daemon.ipc.clients[0];
-    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
-    const notice = try protocol.decode(frame.payload);
-    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
+    try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
 }
 
 test "S2sDaemon: a silent nameserver leaves the loop responsive" {
@@ -7506,14 +7837,15 @@ test "S2sDaemon: a silent nameserver leaves the loop responsive" {
     try std.testing.expect(conn2.fd >= 0);
 
     // The silent job dies on its chain deadline (temporary), not by
-    // blocking the loop.
+    // blocking the loop. The conn goes to backoff and retries rather
+    // than bouncing the queue at once (ADR-13).
     daemon.resolver.step(200);
-    try std.testing.expect(daemon.pool.connections.get("gone.example") == null);
+    try std.testing.expect(daemon.pool.connections.get("gone.example") == conn1);
+    try std.testing.expect(conn1.retry_ident != 0);
+    try std.testing.expect(conn1.dns_key == 0);
 
     const client = &daemon.ipc.clients[0];
-    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
-    const notice = try protocol.decode(frame.payload);
-    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
+    try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
 }
 
 test "S2sDaemon: an inbound DANE lookup defers then releases features" {
@@ -7560,7 +7892,7 @@ test "S2sDaemon: an inbound DANE lookup defers then releases features" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "stream:features") != null);
 }
 
-test "S2sDaemon: SO_ERROR on the last target releases the outbound slot" {
+test "S2sDaemon: SO_ERROR on the last target backs the conn off" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -7575,11 +7907,15 @@ test "S2sDaemon: SO_ERROR on the last target releases the outbound slot" {
     const slot = daemon.findOutboundSlot(conn).?;
     std.Thread.sleep(50 * std.time.ns_per_ms);
     handleOutboundWritable(&daemon, &cl, slot);
-    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
-    try std.testing.expect(daemon.outbound[slot] == null);
+    // Temporary (ADR-13): the attempt is torn down but the conn keeps its
+    // slot entry and queue for the backoff retry.
+    try std.testing.expect(daemon.pool.connections.get("them.example") == conn);
+    try std.testing.expect(daemon.outbound[slot] == conn);
+    try std.testing.expect(conn.fd < 0);
+    try std.testing.expect(conn.retry_ident != 0);
 }
 
-test "S2sDaemon: a deadline on the last target releases the outbound slot" {
+test "S2sDaemon: a deadline on the last target backs the conn off" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -7591,8 +7927,10 @@ test "S2sDaemon: a deadline on the last target releases the outbound slot" {
     daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 5269 }}));
     const slot = daemon.findOutboundSlot(conn).?;
     daemon.handleConnectDeadline(&cl, conn.deadline_ident);
-    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
-    try std.testing.expect(daemon.outbound[slot] == null);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == conn);
+    try std.testing.expect(daemon.outbound[slot] == conn);
+    try std.testing.expect(conn.fd < 0);
+    try std.testing.expect(conn.retry_ident != 0);
 }
 
 test "S2sDaemon: the inbound DANE wait holds then releases read interest" {
@@ -7962,13 +8300,18 @@ test "S2sDaemon: a timer ident below the deadline base never reaches the connect
     try std.testing.expect(conn.deadline_ident >= CONNECT_DEADLINE_IDENT_BASE);
     try std.testing.expect(conn.fd >= 0);
 
-    // An ident in the lifecycle range must not touch the armed deadline.
+    // An ident in the lifecycle range must not touch the armed deadline
+    // and matches no armed retry either.
     daemon.handleTimerEvent(&cl, 1);
     try std.testing.expect(conn.state == .connecting);
     try std.testing.expect(conn.fd >= 0);
     try std.testing.expect(conn.deadline_ident != 0);
+    try std.testing.expect(conn.retry_ident == 0);
 
-    // The real ident still fires.
+    // The real ident still fires; the exhausted list backs the conn off
+    // (ADR-13) instead of dropping it.
     daemon.handleTimerEvent(&cl, conn.deadline_ident);
-    try std.testing.expect(daemon.pool.connections.get("them.example") == null or conn.deadline_ident != 0);
+    try std.testing.expect(conn.deadline_ident == 0);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == conn);
+    try std.testing.expect(conn.retry_ident != 0);
 }

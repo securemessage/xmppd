@@ -188,9 +188,21 @@ pub const OutboundConnection = struct {
     dns_key: usize = 0,
     /// Ident of the armed per-target connect deadline; 0 when none.
     deadline_ident: usize = 0,
+    /// Ident of the armed retry backoff deadline; 0 when none. Nonzero
+    /// means the conn is in backoff after a temporary failure (ADR-13):
+    /// no attempt is running and new stanzas only join the queue.
+    retry_ident: usize = 0,
+    /// Count of temporary failures so far; indexes the backoff schedule.
+    retry_attempt: u8 = 0,
+    /// When the first queued stanza arrived (ms); 0 while the queue is
+    /// empty or unstamped. The queue bounces once its lifetime ends.
+    queue_started_ms: i64 = 0,
 
     const READ_BUF_SIZE = 8192;
     const WRITE_BUF_SIZE = 16384;
+    /// Bound on queued stanzas per domain (X1, ADR-13): overflow is
+    /// bounced and counted by the daemon.
+    pub const MAX_PENDING_STANZAS = 256;
     const PendingQueue = std.ArrayList(PendingStanza);
 
     pub fn init(
@@ -445,6 +457,7 @@ pub const OutboundConnection = struct {
     /// from/to/xml are all copied: the caller's slices borrow the IPC recv
     /// buffer whose next frame rewrites them (T275).
     pub fn queueStanza(self: *OutboundConnection, allocator: std.mem.Allocator, from: []const u8, to: []const u8, xml: []const u8) !void {
+        if (self.pending_stanzas.items.len >= MAX_PENDING_STANZAS) return error.QueueFull;
         const from_copy = try allocator.dupe(u8, from);
         errdefer allocator.free(from_copy);
         const to_copy = try allocator.dupe(u8, to);
