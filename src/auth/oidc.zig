@@ -291,6 +291,29 @@ fn requestOptions(options: ExchangeOptions) http.RequestOptions {
     };
 }
 
+/// Wire view of the token endpoint's 200 body. Parsed with std.json so
+/// only top-level keys bind and a repeated field is a parse error.
+const TokenResponseClaims = struct {
+    id_token: ?[]const u8 = null,
+    access_token: ?[]const u8 = null,
+};
+
+/// Wire view of an RFC 7662 introspection body. Parsed with std.json so
+/// only top-level keys bind, string escapes decode, a repeated field is
+/// a parse error, and active/email_verified must be JSON booleans.
+/// iss/aud are bound from config, never from this body; they sit in the
+/// struct only so a duplicate is still rejected.
+const IntrospectionClaims = struct {
+    active: ?bool = null,
+    sub: ?[]const u8 = null,
+    iss: ?std.json.Value = null,
+    aud: ?std.json.Value = null,
+    username: ?[]const u8 = null,
+    preferred_username: ?std.json.Value = null,
+    email: ?[]const u8 = null,
+    email_verified: ?bool = null,
+};
+
 pub const OidcStore = struct {
     config: OidcConfig,
     allocator: Allocator,
@@ -406,20 +429,19 @@ pub const OidcStore = struct {
         return "";
     }
 
-    /// Same selection for the introspection body: RFC 7662 reports the
-    /// preferred username as "username"; email needs a verified marker.
-    fn suggestionFromIntrospection(self: *const OidcStore, body: []const u8) []const u8 {
+    /// Same selection on the parsed introspection claims: RFC 7662
+    /// reports the preferred username as "username"; email needs a
+    /// verified marker.
+    fn suggestionFromIntrospection(self: *const OidcStore, ic: *const IntrospectionClaims) []const u8 {
         const claim = self.config.localpart_claim;
         if (claim.len == 0) return "";
         if (std.mem.eql(u8, claim, "preferred_username")) {
-            return extractNamedField(body, "\"username\"") orelse "";
+            return ic.username orelse "";
         }
         if (std.mem.eql(u8, claim, "email")) {
-            const verified = std.mem.indexOf(u8, body, "\"email_verified\":true") != null or
-                std.mem.indexOf(u8, body, "\"email_verified\": true") != null;
-            return if (verified) (extractNamedField(body, "\"email\"") orelse "") else "";
+            return if (ic.email_verified orelse false) (ic.email orelse "") else "";
         }
-        if (std.mem.eql(u8, claim, "sub")) return extractNamedField(body, "\"sub\"") orelse "";
+        if (std.mem.eql(u8, claim, "sub")) return ic.sub orelse "";
         return "";
     }
 
@@ -637,7 +659,19 @@ pub const OidcStore = struct {
         options: ExchangeOptions,
         out: *Identity,
     ) Verdict {
-        if (extractNamedField(body, "\"id_token\"")) |id_token| {
+        const parsed = std.json.parseFromSlice(TokenResponseClaims, allocator, body, .{
+            .ignore_unknown_fields = true,
+            .duplicate_field_behavior = .@"error",
+        }) catch {
+            log.warn(
+                "OIDC: IdP accepted the password but returned no usable id_token or access_token",
+                .{},
+            );
+            return .unavailable;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value.id_token) |id_token| {
             if (id_token.len > 0) {
                 return switch (self.checkJwt(allocator, id_token, options, out)) {
                     .verified => .verified,
@@ -660,7 +694,7 @@ pub const OidcStore = struct {
                 };
             }
         }
-        if (extractNamedField(body, "\"access_token\"")) |access_token| {
+        if (parsed.value.access_token) |access_token| {
             if (access_token.len > 0 and self.config.introspection_endpoint != null) {
                 return self.introspect(allocator, access_token, options, out);
             }
@@ -717,20 +751,28 @@ pub const OidcStore = struct {
         }
 
         const resp_body = response.body;
-        if (std.mem.indexOf(u8, resp_body, "\"active\":true") == null and
-            std.mem.indexOf(u8, resp_body, "\"active\": true") == null)
-        {
+        const parsed = std.json.parseFromSlice(IntrospectionClaims, allocator, resp_body, .{
+            .ignore_unknown_fields = true,
+            .duplicate_field_behavior = .@"error",
+        }) catch {
+            log.warn("introspection: unparseable response body", .{});
+            return .unavailable;
+        };
+        defer parsed.deinit();
+        const ic = parsed.value;
+
+        if (ic.active != true) {
             log.info("introspection: token is not active", .{});
             return .rejected;
         }
 
         // sub is required: it binds the account under the configured
         // issuer. username/email are localpart suggestions only.
-        const sub = extractNamedField(resp_body, "\"sub\"") orelse {
+        const sub = ic.sub orelse {
             log.info("introspection: no sub in response", .{});
             return .rejected;
         };
-        const suggestion = self.suggestionFromIntrospection(resp_body);
+        const suggestion = self.suggestionFromIntrospection(&ic);
 
         return switch (self.bindIdentity(allocator, self.config.issuer, sub, suggestion, out)) {
             .verified => .verified,
@@ -1673,6 +1715,13 @@ test "OidcStore: suggestionClaim selects per localpart_claim" {
     try std.testing.expectEqualStrings("", store.suggestionClaim(&claims));
 }
 
+fn parseIntrospectionClaims(allocator: Allocator, body: []const u8) !std.json.Parsed(IntrospectionClaims) {
+    return std.json.parseFromSlice(IntrospectionClaims, allocator, body, .{
+        .ignore_unknown_fields = true,
+        .duplicate_field_behavior = .@"error",
+    });
+}
+
 test "OidcStore: suggestionFromIntrospection gates email on verified" {
     const allocator = std.testing.allocator;
     var store = OidcStore.init(allocator, .{
@@ -1684,16 +1733,82 @@ test "OidcStore: suggestionFromIntrospection gates email on verified" {
     });
     defer store.deinit();
 
-    const body = "{\"active\":true,\"sub\":\"s-9\",\"username\":\"alice\",\"email\":\"a@x.example\"}";
-    try std.testing.expectEqualStrings("alice", store.suggestionFromIntrospection(body));
+    var parsed = try parseIntrospectionClaims(
+        allocator,
+        "{\"active\":true,\"sub\":\"s-9\",\"username\":\"alice\",\"email\":\"a@x.example\"}",
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("alice", store.suggestionFromIntrospection(&parsed.value));
 
     store.config.localpart_claim = "email";
-    try std.testing.expectEqualStrings("", store.suggestionFromIntrospection(body));
-    const verified_body = "{\"active\":true,\"sub\":\"s-9\",\"email\":\"a@x.example\",\"email_verified\":true}";
-    try std.testing.expectEqualStrings("a@x.example", store.suggestionFromIntrospection(verified_body));
+    try std.testing.expectEqualStrings("", store.suggestionFromIntrospection(&parsed.value));
+    var verified = try parseIntrospectionClaims(
+        allocator,
+        "{\"active\":true,\"sub\":\"s-9\",\"email\":\"a@x.example\",\"email_verified\":true}",
+    );
+    defer verified.deinit();
+    try std.testing.expectEqualStrings("a@x.example", store.suggestionFromIntrospection(&verified.value));
 
     store.config.localpart_claim = "sub";
-    try std.testing.expectEqualStrings("s-9", store.suggestionFromIntrospection(body));
+    try std.testing.expectEqualStrings("s-9", store.suggestionFromIntrospection(&parsed.value));
+}
+
+test "introspection claims: a nested act.sub does not shadow the top-level sub" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseIntrospectionClaims(
+        allocator,
+        "{\"active\":true,\"act\":{\"sub\":\"mallory\"},\"sub\":\"s-1\"}",
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("s-1", parsed.value.sub.?);
+}
+
+test "introspection claims: string escapes are decoded" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseIntrospectionClaims(
+        allocator,
+        "{\"active\":true,\"sub\":\"s\\\\u00741\"}",
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("s\\u00741", parsed.value.sub.?);
+    var quoted = try parseIntrospectionClaims(
+        allocator,
+        "{\"active\":true,\"sub\":\"a\\\"b\"}",
+    );
+    defer quoted.deinit();
+    try std.testing.expectEqualStrings("a\"b", quoted.value.sub.?);
+}
+
+test "introspection claims: a duplicate sub rejects the body" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.DuplicateField,
+        parseIntrospectionClaims(allocator, "{\"active\":true,\"sub\":\"a\",\"sub\":\"b\"}"),
+    );
+}
+
+test "introspection claims: email_verified must be a JSON boolean" {
+    const allocator = std.testing.allocator;
+    const bad = parseIntrospectionClaims(
+        allocator,
+        "{\"active\":true,\"sub\":\"s\",\"email_verified\":\"true\"}",
+    ) catch |err| {
+        try std.testing.expect(err != error.OutOfMemory);
+        return;
+    };
+    var parsed = bad;
+    defer parsed.deinit();
+    return error.TestUnexpectedResult;
+}
+
+test "introspection claims: a nested active:true does not activate" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseIntrospectionClaims(
+        allocator,
+        "{\"token\":{\"active\":true},\"sub\":\"s-1\"}",
+    );
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.active != true);
 }
 
 test "OidcStore: bindIdentity maps the resolver outcome" {
