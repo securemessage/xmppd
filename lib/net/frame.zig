@@ -261,6 +261,12 @@ pub const FrameWriter = struct {
     pub fn pending(w: *const FrameWriter) usize {
         return w.buf.items.len - w.start;
     }
+
+    /// The unsent backlog as a slice (tests and introspection; prefer
+    /// pending() when only the count is needed).
+    pub fn unsentBytes(w: *const FrameWriter) []const u8 {
+        return w.buf.items[w.start..];
+    }
 };
 
 const o_nonblock: c_int = 0x4; // O_NONBLOCK

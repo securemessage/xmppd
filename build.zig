@@ -1671,6 +1671,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    auth_ipc_protocol_mod.addImport("net_frame", net_frame_mod);
 
     const auth_ipc_server_mod = b.createModule(.{
         .root_source_file = b.path("src/ipc/server.zig"),
@@ -1791,6 +1792,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    oidc_ipc_protocol_mod.addImport("net_frame", net_frame_mod);
 
     const oidc_ipc_server_mod = b.createModule(.{
         .root_source_file = b.path("src/ipc/server.zig"),
@@ -1916,6 +1918,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    s2s_ipc_protocol_mod.addImport("net_frame", net_frame_mod);
 
     const s2s_ipc_server_mod = b.createModule(.{
         .root_source_file = b.path("src/ipc/server.zig"),

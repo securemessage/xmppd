@@ -514,7 +514,7 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
     defer updateReadBackpressure(ipc, handler, batch, slot, read_paused);
     const conn = ipc.getClient(slot) orelse return;
 
-    const n = conn.recv() catch |err| {
+    const rr = conn.recv() catch |err| {
         log.err("IPC client {d} recv error: {} — closing", .{ slot, err });
         batch.purgeFd(conn.fd);
         closeIpcLane(ipc, handler, slot);
@@ -522,7 +522,9 @@ fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, s
         return;
     };
 
-    if (n == 0) {
+    // .would_block is a stale event, not a hangup (T329): fall through
+    // and still parse whatever the buffer already holds.
+    if (rr == .eof) {
         batch.purgeFd(conn.fd);
         closeIpcLane(ipc, handler, slot);
         return;

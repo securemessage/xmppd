@@ -601,11 +601,12 @@ pub const Daemon = struct {
     fn handleIpcClient(self: *Daemon, slot: usize) void {
         const conn = self.ipc.getClient(slot) orelse return;
 
-        const n = conn.recv() catch {
+        const rr = conn.recv() catch {
             self.closeLane(slot);
             return;
         };
-        if (n == 0) {
+        // .would_block is a stale event, not a hangup (T329).
+        if (rr == .eof) {
             self.closeLane(slot);
             return;
         }
@@ -1231,7 +1232,7 @@ const IpcTestClient = struct {
             .conn = .{
                 .fd = fd,
                 .alloc = allocator,
-                .recv_buf = try allocator.alloc(u8, protocol.MAX_FRAME_SIZE),
+                .reader = protocol.FrameReader.init(try allocator.alloc(u8, protocol.MAX_FRAME_SIZE)),
             },
         };
     }
@@ -1254,7 +1255,7 @@ const IpcTestClient = struct {
         const deadline = std.time.milliTimestamp() + timeout_ms;
         while (std.time.milliTimestamp() < deadline) {
             if (try self.conn.nextMessage()) |m| return m;
-            _ = self.conn.recv() catch 0;
+            _ = self.conn.recv() catch .would_block;
             try daemon.step(10);
         }
         return null;
@@ -1359,7 +1360,7 @@ fn connectClient(allocator: Allocator, fx: *DaemonFixture) !IpcTestClient {
     const dl = std.time.milliTimestamp() + 2000;
     while (std.time.milliTimestamp() < dl) {
         try fx.daemon.step(10);
-        _ = client.conn.recv() catch 0;
+        _ = client.conn.recv() catch .would_block;
         if (try client.conn.nextMessage()) |m| {
             try std.testing.expect(std.meta.activeTag(m) == .mechanism_list);
             return client;
@@ -1702,7 +1703,7 @@ test "a completion for a closed or reused lane is dropped" {
     const dl = std.time.milliTimestamp() + 1500;
     while (std.time.milliTimestamp() < dl) {
         try fx.daemon.step(10);
-        _ = client_b.conn.recv() catch 0;
+        _ = client_b.conn.recv() catch .would_block;
         if (try client_b.conn.nextMessage()) |_| {
             return error.UnexpectedReply;
         }
@@ -1762,7 +1763,7 @@ test "an auth_abort orphans the exchange but the cap still counts it" {
     const dl = std.time.milliTimestamp() + 3500;
     while (std.time.milliTimestamp() < dl) {
         try fx.daemon.step(10);
-        _ = client.conn.recv() catch 0;
+        _ = client.conn.recv() catch .would_block;
         if (try client.conn.nextMessage()) |_| {
             return error.UnexpectedReply;
         }
@@ -2270,7 +2271,7 @@ test "a completion with a stale lane generation is dropped without a reply" {
     const dl = std.time.milliTimestamp() + 2500;
     while (fx.daemon.pending.count() > 0 and std.time.milliTimestamp() < dl) {
         try fx.daemon.step(10);
-        _ = client.conn.recv() catch 0;
+        _ = client.conn.recv() catch .would_block;
         if (try client.conn.nextMessage()) |_| return error.UnexpectedReply;
     }
     try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
@@ -2279,7 +2280,7 @@ test "a completion with a stale lane generation is dropped without a reply" {
     const settle = std.time.milliTimestamp() + 200;
     while (std.time.milliTimestamp() < settle) {
         try fx.daemon.step(10);
-        _ = client.conn.recv() catch 0;
+        _ = client.conn.recv() catch .would_block;
         if (try client.conn.nextMessage()) |_| return error.UnexpectedReply;
     }
 }

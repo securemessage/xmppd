@@ -35,14 +35,9 @@ pub const FrameWriter = net.FrameWriter;
 pub const Frame = net.Frame;
 pub const RecvResult = net.RecvResult;
 pub const WriteResult = net.WriteResult;
+pub const NextError = net.NextError;
+pub const BeginError = net.BeginError;
 pub const parseFrame = net.parseFrame;
-
-/// Legacy boundary check for callers not yet on FrameReader; an
-/// oversized header collapses to null here while parseFrame/next()
-/// report it as Oversize. Removed when every peer is on FrameReader.
-pub fn readFrame(buf: []const u8) ?Frame {
-    return parseFrame(buf) catch null;
-}
 
 comptime {
     // The codec below and lib/net framing share one wire contract; a
@@ -592,7 +587,7 @@ test "AuthRequest encode/decode roundtrip" {
     } };
 
     const written = try encode(msg, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
 
     const decoded = try decode(frame.payload);
     const req = decoded.auth_request;
@@ -614,7 +609,7 @@ test "AuthChallenge encode/decode roundtrip" {
     } };
 
     const written = try encode(msg, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
 
     const decoded = try decode(frame.payload);
     const ch = decoded.auth_challenge;
@@ -632,7 +627,7 @@ test "AuthSuccess encode/decode roundtrip" {
     } };
 
     const written = try encode(msg, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
 
     const decoded = try decode(frame.payload);
     const s = decoded.auth_success;
@@ -650,7 +645,7 @@ test "AuthFailure encode/decode roundtrip" {
     } };
 
     const written = try encode(msg, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
 
     const decoded = try decode(frame.payload);
     const f = decoded.auth_failure;
@@ -667,7 +662,7 @@ test "SaslResponse encode/decode roundtrip" {
     } };
 
     const written = try encode(msg, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
 
     const decoded = try decode(frame.payload);
     const r = decoded.sasl_response;
@@ -679,31 +674,31 @@ test "AuthAbort encode/decode roundtrip" {
     var buf: [64]u8 = undefined;
 
     const written = try encode(.{ .auth_abort = .{ .conn_id = 0xABCD1234 } }, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
     const decoded = try decode(frame.payload);
     try std.testing.expectEqual(@as(u32, 0xABCD1234), decoded.auth_abort.conn_id);
 }
 
-test "readFrame with partial data returns null" {
+test "parseFrame with partial data returns null" {
     // Only 2 bytes — not enough for a header
-    try std.testing.expect(readFrame(&[_]u8{ 0x05, 0x00 }) == null);
+    try std.testing.expect((try parseFrame(&[_]u8{ 0x05, 0x00 })) == null);
 
     // Header says 10 bytes but only 6 total
     var buf: [6]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], 10, .little);
     buf[4] = 0x01;
     buf[5] = 0x00;
-    try std.testing.expect(readFrame(&buf) == null);
+    try std.testing.expect((try parseFrame(&buf)) == null);
 }
 
-test "readFrame with exact data succeeds" {
+test "parseFrame with exact data succeeds" {
     var buf: [7]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], 3, .little); // 3-byte payload
     buf[4] = 0xAA;
     buf[5] = 0xBB;
     buf[6] = 0xCC;
 
-    const frame = readFrame(&buf) orelse return error.NoFrame;
+    const frame = (try parseFrame(&buf)) orelse return error.NoFrame;
     try std.testing.expectEqual(@as(usize, 3), frame.payload.len);
     try std.testing.expectEqual(@as(usize, 7), frame.consumed);
     try std.testing.expectEqual(@as(u8, 0xAA), frame.payload[0]);
@@ -733,7 +728,7 @@ test "encode with empty fields" {
     } };
 
     const written = try encode(msg, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
     const decoded = try decode(frame.payload);
     const req = decoded.auth_request;
     try std.testing.expectEqual(@as(u32, 0), req.conn_id);
@@ -757,13 +752,13 @@ test "multiple frames in sequence" {
     offset += try encode(msg2, buf[offset..]);
 
     // Decode first
-    const frame1 = readFrame(buf[0..offset]) orelse return error.NoFrame;
+    const frame1 = (try parseFrame(buf[0..offset])) orelse return error.NoFrame;
     const decoded1 = try decode(frame1.payload);
     try std.testing.expectEqual(@as(u32, 1), decoded1.auth_failure.conn_id);
 
     // Decode second
     const remaining = buf[frame1.consumed..offset];
-    const frame2 = readFrame(remaining) orelse return error.NoFrame;
+    const frame2 = (try parseFrame(remaining)) orelse return error.NoFrame;
     const decoded2 = try decode(frame2.payload);
     try std.testing.expectEqual(@as(u32, 2), decoded2.auth_failure.conn_id);
 }
@@ -815,7 +810,6 @@ test "parseFrame reports oversize headers" {
     var buf: [HEADER_SIZE]u8 = undefined;
     std.mem.writeInt(u32, &buf, MAX_PAYLOAD_SIZE + 1, .little);
     try std.testing.expectError(error.Oversize, parseFrame(&buf));
-    try std.testing.expect(readFrame(&buf) == null);
 }
 
 test "auth_success without photo_url decodes with default" {
@@ -915,7 +909,7 @@ test "S2sDeliver encode/decode roundtrip" {
     } };
 
     const written = try encode(msg, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
     const decoded = try decode(frame.payload);
     const d = decoded.s2s_deliver;
     try std.testing.expectEqualStrings("alice@a.example/res", d.from_jid);
@@ -934,7 +928,7 @@ test "S2sInbound encode/decode roundtrip" {
     } };
 
     const written = try encode(msg, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
     const decoded = try decode(frame.payload);
     const d = decoded.s2s_inbound;
     try std.testing.expectEqualStrings("carol@remote.example", d.from_jid);
@@ -952,7 +946,7 @@ test "S2sDeliveryFailed encode/decode roundtrip" {
     } };
 
     const written = try encode(msg, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
     const decoded = try decode(frame.payload);
     const d = decoded.s2s_delivery_failed;
     try std.testing.expectEqualStrings("alice@a.example/res", d.from_jid);
@@ -968,7 +962,7 @@ test "MechanismList encode/decode roundtrip" {
     const msg = Message{ .mechanism_list = ml };
 
     const written = try encode(msg, &buf);
-    const frame = readFrame(buf[0..written]) orelse return error.NoFrame;
+    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
     const decoded = try decode(frame.payload);
     const decoded_ml = decoded.mechanism_list;
     try std.testing.expectEqual(@as(u8, 2), decoded_ml.count);
@@ -1005,7 +999,7 @@ test "lib/net FrameWriter hosts encode() in place" {
     const n = try encode(msg, &ref);
     try std.testing.expectEqualSlices(u8, ref[0..n], w.buf.items);
 
-    const frame = readFrame(w.buf.items) orelse return error.NoFrame;
+    const frame = (try parseFrame(w.buf.items)) orelse return error.NoFrame;
     try std.testing.expectEqual(w.buf.items.len, frame.consumed);
     const decoded = try decode(frame.payload);
     try std.testing.expectEqual(@as(u32, 7), decoded.auth_failure.conn_id);

@@ -2899,11 +2899,16 @@ pub const Server = struct {
     // ========================================================================
 
     fn handleIpcReadable(self: *Server, changes: *ChangeList) void {
-        _ = self.ipc.recv() catch |err| {
+        const rr = self.ipc.recv() catch |err| {
             log.err("auth daemon IPC recv error: {}", .{err});
             self.dropIpcAuth(changes);
             return;
         };
+        if (rr == .eof) {
+            log.warn("auth daemon closed the IPC link - dropping", .{});
+            self.dropIpcAuth(changes);
+            return;
+        }
 
         // Process all complete messages
         while (true) {
@@ -2911,7 +2916,7 @@ pub const Server = struct {
                 // A decode error does not consume the frame; keeping the
                 // link retries the same bytes forever and wedges every
                 // SASL exchange behind it. Drop and reconnect (S10).
-                log.warn("auth daemon IPC decode error: {} len={d} consumed={d} — dropping link", .{ err, self.ipc.recv_len, self.ipc.recv_consumed });
+                log.warn("auth daemon IPC decode error: {} len={d} consumed={d} — dropping link", .{ err, self.ipc.reader.len, self.ipc.reader.consumed });
                 self.dropIpcAuth(changes);
                 return;
             };
@@ -3486,11 +3491,16 @@ pub const Server = struct {
     }
 
     fn handleS2sIpcReadable(self: *Server, changes: *ChangeList) void {
-        _ = self.s2s_ipc.recv() catch {
+        const rr = self.s2s_ipc.recv() catch {
             log.err("S2S daemon IPC recv error", .{});
             self.dropS2sIpc(changes);
             return;
         };
+        if (rr == .eof) {
+            log.warn("S2S daemon closed the IPC link - dropping", .{});
+            self.dropS2sIpc(changes);
+            return;
+        }
 
         while (true) {
             const msg = self.s2s_ipc.nextMessage() catch {
@@ -9560,7 +9570,7 @@ test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
     _ = server.s2s_ipc.flush() catch {};
     const groupchat_n = posix.read(daemon_fd, &frame_buf) catch 0;
     try std.testing.expect(groupchat_n > 0);
-    const groupchat_frame = ipc_protocol.readFrame(frame_buf[0..groupchat_n]);
+    const groupchat_frame = try ipc_protocol.parseFrame(frame_buf[0..groupchat_n]);
     try std.testing.expect(groupchat_frame != null);
     const groupchat_bounce = switch (try ipc_protocol.decode(groupchat_frame.?.payload)) {
         .s2s_deliver => |d| d,
@@ -10254,7 +10264,7 @@ test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {
     var frame_buf: [4096]u8 = undefined;
     const got = posix.read(daemon_fd, &frame_buf) catch 0;
     try std.testing.expect(got > 0);
-    const frame = ipc_protocol.readFrame(frame_buf[0..got]);
+    const frame = try ipc_protocol.parseFrame(frame_buf[0..got]);
     try std.testing.expect(frame != null);
     const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
         .s2s_deliver => |d| d,
@@ -10346,7 +10356,7 @@ test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
     var frame_buf: [4096]u8 = undefined;
     const got = posix.read(daemon_fd, &frame_buf) catch 0;
     try std.testing.expect(got > 0);
-    const frame = ipc_protocol.readFrame(frame_buf[0..got]);
+    const frame = try ipc_protocol.parseFrame(frame_buf[0..got]);
     try std.testing.expect(frame != null);
     const msg = try ipc_protocol.decode(frame.?.payload);
     const delivered = switch (msg) {
@@ -10404,7 +10414,7 @@ test "Server: E2b an unstorable inbound S2S stanza bounces but an error stanza d
     var frame_buf: [4096]u8 = undefined;
     const got = posix.read(daemon_fd, &frame_buf) catch 0;
     try std.testing.expect(got > 0);
-    const frame = ipc_protocol.readFrame(frame_buf[0..got]);
+    const frame = try ipc_protocol.parseFrame(frame_buf[0..got]);
     try std.testing.expect(frame != null);
     const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
         .s2s_deliver => |d| d,
@@ -10435,7 +10445,7 @@ test "Server: E2b an unstorable inbound S2S stanza bounces but an error stanza d
     _ = server.s2s_ipc.flush() catch {};
     const iq_n = posix.read(daemon_fd, &frame_buf) catch 0;
     try std.testing.expect(iq_n > 0);
-    const iq_frame = ipc_protocol.readFrame(frame_buf[0..iq_n]);
+    const iq_frame = try ipc_protocol.parseFrame(frame_buf[0..iq_n]);
     try std.testing.expect(iq_frame != null);
     const iq_bounce = switch (try ipc_protocol.decode(iq_frame.?.payload)) {
         .s2s_deliver => |d| d,
@@ -10522,7 +10532,7 @@ test "Server: G7 an inbound id with an entity is escaped once in the bounce" {
     var frame_buf: [4096]u8 = undefined;
     const got = posix.read(daemon_fd, &frame_buf) catch 0;
     try std.testing.expect(got > 0);
-    const frame = ipc_protocol.readFrame(frame_buf[0..got]);
+    const frame = try ipc_protocol.parseFrame(frame_buf[0..got]);
     try std.testing.expect(frame != null);
     const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
         .s2s_deliver => |d| d,
@@ -10584,7 +10594,7 @@ test "Server: G7 a storage error on the offline hold still bounces" {
     var frame_buf: [4096]u8 = undefined;
     const got = posix.read(daemon_fd, &frame_buf) catch 0;
     try std.testing.expect(got > 0);
-    const frame = ipc_protocol.readFrame(frame_buf[0..got]);
+    const frame = try ipc_protocol.parseFrame(frame_buf[0..got]);
     try std.testing.expect(frame != null);
     const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
         .s2s_deliver => |d| d,

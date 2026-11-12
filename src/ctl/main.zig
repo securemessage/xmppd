@@ -163,7 +163,7 @@ pub fn main() !void {
     // Try IPC to running auth daemon first for adduser/deluser/passwd.
     // This is required for RocksDB (exclusive lock) and preferred for all backends.
     if (!raw and (std.mem.eql(u8, command, "adduser") or std.mem.eql(u8, command, "deluser") or std.mem.eql(u8, command, "passwd"))) {
-        if (tryIpcCommand(command, remaining_args.items, auth_socket, cli_password, password_file)) {
+        if (tryIpcCommand(allocator, command, remaining_args.items, auth_socket, cli_password, password_file)) {
             return; // IPC succeeded
         }
         // Fall through to direct DB access
@@ -1070,6 +1070,7 @@ fn printErr(msg: []const u8) void {
 /// Try to execute a management command via IPC to the running auth daemon.
 /// Returns true if IPC succeeded, false if daemon is unreachable (fall back to direct DB).
 fn tryIpcCommand(
+    allocator: std.mem.Allocator,
     command: []const u8,
     cmd_args: []const []const u8,
     socket_path: []const u8,
@@ -1153,11 +1154,20 @@ fn tryIpcCommand(
 
     // Read response (blocking). Auth daemon sends MechanismList on connect
     // before our command response, so we must skip non-result frames.
-    var recv_buf: [4096]u8 = undefined;
+    // The buffer holds one full wire frame; parseFrame walks it by offset
+    // so a 64 KiB result frame cannot wedge the loop the way the old
+    // 4 KiB buffer did.
+    const recv_buf = allocator.alloc(u8, ipc_protocol.MAX_FRAME_SIZE) catch return false;
+    defer allocator.free(recv_buf);
     var recv_len: usize = 0;
-    while (recv_len < recv_buf.len) {
-        // Try to parse from existing buffer before reading more
-        while (ipc_protocol.readFrame(recv_buf[0..recv_len])) |frame| {
+    var consumed: usize = 0;
+    while (true) {
+        // Parse every complete frame already buffered before reading more
+        while (true) {
+            const frame = ipc_protocol.parseFrame(recv_buf[consumed..recv_len]) catch {
+                printErr("invalid response from auth daemon\n");
+                return true;
+            } orelse break;
             const resp = ipc_protocol.decode(frame.payload) catch {
                 printErr("invalid response from auth daemon\n");
                 return true;
@@ -1202,15 +1212,18 @@ fn tryIpcCommand(
                 },
                 else => {
                     // Skip non-result messages (e.g. mechanism_list) and try next frame
-                    if (frame.consumed < recv_len) {
-                        std.mem.copyForwards(u8, recv_buf[0 .. recv_len - frame.consumed], recv_buf[frame.consumed..recv_len]);
-                    }
-                    recv_len -= frame.consumed;
+                    consumed += frame.consumed;
                 },
             }
         }
 
-        // Need more data
+        // Fold the consumed prefix away, then read more
+        if (consumed > 0) {
+            const remaining = recv_len - consumed;
+            std.mem.copyForwards(u8, recv_buf[0..remaining], recv_buf[consumed..recv_len]);
+            recv_len = remaining;
+            consumed = 0;
+        }
         const n = posix.read(sock, recv_buf[recv_len..]) catch break;
         if (n == 0) break;
         recv_len += n;
