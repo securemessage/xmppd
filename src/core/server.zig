@@ -77,7 +77,7 @@ const muc_handler = @import("muc_handler.zig");
 const presence_handler = @import("presence_handler.zig");
 pub const sub_cache_mod = @import("subscription_cache.zig");
 pub const caps_mod = @import("caps.zig");
-const router = @import("router.zig");
+const router = @import("routing/router.zig");
 const session_lifecycle = @import("c2s/lifecycle.zig");
 const stanza_writer = @import("stanza/writer.zig");
 const stanza_facts = @import("stanza/facts.zig");
@@ -93,6 +93,7 @@ pub const sm_state = @import("c2s/sm_state.zig");
 const sm_handoff = @import("c2s/sm_handoff.zig");
 const c2s_session = @import("c2s/session.zig");
 const c2s_sm = @import("c2s/sm.zig");
+const routing_deliver = @import("routing/deliver.zig");
 const block_store_mod = @import("block_store");
 const metrics = @import("metrics.zig");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
@@ -697,38 +698,6 @@ pub const Server = struct {
         }
     }
 
-    /// Park a message behind a session's draining offline tail. The held bytes
-    /// are authoritative; archive metadata is retained only for fallback reads.
-    ///
-    /// Returns true when the message is held, which includes the case where this
-    /// dispatch is already held for this bare JID: the tail is per bare JID, so
-    /// every draining resource and every worker holding one sees the same
-    /// message and must not add a second row for it. `token` identifies the
-    /// dispatch, so two messages with identical bytes stay two rows.
-    pub fn holdBehindOfflineTail(
-        self: *Server,
-        target: *Session,
-        local: []const u8,
-        domain: []const u8,
-        from_jid: []const u8,
-        stanza_id: []const u8,
-        timestamp: u64,
-        stanza_xml: []const u8,
-        token: offline_store_mod.HoldToken,
-    ) bool {
-        if (!target.offline_pending) return false;
-        const store = self.offline orelse return false;
-        var recipient_buf: [router.BARE_JID_MAX]u8 = undefined;
-        const recipient = router.buildBareJid(local, domain, &recipient_buf) catch return false;
-        const outcome = store.storeHeldPointerOnce(recipient, from_jid, stanza_id, timestamp, stanza_xml, token) catch |err| {
-            log.warn("message to {s} could not be held behind the offline tail: {s}", .{ recipient, @errorName(err) });
-            return false;
-        };
-        return switch (outcome) {
-            .stored, .already_held => true,
-            .full => false,
-        };
-    }
 
     /// Configure the vCard store (XEP-0054).
     pub fn configureVcard(self: *Server, vcard_store: *GenericVCardStore) void {
@@ -1038,7 +1007,7 @@ pub const Server = struct {
                 switch (ev) {
                     .fd_readable => |e| {
                         if (e.udata == WAKE_PIPE_UDATA) {
-                            self.handleDeliveryWake(&changes);
+                            routing_deliver.handleDeliveryWake(self, &changes);
                         }
                     },
                     else => {},
@@ -1062,7 +1031,7 @@ pub const Server = struct {
             if (self.delivery_system) |ds| {
                 ds.getState(self.worker_id).setIdle();
                 if (ds.getQueue(self.worker_id).hasPending()) {
-                    self.drainDeliveryQueue(&changes);
+                    routing_deliver.drainDeliveryQueue(self, &changes);
                     _ = self.drainRoomMailboxes(&changes);
                     // Self-wake only for MPSC queue CAS race (producer reserved
                     // slot but hasn't stored ready=true yet). Room mailboxes
@@ -1776,108 +1745,8 @@ pub const Server = struct {
         // Write interest: reconcileIpcWriteInterest (S10).
     }
 
-    /// Return a service-unavailable error over the inbound S2S link.
-    fn bounceS2sInbound(self: *Server, remote_from: []const u8, local_to: []const u8, tag_name: []const u8, stanza_id: []const u8) void {
-        _ = self.sendS2sError(remote_from, local_to, tag_name, stanza_id);
-    }
 
-    /// Serialize and queue a service-unavailable bounce for an inbound S2S
-    /// stanza. Returns false when the bounce could not be handed to the S2S
-    /// daemon, so callers can count and log the refusal instead of assuming
-    /// the sender was told.
-    fn sendS2sError(self: *Server, remote_from: []const u8, local_to: []const u8, tag_name: []const u8, stanza_id: []const u8) bool {
-        if (!self.s2s_ipc.connected) {
-            log.warn("S2S bounce for {s} dropped: no S2S daemon", .{remote_from});
-            return false;
-        }
 
-        var lease = self.leaseByteScratch() orelse return false;
-        defer lease.release();
-        var fbs = std.io.fixedBufferStream(lease.buf);
-        stanza_writer.writeS2sError(fbs.writer(), tag_name, local_to, remote_from, stanza_id) catch {
-            log.warn("S2S bounce for {s} dropped: serialization failed", .{remote_from});
-            return false;
-        };
-
-        self.s2s_ipc.send(.{ .s2s_deliver = .{
-            .from_jid = local_to,
-            .to_jid = remote_from,
-            .stanza_xml = fbs.getWritten(),
-        } }) catch {
-            log.err("failed to bounce S2S inbound for {s}", .{remote_from});
-            return false;
-        };
-        _ = delivery_queue_mod.s2s_bounces.fetchAdd(1, .monotonic);
-        // Write interest: reconcileIpcWriteInterest (S10).
-        return true;
-    }
-
-    /// Tell the sender of a cross-worker stanza that it could not be held
-    /// behind the recipient's draining offline tail. The sender may live on
-    /// another worker, so the bounce is routed through the session map and
-    /// the MPSC queue the same way a delivery is.
-    fn bounceCrossWorkerUnavailable(
-        self: *Server,
-        sender_wire: []const u8,
-        recipient_bare: []const u8,
-        stanza_id: []const u8,
-        tag_name: []const u8,
-        changes: *ChangeList,
-    ) void {
-        const sm = self.session_map orelse return;
-        // sender_wire is the raw on-wire attribute, still entity-encoded.
-        var sender_buf: [512]u8 = undefined;
-        var sender_fbs = std.io.fixedBufferStream(&sender_buf);
-        xml.decodeWrite(sender_fbs.writer(), sender_wire) catch {
-            log.warn("cross-worker bounce dropped: sender attribute does not decode", .{});
-            return;
-        };
-        const sender_full = sender_fbs.getWritten();
-        const sender = xmpp.Jid.parse(sender_full) catch {
-            log.warn("cross-worker bounce for {s} dropped: unparsable sender", .{sender_full});
-            return;
-        };
-        if (sender.resource.len == 0) {
-            log.warn("cross-worker bounce for {s} dropped: sender is a bare JID", .{sender_full});
-            return;
-        }
-        const entry = sm.findByFullJid(sender.local, sender.domain, sender.resource) orelse {
-            log.warn("cross-worker bounce for {s} dropped: sender session gone", .{sender_full});
-            return;
-        };
-
-        var buf: [1024]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        stanza_writer.writeCrossWorkerError(fbs.writer(), tag_name, recipient_bare, sender_full, stanza_id) catch {
-            log.warn("cross-worker bounce for {s} dropped: serialization failed", .{sender_full});
-            return;
-        };
-        const stanza = fbs.getWritten();
-
-        if (entry.worker_id == self.worker_id) {
-            const session = self.sessions[entry.local_session_id] orelse {
-                log.warn("cross-worker bounce for {s} dropped: sender slot empty", .{sender_full});
-                return;
-            };
-            session.queueSendStanza(stanza) catch |err| {
-                log.warn("cross-worker bounce for {s} not queued: {s}", .{ sender_full, @errorName(err) });
-                return;
-            };
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
-        } else if (self.delivery_system) |ds| {
-            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, stanza) catch {
-                _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
-                log.warn("cross-worker bounce for {s} dropped: delivery queue full", .{sender_full});
-                return;
-            };
-        } else {
-            log.warn("cross-worker bounce for {s} dropped: no delivery system", .{sender_full});
-            return;
-        }
-        _ = delivery_queue_mod.offline_hold_bounces.fetchAdd(1, .monotonic);
-    }
 
     fn handleS2sIpcReadable(self: *Server, changes: *ChangeList) void {
         const rr = self.s2s_ipc.recv() catch {
@@ -1913,7 +1782,7 @@ pub const Server = struct {
         // Write interest: reconcileIpcWriteInterest (S10).
     }
 
-    fn dispatchS2sResponse(self: *Server, msg: ipc_protocol.Message, changes: *ChangeList) void {
+    pub fn dispatchS2sResponse(self: *Server, msg: ipc_protocol.Message, changes: *ChangeList) void {
         switch (msg) {
             .s2s_inbound => |m| {
                 // Inbound stanza from remote — deliver to local session(s) by
@@ -1942,13 +1811,13 @@ pub const Server = struct {
                     const parts = stanza_facts.extractStanzaParts(m.stanza_xml);
                     if (parts.is_message and std.mem.eql(u8, parts.msg_type, "groupchat")) {
                         log.warn("S2S groupchat to {s}: recipient unavailable, bouncing", .{m.to_jid});
-                        self.bounceS2sInbound(m.from_jid, m.to_jid, "message", parts.msg_id);
+                        routing_deliver.bounceS2sInbound(self, m.from_jid, m.to_jid, "message", parts.msg_id);
                         return;
                     }
                     if (parts.is_iq) {
                         if (std.mem.eql(u8, parts.msg_type, "get") or std.mem.eql(u8, parts.msg_type, "set")) {
                             log.warn("S2S IQ to {s}: recipient unavailable, bouncing", .{m.to_jid});
-                            self.bounceS2sInbound(m.from_jid, m.to_jid, "iq", parts.msg_id);
+                            routing_deliver.bounceS2sInbound(self, m.from_jid, m.to_jid, "iq", parts.msg_id);
                         }
                         return;
                     }
@@ -1959,7 +1828,7 @@ pub const Server = struct {
                             var recip_buf: [router.BARE_JID_MAX]u8 = undefined;
                             const recipient_bare = router.buildBareJid(to_jid.local, to_jid.domain, &recip_buf) catch |err| {
                                 log.warn("S2S message to {s} has an invalid offline key: {s}", .{ m.to_jid, @errorName(err) });
-                                self.bounceS2sInbound(m.from_jid, m.to_jid, "message", parts.msg_id);
+                                routing_deliver.bounceS2sInbound(self, m.from_jid, m.to_jid, "message", parts.msg_id);
                                 return;
                             };
 
@@ -1986,7 +1855,7 @@ pub const Server = struct {
                         // Quota reached, or no offline store at all: tell the remote
                         // sender instead of dropping the stanza on the floor (E2b).
                         log.warn("S2S inbound to {s}: recipient offline and not storable, bouncing", .{m.to_jid});
-                        self.bounceS2sInbound(m.from_jid, m.to_jid, "message", parts.msg_id);
+                        routing_deliver.bounceS2sInbound(self, m.from_jid, m.to_jid, "message", parts.msg_id);
                         return;
                     }
                     log.info("S2S inbound to {s}: recipient unavailable, nothing stored", .{m.to_jid});
@@ -2023,14 +1892,14 @@ pub const Server = struct {
                             // this worker asks, and the store collapses them.
                             if (s2s_hold_stored) continue;
                             const hold_id = if (live_parts.msg_id.len > 0) live_parts.msg_id else "s2s-offline";
-                            if (self.holdBehindOfflineTail(target_session, to_jid.local, to_jid.domain, m.from_jid, hold_id, s2s_archive_ts, m.stanza_xml, s2s_hold_token)) {
+                            if (routing_deliver.holdBehindOfflineTail(self, target_session, to_jid.local, to_jid.domain, m.from_jid, hold_id, s2s_archive_ts, m.stanza_xml, s2s_hold_token)) {
                                 s2s_hold_stored = true;
                                 continue;
                             }
                             // Held neither in the queue nor on the wire: tell
                             // the remote sender instead of dropping (H2).
                             log.warn("S2S message to {s} not held, bouncing to the sender", .{m.to_jid});
-                            if (self.sendS2sError(m.from_jid, m.to_jid, "message", live_parts.msg_id)) {
+                            if (routing_deliver.sendS2sError(self, m.from_jid, m.to_jid, "message", live_parts.msg_id)) {
                                 _ = delivery_queue_mod.offline_hold_bounces.fetchAdd(1, .monotonic);
                             }
                             continue;
@@ -2183,151 +2052,14 @@ pub const Server = struct {
     // Cross-thread delivery (MPSC queue consumer)
     // ========================================================================
 
-    /// Handle EVFILT_READ on the wake pipe — drain pipe bytes, then drain the MPSC queue,
-    /// then drain per-room mailboxes.
-    fn handleDeliveryWake(self: *Server, changes: *ChangeList) void {
-        const ds = self.delivery_system orelse return;
-        if (metrics.get()) |c| metrics.bump(&c.wakes, 1);
-        ds.drainPipe(self.worker_id);
-        self.drainDeliveryQueue(changes);
-        _ = self.drainRoomMailboxes(changes);
-    }
 
-    /// Drain all pending deliveries from this worker's MPSC queue.
-    /// Validates generation (ABA protection) before delivering to local sessions.
-    fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
-        const ds = self.delivery_system orelse return;
-        const sm = self.session_map orelse return;
-        const queue = ds.getQueue(self.worker_id);
 
-        const Ctx = struct {
-            server: *Server,
-            changes: *ChangeList,
-            session_map: *SessionMap,
-            queue: *delivery_queue_mod.MpscQueue,
-        };
-        const ctx = Ctx{ .server = self, .changes = changes, .session_map = sm, .queue = queue };
-
-        _ = queue.drain(ctx, struct {
-            fn handle(c: Ctx, local_session_id: u32, generation: u32, payload: []const u8) void {
-                // Multicast delivery: fan-out to all local occupants in a room
-                if (local_session_id == delivery_queue_mod.MULTICAST_SENTINEL) {
-                    c.server.handleMulticastDelivery(payload, c.changes);
-                    return;
-                }
-
-                // Room actor message: decode and dispatch to local room shard
-                if (local_session_id == delivery_queue_mod.ROOM_ACTOR_SENTINEL) {
-                    c.server.handleRoomActorMessage(payload, c.changes);
-                    return;
-                }
-
-                // SM resume handoff actor message (T177)
-                if (local_session_id == delivery_queue_mod.SM_ACTOR_SENTINEL) {
-                    c2s_sm.handleSmActorMessage(c.server,payload, c.changes);
-                    return;
-                }
-
-                // Unicast: ABA check then deliver to single session
-                if (!c.session_map.getGenerationById(c.server.worker_id, local_session_id, generation)) return;
-
-                const target_session = c.server.sessions[local_session_id] orelse return;
-                const parts = stanza_facts.extractStanzaParts(payload);
-                // XEP-0280 sections 2 and 7: a carbon copy reaches only a
-                // Carbons-enabled resource, live or not at all. The producer
-                // tags the slot so the same per-session policy the local
-                // carbon path applies (sendCarbons -> deliverToSession,
-                // which never holds) applies to a remote target: it is
-                // never held behind a draining offline tail, never stored
-                // and never bounced.
-                const is_carbon = c.queue.current_slot_kind == .carbon;
-                if (is_carbon and !target_session.carbons_enabled) return;
-                // The hold check comes before the SM-detach check: a detached
-                // session may still have an undrained offline tail, and a
-                // message pushed into its replay queue would be replayed
-                // ahead of that tail (H3). The c2s router orders them the
-                // same way.
-                if (target_session.offline_pending and !is_carbon and parts.is_message and !std.mem.eql(u8, parts.msg_type, "error")) {
-                    const hold_id = if (parts.msg_id.len > 0) parts.msg_id else "offline";
-                    // Stamp the producer's receipt time, not the time a busy
-                    // consumer worker got to the slot.
-                    const timestamp: u64 = if (c.queue.current_slot_receipt_ts != 0)
-                        c.queue.current_slot_receipt_ts
-                    else
-                        @intCast(std.time.timestamp());
-                    const from_jid = stanza_facts.extractAttrValue(payload, "from");
-                    const bound = target_session.stream.bound_jid orelse {
-                        log.warn("cross-worker message to session {d} has no bound recipient for its offline hold", .{local_session_id});
-                        return;
-                    };
-                    // A producer that minted a token (the router, S2S inbound)
-                    // has every worker holding a resource of this bare JID
-                    // collapse the same dispatch. A producer that did not gets
-                    // a token here, so the message is still stored; only the
-                    // cross-worker collapse is lost, never the message.
-                    const token = if (c.queue.current_slot_token != 0)
-                        c.queue.current_slot_token
-                    else
-                        c.server.mintHoldToken();
-                    if (c.server.holdBehindOfflineTail(target_session, bound.local, bound.domain, from_jid, hold_id, timestamp, payload, token)) return;
-                    // The stanza can neither be held nor sent without
-                    // overtaking the draining tail. Tell the sender rather
-                    // than dropping it (H2), as the c2s router does.
-                    var recip_buf: [router.BARE_JID_MAX]u8 = undefined;
-                    const recipient_bare = router.buildBareJid(bound.local, bound.domain, &recip_buf) catch "";
-                    log.warn("cross-worker message to session {d} not held, bouncing to the sender", .{local_session_id});
-                    if (recipient_bare.len > 0) {
-                        c.server.bounceCrossWorkerUnavailable(from_jid, recipient_bare, parts.msg_id, "message", c.changes);
-                    }
-                    return;
-                }
-                if (target_session.sm_detached) {
-                    // T153: no live connection to deliver to — track for resume
-                    // replay instead of silently dropping the stanza.
-                    target_session.smTrackOutbound(payload);
-                    return;
-                }
-                target_session.conn.queueSend(payload) catch return;
-                target_session.smTrackOutbound(payload);
-                if (target_session.conn.hasPendingWrite()) {
-                    c.changes.addWrite(target_session.conn.fd, local_session_id) catch {};
-                }
-            }
-        }.handle);
-    }
-
-    /// Handle a multicast delivery from the MPSC queue.
-    /// Decodes the payload (room_jid + prefix + suffix), finds the room,
-    /// and delivers the pre-built stanza to all local occupants.
-    fn handleMulticastDelivery(self: *Server, payload: []const u8, changes: *ChangeList) void {
-        const decoded = fanout_mod.decodeMulticastPayload(payload) orelse {
-            log.warn("malformed multicast payload ({d} bytes)", .{payload.len});
-            return;
-        };
-
-        const reg = self.room_registry orelse return;
-        const room = reg.findByJid(decoded.room_jid) orelse return;
-
-        // One delivery buffer reused for every local occupant (S18). The
-        // prefix and suffix read here live in the decoded multicast payload.
-        var deliver_lease = self.leaseByteScratch() orelse return;
-        defer deliver_lease.release();
-
-        for (&room.occupants) |*slot| {
-            const occ = slot.* orelse continue;
-            if (occ.worker_id != self.worker_id) continue;
-            if (occ.session_id == room_registry_mod.REMOTE_OCCUPANT) continue;
-
-            const target_session = self.sessions[occ.session_id] orelse continue;
-            fanout_mod.deliverPrebuiltToSession(target_session, deliver_lease.buf, decoded.prefix, occ.getRealJid(), decoded.suffix, occ.session_id, changes);
-        }
-    }
 
     /// Handle a room actor message from the MPSC queue.
     /// Room-targeted messages (join, part, groupchat, disco) are pushed into the
     /// target room's per-room mailbox for fair scheduling. Non-room messages
     /// (shadow updates, session close) are dispatched immediately.
-    fn handleRoomActorMessage(self: *Server, payload: []const u8, changes: *ChangeList) void {
+    pub fn handleRoomActorMessage(self: *Server, payload: []const u8, changes: *ChangeList) void {
         const msg = actor_message.decode(payload) orelse {
             log.warn("malformed room actor message ({d} bytes)", .{payload.len});
             return;
@@ -2407,7 +2139,7 @@ pub const Server = struct {
     /// per room per iteration, bounded to MAX_DRAIN_PER_TICK total messages to
     /// prevent infinite spinning when cross-thread traffic generates responses.
     /// Returns true if there are still pending messages (caller should self-wake).
-    fn drainRoomMailboxes(self: *Server, changes: *ChangeList) bool {
+    pub fn drainRoomMailboxes(self: *Server, changes: *ChangeList) bool {
         const reg = self.room_registry orelse return false;
         const MAX_DRAIN_PER_TICK: usize = 32;
         var processed: usize = 0;
@@ -2513,29 +2245,6 @@ pub const Server = struct {
         return 1;
     }
 
-    /// Encode and enqueue a multicast delivery to each remote worker that has
-    /// occupants in the given room. Iterates set bits in worker_mask, excluding self.
-    pub fn deliverMulticastToWorkers(self: *Server, room: *const room_registry_mod.Room, prefix: []const u8, suffix: []const u8) void {
-        const ds = self.delivery_system orelse return;
-
-        var mcast_buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
-        const mcast_len = fanout_mod.encodeMulticastPayload(&mcast_buf, room.getJid(), prefix, suffix) orelse {
-            log.warn("multicast payload too large for room {s}", .{room.getJid()});
-            return;
-        };
-        const mcast_payload = mcast_buf[0..mcast_len];
-
-        // Iterate set bits in worker_mask, excluding self
-        var mask = room.worker_mask;
-        mask.unset(self.worker_id);
-        var mask_it = mask.iterator(.{});
-        while (mask_it.next()) |bit| {
-            const wid: u16 = @intCast(bit);
-            ds.deliver(wid, delivery_queue_mod.MULTICAST_SENTINEL, 0, mcast_payload) catch |err| {
-                log.warn("multicast delivery failed to worker {d}: {}", .{ wid, err });
-            };
-        }
-    }
 
     // ========================================================================
     // XEP-0198: Stream Management
@@ -2933,145 +2642,8 @@ test "Server: M1 SIGUSR1 dump runs against a live worker block" {
     try std.testing.expectEqual(@as(u64, 3), c.stanzas_message.load(.monotonic));
 }
 
-test "cross-thread delivery: enqueue and drain" {
-    const allocator = std.testing.allocator;
 
-    // Set up shared infrastructure
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
 
-    // Create a server that acts as worker 1 (the one draining)
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 1;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-
-    // Create a target session on worker 1 using a socketpair
-    // Local session ID = 5
-    const fds = try makeSocketPair();
-    defer posix.close(fds[1]);
-    const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 5, "localhost", false, allocator);
-    server.sessions[5] = session;
-
-    // Bind in session map (local_session_id = 5, worker = 1)
-    const gen = try sm.bind(1, 5, "bob", "localhost", "desktop");
-
-    // Simulate a cross-thread enqueue FROM worker 0 TO session 5 on worker 1
-    const route = sm.findByFullJid("bob", "localhost", "desktop").?;
-    try std.testing.expectEqual(@as(u16, 1), route.worker_id);
-    try std.testing.expectEqual(@as(u32, 5), route.local_session_id);
-    try std.testing.expectEqual(gen, route.generation);
-
-    // Build a stanza and enqueue it (as if worker 0 is sending)
-    try delivery_sys.deliver(route.worker_id, route.local_session_id, route.generation, "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>cross-thread!</body></message>");
-
-    // Worker 1 drains its queue
-    var change_buf: [16]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.drainDeliveryQueue(&changes);
-
-    // The session should now have pending write data
-    try std.testing.expect(session.conn.hasPendingWrite());
-
-    // Flush and read from the client side of the socketpair
-    _ = try session.conn.flushSend();
-    var buf: [4096]u8 = undefined;
-    const n = posix.read(fds[1], &buf) catch 0;
-    const received = buf[0..n];
-
-    // Verify the stanza arrived intact
-    try std.testing.expect(std.mem.indexOf(u8, received, "cross-thread!") != null);
-    try std.testing.expect(std.mem.indexOf(u8, received, "alice@localhost/mobile") != null);
-    try std.testing.expect(std.mem.indexOf(u8, received, "bob@localhost") != null);
-}
-
-test "S35: the cross-worker hold stamps the producer receipt time" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
-    defer server.deinit();
-    server.worker_id = 1;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-
-    var change_buf: [16]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-
-    const fds = try makeSocketPair();
-    defer posix.close(fds[1]);
-    const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 5, "localhost", false, allocator);
-    session.stream.state = .features_bind;
-    session.stream.authenticated = true;
-    session.stream.authenticated_jid = xmpp.Jid{ .local = "bob", .domain = "localhost" };
-    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
-    session.offline_pending = true;
-    server.sessions[5] = session;
-    const gen = try sm.bind(1, 5, "bob", "localhost", "desktop");
-
-    // The producer tags the slot with its own receipt time; the hold on the
-    // consuming worker must store that time, not the time the drain ran.
-    try delivery_sys.deliverDelivery(1, 5, gen, "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345, .stanza);
-    server.drainDeliveryQueue(&changes);
-
-    session_lifecycle.drainOfflinePending(&server, session, &changes);
-
-    _ = try session.conn.flushSend();
-    var buf: [2048]u8 = undefined;
-    const n = posix.read(fds[1], &buf) catch 0;
-    const wire = buf[0..n];
-    // 12345 seconds past the epoch, not the consumer-side wall clock.
-    try std.testing.expect(std.mem.indexOf(u8, wire, "stamp='1970-01-01T03:25:45Z'") != null);
-}
-
-test "cross-thread delivery: generation mismatch drops stanza" {
-    const allocator = std.testing.allocator;
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
-
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-
-    // Bind a session, get its generation, then unbind (simulating disconnect)
-    const gen = try sm.bind(0, 3, "alice", "localhost", "mobile");
-    _ = sm.unbind("alice", "localhost", "mobile");
-
-    // Enqueue with the OLD generation (stale delivery)
-    try delivery_sys.deliver(0, 3, gen, "<message>stale</message>");
-
-    // Drain — should silently drop (generation mismatch)
-    var change_buf: [16]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.drainDeliveryQueue(&changes);
-
-    // No session at slot 3, so nothing should crash or write
-    try std.testing.expect(server.sessions[3] == null);
-}
 
 // The live delivery path enqueues with queueSendWithFlush. Counting the call
 // is not enough: the stanza still has to be tracked for XEP-0198, or the ack
@@ -3092,9 +2664,10 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "connection.zig", @embedFile("connection.zig"), 17 }, // Connection layer self-tests incl. the M1 counter test; no Session.
         .{ "fanout.zig", @embedFile("fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
-        .{ "router.zig", @embedFile("router.zig"), 2 }, // one comment; queueSendWithFlush is tracked.
+        .{ "routing/router.zig", @embedFile("routing/router.zig"), 2 }, // one comment; queueSendWithFlush is tracked.
         .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig"), 0 },
-        .{ "server.zig", @embedFile("server.zig"), 5 }, // stream/SASL/SM nonzas + M1 counter self-test.
+        .{ "server.zig", @embedFile("server.zig"), 4 }, // stream/SASL/SM nonzas + M1 counter self-test.
+        .{ "routing/deliver.zig", @embedFile("routing/deliver.zig"), 1 }, // cross-worker drain queues the stanza raw.
         .{ "c2s/session.zig", @embedFile("c2s/session.zig"), 13 }, // queueSendStanza itself + stream/SASL nonzas.
         .{ "c2s/sm.zig", @embedFile("c2s/sm.zig"), 9 }, // SM enable/resume/failed nonzas.
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), 0 },
@@ -3106,7 +2679,7 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "archive_queue.zig", @embedFile("archive_queue.zig"), 0 },
         .{ "xworker/ring.zig", @embedFile("xworker/ring.zig"), 0 },
         .{ "event_loop.zig", @embedFile("event_loop.zig"), 0 },
-        .{ "jid_bounds.zig", @embedFile("jid_bounds.zig"), 0 },
+        .{ "routing/address.zig", @embedFile("routing/address.zig"), 0 },
         .{ "listener.zig", @embedFile("listener.zig"), 0 },
         .{ "main.zig", @embedFile("main.zig"), 0 },
         .{ "metrics.zig", @embedFile("metrics.zig"), 0 },
@@ -3121,8 +2694,8 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "stanza/facts.zig", @embedFile("stanza/facts.zig"), 0 },
         .{ "stanza/writer.zig", @embedFile("stanza/writer.zig"), 0 },
     };
-    if (cases.len != 29) {
-        log.err("S15 ratchet: covers {d} core files, expected 29", .{cases.len});
+    if (cases.len != 30) {
+        log.err("S15 ratchet: covers {d} core files, expected 30", .{cases.len});
         return error.RatchetCoverage;
     }
     inline for (cases) |case| {
@@ -3144,61 +2717,6 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
     }
 }
 
-test "Server: an over-long sender bare JID still delivers live" {
-    const allocator = std.testing.allocator;
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-
-    const target_fds = try makeSocketPair();
-    defer posix.close(target_fds[1]);
-    const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
-    server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    // The localpart parses, but local@domain overflows the 512-byte bare JID
-    // that keys the archive and the offline store. Dispatch must still deliver
-    // live rather than return, or the stanza reaches nobody silently.
-    var long_local: [600]u8 = undefined;
-    @memset(&long_local, 'l');
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = .{ .local = &long_local, .domain = "localhost", .resource = "mobile" };
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-    alice.stanza_id = "m1";
-    const body = "<body>long</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    _ = target.conn.flushSend() catch {};
-    var buf: [2048]u8 = undefined;
-    const n = posix.read(target_fds[1], &buf) catch 0;
-    try std.testing.expect(n > 0);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>long</body>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "to='bob@localhost'") != null);
-
-    // The sender got no error: the stanza was delivered.
-    _ = alice.conn.flushSend() catch {};
-    var abuf: [512]u8 = undefined;
-    const an = posix.read(alice_fds[1], &abuf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), an);
-}
 
 // The MUC fan-out tears down a session whose buffer is genuinely full rather
 // than leaving it wedged. c2s delivery now answers the same condition the same
@@ -3386,89 +2904,6 @@ test "Server: a non-archivable message stores offline with no archive" {
     }
 }
 
-test "Server: S13 message held behind a draining offline tail" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    try tmp.dir.makePath("archive");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
-    defer allocator.free(arch_path);
-
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
-    defer arch_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-    server.archive = &arch_store;
-
-    // bob is online but his offline tail is still draining (S13).
-    const target_fds = try makeSocketPair();
-    defer posix.close(target_fds[1]);
-    const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
-    target.offline_pending = true;
-    server.sessions[5] = target;
-
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-    alice.stanza_id = "m1";
-    const body = "<body>held</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    // Not delivered live: it would overtake the draining tail.
-    _ = target.conn.flushSend() catch {};
-    var buf: [1024]u8 = undefined;
-    const n = posix.read(target_fds[1], &buf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), n);
-
-    _ = alice.conn.flushSend() catch {};
-    const sender_n = posix.read(alice_fds[1], &buf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), sender_n);
-
-    // Parked behind the tail instead: one offline pointer whose held copy
-    // carries the stanza itself, so the drain does not depend on an archive
-    // row the async writer queue may not have committed yet (E2a).
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-    const ptrs = try offline_store.getPointers("bob@localhost");
-    defer offline_store.freePointers(ptrs);
-    const held = try offline_store.getHeldStanza(ptrs[0]);
-    try std.testing.expect(held != null);
-    if (held) |h| {
-        defer allocator.free(h);
-        try std.testing.expect(std.mem.indexOf(u8, h, "<body>held</body>") != null);
-    }
-}
 
 // The tail is per bare JID but the drain flag is per session, so one resource
 // draining the tail leaves every other resource of that JID marked pending.
@@ -3590,116 +3025,7 @@ test "Re-review 6.8: an empty tail cancels the retry timer" {
     try std.testing.expectEqual(@as(usize, 1), timers);
 }
 
-// Two draining resources on one worker ask to hold the same message. The
-// store would collapse them, but the second ask must not happen at all: it
-// would log a second hold and count a second dispatch.
-test "Re-review 6.8: the router holds a bare-JID message once per worker" {
-    const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-
-    for ([_]struct { id: u32, res: []const u8 }{ .{ .id = 5, .res = "desktop" }, .{ .id = 6, .res = "phone" } }) |r| {
-        const fds = try makeSocketPair();
-        defer posix.close(fds[1]);
-        const sess = try allocator.create(Session);
-        sess.* = Session.init(fds[0], r.id, "localhost", false, allocator);
-        sess.offline_pending = true;
-        server.sessions[r.id] = sess;
-        _ = try sm.bind(0, r.id, "bob", "localhost", r.res);
-        sm.setPresenceAvailable("bob", "localhost", r.res, true);
-    }
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-    alice.stanza_id = "r1b";
-    const body = "<body>one hold</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    // One row, and exactly one store call: the second resource short-circuits
-    // on the flag instead of asking the store to collapse it.
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-    try std.testing.expectEqual(@as(u32, 1), offline_store.test_hold_calls);
-}
-
-// The S2S inbound loop keeps its own per-worker flag for the same reason: two
-// draining resources of one bare JID ask once, not twice.
-test "Re-review 6.8: the S2S hold asks the store once per worker" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-
-    for ([_]struct { id: u32, res: []const u8 }{ .{ .id = 5, .res = "desktop" }, .{ .id = 6, .res = "phone" } }) |r| {
-        const fds = try makeSocketPair();
-        defer posix.close(fds[1]);
-        const sess = try allocator.create(Session);
-        sess.* = Session.init(fds[0], r.id, "localhost", false, allocator);
-        sess.offline_pending = true;
-        server.sessions[r.id] = sess;
-        _ = try sm.bind(0, r.id, "bob", "localhost", r.res);
-        sm.setPresenceAvailable("bob", "localhost", r.res, true);
-    }
-
-    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='r1c' type='chat'><body>one hold</body></message>";
-    var change_buf: [32]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = stanza,
-    } }, &changes);
-
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-    try std.testing.expectEqual(@as(u32, 1), offline_store.test_hold_calls);
-}
 
 // After the retry's delete lands, no row is outstanding for this session, so
 // the recorded sequence must be cleared: it travels in the resume bundle, and
@@ -3746,67 +3072,6 @@ test "Re-review 6.8: a successful retry delete clears the recorded sequence" {
     try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
 }
 
-// A delivery form can exceed the scratch bank even when the stanza itself fits
-// the parser's 16 KiB buffer: a bound JID full of characters that escape to
-// five bytes adds more than the bank's headroom. Nothing can be delivered, so
-// the sender has to hear it instead of the bytes vanishing.
-test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sender" {
-    const allocator = std.testing.allocator;
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-
-    const bob_fds = try makeSocketPair();
-    defer posix.close(bob_fds[1]);
-    const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
-    bob.stream.state = .active;
-    bob.stream.authenticated = true;
-    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
-    server.sessions[5] = bob;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desk");
-    sm.setPresenceAvailable("bob", "localhost", "desk", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.state = .active;
-    // The sender's full JID stays inside the 1 KiB form buffer but every byte
-    // of it escapes to five, so the delivery head outgrows the headroom the
-    // 20 KiB scratch bank leaves above a 16 KiB stanza.
-    var local_buf: [500]u8 = undefined;
-    @memset(&local_buf, '&');
-    var res_buf: [400]u8 = undefined;
-    @memset(&res_buf, '&');
-    alice.stream.bound_jid = .{ .local = &local_buf, .domain = "localhost", .resource = &res_buf };
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-    alice.stanza_id = "big";
-    const body_len = 16384;
-    @memset(alice.stanza_buf[0..body_len], 'x');
-    alice.stanza_buf_len = body_len;
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    // Nothing was queued for the recipient: there is no delivery form at all.
-    try std.testing.expectEqual(@as(usize, 0), bob.conn.pendingWriteBytes());
-
-    // The sender is told instead.
-    _ = alice.conn.flushSend() catch {};
-    var wire: [4096]u8 = undefined;
-    const n = posix.read(alice_fds[1], &wire) catch 0;
-    try std.testing.expect(n > 0);
-    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "id='big'") != null);
-}
 
 // A delivery form between the write buffer and the scratch bank fits the
 // serializer but never the socket buffer. That is not a slow reader: the form
@@ -3977,254 +3242,9 @@ test "Re-review 6.2: a real delete failure records the sequence, the retry does 
     try std.testing.expect(!session.offline_pending);
 }
 
-test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
 
-    const target_fds = try makeSocketPair();
-    defer posix.close(target_fds[1]);
-    const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
-    target.offline_pending = true;
-    server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    const entry = sm.findByFullJid("bob", "localhost", "desktop") orelse return error.MissingSession;
 
-    const payload = "<message from='alice@localhost/mobile' to='bob@localhost' id='q1' type='chat'><body>queued</body></message>";
-    try delivery_sys.deliver(0, 5, entry.generation, payload);
-    var change_buf: [16]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.drainDeliveryQueue(&changes);
-
-    _ = target.conn.flushSend() catch {};
-    var buf: [4096]u8 = undefined;
-    const n = posix.read(target_fds[1], &buf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), n);
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-    const pointers = try offline_store.getPointers("bob@localhost");
-    defer offline_store.freePointers(pointers);
-    try std.testing.expectEqual(@as(usize, 1), pointers.len);
-    try std.testing.expectEqualStrings("q1", pointers[0].stanza_id);
-    const held = try offline_store.getHeldStanza(pointers[0]);
-    try std.testing.expect(held != null);
-    defer if (held) |xml_bytes| allocator.free(xml_bytes);
-    try std.testing.expectEqualStrings(payload, held.?);
-}
-
-test "Server: G3 inbound S2S delivery parks behind a draining offline tail" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.offline = &offline_store;
-
-    const target_fds = try makeSocketPair();
-    defer posix.close(target_fds[1]);
-    const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
-    target.offline_pending = true;
-    server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    const payload = "<message from='carol@example.com/res' to='bob@localhost' id='s1' type='chat'><body>federated-tail</body></message>";
-    var change_buf: [16]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = payload,
-    } }, &changes);
-
-    _ = target.conn.flushSend() catch {};
-    var buf: [4096]u8 = undefined;
-    const n = posix.read(target_fds[1], &buf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), n);
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-    const pointers = try offline_store.getPointers("bob@localhost");
-    defer offline_store.freePointers(pointers);
-    try std.testing.expectEqual(@as(usize, 1), pointers.len);
-    try std.testing.expectEqualStrings("s1", pointers[0].stanza_id);
-    const held = try offline_store.getHeldStanza(pointers[0]);
-    try std.testing.expect(held != null);
-    defer if (held) |xml_bytes| allocator.free(xml_bytes);
-    try std.testing.expectEqualStrings(payload, held.?);
-}
-
-test "Server: G3 type normal parks behind a draining offline tail" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.offline = &offline_store;
-
-    const target_fds = try makeSocketPair();
-    defer posix.close(target_fds[1]);
-    const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
-    target.offline_pending = true;
-    server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "normal";
-    alice.stanza_id = "n1";
-    const body = "<body>normal-tail</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-    var change_buf: [16]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    _ = target.conn.flushSend() catch {};
-    var buf: [4096]u8 = undefined;
-    const n = posix.read(target_fds[1], &buf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), n);
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-    const pointers = try offline_store.getPointers("bob@localhost");
-    defer offline_store.freePointers(pointers);
-    try std.testing.expectEqual(@as(usize, 1), pointers.len);
-    try std.testing.expectEqualStrings("n1", pointers[0].stanza_id);
-    const held = try offline_store.getHeldStanza(pointers[0]);
-    try std.testing.expect(held != null);
-    defer if (held) |xml_bytes| allocator.free(xml_bytes);
-    try std.testing.expect(std.mem.indexOf(u8, held.?, "<body>normal-tail</body>") != null);
-}
-
-// H4: the G3 tests above start with an empty store, so none of them proves
-// that a live message lands behind rows that were already queued. Each of
-// these starts with a stored row and checks both the pointer order and the
-// order the drain puts on the wire.
-test "Server: H4 a cross-worker message lands behind an existing offline tail" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    try tmp.dir.makePath("archive");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
-    defer allocator.free(arch_path);
-
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
-    defer arch_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-    server.archive = &arch_store;
-
-    // The row bob never received, stored before anything live arrives.
-    const tail = "<message from='alice@localhost/mobile' to='bob@localhost' id='tail-0' type='chat'><body>tail</body></message>";
-    try std.testing.expect(try offline_store.storeHeldPointer("bob@localhost", "alice@localhost/mobile", "tail-0", 1000, tail));
-
-    const target_fds = try makeSocketPair();
-    defer posix.close(target_fds[1]);
-    const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
-    target.offline_pending = true;
-    server.sessions[5] = target;
-    const gen = try sm.bind(0, 5, "bob", "localhost", "desktop");
-
-    const live = "<message from='alice@localhost/mobile' to='bob@localhost' id='live-1' type='chat'><body>live</body></message>";
-    try delivery_sys.deliver(0, 5, gen, live);
-
-    var change_buf: [32]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.drainDeliveryQueue(&changes);
-
-    // Both are in the store, and the live one is behind the tail.
-    try std.testing.expectEqual(@as(usize, 2), try offline_store.countMessages("bob@localhost"));
-    const ptrs = try offline_store.getPointers("bob@localhost");
-    defer offline_store.freePointers(ptrs);
-    try std.testing.expectEqual(@as(usize, 2), ptrs.len);
-    try std.testing.expectEqualStrings("tail-0", ptrs[0].stanza_id);
-    try std.testing.expectEqualStrings("live-1", ptrs[1].stanza_id);
-
-    // The drain puts the tail on the wire first.
-    session_lifecycle.deliverOfflineMessages(&server, target, "bob", "localhost", &changes);
-    _ = target.conn.flushSend() catch {};
-    var wire = std.ArrayList(u8){};
-    defer wire.deinit(allocator);
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = posix.read(target_fds[1], &buf) catch break;
-        if (n == 0) break;
-        try wire.appendSlice(allocator, buf[0..n]);
-    }
-    try std.testing.expect(!target.offline_pending);
-    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
-    const tail_at = std.mem.indexOf(u8, wire.items, "<body>tail</body>");
-    const live_at = std.mem.indexOf(u8, wire.items, "<body>live</body>");
-    try std.testing.expect(tail_at != null);
-    try std.testing.expect(live_at != null);
-    try std.testing.expect(tail_at.? < live_at.?);
-}
 
 test "Server: H4 an inbound S2S message lands behind an existing offline tail" {
     const allocator = std.testing.allocator;
@@ -4553,297 +3573,8 @@ test "Server: E2d an oversized archive form is not stored offline" {
     try std.testing.expectEqual(not_stored_before + 1, delivery_queue_mod.offline_not_stored.load(.monotonic));
 }
 
-// E2b: an inbound S2S stanza for an offline local user is stored with its
-// payload, and a full offline queue bounces back over the same link instead of
-// dropping the stanza silently.
-test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
-    const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    try tmp.dir.makePath("archive");
-    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &dir_path);
-    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
 
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
-    defer allocator.free(arch_path);
-
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
-    defer arch_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-
-    var listener = try TestIpcListener.init(sock_path);
-    defer listener.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-    server.archive = &arch_store;
-    try server.configureS2s(sock_path);
-    try std.testing.expect(server.s2s_ipc.connected);
-
-    // Accept the daemon side so the bounce frame can be read back. Non-blocking:
-    // this test asserts that nothing was sent.
-    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
-    defer posix.close(daemon_fd);
-
-    // bob is offline: no session bound anywhere.
-    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='r1' type='chat'><body>federated</body></message>";
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = stanza,
-    } }, &changes);
-
-    // The pointer carries the payload, so a drain cannot depend on the archive
-    // row landing first.
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-    const ptrs = try offline_store.getPointers("bob@localhost");
-    defer offline_store.freePointers(ptrs);
-    try std.testing.expectEqual(@as(usize, 1), ptrs.len);
-
-    const held = try offline_store.getHeldStanza(ptrs[0]);
-    try std.testing.expect(held != null);
-    defer if (held) |h| allocator.free(h);
-    try std.testing.expect(std.mem.indexOf(u8, held.?, "<body>federated</body>") != null);
-
-    // Nothing was bounced back to the remote sender.
-    _ = server.s2s_ipc.flush() catch {};
-    var frame_buf: [4096]u8 = undefined;
-    const got = posix.read(daemon_fd, &frame_buf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), got);
-
-    changes.reset();
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = "<message from='carol@example.com/res' to='bob@localhost' id='gc1' type='groupchat'><body>not offline</body></message>",
-    } }, &changes);
-    _ = server.s2s_ipc.flush() catch {};
-    const groupchat_n = posix.read(daemon_fd, &frame_buf) catch 0;
-    try std.testing.expect(groupchat_n > 0);
-    const groupchat_frame = try ipc_protocol.parseFrame(frame_buf[0..groupchat_n]);
-    try std.testing.expect(groupchat_frame != null);
-    const groupchat_bounce = switch (try ipc_protocol.decode(groupchat_frame.?.payload)) {
-        .s2s_deliver => |d| d,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect(std.mem.indexOf(u8, groupchat_bounce.stanza_xml, "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, groupchat_bounce.stanza_xml, "id='gc1'") != null);
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-}
-
-// H2: a message that cannot be held behind a draining offline tail has to
-// bounce (and count) on every path, so the sender is never told nothing.
-test "Server: H2 a cross-worker hold failure bounces to the sender on the same worker" {
-    const allocator = std.testing.allocator;
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    // No offline store at all: the hold cannot succeed.
-
-    // alice (the sender) lives on this worker.
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    server.sessions[9] = alice;
-    _ = try sm.bind(0, 9, "alice", "localhost", "mobile");
-    const alice_bound = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
-    alice.stream.bound_jid = alice_bound;
-
-    // bob (the recipient) lives here too, with a draining offline tail.
-    const bob_fds = try makeSocketPair();
-    defer posix.close(bob_fds[1]);
-    const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
-    bob.offline_pending = true;
-    bob.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
-    server.sessions[5] = bob;
-    const bob_gen = try sm.bind(0, 5, "bob", "localhost", "desktop");
-
-    const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' id='h2-1' type='chat'><body>hi</body></message>";
-    try delivery_sys.deliver(0, 5, bob_gen, stanza);
-
-    const bounces_before = delivery_queue_mod.offline_hold_bounces.load(.monotonic);
-    var change_buf: [32]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.drainDeliveryQueue(&changes);
-
-    // alice is told the message was not accepted.
-    const alice_n = try alice.conn.flushSend();
-    try std.testing.expect(alice_n > 0);
-    var buf: [4096]u8 = undefined;
-    const n = posix.read(alice_fds[1], &buf) catch 0;
-    const got = buf[0..n];
-    try std.testing.expect(std.mem.indexOf(u8, got, "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "id='h2-1'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "from='bob@localhost'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "to='alice@localhost/mobile'") != null);
-
-    // bob's socket got nothing: the stanza never overtook his tail.
-    _ = bob.conn.flushSend() catch {};
-    var bbuf: [4096]u8 = undefined;
-    const bn = posix.read(bob_fds[1], &bbuf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), bn);
-
-    try std.testing.expectEqual(bounces_before + 1, delivery_queue_mod.offline_hold_bounces.load(.monotonic));
-}
-
-test "Server: H2 a cross-worker hold failure bounces across workers" {
-    const allocator = std.testing.allocator;
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
-
-    // Worker 1 drains bob's queue; alice lives on worker 0.
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 1;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-
-    const bob_fds = try makeSocketPair();
-    defer posix.close(bob_fds[1]);
-    const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
-    bob.offline_pending = true;
-    bob.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
-    server.sessions[5] = bob;
-    const bob_gen = try sm.bind(1, 5, "bob", "localhost", "desktop");
-
-    _ = try sm.bind(0, 9, "alice", "localhost", "mobile");
-
-    const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' id='h2-2' type='chat'><body>hi</body></message>";
-    try delivery_sys.deliver(1, 5, bob_gen, stanza);
-
-    var change_buf: [32]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.drainDeliveryQueue(&changes);
-
-    // bob got nothing.
-    _ = bob.conn.flushSend() catch {};
-    var bbuf: [4096]u8 = undefined;
-    const bn = posix.read(bob_fds[1], &bbuf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), bn);
-
-    // The bounce went back through worker 0's queue, generation-checked.
-    const Seen = struct {
-        count: usize = 0,
-        session_id: u32 = 0,
-        payload: []const u8 = "",
-
-        fn handle(self: *@This(), id: u32, _: u32, payload: []const u8) void {
-            self.count += 1;
-            self.session_id = id;
-            self.payload = payload;
-        }
-    };
-    var seen = Seen{};
-    _ = delivery_sys.getQueue(0).drain(&seen, Seen.handle);
-    try std.testing.expectEqual(@as(usize, 1), seen.count);
-    try std.testing.expectEqual(@as(u32, 9), seen.session_id);
-    try std.testing.expect(std.mem.indexOf(u8, seen.payload, "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen.payload, "id='h2-2'") != null);
-}
-// H3: a detached session can still have an undrained offline tail. A live
-// message must be parked behind that tail, not pushed into the SM replay
-// queue, which would replay it ahead of the tail.
-test "Server: H3 a cross-worker message to a detached session is held behind its tail" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-
-    const fds = try makeSocketPair();
-    defer posix.close(fds[1]);
-    const target = try allocator.create(Session);
-    target.* = Session.init(fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
-    target.sm_detached = true;
-    target.sm_resume_enabled = true;
-    target.sm_detach_time = std.time.timestamp();
-    target.sm_id_len = sm_state.SM_ID_HEX_LEN;
-    const sm_id = "11112222333344445555666677778888";
-    @memcpy(&target.sm_id, sm_id);
-    target.offline_pending = true;
-    const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(allocator);
-    queue.base_seq = 1;
-    target.sm_unacked = queue;
-    server.sessions[5] = target;
-    server.detached_count = 1;
-    c2s_sm.smIdMapInsert(&server,&target.sm_id, 5);
-    const bob_gen = try sm.bind(0, 5, "bob", "localhost", "desktop");
-
-    const payload = "<message from='alice@localhost/mobile' to='bob@localhost' id='h3-1' type='chat'><body>live</body></message>";
-    try delivery_sys.deliver(0, 5, bob_gen, payload);
-
-    var change_buf: [16]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.drainDeliveryQueue(&changes);
-
-    // Nothing went into the replay queue: that would have replayed ahead of
-    // the undrained tail.
-    try std.testing.expectEqual(@as(u32, 0), queue.count);
-    // Parked in the offline store instead.
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-    const ptrs = try offline_store.getPointers("bob@localhost");
-    defer offline_store.freePointers(ptrs);
-    const held = try offline_store.getHeldStanza(ptrs[0]);
-    try std.testing.expect(held != null);
-    if (held) |h| {
-        defer allocator.free(h);
-        try std.testing.expect(std.mem.indexOf(u8, h, "<body>live</body>") != null);
-    }
-    // The flag survives: the tail is still outstanding.
-    try std.testing.expect(target.offline_pending);
-}
 
 test "Server: H3 a resume carries the stalled offline tail" {
     const allocator = std.testing.allocator;
@@ -5263,415 +3994,12 @@ test "Server: H3 a local resume carries the stalled offline tail" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "tail-2") != null);
 }
 
-test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {
-    const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &dir_path);
-    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
 
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
 
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
 
-    var listener = try TestIpcListener.init(sock_path);
-    defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-    try server.configureS2s(sock_path);
-
-    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
-    defer posix.close(daemon_fd);
-
-    // bob is online but his offline tail is still draining, and his queue is
-    // at quota so the hold cannot succeed.
-    const bob_fds = try makeSocketPair();
-    defer posix.close(bob_fds[1]);
-    const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
-    bob.offline_pending = true;
-    server.sessions[5] = bob;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    var i: usize = 0;
-    while (i < 100) : (i += 1) {
-        var id_buf: [16]u8 = undefined;
-        const sid = std.fmt.bufPrint(&id_buf, "q{d}", .{i}) catch unreachable;
-        const stored = try offline_store.storePointer("bob@localhost", "carol@example.com", sid, 100 + @as(u64, @intCast(i)));
-        try std.testing.expect(stored);
-    }
-
-    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='h2-3' type='chat'><body>federated</body></message>";
-    const bounces_before = delivery_queue_mod.s2s_bounces.load(.monotonic);
-    var change_buf: [32]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = stanza,
-    } }, &changes);
-
-    // The remote sender learns the stanza was refused.
-    _ = server.s2s_ipc.flush() catch {};
-    var frame_buf: [4096]u8 = undefined;
-    const got = posix.read(daemon_fd, &frame_buf) catch 0;
-    try std.testing.expect(got > 0);
-    const frame = try ipc_protocol.parseFrame(frame_buf[0..got]);
-    try std.testing.expect(frame != null);
-    const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
-        .s2s_deliver => |d| d,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqualStrings("carol@example.com/res", bounced.to_jid);
-    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "id='h2-3'") != null);
-    try std.testing.expectEqual(bounces_before + 1, delivery_queue_mod.s2s_bounces.load(.monotonic));
-
-    // Nothing was stored on top of the full queue, and bob's socket stayed
-    // empty: the stanza did not overtake his tail.
-    try std.testing.expectEqual(@as(usize, 100), try offline_store.countMessages("bob@localhost"));
-    _ = bob.conn.flushSend() catch {};
-    var bbuf: [4096]u8 = undefined;
-    const bn = posix.read(bob_fds[1], &bbuf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), bn);
-}
-
-test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    try tmp.dir.makePath("archive");
-    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &dir_path);
-    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
-
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
-    defer allocator.free(arch_path);
-
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
-    defer arch_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-
-    var listener = try TestIpcListener.init(sock_path);
-    defer listener.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-    server.archive = &arch_store;
-    try server.configureS2s(sock_path);
-
-    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
-    defer posix.close(daemon_fd);
-
-    // Fill bob's offline queue to the per-user maximum.
-    var i: usize = 0;
-    while (i < 100) : (i += 1) {
-        var id_buf: [16]u8 = undefined;
-        const sid = std.fmt.bufPrint(&id_buf, "q{d}", .{i}) catch unreachable;
-        const stored = try offline_store.storePointer("bob@localhost", "carol@example.com", sid, 100 + @as(u64, @intCast(i)));
-        try std.testing.expect(stored);
-    }
-
-    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='r2' type='chat'><body>too much</body></message>";
-    const bounces_before = delivery_queue_mod.s2s_bounces.load(.monotonic);
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = stanza,
-    } }, &changes);
-
-    // The queue stayed exactly at quota: nothing new was accepted.
-    try std.testing.expectEqual(@as(usize, 100), try offline_store.countMessages("bob@localhost"));
-
-    // The remote sender learns the stanza was dropped rather than being told
-    // it was delivered.
-    _ = server.s2s_ipc.flush() catch {};
-    var frame_buf: [4096]u8 = undefined;
-    const got = posix.read(daemon_fd, &frame_buf) catch 0;
-    try std.testing.expect(got > 0);
-    const frame = try ipc_protocol.parseFrame(frame_buf[0..got]);
-    try std.testing.expect(frame != null);
-    const msg = try ipc_protocol.decode(frame.?.payload);
-    const delivered = switch (msg) {
-        .s2s_deliver => |d| d,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqualStrings("carol@example.com/res", delivered.to_jid);
-    try std.testing.expect(std.mem.indexOf(u8, delivered.stanza_xml, "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, delivered.stanza_xml, "id='r2'") != null);
-    try std.testing.expectEqual(bounces_before + 1, delivery_queue_mod.s2s_bounces.load(.monotonic));
-}
-
-// E2b: with no offline store the inbound message still bounces rather than
-// vanishing, and an inbound error stanza is never bounced back (two servers
-// would otherwise trade bounces forever).
-test "Server: E2b an unstorable inbound S2S stanza bounces but an error stanza does not" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &dir_path);
-    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-
-    var listener = try TestIpcListener.init(sock_path);
-    defer listener.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    // No offline store, no archive: nothing here can hold the stanza.
-    try server.configureS2s(sock_path);
-
-    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
-    defer posix.close(daemon_fd);
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = "<message from='carol@example.com/res' to='bob@localhost' id='r3' type='chat'><body>hello</body></message>",
-    } }, &changes);
-
-    _ = server.s2s_ipc.flush() catch {};
-    var frame_buf: [4096]u8 = undefined;
-    const got = posix.read(daemon_fd, &frame_buf) catch 0;
-    try std.testing.expect(got > 0);
-    const frame = try ipc_protocol.parseFrame(frame_buf[0..got]);
-    try std.testing.expect(frame != null);
-    const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
-        .s2s_deliver => |d| d,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "id='r3'") != null);
-
-    // An error stanza for the same offline recipient is dropped without a
-    // reply, so the bounce cannot come back as another bounce.
-    changes.reset();
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = "<message from='carol@example.com/res' to='bob@localhost' id='r4' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>",
-    } }, &changes);
-
-    _ = server.s2s_ipc.flush() catch {};
-    const second = posix.read(daemon_fd, &frame_buf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), second);
-
-    changes.reset();
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = "<iq from='carol@example.com/res' to='bob@localhost' id='q1' type='get'><query xmlns='jabber:iq:version'/></iq>",
-    } }, &changes);
-    _ = server.s2s_ipc.flush() catch {};
-    const iq_n = posix.read(daemon_fd, &frame_buf) catch 0;
-    try std.testing.expect(iq_n > 0);
-    const iq_frame = try ipc_protocol.parseFrame(frame_buf[0..iq_n]);
-    try std.testing.expect(iq_frame != null);
-    const iq_bounce = switch (try ipc_protocol.decode(iq_frame.?.payload)) {
-        .s2s_deliver => |d| d,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect(std.mem.startsWith(u8, iq_bounce.stanza_xml, "<iq type='error'"));
-    try std.testing.expect(std.mem.indexOf(u8, iq_bounce.stanza_xml, "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, iq_bounce.stanza_xml, "id='q1'") != null);
-
-    changes.reset();
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = "<iq from='carol@example.com/res' to='bob@localhost' id='q2' type='result'><query xmlns='jabber:iq:version'/></iq>",
-    } }, &changes);
-    _ = server.s2s_ipc.flush() catch {};
-    const iq_result_n = posix.read(daemon_fd, &frame_buf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), iq_result_n);
-}
-
-test "G7: the S2S bounce escapes the id once and from/to once" {
-    var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    // msg_id is the raw on-wire form: an entity is decoded then escaped once,
-    // not double-escaped. from/to are plain JIDs, escaped once.
-    try stanza_writer.writeS2sBounce(fbs.writer(), "b&b@localhost", "carol@example.com/res", "a&amp;b");
-    const out = fbs.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, out, "id='a&amp;b'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "a&amp;amp;") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "from='b&amp;b@localhost'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "to='carol@example.com/res'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "service-unavailable") != null);
-}
-
-test "G7: a single quote in the id cannot break the bounce attribute" {
-    var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try stanza_writer.writeS2sBounce(fbs.writer(), "bob@localhost", "carol@example.com", "x'y");
-    const out = fbs.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, out, "id='x&apos;y'") != null);
-}
-
-// G7: an inbound id carrying an XML entity is escaped exactly once through the
-// real parse and bounce path.
-test "Server: G7 an inbound id with an entity is escaped once in the bounce" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &dir_path);
-    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-
-    var listener = try TestIpcListener.init(sock_path);
-    defer listener.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    // No offline store: the stanza bounces.
-    try server.configureS2s(sock_path);
-
-    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
-    defer posix.close(daemon_fd);
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = "<message from='carol@example.com/res' to='bob@localhost' id='a&amp;b' type='chat'><body>hello</body></message>",
-    } }, &changes);
-
-    _ = server.s2s_ipc.flush() catch {};
-    var frame_buf: [4096]u8 = undefined;
-    const got = posix.read(daemon_fd, &frame_buf) catch 0;
-    try std.testing.expect(got > 0);
-    const frame = try ipc_protocol.parseFrame(frame_buf[0..got]);
-    try std.testing.expect(frame != null);
-    const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
-        .s2s_deliver => |d| d,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "id='a&amp;b'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "a&amp;amp;") == null);
-}
-
-// G7: a storage error, not only a full queue, bounces the inbound stanza. An
-// over-long recipient makes the offline hold fail with KeyTooLong.
-test "Server: G7 a storage error on the offline hold still bounces" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    var dir_path: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &dir_path);
-    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-
-    var listener = try TestIpcListener.init(sock_path);
-    defer listener.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-    try server.configureS2s(sock_path);
-
-    const daemon_fd = try posix.accept(listener.fd, null, null, posix.SOCK.NONBLOCK);
-    defer posix.close(daemon_fd);
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-
-    const long_to = "bob@" ++ ("d" ** 520);
-    server.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = long_to,
-        .stanza_xml = "<message from='carol@example.com/res' to='bob@localhost' id='r9' type='chat'><body>hello</body></message>",
-    } }, &changes);
-
-    _ = server.s2s_ipc.flush() catch {};
-    var frame_buf: [4096]u8 = undefined;
-    const got = posix.read(daemon_fd, &frame_buf) catch 0;
-    try std.testing.expect(got > 0);
-    const frame = try ipc_protocol.parseFrame(frame_buf[0..got]);
-    try std.testing.expect(frame != null);
-    const bounced = switch (try ipc_protocol.decode(frame.?.payload)) {
-        .s2s_deliver => |d| d,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect(std.mem.indexOf(u8, bounced.stanza_xml, "service-unavailable") != null);
-}
 
 // E2c: the stanza ID is the key tiebreaker within a timestamp
 // (owner\x00timestamp_be\x00stanza_id), so its lexicographic order has to match
@@ -5967,96 +4295,6 @@ test "Server: S13 writable handler resumes the stalled offline drain" {
     try std.testing.expect(filler_at.? < tail_at.?);
 }
 
-// S13: when the offline queue is at quota the held copy cannot be stored.
-// Dropping it silently lost the message, so the sender must be told.
-test "Server: S13 hold at quota bounces instead of dropping silently" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    try tmp.dir.makePath("archive");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
-    defer allocator.free(arch_path);
-
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
-    defer arch_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-    server.archive = &arch_store;
-
-    // Fill bob's offline queue to MAX_PER_USER so the hold is refused.
-    var i: usize = 0;
-    while (i < 100) : (i += 1) {
-        var id_buf: [16]u8 = undefined;
-        const sid = std.fmt.bufPrint(&id_buf, "q{d}", .{i}) catch unreachable;
-        const stored = try offline_store.storePointer("bob@localhost", "carol@localhost", sid, 100 + @as(u64, @intCast(i)));
-        try std.testing.expect(stored);
-    }
-
-    // bob is online but his offline tail is still draining.
-    const target_fds = try makeSocketPair();
-    defer posix.close(target_fds[1]);
-    const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
-    target.offline_pending = true;
-    server.sessions[5] = target;
-
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-    alice.stanza_id = "m1";
-    const body = "<body>bounced</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-
-    const hold_bounces_before = delivery_queue_mod.offline_hold_bounces.load(.monotonic);
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    // The sender gets a service-unavailable error rather than silence.
-    _ = alice.conn.flushSend() catch {};
-    var buf: [4096]u8 = undefined;
-    const n = posix.read(alice_fds[1], &buf) catch 0;
-    const got = buf[0..n];
-    try std.testing.expect(std.mem.indexOf(u8, got, "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "id='m1'") != null);
-
-    // Nothing was held: the queue is still exactly at quota.
-    try std.testing.expectEqual(@as(usize, 100), try offline_store.countMessages("bob@localhost"));
-    try std.testing.expectEqual(hold_bounces_before + 1, delivery_queue_mod.offline_hold_bounces.load(.monotonic));
-
-    // bob got nothing out of order.
-    _ = target.conn.flushSend() catch {};
-    var tbuf: [4096]u8 = undefined;
-    const tn = posix.read(target_fds[1], &tbuf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), tn);
-}
 
 test "Server: R5 S2S cross-worker delivery drops are counted" {
     const allocator = std.testing.allocator;
@@ -6094,225 +4332,9 @@ test "Server: R5 S2S cross-worker delivery drops are counted" {
     try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.cross_worker_drops.load(.monotonic));
 }
 
-test "S14: failed cross-worker resource does not block local delivery" {
-    const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
 
-    // bob has a local resource (worker 0, session 5) and a remote one
-    // (worker 1, session 7). The stanza exceeds the 4080-byte delivery
-    // slot, so the cross-worker enqueue fails.
-    const target_fds = try makeSocketPair();
-    defer posix.close(target_fds[1]);
-    const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
-    server.sessions[5] = target;
-
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    _ = try sm.bind(1, 7, "bob", "localhost", "phone");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-    sm.setPresenceAvailable("bob", "localhost", "phone", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-    alice.stanza_id = "m1";
-    const body = "<body>" ++ ([_]u8{'x'} ** 5000) ++ "</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    // The local resource still receives the stanza.
-    _ = try target.conn.flushSend();
-    var buf: [8192]u8 = undefined;
-    const n = posix.read(target_fds[1], &buf) catch 0;
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>") != null);
-
-    // The sender is not bounced: another resource took the message.
-    _ = alice.conn.flushSend() catch {};
-    var abuf: [1024]u8 = undefined;
-    const an = posix.read(alice_fds[1], &abuf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), an);
-}
-
-test "S14: oversize cross-worker stanza falls back to the offline store" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    try tmp.dir.makePath("archive");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
-    defer allocator.free(arch_path);
-
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var arch_db = try ArchiveBackendMod.Backend.open(arch_path, .{});
-    defer arch_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-    var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-    server.archive = &arch_store;
-
-    // bob's only resource lives on worker 1: the direct handoff is the
-    // cross-thread enqueue, and the stanza exceeds the delivery slot, so
-    // the fallback alone decides what happens to it.
-    _ = try sm.bind(1, 7, "bob", "localhost", "phone");
-    sm.setPresenceAvailable("bob", "localhost", "phone", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-    alice.stanza_id = "m1";
-    const body = "<body>" ++ ([_]u8{'x'} ** 5000) ++ "</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    // Nothing delivered live; the fallback parked it offline.
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-
-    // The sender is not bounced: the message is held, not lost.
-    _ = alice.conn.flushSend() catch {};
-    var abuf: [1024]u8 = undefined;
-    const an = posix.read(alice_fds[1], &abuf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), an);
-}
-
-test "S14: oversize cross-worker stanza with no offline store bounces" {
-    const allocator = std.testing.allocator;
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-
-    // bob remote-only again, but no offline store: the bounce fallback
-    // is the only path left.
-    _ = try sm.bind(1, 7, "bob", "localhost", "phone");
-    sm.setPresenceAvailable("bob", "localhost", "phone", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-    alice.stanza_id = "m1";
-    const body = "<body>" ++ ([_]u8{'x'} ** 5000) ++ "</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    _ = alice.conn.flushSend() catch {};
-    var abuf: [2048]u8 = undefined;
-    const an = posix.read(alice_fds[1], &abuf) catch 0;
-    try std.testing.expect(an > 0);
-    try std.testing.expect(std.mem.indexOf(u8, abuf[0..an], "service-unavailable") != null);
-}
-
-// The owning worker's snapshot decides what the resumed session believes it
-// has already drained. A bundle built without the drain sequence makes the
-// requesting worker resend a tail the resumed client already has.
-test "Server: G4 a near-limit online stanza is bounced when delivery cannot queue it" {
-    const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-
-    const bob_fds = try makeSocketPair();
-    defer posix.close(bob_fds[1]);
-    const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
-    server.sessions[5] = bob;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    server.sessions[9] = alice;
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-
-    const body_prefix = "<body>";
-    const body_suffix = "</body>";
-    const filler_len = alice.stanza_buf.len - body_prefix.len - body_suffix.len;
-    @memcpy(alice.stanza_buf[0..body_prefix.len], body_prefix);
-    @memset(alice.stanza_buf[body_prefix.len..][0..filler_len], 'A');
-    @memcpy(alice.stanza_buf[body_prefix.len + filler_len ..][0..body_suffix.len], body_suffix);
-    alice.stanza_buf_len = alice.stanza_buf.len;
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, alice, &changes);
-
-    _ = bob.conn.flushSend() catch {};
-    var bob_buf: [4096]u8 = undefined;
-    const bob_n = posix.read(bob_fds[1], &bob_buf) catch 0;
-    try std.testing.expectEqual(@as(usize, 0), bob_n);
-
-    _ = alice.conn.flushSend() catch {};
-    var alice_buf: [4096]u8 = undefined;
-    const alice_n = posix.read(alice_fds[1], &alice_buf) catch 0;
-    try std.testing.expect(std.mem.indexOf(u8, alice_buf[0..alice_n], "service-unavailable") != null);
-}
 
 // E6 (S11): only whitespace is allowed at the stream level between stanzas.
 // Non-whitespace there is a stream error (RFC 6120 4.6.1).
@@ -6381,7 +4403,7 @@ test "S10: IPC write interest lives only in server.zig" {
     const s2s_needle = "IPC_S2S_" ++ "UDATA";
     const cases = .{
         .{ "iq_handler.zig", @embedFile("iq_handler.zig") },
-        .{ "router.zig", @embedFile("router.zig") },
+        .{ "routing/router.zig", @embedFile("routing/router.zig") },
         .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig") },
         .{ "presence_handler.zig", @embedFile("presence_handler.zig") },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig") },
@@ -6454,7 +4476,7 @@ test "S10: the IPC reconnect timers are armed in exactly one place" {
         .{ "server.zig", @embedFile("server.zig"), @as(usize, 1), @as(usize, 1) },
         .{ "connection.zig", @embedFile("connection.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "router.zig", @embedFile("router.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "routing/router.zig", @embedFile("routing/router.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig"), @as(usize, 0), @as(usize, 0) },
@@ -6722,11 +4744,11 @@ test "Server: S10 a deferred IPC disarm keeps the armed flag set" {
 }
 
 /// Listening AF_UNIX socket, for exercising a real IPC reconnect.
-const TestIpcListener = struct {
+pub const TestIpcListener = struct {
     fd: posix.fd_t = -1,
     path: []const u8,
 
-    fn init(path: []const u8) !TestIpcListener {
+    pub fn init(path: []const u8) !TestIpcListener {
         var self = TestIpcListener{ .path = path };
         std.fs.cwd().deleteFile(path) catch {};
 
@@ -6749,7 +4771,7 @@ const TestIpcListener = struct {
         return self;
     }
 
-    fn deinit(self: *TestIpcListener) void {
+    pub fn deinit(self: *TestIpcListener) void {
         if (self.fd >= 0) posix.close(self.fd);
         std.fs.cwd().deleteFile(self.path) catch {};
     }
@@ -7222,238 +5244,8 @@ test "every store namespace constant is registered and every registry entry is o
     }
 }
 
-// N1: the offline tail is per bare JID, but the hold decision is per session,
-// so every draining resource asks to hold the same message. The store keeps one
-// row per dispatch, and that row reaches whichever resource drains first. The
-// other resource finds the tail empty and gets nothing: the tail is shared, not
-// per resource.
-test "N1: two draining resources hold a bare-JID message once" {
-    const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 1);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-
-    const desktop_fds = try makeSocketPair();
-    defer posix.close(desktop_fds[1]);
-    const desktop = try allocator.create(Session);
-    desktop.* = Session.init(desktop_fds[0], 5, "localhost", false, allocator);
-    desktop.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
-    desktop.offline_pending = true;
-    server.sessions[5] = desktop;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    const phone_fds = try makeSocketPair();
-    defer posix.close(phone_fds[1]);
-    const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
-    phone.stream.bound_jid = xmpp.Jid.parse("bob@localhost/phone") catch unreachable;
-    phone.offline_pending = true;
-    server.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
-    sm.setPresenceAvailable("bob", "localhost", "phone", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-    alice.stanza_id = "n1-1";
-    const body = "<body>held once</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    // One message, one row, however many resources are draining it.
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-
-    // The tail is per bare JID, so exactly one resource receives the message:
-    // the first to drain. The second finds the tail empty and sends nothing.
-    var delivered_copies: usize = 0;
-    for ([_]*Session{ desktop, phone }) |session| {
-        session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
-        _ = session.conn.flushSend() catch {};
-        var wire: [8192]u8 = undefined;
-        const fd = if (session == desktop) desktop_fds[1] else phone_fds[1];
-        const got = posix.read(fd, &wire) catch 0;
-        delivered_copies += std.mem.count(u8, wire[0..got], "<body>held once</body>");
-    }
-    try std.testing.expectEqual(@as(usize, 1), delivered_copies);
-    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
-}
-
-// N1: the same collapse has to hold across workers. The tail is one bare JID
-// row, so a resource of bob on each worker both ask to hold the same message
-// and the store must write it once, whichever worker wins the race.
-// Two identical messages must stay two rows. A message with no server
-// stanza-id (type='normal', no id) serializes identically on both dispatches,
-// so only the token minted per dispatch can tell them apart.
-test "N1: two identical stanza-less messages to a draining bare JID are two rows" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.offline = &offline_store;
-
-    const desktop_fds = try makeSocketPair();
-    defer posix.close(desktop_fds[1]);
-    const desktop = try allocator.create(Session);
-    desktop.* = Session.init(desktop_fds[0], 5, "localhost", false, allocator);
-    desktop.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
-    desktop.offline_pending = true;
-    server.sessions[5] = desktop;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "normal";
-    const body = "<body>otr</body>";
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-
-    // Two dispatches, byte-identical: type='normal' gets no stanza-id and the
-    // client sent no id.
-    var round: usize = 0;
-    while (round < 2) : (round += 1) {
-        // dispatchStanza consumes the parsed stanza, so each round rebuilds the
-        // identical one from scratch.
-        alice.stanza_kind = .message;
-        alice.stanza_to = "bob@localhost";
-        alice.stanza_type = "normal";
-        alice.stanza_id = "";
-        @memcpy(alice.stanza_buf[0..body.len], body);
-        alice.stanza_buf_len = body.len;
-        router.dispatchStanza(&server, &alice, &changes);
-    }
-
-    const got_rows = try offline_store.countMessages("bob@localhost");
-    try std.testing.expectEqual(@as(usize, 2), got_rows);
-}
-
-// Cross-worker dedupe relies on the local and the cross-worker forms being
-// byte-identical: the token identifies the dispatch, so a difference in the
-// serialized bytes would make one message look like two or make the two
-// holders disagree about what is on the wire.
-test "Router: the local and cross-worker delivery forms are byte-identical" {
-    const allocator = std.testing.allocator;
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.worker_id = 0;
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-
-    // bob has one resource here and one on worker 1, so this dispatch takes
-    // both the local send and the cross-worker enqueue.
-    const local_fds = try makeSocketPair();
-    defer posix.close(local_fds[1]);
-    const local = try allocator.create(Session);
-    local.* = Session.init(local_fds[0], 5, "localhost", false, allocator);
-    local.stream.state = .active;
-    local.stream.authenticated = true;
-    local.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desk") catch null;
-    server.sessions[5] = local;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desk");
-    sm.setPresenceAvailable("bob", "localhost", "desk", true);
-
-    const remote_fds = try makeSocketPair();
-    defer posix.close(remote_fds[1]);
-    const remote = try allocator.create(Session);
-    remote.* = Session.init(remote_fds[0], 6, "localhost", false, allocator);
-    remote.stream.state = .active;
-    remote.stream.authenticated = true;
-    remote.stream.bound_jid = xmpp.Jid.parse("bob@localhost/phone") catch null;
-    server.sessions[6] = remote;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
-    sm.setPresenceAvailable("bob", "localhost", "phone", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
-    alice.stanza_kind = .message;
-    // A JID that needs escaping, so the two forms would differ if either
-    // serializer handled it differently.
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "normal";
-    alice.stanza_id = "a&b<c>";
-    const body = "<body>same bytes</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-
-    var change_buf: [64]posix.Kevent = undefined;
-    var changes = ChangeList.init(&change_buf);
-    router.dispatchStanza(&server, &alice, &changes);
-
-    _ = local.conn.flushSend() catch {};
-    var wire: [8192]u8 = undefined;
-    const wire_len = posix.read(local_fds[1], &wire) catch 0;
-    try std.testing.expect(wire_len > 0);
-
-    var captured = struct {
-        buf: [8192]u8 = undefined,
-        len: usize = 0,
-        fn onDelivery(self: *@This(), _: u32, _: u32, payload: []const u8) void {
-            @memcpy(self.buf[0..payload.len], payload);
-            self.len = payload.len;
-        }
-    }{};
-    const queue = delivery_sys.getQueue(1);
-    _ = queue.drain(&captured, @TypeOf(captured).onDelivery);
-    try std.testing.expect(captured.len > 0);
-
-    try std.testing.expectEqualStrings(wire[0..wire_len], captured.buf[0..captured.len]);
-}
 
 // A worker that restarts within the same wall second starts its stanza id
 // counter from zero again, so without per-process entropy both incarnations
@@ -7477,167 +5269,7 @@ test "hold token: a second incarnation in the same second mints a new token" {
     try std.testing.expect(b != 0);
 }
 
-// The same dispatch identity must survive the c2s router's hop through the
-// delivery slot: the receiving worker reads the token off the slot instead of
-// minting its own.
-test "c2s: one routed message to two draining workers holds one row" {
-    const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
-
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer w1.deinit();
-    w1.worker_id = 1;
-    w1.session_map = &sm;
-    w1.delivery_system = &delivery_sys;
-    w1.offline = &offline_store;
-
-    const desk_fds = try makeSocketPair();
-    defer posix.close(desk_fds[1]);
-    const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
-    desk.offline_pending = true;
-    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
-    w1.sessions[5] = desk;
-    _ = try sm.bind(1, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer w0.deinit();
-    w0.worker_id = 0;
-    w0.session_map = &sm;
-    w0.delivery_system = &delivery_sys;
-    w0.offline = &offline_store;
-
-    const phone_fds = try makeSocketPair();
-    defer posix.close(phone_fds[1]);
-    const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
-    phone.offline_pending = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
-    w0.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
-    sm.setPresenceAvailable("bob", "localhost", "phone", true);
-
-    const alice_fds = try makeSocketPair();
-    defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
-    defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
-    alice.stanza_kind = .message;
-    alice.stanza_to = "bob@localhost";
-    alice.stanza_type = "chat";
-    alice.stanza_id = "c2s-one";
-    const body = "<body>one row</body>";
-    @memcpy(alice.stanza_buf[0..body.len], body);
-    alice.stanza_buf_len = body.len;
-
-    var w1_changes_buf: [64]posix.Kevent = undefined;
-    var w1_changes = ChangeList.init(&w1_changes_buf);
-    router.dispatchStanza(&w1, &alice, &w1_changes);
-
-    var w0_changes_buf: [32]posix.Kevent = undefined;
-    var w0_changes = ChangeList.init(&w0_changes_buf);
-    w0.drainDeliveryQueue(&w0_changes);
-
-    // Count the routed message only. T-D689B13D: a <received> carbon to a
-    // resource that got the original is never produced, and a carbon is
-    // never held behind an offline tail, so no second row can appear.
-    const ptrs = try offline_store.getPointers("bob@localhost");
-    defer offline_store.freePointers(ptrs);
-    var message_rows: usize = 0;
-    for (ptrs) |ptr| {
-        const held = try offline_store.getHeldStanza(ptr) orelse continue;
-        defer allocator.free(held);
-        if (std.mem.indexOf(u8, held, "urn:xmpp:carbons:2") != null) continue;
-        if (std.mem.indexOf(u8, held, "from='alice@localhost/mobile' to='bob@localhost'") != null) message_rows += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 1), message_rows);
-}
-
-// An S2S dispatch that reaches one resource locally and another on a second
-// worker must hold one row. The remote worker learns the dispatch identity
-// from the delivery slot; a fresh token there would store the stanza twice.
-test "S2S: one inbound stanza to two draining workers holds one row" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
-
-    // Worker 1 receives the stanza and owns the first resource of the bare JID.
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer w1.deinit();
-    w1.worker_id = 1;
-    w1.session_map = &sm;
-    w1.delivery_system = &delivery_sys;
-    w1.offline = &offline_store;
-
-    const desk_fds = try makeSocketPair();
-    defer posix.close(desk_fds[1]);
-    const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
-    desk.offline_pending = true;
-    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
-    w1.sessions[5] = desk;
-    _ = try sm.bind(1, 5, "bob", "localhost", "desktop");
-    sm.setPresenceAvailable("bob", "localhost", "desktop", true);
-
-    // Worker 0 owns the second resource, so the second target is remote.
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer w0.deinit();
-    w0.worker_id = 0;
-    w0.session_map = &sm;
-    w0.delivery_system = &delivery_sys;
-    w0.offline = &offline_store;
-
-    const phone_fds = try makeSocketPair();
-    defer posix.close(phone_fds[1]);
-    const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
-    phone.offline_pending = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
-    w0.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
-    sm.setPresenceAvailable("bob", "localhost", "phone", true);
-
-    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='h1' type='chat'><body>cross</body></message>";
-    var w1_changes_buf: [32]posix.Kevent = undefined;
-    var w1_changes = ChangeList.init(&w1_changes_buf);
-    w1.dispatchS2sResponse(.{ .s2s_inbound = .{
-        .from_jid = "carol@example.com/res",
-        .to_jid = "bob@localhost",
-        .stanza_xml = stanza,
-    } }, &w1_changes);
-
-    var w0_changes_buf: [32]posix.Kevent = undefined;
-    var w0_changes = ChangeList.init(&w0_changes_buf);
-    w0.drainDeliveryQueue(&w0_changes);
-
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-}
 
 // A bare-JID dispatch routes the message to bob's phone on the other worker
 // and queues a <received> carbon for it in the same drain. The phone never
@@ -7693,7 +5325,7 @@ test "carbons: a phone with carbons off on another worker gets only the routed m
 
     var w1_changes_buf: [32]posix.Kevent = undefined;
     var w1_changes = ChangeList.init(&w1_changes_buf);
-    w1.drainDeliveryQueue(&w1_changes);
+    routing_deliver.drainDeliveryQueue(&w1, &w1_changes);
 
     _ = phone.conn.flushSend() catch 0;
     var wire: [8192]u8 = undefined;
@@ -7770,7 +5402,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
 
     var w1_changes_buf: [32]posix.Kevent = undefined;
     var w1_changes = ChangeList.init(&w1_changes_buf);
-    w1.drainDeliveryQueue(&w1_changes);
+    routing_deliver.drainDeliveryQueue(&w1, &w1_changes);
 
     _ = phone.conn.flushSend() catch 0;
     var wire: [8192]u8 = undefined;
@@ -7846,7 +5478,7 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
 
     var w1_changes_buf: [32]posix.Kevent = undefined;
     var w1_changes = ChangeList.init(&w1_changes_buf);
-    w1.drainDeliveryQueue(&w1_changes);
+    routing_deliver.drainDeliveryQueue(&w1, &w1_changes);
 
     _ = phone.conn.flushSend() catch 0;
     var wire: [8192]u8 = undefined;
@@ -7929,7 +5561,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
 
     var w1_changes_buf: [32]posix.Kevent = undefined;
     var w1_changes = ChangeList.init(&w1_changes_buf);
-    w1.drainDeliveryQueue(&w1_changes);
+    routing_deliver.drainDeliveryQueue(&w1, &w1_changes);
 
     // The carbon went out live; the draining tail never owned it.
     _ = phone.conn.flushSend() catch 0;
@@ -8007,7 +5639,7 @@ test "carbons: a delivered resource gets no received copy on the same dispatch" 
 
     var w1_changes_buf: [32]posix.Kevent = undefined;
     var w1_changes = ChangeList.init(&w1_changes_buf);
-    w1.drainDeliveryQueue(&w1_changes);
+    routing_deliver.drainDeliveryQueue(&w1, &w1_changes);
 
     _ = phone.conn.flushSend() catch 0;
     var wire: [8192]u8 = undefined;
@@ -8293,7 +5925,7 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
         @memcpy(alice.stanza_buf[0..inner.len], inner);
         alice.stanza_buf_len = inner.len;
         router.dispatchStanza(&w0, &alice, &w0_changes);
-        w1.drainDeliveryQueue(&w1_changes);
+        routing_deliver.drainDeliveryQueue(&w1, &w1_changes);
     }
 
     _ = phone.conn.flushSend() catch 0;
@@ -8302,66 +5934,13 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     try std.testing.expectEqual(@as(usize, 0), wire_len);
 }
 
-test "N1: two workers draining one bare JID hold a message once" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("op");
-    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
-    defer allocator.free(op_path);
-    var op_db = try OpBackendMod.Backend.open(op_path, .{});
-    defer op_db.close();
-    var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
-
-    var sm = SessionMap.init(allocator, true, 0);
-    defer sm.deinit();
-    var delivery_sys = try DeliverySystem.init(allocator, 2);
-    defer delivery_sys.deinit();
-
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
-    defer server.deinit();
-    server.session_map = &sm;
-    server.delivery_system = &delivery_sys;
-    server.offline = &offline_store;
-
-    // One draining resource of bob per worker, same bare JID.
-    server.worker_id = 0;
-    const desk_fds = try makeSocketPair();
-    defer posix.close(desk_fds[1]);
-    const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
-    desk.offline_pending = true;
-    server.sessions[5] = desk;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-
-    server.worker_id = 1;
-    const phone_fds = try makeSocketPair();
-    defer posix.close(phone_fds[1]);
-    const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
-    phone.offline_pending = true;
-    server.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
-
-    const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' type='chat' id='n1-2'><body>cross</body></message>";
-    const ts: u64 = 1700000000;
-
-    // Both workers hold the same dispatch under the one token the producer
-    // minted, so the store writes one row whichever worker wins.
-    const token = server.mintHoldToken();
-    try std.testing.expect(server.holdBehindOfflineTail(desk, "bob", "localhost", "alice@localhost/mobile", "n1-2", ts, stanza, token));
-    try std.testing.expect(server.holdBehindOfflineTail(phone, "bob", "localhost", "alice@localhost/mobile", "n1-2", ts, stanza, token));
-
-    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
-}
 
 // ============================================================================
 // Pubsub feature dispatch coverage (forge #22, S33)
 // ============================================================================
 
 /// Build the xml.Element the reader would produce for a start tag.
-fn testElem(local_name: []const u8, ns: []const u8, attrs: []const xml.Attribute) xml.Element {
+pub fn testElem(local_name: []const u8, ns: []const u8, attrs: []const xml.Attribute) xml.Element {
     return .{
         .name = local_name,
         .prefix = "",
@@ -8372,7 +5951,7 @@ fn testElem(local_name: []const u8, ns: []const u8, attrs: []const xml.Attribute
     };
 }
 
-fn testAttr(local_name: []const u8, value: []const u8) xml.Attribute {
+pub fn testAttr(local_name: []const u8, value: []const u8) xml.Attribute {
     return .{ .name = local_name, .value = value, .prefix = "", .local_name = local_name };
 }
 
@@ -8380,7 +5959,7 @@ fn testAttr(local_name: []const u8, value: []const u8) xml.Attribute {
 /// handleIqChild for each child element, then dispatchIq. When `item_payload`
 /// is set it is appended to pep_payload after the <item> child, the way the
 /// server's collection path fills it. Returns the bytes written to the peer.
-fn driveTestIq(
+pub fn driveTestIq(
     server: *Server,
     session: *Session,
     changes: *ChangeList,

@@ -33,10 +33,11 @@ const Session = server_mod.Session;
 const ChangeList = @import("event_loop.zig").ChangeList;
 const fanout = @import("fanout.zig");
 const FanoutQueue = fanout.FanoutQueue;
-const router = @import("router.zig");
+const router = @import("routing/router.zig");
 const PendingFanout = fanout.PendingFanout;
 const actor_message = @import("xworker/envelope.zig");
 const delivery_queue = @import("delivery_queue");
+const routing_deliver = @import("routing/deliver.zig");
 
 const log = std.log.scoped(.muc);
 
@@ -266,7 +267,7 @@ pub fn handleMucGroupchat(
     const suffix = suffix_lease.buf[0..suffix_len];
 
     // Cross-thread multicast: one MPSC enqueue per remote worker (not per occupant)
-    server.deliverMulticastToWorkers(room, prefix, suffix);
+    routing_deliver.deliverMulticastToWorkers(server, room, prefix, suffix);
 
     // One delivery buffer reused for every local occupant. Leased from the
     // per-worker pool instead of taken per delivery so the fan-out loop does
@@ -1620,7 +1621,7 @@ fn broadcastOccupantJoin(
     };
 
     // Multicast to remote workers
-    server.deliverMulticastToWorkers(room, prefix, suffix);
+    routing_deliver.deliverMulticastToWorkers(server, room, prefix, suffix);
 
     // One delivery buffer reused for every occupant (S18).
     var deliver_lease = server.leaseByteScratch() orelse {
@@ -1688,7 +1689,7 @@ fn broadcastOccupantLeave(
     };
 
     // Multicast to remote workers
-    server.deliverMulticastToWorkers(room, prefix, suffix);
+    routing_deliver.deliverMulticastToWorkers(server, room, prefix, suffix);
 
     // One delivery buffer reused for the whole function: each delivery copies,
     // so the stanza built for one occupant is dead before the next is built
@@ -2439,7 +2440,7 @@ pub fn processRemoteGroupchat(
     const suffix = suffix_lease.buf[0..suffix_len];
 
     // Cross-thread multicast
-    server.deliverMulticastToWorkers(room, prefix, suffix);
+    routing_deliver.deliverMulticastToWorkers(server, room, prefix, suffix);
 
     // One delivery buffer reused for every local occupant (S18), as in
     // handleMucGroupchat.

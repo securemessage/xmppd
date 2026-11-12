@@ -89,7 +89,7 @@ const GenericRosterStore = generic_roster.RosterStore(server_mod.OpBackendType);
 const ChangeList = @import("event_loop.zig").ChangeList;
 const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;
-const router = @import("router.zig");
+const router = @import("routing/router.zig");
 
 /// RSM namespace URI.
 const ns_rsm = "http://jabber.org/protocol/rsm";

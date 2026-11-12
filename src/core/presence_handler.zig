@@ -33,7 +33,7 @@ const muc_handler = @import("muc_handler.zig");
 const session_lifecycle = @import("c2s/lifecycle.zig");
 const iq_handler = @import("iq_handler.zig");
 const fanout = @import("fanout.zig");
-const router = @import("router.zig");
+const router = @import("routing/router.zig");
 const sub_cache_mod = server_mod.sub_cache_mod;
 
 const log = std.log.scoped(.presence);

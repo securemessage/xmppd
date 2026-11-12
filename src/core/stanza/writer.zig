@@ -5,7 +5,6 @@
 const std = @import("std");
 const xml = @import("xml");
 
-
 // ============================================================================
 // Base64 helpers for SASL XML payloads
 // ============================================================================
@@ -139,3 +138,24 @@ pub fn writeS2sError(w: anytype, tag_name: []const u8, local_to: []const u8, rem
     try w.writeByte('>');
 }
 
+test "G7: the S2S bounce escapes the id once and from/to once" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    // msg_id is the raw on-wire form: an entity is decoded then escaped once,
+    // not double-escaped. from/to are plain JIDs, escaped once.
+    try writeS2sBounce(fbs.writer(), "b&b@localhost", "carol@example.com/res", "a&amp;b");
+    const out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "id='a&amp;b'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a&amp;amp;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "from='b&amp;b@localhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "to='carol@example.com/res'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "service-unavailable") != null);
+}
+
+test "G7: a single quote in the id cannot break the bounce attribute" {
+    var buf: [2048]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeS2sBounce(fbs.writer(), "bob@localhost", "carol@example.com", "x'y");
+    const out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "id='x&apos;y'") != null);
+}

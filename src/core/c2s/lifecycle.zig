@@ -25,7 +25,7 @@ const ChangeList = @import("../event_loop.zig").ChangeList;
 const muc_handler = @import("../muc_handler.zig");
 const presence_handler = @import("../presence_handler.zig");
 const lastact_store = @import("last_activity_store");
-const router = @import("../router.zig");
+const router = @import("../routing/router.zig");
 const connection_mod = @import("../connection.zig");
 const delivery_queue_mod = @import("delivery_queue");
 
