@@ -40,6 +40,11 @@ const TCP_TIMEOUT_MS: i64 = 4000;
 /// per-query deadline still applies inside it.
 const CHAIN_DEADLINE_MS: i64 = 10_000;
 const MAX_JOBS: usize = 64;
+/// Stale ICMP errors a single send drains before giving up: a
+/// connected UDP socket surfaces each port-unreachable as
+/// ECONNREFUSED on the next send, and the job table bounds the
+/// datagrams in flight that can produce them.
+const STALE_ICMP_MAX: usize = MAX_JOBS;
 /// Flattened connect targets per resolution; a hostile SRV answer
 /// cannot grow a job's target list past this.
 const TARGET_CAP: usize = 16;
@@ -959,21 +964,28 @@ pub const Resolver = struct {
     /// Connected-UDP send. An ICMP port-unreachable queued from an
     /// earlier datagram surfaces as ECONNREFUSED on a later send; that
     /// error belongs to the earlier packet, so it is consumed and the
-    /// send retried once instead of failing the wrong job.
+    /// send retried instead of failing the wrong job. A dead
+    /// nameserver under a query burst queues several at once, so the
+    /// drain runs until the send goes out or the backlog bound trips.
     fn sendUdp(self: *Resolver, pkt: []const u8) !void {
         // Test seam: report a wire send failure without touching the
         // socket (a closed fd is UB territory, not a failure path).
         if (builtin.is_test) {
             if (self.fail_sends) return error.SendFailed;
         }
-        _ = rawSend(self.fd, pkt, 0) catch |err| switch (err) {
-            error.Refused => {
-                self.stale_icmp += 1;
-                _ = rawSend(self.fd, pkt, 0) catch return error.SendFailed;
-                return;
-            },
-            else => return error.SendFailed,
-        };
+        var refused: usize = 0;
+        while (true) {
+            _ = rawSend(self.fd, pkt, 0) catch |err| switch (err) {
+                error.Refused => {
+                    self.stale_icmp += 1;
+                    refused += 1;
+                    if (refused >= STALE_ICMP_MAX) return error.SendFailed;
+                    continue;
+                },
+                else => return error.SendFailed,
+            };
+            return;
+        }
     }
 
     /// Apply changelist entries and surface per-entry failures. Every
@@ -3404,6 +3416,24 @@ fn appendAnswerTail(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), rty
     list.appendSlice(a, std.mem.asBytes(&std.mem.nativeToBig(u16, @intCast(rdlen)))) catch return;
 }
 
+/// A TCP port that is provably dead: the returned socket is bound
+/// but never listens, so connects refuse and the reservation keeps
+/// any other process off the number. "Nobody listens on this port"
+/// does not survive parallel test runs. The caller holds the fd for
+/// the length of the test.
+const DeadTcp = struct { fd: posix.fd_t, port: u16 };
+
+fn deadTcpPort() !DeadTcp {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    errdefer posix.close(fd);
+    const addr = try net.Address.parseIp("127.0.0.1", 0);
+    try posix.bind(fd, &addr.any, addr.getOsSockLen());
+    var actual: posix.sockaddr = undefined;
+    var slen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(fd, &actual, &slen);
+    return .{ .fd = fd, .port = net.Address.initPosix(@alignCast(&actual)).getPort() };
+}
+
 fn startFakeDns(truncate: bool, decoy: []const u8) !*FakeDns {
     const srv = try std.testing.allocator.create(FakeDns);
     srv.* = .{
@@ -3897,16 +3927,17 @@ test "dns-async: the whole-chain deadline bounds a silent target list" {
     var ctx = TestCtx{};
     r.setCallback(.{ .ctx = &ctx, .fun = TestCtx.onResolve });
 
-    const start = std.time.milliTimestamp();
     try r.resolve("svc.test", .client, 5222, 3, true);
     var spins: usize = 0;
     while (ctx.status == null and spins < 400) : (spins += 1) r.step(50);
-    const elapsed = std.time.milliTimestamp() - start;
 
     try std.testing.expectEqual(Status.failed, ctx.status.?);
     // The chain bound fired long before two 2 s per-query retries
-    // plus a 10 s fallback tail could.
-    try std.testing.expect(elapsed < 1500);
+    // plus a 10 s fallback tail could (~280 spins). spins is counted,
+    // not clocked: a fired timer waits in the kqueue and returns the
+    // next step at once, so a descheduled test process cannot inflate
+    // the count.
+    try std.testing.expect(spins < 30);
 }
 
 test "dns-async: the chain deadline completes with collected targets" {
@@ -5089,7 +5120,11 @@ test "dns-async: a wrong-qtype decoy cannot steer the chain" {
 test "dns-async: a refused TCP connect fails the job via SO_ERROR" {
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
-    r.setServer(try net.Address.parseIp("127.0.0.1", 9));
+    // A bound socket that never listens refuses the connect and
+    // holds the port against every other process.
+    const dead = try deadTcpPort();
+    defer posix.close(dead.fd);
+    r.setServer(try net.Address.parseIp("127.0.0.1", dead.port));
     var ctx = TestCtx{};
     r.setQueryCallback(.{ .ctx = &ctx, .fun = TestCtx.onQuery });
 
@@ -5555,18 +5590,37 @@ test "dns-async: a refused TCP connect fails the phase, not the job" {
     // reconnect), so a TLSA leg ends lookup_failed and the resolve
     // completes instead of dropping the whole job.
     // Method: the chain is fed to .tlsa over injected answers, then
-    // the TC upgrade connects to a port nobody listens on. The UDP
-    // target is a bound socket that absorbs the queries: an
-    // unbound port's ICMP refusals could latch onto the resolver's
-    // own sends and fail the leg before TCP is reached.
-    const ufd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    // the TC upgrade connects to a provably dead TCP port: a bound
+    // socket that never listens refuses the connect while holding
+    // the number against every other process. The UDP half of the
+    // same port is bound to absorb the queries: an unbound port's
+    // ICMP refusals could latch onto the resolver's own sends and
+    // fail the leg before TCP is reached.
+    var dead: DeadTcp = undefined;
+    var ufd: posix.fd_t = undefined;
+    var attempts: usize = 0;
+    while (true) : (attempts += 1) {
+        if (attempts == 256) return error.AddressInUse;
+        dead = try deadTcpPort();
+        ufd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+        const uaddr = try net.Address.parseIp("127.0.0.1", dead.port);
+        posix.bind(ufd, &uaddr.any, uaddr.getOsSockLen()) catch |err| switch (err) {
+            error.AddressInUse => {
+                posix.close(ufd);
+                posix.close(dead.fd);
+                continue;
+            },
+            else => {
+                posix.close(ufd);
+                posix.close(dead.fd);
+                return err;
+            },
+        };
+        break;
+    }
     defer posix.close(ufd);
-    const uaddr = try net.Address.parseIp("127.0.0.1", 0);
-    try posix.bind(ufd, &uaddr.any, uaddr.getOsSockLen());
-    var uactual: posix.sockaddr = undefined;
-    var uslen: posix.socklen_t = @sizeOf(posix.sockaddr);
-    try posix.getsockname(ufd, &uactual, &uslen);
-    const port = net.Address.initPosix(@alignCast(&uactual)).getPort();
+    defer posix.close(dead.fd);
+    const port = dead.port;
 
     var r = Resolver.init(std.testing.allocator);
     defer r.deinit();
