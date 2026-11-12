@@ -6598,12 +6598,16 @@ test "S2sDaemon: a callback conn torn down with pending exchanges answers them i
 
     // The peer goes away while the verdict is still in flight: the conn is
     // torn down and the exchange must be answered, not left waiting. The
-    // FIN reaches conn.fd asynchronously; production hears it as a fresh
-    // readable event, so wait for that edge before driving the handler.
+    // FIN reaches conn.fd asynchronously, and a stray post-handshake TLS
+    // record can precede it: production's kqueue refires while the socket
+    // stays readable, so drive one handler per event until the slot clears.
     posix.close(cb.peer_fd);
     cb.peer_fd = -1;
-    try std.testing.expect(try waitFdReadable(cb.conn.fd, 5000));
-    handleOutboundReadable(&daemon, &cl, 0);
+    var drives: usize = 0;
+    while (daemon.outbound[0] != null and drives < 8) : (drives += 1) {
+        try std.testing.expect(try waitFdReadable(cb.conn.fd, 5000));
+        handleOutboundReadable(&daemon, &cl, 0);
+    }
     try std.testing.expect(daemon.outbound[0] == null);
 
     const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
