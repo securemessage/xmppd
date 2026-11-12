@@ -397,6 +397,14 @@ pub const S2sDaemon = struct {
             return;
         };
 
+        // A pair whose dialback assertion already errored is dead on a
+        // stream kept alive for other exchanges (XEP-0220 2.5): bounce at
+        // once instead of queueing behind a verdict that will never come.
+        if (conn.db_assertion_errored) {
+            self.sendDeliveryFailed(from, to, "remote-server-timeout");
+            return;
+        }
+
         // Queue the stanza first (delivery happens when connection is established)
         conn.queueStanza(self.allocator, from, to, stanza_xml) catch |err| {
             switch (err) {
@@ -796,7 +804,9 @@ pub const S2sDaemon = struct {
         if (slot >= MAX_OUTBOUND_CONNS) return;
         if (self.outbound[slot]) |conn| {
             for (0..conn.db_pending.len) |idx| {
-                if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, false);
+                // A conn going away with exchanges in flight fails them
+                // like an error response (XEP-0220 2.1.2 note).
+                if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, .error_timeout);
             }
             self.cancelResolve(conn);
             self.clearConnectDeadline(batch, conn);
@@ -824,7 +834,8 @@ pub const S2sDaemon = struct {
             self.sendDeliveryFailed(stanza.from_jid, stanza.to_jid, reason);
         }
         for (0..conn.db_pending.len) |idx| {
-            if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, false);
+            const verdict: DbVerdict = if (std.mem.eql(u8, reason, "remote-server-not-found")) .error_not_found else .error_timeout;
+            if (conn.db_pending[idx].in_use) handleDbVerifyResponse(self, batch, conn, idx, verdict);
         }
         self.releaseOutboundSlot(batch, conn);
         self.pool.remove(conn.remote_domain);
@@ -1989,8 +2000,9 @@ fn initiateDialbackCallback(daemon: *S2sDaemon, batch: *ChangeList, session: *S2
 
 /// Send db:verify stanzas for every registered callback that has not been
 /// sent yet on this outbound connection. Returns false when the write
-/// failed: the exchanges the connection carried are answered invalid and
-/// the caller tears it down, so a submitting stream is never left waiting
+/// failed: the exchanges the connection carried are answered with a
+/// dialback error and the caller tears it down, so a submitting stream is
+/// never left waiting
 /// for a verdict that can no longer arrive. Verifies that could not be
 /// queued (full write buffer) stay unsent and go out from the writable
 /// edge.
@@ -2002,8 +2014,8 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
         if (key.len == 0 or sid.len == 0) {
             // An exchange without key or stream id can never produce a
             // db:verify; leaving it would spin the writable re-arm.
-            log.warn("dialback callback: exchange without key or stream id; answering invalid", .{});
-            handleDbVerifyResponse(daemon, batch, conn, idx, false);
+            log.warn("dialback callback: exchange without key or stream id; answering error", .{});
+            handleDbVerifyResponse(daemon, batch, conn, idx, .error_timeout);
             continue;
         }
 
@@ -2015,11 +2027,11 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
             sid,
             key,
         ) catch {
-            // Unbuildable exchange: answered invalid and cleared like a
+            // Unbuildable exchange: answered error and cleared like a
             // write failure. An unsent entry would stay forever and re-arm
             // the one-shot write on every edge.
-            log.warn("dialback callback: db:verify for stream {s} cannot be built; answering invalid", .{sid});
-            handleDbVerifyResponse(daemon, batch, conn, idx, false);
+            log.warn("dialback callback: db:verify for stream {s} cannot be built; answering error", .{sid});
+            handleDbVerifyResponse(daemon, batch, conn, idx, .error_timeout);
             continue;
         };
 
@@ -2032,9 +2044,9 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
     }
     if (conn.hasPendingWrite()) {
         _ = conn.flushWrite() catch {
-            log.warn("dialback callback: db:verify write to {s} failed; answering pending exchanges invalid", .{conn.remote_domain});
+            log.warn("dialback callback: db:verify write to {s} failed; answering pending exchanges error", .{conn.remote_domain});
             for (0..conn.db_pending.len) |idx| {
-                if (conn.db_pending[idx].in_use) handleDbVerifyResponse(daemon, batch, conn, idx, false);
+                if (conn.db_pending[idx].in_use) handleDbVerifyResponse(daemon, batch, conn, idx, .error_timeout);
             }
             conn.fail("write-failed");
             return false;
@@ -2047,9 +2059,9 @@ fn sendDbVerifyOnCallback(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
             batch.addWriteOnce(conn.fd, OUTBOUND_UDATA_BASE + slot) catch {
                 // Nothing is armed: the queued verifies would never go
                 // out. Fail the exchanges instead of losing them.
-                log.warn("dialback callback: cannot arm the writable edge for {s}; answering pending exchanges invalid", .{conn.remote_domain});
+                log.warn("dialback callback: cannot arm the writable edge for {s}; answering pending exchanges error", .{conn.remote_domain});
                 for (0..conn.db_pending.len) |i| {
-                    if (conn.db_pending[i].in_use) handleDbVerifyResponse(daemon, batch, conn, i, false);
+                    if (conn.db_pending[i].in_use) handleDbVerifyResponse(daemon, batch, conn, i, .error_timeout);
                 }
                 conn.fail("write-failed");
                 return false;
@@ -2090,11 +2102,17 @@ fn failDbResultAnswer(daemon: *S2sDaemon, batch: *ChangeList, session: *S2sSessi
     daemon.closeInbound(batch, slot);
 }
 
+/// Verdict on a pending dialback callback. The peer's valid/invalid, or a
+/// dialback error (XEP-0220 2.5): a Step-3 error verdict maps to
+/// remote-server-not-found and our own failure to complete verification
+/// maps to remote-server-timeout.
+const DbVerdict = enum { valid, invalid, error_not_found, error_timeout };
+
 /// Handle a db:verify verdict that matched a pending callback entry.
 /// Answers db:result on the original inbound session, addressed to the
 /// verified origin, and only while the slot still holds the session that
 /// submitted the key (generation check) (S2).
-fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, idx: usize, valid: bool) void {
+fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection, idx: usize, verdict: DbVerdict) void {
     const pending = &conn.db_pending[idx];
     const inbound_slot = pending.inbound_slot;
     const gen = pending.inbound_gen;
@@ -2122,19 +2140,19 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
     // whatever the header claimed at stream open. The record happens BEFORE
     // the answer: a full domain set means the verdict cannot be honored and
     // the answer must be invalid, never a valid the session will not accept.
-    var accepted = valid;
-    if (valid and !session.addAuthenticatedDomain(origin)) accepted = false;
+    var accepted = verdict == .valid;
+    if (verdict == .valid and !session.addAuthenticatedDomain(origin)) accepted = false;
 
     // Send db:result response on the original inbound connection, from the
     // host the db:result named and to the verified origin (not the
     // header-claimed remote domain).
     var resp_buf: [512]u8 = undefined;
-    const resp = dialback.buildDbResultResponse(
-        &resp_buf,
-        if (target.len > 0) target else daemon.local_domain,
-        origin,
-        accepted,
-    ) catch {
+    const from_host = if (target.len > 0) target else daemon.local_domain;
+    const resp = switch (verdict) {
+        .valid, .invalid => dialback.buildDbResultResponse(&resp_buf, from_host, origin, accepted),
+        .error_not_found => dialback.buildDbResultError(&resp_buf, from_host, origin, "remote-server-not-found"),
+        .error_timeout => dialback.buildDbResultError(&resp_buf, from_host, origin, "remote-server-timeout"),
+    } catch {
         failDbResultAnswer(daemon, batch, session, inbound_slot, origin);
         return;
     };
@@ -2153,7 +2171,7 @@ fn handleDbVerifyResponse(daemon: *S2sDaemon, batch: *ChangeList, conn: *Outboun
         log.info("dialback callback: {s} verified, inbound session {d} authenticated", .{ origin, inbound_slot });
     } else {
         session.inbound_dialback.setInvalid();
-        log.warn("dialback callback: {s} rejected for inbound session {d}", .{ origin, inbound_slot });
+        log.warn("dialback callback: {s} rejected ({s}) for inbound session {d}", .{ origin, @tagName(verdict), inbound_slot });
     }
 }
 
@@ -2514,6 +2532,20 @@ fn processOutboundEvent(
             conn.handleRemoteStreamOpen(from, id);
         },
         .element_start => |elem| {
+            // Inside a peer's type='error' verdict everything up to its
+            // close is swallowed; the only content of interest is the
+            // stanza error condition inside the <error/> child.
+            if (conn.db_error_depth > 0) {
+                if (conn.db_error_depth == 1 and std.mem.eql(u8, elem.local_name, "error")) {
+                    conn.db_error_depth = 2;
+                } else if (conn.db_error_depth == 2) {
+                    const n = @min(elem.local_name.len, conn.db_error_cond_buf.len);
+                    @memcpy(conn.db_error_cond_buf[0..n], elem.local_name[0..n]);
+                    conn.db_error_cond_len = n;
+                    conn.db_error_depth = 3;
+                }
+                return;
+            }
             // <starttls> features
             if (std.mem.eql(u8, elem.namespace_uri, xml.ns.tls)) {
                 if (std.mem.eql(u8, elem.local_name, "proceed")) {
@@ -2609,9 +2641,20 @@ fn processOutboundEvent(
                     daemon.closeOutbound(batch, slot);
                     return;
                 }
+                const is_error = std.mem.eql(u8, result_type, "error");
                 if (conn.findPendingVerify(r_id, r_from, r_to)) |idx| {
                     log.info("dialback callback: db:result verdict type={s} from {s}", .{ result_type, conn.remote_domain });
-                    handleDbVerifyResponse(daemon, batch, conn, idx, std.mem.eql(u8, result_type, "valid"));
+                    if (is_error) {
+                        // XEP-0220 2.5: a Step-3 error is non-fatal; the
+                        // submitter is answered remote-server-not-found.
+                        if (!elem.self_closing) conn.armDbErrorCapture();
+                        handleDbVerifyResponse(daemon, batch, conn, idx, .error_not_found);
+                    } else {
+                        handleDbVerifyResponse(daemon, batch, conn, idx, if (std.mem.eql(u8, result_type, "valid")) .valid else .invalid);
+                    }
+                    // A conn whose assertion errored is kept only for the
+                    // exchanges it still carries; once they drain it goes.
+                    if (conn.db_assertion_errored and !conn.hasPendingVerify()) daemon.closeOutbound(batch, slot);
                     return;
                 }
                 // The verdict on the dialback key this connection sent:
@@ -2622,11 +2665,33 @@ fn processOutboundEvent(
                         log.info("outbound dialback verified by {s}", .{conn.remote_domain});
                         conn.handleAuthSuccess();
                         daemon.flushOutboundStanzas(batch, conn);
+                    } else if (is_error) {
+                        // XEP-0220 2.5: non-fatal for the stream; only this
+                        // domain pair's queued stanzas bounce, and the conn
+                        // stays up for any other exchanges it carries.
+                        if (!elem.self_closing) conn.armDbErrorCapture();
+                        conn.db_assertion_errored = true;
+                        log.warn("outbound dialback errored by {s}; bouncing the pair's queue", .{conn.remote_domain});
+                        for (conn.pending_stanzas.items) |*stanza| {
+                            daemon.sendDeliveryFailed(stanza.from_jid, stanza.to_jid, "remote-server-timeout");
+                            stanza.deinit(daemon.allocator);
+                        }
+                        conn.pending_stanzas.clearRetainingCapacity();
+                        conn.queue_started_ms = 0;
+                        if (!conn.hasPendingVerify()) daemon.closeOutbound(batch, slot);
                     } else {
                         log.warn("outbound dialback rejected by {s}: type={s}", .{ conn.remote_domain, result_type });
                         conn.handleAuthFailure();
                         daemon.closeOutbound(batch, slot);
                     }
+                    return;
+                }
+                if (is_error) {
+                    // An error verdict that names no exchange of ours is
+                    // still non-fatal (XEP-0220 2.5); drop it, keep the
+                    // stream, and capture its condition for the log.
+                    if (!elem.self_closing) conn.armDbErrorCapture();
+                    log.warn("dialback: unmatched db:result error verdict from {s} (id={s} from={s} to={s}); ignored", .{ conn.remote_domain, r_id, r_from, r_to });
                     return;
                 }
                 log.warn("dialback: unmatched db:result verdict type={s} from {s} (id={s} from={s} to={s}); failing the stream", .{ result_type, conn.remote_domain, r_id, r_from, r_to });
@@ -2655,12 +2720,35 @@ fn processOutboundEvent(
                     log.warn("dialback callback: unmatched db:verify verdict from {s} (id={s} from={s} to={s}); ignored", .{ conn.remote_domain, v_id, v_from, v_to });
                     return;
                 };
-                const valid = std.mem.eql(u8, verify_type, "valid");
                 log.info("dialback callback: db:verify response type={s} from {s}", .{ verify_type, conn.remote_domain });
-                handleDbVerifyResponse(daemon, batch, conn, idx, valid);
+                if (std.mem.eql(u8, verify_type, "error")) {
+                    // XEP-0220 2.5: a Step-3 error is non-fatal; the
+                    // submitter is answered remote-server-not-found.
+                    if (!elem.self_closing) conn.armDbErrorCapture();
+                    handleDbVerifyResponse(daemon, batch, conn, idx, .error_not_found);
+                } else {
+                    handleDbVerifyResponse(daemon, batch, conn, idx, if (std.mem.eql(u8, verify_type, "valid")) .valid else .invalid);
+                }
+                // A conn whose assertion errored is kept only for the
+                // exchanges it still carries; once they drain it goes.
+                if (conn.db_assertion_errored and !conn.hasPendingVerify()) daemon.closeOutbound(batch, slot);
             }
         },
         .element_end => |name| {
+            // A peer's type='error' verdict is closing: log the captured
+            // condition and resume normal event handling. Any other close
+            // inside one is swallowed content.
+            if (conn.db_error_depth > 0) {
+                if (std.mem.eql(u8, name, "result") or std.mem.eql(u8, name, "db:result") or
+                    std.mem.eql(u8, name, "verify") or std.mem.eql(u8, name, "db:verify"))
+                {
+                    if (conn.dbErrorCond().len > 0) {
+                        log.info("dialback: peer error condition '{s}' from {s}", .{ conn.dbErrorCond(), conn.remote_domain });
+                    }
+                    conn.db_error_depth = 0;
+                }
+                return;
+            }
             // End of <stream:features> — decide what to do
             if (std.mem.eql(u8, name, "features") or std.mem.eql(u8, name, "stream:features")) {
                 // Post-auth features: connection is established, flush queued stanzas
@@ -4466,14 +4554,17 @@ fn makeVerifyRig(alloc: std.mem.Allocator, daemon: *S2sDaemon, origin: []const u
     };
 }
 
-/// The failed initiation answered exactly one invalid db:result on the
-/// submitting peer, nothing on any other session, and the delivery-failed
-/// notice carries the failure reason.
-fn expectInitiationFailure(daemon: *S2sDaemon, rig: anytype, expected_to: ?[]const u8, reason: []const u8) !void {
+/// The failed initiation answered exactly one db:result verdict on the
+/// submitting peer (type='invalid' or type='error' carrying `verdict_cond`),
+/// nothing on any other session, and the delivery-failed notice carries
+/// the failure reason.
+fn expectInitiationFailure(daemon: *S2sDaemon, rig: anytype, expected_to: ?[]const u8, reason: []const u8, verdict_cond: []const u8) !void {
     if (daemon.getInbound(1)) |s| _ = try s.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(rig.submitter_peer, &rbuf)];
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, resp, "type='invalid'"));
+    const answers = std.mem.count(u8, resp, "type='invalid'") + std.mem.count(u8, resp, "type='error'");
+    try std.testing.expectEqual(@as(usize, 1), answers);
+    try std.testing.expect(std.mem.indexOf(u8, resp, verdict_cond) != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "from='us.example'") != null);
     if (expected_to) |to| {
         try std.testing.expect(std.mem.indexOf(u8, resp, to) != null);
@@ -4499,7 +4590,7 @@ fn makeBufferOnlyClient(daemon: *S2sDaemon, alloc: std.mem.Allocator) void {
     client.active = true;
 }
 
-test "S2sDaemon: an exhausted outbound slot table answers the pending verify invalid" {
+test "S2sDaemon: an exhausted outbound slot table answers the pending verify with a dialback error" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -4518,7 +4609,7 @@ test "S2sDaemon: an exhausted outbound slot table answers the pending verify inv
     var cl = ChangeList.init(&scratch);
     daemon.deliverResolution(&cl, rig.conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1" }}));
 
-    try expectInitiationFailure(&daemon, rig, "to='them.example'", "outbound-slots-exhausted");
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "outbound-slots-exhausted", "remote-server-timeout");
     // The failed conn leaves the pool so the next delivery starts fresh.
     try std.testing.expect(daemon.pool.connections.get("them.example") == null);
 }
@@ -4555,7 +4646,7 @@ test "S2sDaemon: a connect failure keeps the queue and arms a retry" {
     try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
 }
 
-test "S2sDaemon: a DNS failure answers the pending verify invalid" {
+test "S2sDaemon: a DNS failure answers the pending verify remote-server-not-found" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -4575,7 +4666,7 @@ test "S2sDaemon: a DNS failure answers the pending verify invalid" {
     var cl = ChangeList.init(&scratch);
     daemon.initiateOutbound(&cl, rig.conn, domain);
 
-    try expectInitiationFailure(&daemon, rig, null, "remote-server-not-found");
+    try expectInitiationFailure(&daemon, rig, null, "remote-server-not-found", "remote-server-not-found");
     try std.testing.expect(daemon.pool.connections.get(domain) == null);
 }
 
@@ -4679,7 +4770,7 @@ test "S2sDaemon: a permanent resolution failure bounces at once" {
     // NXDOMAIN is proof of absence (ADR-13): the queue dies immediately.
     daemon.deliverResolution(&cl, rig.conn, .nxdomain, null);
 
-    try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-not-found");
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-not-found", "remote-server-not-found");
     try std.testing.expect(daemon.pool.connections.get("them.example") == null);
 }
 
@@ -4719,7 +4810,7 @@ test "S2sDaemon: a queue that outlives its lifetime bounces remote-server-timeou
     // answered and the conn leaves the pool.
     test_now_ms.store(1_000_000 + 121_000, .monotonic);
     daemon.deliverResolution(&cl, rig.conn, .failed, null);
-    try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-timeout");
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-timeout", "remote-server-timeout");
     try std.testing.expect(daemon.pool.connections.get("them.example") == null);
 }
 
@@ -6344,15 +6435,16 @@ test "S2sDaemon: a db:result verdict for a verify that never went out authentica
     };
     processOutboundEvent(&daemon, &cl, 0, t.conn, &reader, .{ .element_start = elem });
 
-    // The unsent exchange is answered invalid and the stream fails; the
-    // inbound session never becomes authenticated.
+    // The unsent exchange is answered with a dialback error and the
+    // stream fails; the inbound session never becomes authenticated.
     try std.testing.expect(daemon.outbound[0] == null);
     const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
     _ = try session.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
-    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "remote-server-timeout") != null);
 }
 
 test "S2sDaemon: a dialback key is never sent before TLS" {
@@ -6655,7 +6747,227 @@ test "S2sDaemon: a typed db:result verdict answers the dialback key this connect
     try std.testing.expect(!ob.conn.db_assertion_pending);
 }
 
-test "S2sDaemon: a failed db:verify write answers the exchange invalid" {
+test "S2sDaemon: a db:verify error verdict answers the submission remote-server-not-found" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var cb = try makeTestCallbackConn(&daemon, "them.example");
+    defer cb.deinit();
+    daemon.outbound[0] = cb.conn;
+
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    const key = "6666666666666666666666666666666666666666666666666666666666666666";
+    submitDbResult(&daemon, in1.session, &cl, "them.example", "us.example", key);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    const sid = try alloc.dupe(u8, daemon.getInbound(1).?.getStreamId());
+    defer alloc.free(sid);
+
+    var wire: [2048]u8 = undefined;
+    const sent = wire[0..drainTlsPeer(&cb.peer, &wire)];
+    try std.testing.expect(std.mem.indexOf(u8, sent, "<db:verify") != null);
+
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    feedVerifyVerdict(&daemon, cb.conn, &cl, &reader, "error", sid, "them.example", "us.example");
+
+    // XEP-0220 2.5: a Step-3 error is non-fatal — the conn, the stream and
+    // the inbound session all stay up; the submission is answered with a
+    // remote-server-not-found dialback error.
+    try std.testing.expect(daemon.outbound[0] == cb.conn);
+    try std.testing.expect(!cb.conn.isFailed());
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
+    try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
+
+    _ = try daemon.getInbound(1).?.flushWrite();
+    var rbuf: [1024]u8 = undefined;
+    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "remote-server-not-found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "to='them.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "from='us.example'") != null);
+}
+
+test "S2sDaemon: a db:result error verdict on our key bounces only that pair" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer ob.deinit();
+    daemon.outbound[0] = ob.conn;
+    makeBufferOnlyClient(&daemon, alloc);
+
+    // Drive the dialback assertion: post-TLS features pick dialback and
+    // our key goes out on this conn.
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    ob.conn.stream.state = .awaiting_stream_open_tls;
+    ob.conn.handleRemoteStreamOpen("them.example", "streamid-88");
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_end = "features" });
+    try std.testing.expect(ob.conn.db_assertion_pending);
+    try ob.conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>x</body></message>");
+
+    // An inbound session's pending verify multiplexes on the same conn:
+    // the other domain pair that must survive the error verdict.
+    const in1 = try makeTestInbound(alloc, &daemon, 1);
+    defer posix.close(in1.peer_fd);
+    const pv = ob.conn.addPendingVerify(1, daemon.inbound_gens[1], "sid-1", "peer.example", "us.example", "aaaa") orelse return error.TestUnexpectedResult;
+    ob.conn.db_pending[pv].verify_sent = true;
+
+    var kbuf: [1024]u8 = undefined;
+    _ = kbuf[0..drainTlsPeer(&ob.peer, &kbuf)];
+
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "error", "them.example", "us.example");
+
+    // XEP-0220 2.5: non-fatal. The pair is dead and its queue bounced, but
+    // the conn stays up for the surviving exchange.
+    try std.testing.expect(daemon.outbound[0] == ob.conn);
+    try std.testing.expect(ob.conn.db_assertion_errored);
+    try std.testing.expect(!ob.conn.db_assertion_pending);
+    try std.testing.expectEqual(@as(usize, 0), ob.conn.pendingCount());
+    try std.testing.expect(ob.conn.hasPendingVerify());
+
+    const client = &daemon.ipc.clients[0];
+    const first_len = client.send_list.items.len;
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
+    try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
+    try std.testing.expectEqualStrings("b@them.example", notice.s2s_delivery_failed.to_jid);
+
+    // New stanzas for the dead pair bounce at once, never queue.
+    daemon.handleDelivery(&cl, "a@us.example", "b@them.example", "<message to='b@them.example'><body>y</body></message>");
+    const frame2 = protocol.readFrame(client.send_list.items[first_len..]) orelse return error.NoDeliveryFailedNotice;
+    const notice2 = try protocol.decode(frame2.payload);
+    try std.testing.expectEqualStrings("remote-server-timeout", notice2.s2s_delivery_failed.error_type);
+    try std.testing.expectEqual(@as(usize, 0), ob.conn.pendingCount());
+
+    // The surviving exchange still resolves; draining it closes the conn.
+    feedVerifyVerdict(&daemon, ob.conn, &cl, &reader, "valid", "sid-1", "peer.example", "us.example");
+    try std.testing.expect(daemon.outbound[0] == null);
+    try std.testing.expect(daemon.getInbound(1) != null);
+    try std.testing.expect(daemon.getInbound(1).?.isAuthenticatedDomain("peer.example"));
+}
+
+test "S2sDaemon: a db:result error verdict with nothing left closes the conn" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer ob.deinit();
+    daemon.outbound[0] = ob.conn;
+    makeBufferOnlyClient(&daemon, alloc);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    ob.conn.db_assertion_pending = true;
+    try ob.conn.queueStanza(alloc, "a@us.example", "b@them.example", "<message to='b@them.example'><body>x</body></message>");
+
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "error", "them.example", "us.example");
+
+    // No surviving exchange: the stream closes after the queue bounces.
+    try std.testing.expect(daemon.outbound[0] == null);
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+    const client = &daemon.ipc.clients[0];
+    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const notice = try protocol.decode(frame.payload);
+    try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
+}
+
+test "S2sDaemon: a dialback error verdict's condition is captured" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer ob.deinit();
+    daemon.outbound[0] = ob.conn;
+
+    var scratch: [16]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+    ob.conn.db_assertion_pending = true;
+    // Keep the conn alive past the verdict: a pending exchange holds it.
+    try std.testing.expect(ob.conn.addPendingVerify(1, daemon.inbound_gens[1], "sid-1", "peer.example", "us.example", "aaaa") != null);
+
+    // Feed a non-self-closing db:result type='error' with an <error/> child.
+    var attrs = [_]xml.Attribute{ testAttr("type", "error"), testAttr("from", "them.example"), testAttr("to", "us.example") };
+    const result_elem = xml.Element{
+        .name = "db:result",
+        .prefix = "db",
+        .local_name = "result",
+        .namespace_uri = xml.ns.dialback,
+        .attributes = &attrs,
+        .self_closing = false,
+    };
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_start = result_elem });
+    try std.testing.expectEqual(@as(u8, 1), ob.conn.db_error_depth);
+
+    var no_attrs = [_]xml.Attribute{};
+    const err_elem = xml.Element{
+        .name = "error",
+        .prefix = "",
+        .local_name = "error",
+        .namespace_uri = "jabber:server",
+        .attributes = &no_attrs,
+        .self_closing = false,
+    };
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_start = err_elem });
+    try std.testing.expectEqual(@as(u8, 2), ob.conn.db_error_depth);
+
+    const cond_elem = xml.Element{
+        .name = "item-not-found",
+        .prefix = "",
+        .local_name = "item-not-found",
+        .namespace_uri = "urn:ietf:params:xml:ns:xmpp-stanzas",
+        .attributes = &no_attrs,
+        .self_closing = true,
+    };
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_start = cond_elem });
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_end = "item-not-found" });
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_end = "error" });
+    processOutboundEvent(&daemon, &cl, 0, ob.conn, &reader, .{ .element_end = "db:result" });
+
+    try std.testing.expectEqualStrings("item-not-found", ob.conn.dbErrorCond());
+    try std.testing.expectEqual(@as(u8, 0), ob.conn.db_error_depth);
+    try std.testing.expect(daemon.outbound[0] == ob.conn);
+    try std.testing.expect(ob.conn.db_assertion_errored);
+}
+
+test "S2sDaemon: an unmatched db:result error verdict is dropped, not fatal" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+
+    var ob = try makeTestOutboundConn(&daemon, "them.example");
+    defer ob.deinit();
+    daemon.outbound[0] = ob.conn;
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    var reader = XmlReader.init(alloc);
+    defer reader.deinit();
+
+    // No assertion pending, no exchange: an error verdict still must not
+    // fail the stream (XEP-0220 2.5).
+    feedDbResultVerdict(&daemon, ob.conn, &cl, &reader, "error", "them.example", "us.example");
+    try std.testing.expect(daemon.outbound[0] == ob.conn);
+    try std.testing.expect(!ob.conn.isFailed());
+}
+
+test "S2sDaemon: a failed db:verify write answers the exchange with a dialback error" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -6685,11 +6997,12 @@ test "S2sDaemon: a failed db:verify write answers the exchange invalid" {
     try std.testing.expect(daemon.getInbound(1) != null);
     try std.testing.expect(!daemon.getInbound(1).?.isAuthenticatedDomain("them.example"));
 
-    // The submitting stream is told the key did not verify.
+    // The submitting stream is told verification errored.
     _ = try daemon.getInbound(1).?.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
-    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "remote-server-timeout") != null);
 }
 
 test "S2sDaemon: a failed db:verify write tears the outbound conn out of its slot" {
@@ -6720,7 +7033,8 @@ test "S2sDaemon: a failed db:verify write tears the outbound conn out of its slo
     _ = try session.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
-    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "remote-server-timeout") != null);
 }
 
 test "S2sDaemon: a full changelist fails the pending exchanges instead of losing them" {
@@ -6762,7 +7076,8 @@ test "S2sDaemon: a full changelist fails the pending exchanges instead of losing
     _ = try session.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
-    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "remote-server-timeout") != null);
     try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
 }
 
@@ -6882,7 +7197,7 @@ test "S2sDaemon: a db:verify registered while connecting stays off the wire unti
     try std.testing.expect(!conn.hasUnsentVerify());
 }
 
-test "S2sDaemon: a callback conn torn down with pending exchanges answers them invalid" {
+test "S2sDaemon: a callback conn torn down with pending exchanges answers them with a dialback error" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
     defer daemon.deinit();
@@ -6915,14 +7230,16 @@ test "S2sDaemon: a callback conn torn down with pending exchanges answers them i
     _ = try session.flushWrite();
     var rbuf: [1024]u8 = undefined;
     const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
-    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "remote-server-timeout") != null);
     try std.testing.expect(!session.isAuthenticatedDomain("them.example"));
 }
 
-test "S2sDaemon: an exchange whose db:verify cannot be built is answered invalid and cleared" {
+test "S2sDaemon: an exchange whose db:verify and error answer cannot be built fails the stream" {
     // A long served host and a long origin overflow the fixed db:verify
     // buffer: the exchange can never be sent, and must die immediately
-    // instead of spinning the writable re-arm forever.
+    // instead of spinning the writable re-arm forever. Its dialback error
+    // answer overflows the response buffer too, so the stream fails.
     var host_buf: [225]u8 = undefined;
     @memset(host_buf[0..220], 'a');
     @memcpy(host_buf[220..], ".test");
@@ -6948,16 +7265,11 @@ test "S2sDaemon: an exchange whose db:verify cannot be built is answered invalid
     const key = "9999999999999999999999999999999999999999999999999999999999999999";
     submitDbResult(&daemon, in1.session, &cl, long_origin, long_host, key);
 
-    // The entry is answered invalid and cleared: nothing waits and nothing
-    // re-arms.
+    // The entry is cleared and the session failed: nothing waits and
+    // nothing re-arms.
     try std.testing.expect(!cb.conn.hasUnsentVerify());
     try std.testing.expectEqual(@as(usize, 0), cb.conn.pendingVerifyCount());
-    const session = daemon.getInbound(1) orelse return error.TestUnexpectedResult;
-    _ = try session.flushWrite();
-    var rbuf: [1024]u8 = undefined;
-    const resp = rbuf[0..drainPeer(in1.peer_fd, &rbuf)];
-    try std.testing.expect(std.mem.indexOf(u8, resp, "type='invalid'") != null);
-    try std.testing.expect(!session.isAuthenticatedDomain(long_origin));
+    try std.testing.expect(daemon.getInbound(1) == null);
 }
 
 test "S2sDaemon: a db:result verdict whose answer cannot be built fails the inbound stream" {

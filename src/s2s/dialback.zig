@@ -153,6 +153,30 @@ pub fn buildDbResultResponse(
     return fbs.getWritten();
 }
 
+/// Build a `<db:result type='error'>` verdict (XEP-0220 section 2.5): the
+/// exchange failed for a reason unrelated to key validity. `condition` is a
+/// stanza error condition name, emitted inside the mandatory <error/> child.
+///
+/// `<db:result from='target' to='origin' type='error'><error type='cancel'><COND/></error></db:result>`
+pub fn buildDbResultError(
+    buf: []u8,
+    from: []const u8,
+    to: []const u8,
+    condition: []const u8,
+) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    const esc = @import("session.zig").xmlEscapeWrite;
+    try w.writeAll("<db:result xmlns:db='jabber:server:dialback' from='");
+    try esc(w, from);
+    try w.writeAll("' to='");
+    try esc(w, to);
+    try w.writeAll("' type='error'><error type='cancel'><");
+    try esc(w, condition);
+    try w.writeAll(" xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></db:result>");
+    return fbs.getWritten();
+}
+
 /// Whether text has the shape of a dialback key: exactly 64 lowercase-hex
 /// characters (computeKeyHex output). The callback path re-emits a captured
 /// peer key, which may have contained entity-decoded markup (S1),
@@ -467,6 +491,16 @@ test "buildDbResultResponse: invalid response" {
     var buf: [256]u8 = undefined;
     const xml = try buildDbResultResponse(&buf, "b.example", "a.example", false);
     try std.testing.expect(std.mem.indexOf(u8, xml, "type='invalid'") != null);
+}
+
+test "buildDbResultError: error verdict carries the stanza condition" {
+    var buf: [512]u8 = undefined;
+    const xml = try buildDbResultError(&buf, "b.example", "a.example", "remote-server-not-found");
+    try std.testing.expect(std.mem.indexOf(u8, xml, "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "from='b.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "to='a.example'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<error type='cancel'>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'") != null);
 }
 
 test "buildDbVerify: correct XML format" {
