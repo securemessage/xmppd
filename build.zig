@@ -631,7 +631,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const delivery_queue_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/delivery_queue.zig"),
+        .root_source_file = b.path("src/core/xworker/ring.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -973,7 +973,7 @@ pub fn build(b: *std.Build) void {
     // --- Delivery queue tests ---
 
     const delivery_queue_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/delivery_queue.zig"),
+        .root_source_file = b.path("src/core/xworker/ring.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1381,7 +1381,7 @@ pub fn build(b: *std.Build) void {
     // --- Message (actor model) tests ---
 
     const message_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/message.zig"),
+        .root_source_file = b.path("src/core/xworker/envelope.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -2229,7 +2229,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     const bench_delivery_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/delivery_queue.zig"),
+        .root_source_file = b.path("src/core/xworker/ring.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });

@@ -88,7 +88,7 @@ const room_store_mod = @import("room_store");
 const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
 const fanout_mod = @import("fanout.zig");
 const FanoutQueue = fanout_mod.FanoutQueue;
-const actor_message = @import("message.zig");
+const actor_message = @import("xworker/envelope.zig");
 pub const sm_state = @import("c2s/sm_state.zig");
 const sm_handoff = @import("c2s/sm_handoff.zig");
 const c2s_session = @import("c2s/session.zig");
@@ -3099,12 +3099,12 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "c2s/sm.zig", @embedFile("c2s/sm.zig"), 9 }, // SM enable/resume/failed nonzas.
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), 0 },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig"), 0 },
-        .{ "message.zig", @embedFile("message.zig"), 0 },
+        .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig"), 0 },
         .{ "caps.zig", @embedFile("caps.zig"), 0 },
         // Remaining core files (S15): a raw send added here must be caught
         // like any other, not smuggled in outside the allowlist.
         .{ "archive_queue.zig", @embedFile("archive_queue.zig"), 0 },
-        .{ "delivery_queue.zig", @embedFile("delivery_queue.zig"), 0 },
+        .{ "xworker/ring.zig", @embedFile("xworker/ring.zig"), 0 },
         .{ "event_loop.zig", @embedFile("event_loop.zig"), 0 },
         .{ "jid_bounds.zig", @embedFile("jid_bounds.zig"), 0 },
         .{ "listener.zig", @embedFile("listener.zig"), 0 },
@@ -6385,7 +6385,7 @@ test "S10: IPC write interest lives only in server.zig" {
         .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig") },
         .{ "presence_handler.zig", @embedFile("presence_handler.zig") },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig") },
-        .{ "message.zig", @embedFile("message.zig") },
+        .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig") },
         .{ "fanout.zig", @embedFile("fanout.zig") },
         .{ "caps.zig", @embedFile("caps.zig") },
     };
@@ -6458,7 +6458,7 @@ test "S10: the IPC reconnect timers are armed in exactly one place" {
         .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "message.zig", @embedFile("message.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "fanout.zig", @embedFile("fanout.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "caps.zig", @embedFile("caps.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "event_loop.zig", @embedFile("event_loop.zig"), @as(usize, 0), @as(usize, 0) },

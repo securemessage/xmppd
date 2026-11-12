@@ -24,7 +24,7 @@ const muc_handler = @import("muc_handler.zig");
 const fanout = @import("fanout.zig");
 const connection_mod = @import("connection.zig");
 const room_registry_mod = @import("room_registry");
-const actor_message = @import("message.zig");
+const actor_message = @import("xworker/envelope.zig");
 const delivery_queue = @import("delivery_queue");
 
 const log = std.log.scoped(.xmppd);

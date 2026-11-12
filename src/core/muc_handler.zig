@@ -35,7 +35,7 @@ const fanout = @import("fanout.zig");
 const FanoutQueue = fanout.FanoutQueue;
 const router = @import("router.zig");
 const PendingFanout = fanout.PendingFanout;
-const actor_message = @import("message.zig");
+const actor_message = @import("xworker/envelope.zig");
 const delivery_queue = @import("delivery_queue");
 
 const log = std.log.scoped(.muc);

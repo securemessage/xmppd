@@ -22,8 +22,6 @@ src/core/c2s/sm.zig	catch {}	13
 src/core/c2s/sm_state.zig	catch return	2
 src/core/connection.zig	catch return	4
 src/core/connection.zig	catch {}	6
-src/core/delivery_queue.zig	catch return	1
-src/core/delivery_queue.zig	catch {}	1
 src/core/event_loop.zig	catch {}	1
 src/core/fanout.zig	catch return	14
 src/core/fanout.zig	catch {}	1
@@ -35,7 +33,6 @@ src/core/listener.zig	catch return	2
 src/core/listener.zig	catch {}	1
 src/core/main.zig	catch return	1
 src/core/main.zig	catch {}	2
-src/core/message.zig	catch return	100
 src/core/muc_handler.zig	catch continue	15
 src/core/muc_handler.zig	catch return	165
 src/core/muc_handler.zig	catch {}	30
@@ -55,6 +52,9 @@ src/core/router.zig	catch {}	10
 src/core/server.zig	catch return	12
 src/core/server.zig	catch {}	65
 src/core/stanza/writer.zig	catch return	2
+src/core/xworker/envelope.zig	catch return	100
+src/core/xworker/ring.zig	catch return	1
+src/core/xworker/ring.zig	catch {}	1
 src/ctl/main.zig	catch return	14
 src/ctl/main.zig	catch {}	2
 src/ctl/migrate_precis.zig	catch continue	1
