@@ -233,6 +233,10 @@ pub const MemoryBackend = struct {
     claim_mutex: std.Thread.Mutex = .{},
     compound_mutex: std.Thread.Mutex = .{},
 
+    /// Claim checks are serialized by claim_mutex only; there is no shared
+    /// store at all across processes.
+    pub const cross_process_claims = false;
+
     pub fn open(path: []const u8, opts: OpenOptions) !Self {
         _ = path;
         _ = opts;

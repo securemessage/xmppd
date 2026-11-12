@@ -40,6 +40,12 @@ pub const RocksDbBackend = struct {
     /// write, so they do not need the store's compound lock (S9).
     pub const reads_are_snapshot = true;
 
+    /// putIfAbsent claim checks run under claim_mutex, which only orders
+    /// batches inside this process. Nothing stops a second daemon on the
+    /// same DB from interleaving a claim, so OIDC account binding is not
+    /// safe on this backend.
+    pub const cross_process_claims = false;
+
     comptime {
         backend.assertBackend(RocksDbBackend);
     }

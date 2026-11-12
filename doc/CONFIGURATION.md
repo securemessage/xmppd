@@ -100,6 +100,15 @@ Local registration runs the reverse index too: XEP-0077 registration and
 bound-localpart error at the ctl) instead of attaching a password
 credential to the bound account.
 
+Claiming a localpart is a conditional write that must hold against every
+process that can open `{db}/auth` (`xmppd-auth-oidc`, the core daemon,
+`xmppctl`, and any second auth daemon). Only the LMDB and SQLite
+backends serialize that check across processes; RocksDB orders
+`putIfAbsent` with an in-process mutex, so `xmppd-auth-oidc` refuses to
+start when the operational storage backend is RocksDB. OIDC account
+binding requires `-Dop-storage=lmdb` (the default) or
+`-Dop-storage=sqlite`.
+
 | IdP | Recommended keys | Notes |
 |-----|------------------|-------|
 | identity-oidc | `localpart_claim = sub`, `localpart_claim_prefix = user:` | While subject IDs are handle-form (`user:name`), strip the prefix. After identityd issue #52 lands opaque subjects, use an admin-controlled preferred username instead. |

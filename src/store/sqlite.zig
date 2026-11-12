@@ -29,6 +29,11 @@ pub const SqliteBackend = struct {
     /// created at open(); the lock covers only test/unknown names.
     table_lock: std.Thread.Mutex = .{},
 
+    /// WriteBatch runs inside BEGIN IMMEDIATE, so a claim's get +
+    /// putIfAbsent is serialized against every other process holding the
+    /// same database file.
+    pub const cross_process_claims = true;
+
     comptime {
         backend.assertBackend(SqliteBackend);
     }

@@ -258,7 +258,17 @@ pub fn main() !void {
 
     // The (iss, sub) -> localpart binding map lives in the same {db}/auth
     // env. It needs the read-write handle: first-login claims write both
-    // index rows, and the users-namespace check shares the env (S3).
+    // index rows, and the users-namespace check shares the env (S3). The
+    // claim has to hold against every process that can open the env, so a
+    // backend whose putIfAbsent is only in-process cannot serve bindings.
+    requireClaimAtomicity(OpBackendType) catch |err| {
+        log.err(
+            "OIDC account binding needs a backend with cross-process claim atomicity " ++
+                "(LMDB or SQLite); refusing to start on this storage backend: {}",
+            .{err},
+        );
+        return err;
+    };
     var binding_backend = openReadWriteProvisioned(OpBackendType, auth_path, .{
         .map_size = map_size_mb * 1024 * 1024,
     }) catch |err| {
@@ -1002,6 +1012,20 @@ fn openReadWriteProvisioned(
     };
 }
 
+/// OIDC first-login binding claims a localpart through putIfAbsent. On a
+/// backend whose claim check is serialized only inside the process
+/// (RocksDB's claim_mutex, the memory backend), a second daemon on the
+/// same store could interleave a claim and two identities would land on
+/// one account. Refuse startup unless the backend serializes claims
+/// across processes; an undeclared capability counts as unsafe.
+fn requireClaimAtomicity(comptime Backend: type) !void {
+    const capable = if (@hasDecl(Backend, "cross_process_claims"))
+        Backend.cross_process_claims
+    else
+        false;
+    if (!capable) return error.ClaimNotCrossProcess;
+}
+
 /// Read-only probe handle on an account-data environment: null when the
 /// environment does not exist yet (fresh install means no claimable
 /// data); any other failure propagates so a blind probe never allows a
@@ -1087,6 +1111,47 @@ test "oidc daemon: the start path migrates legacy lock keys before the read-only
     const alice = (try store.isLocked(allocator, "ALICE")) orelse return error.NotLocked;
     try std.testing.expectEqual(@as(u32, 7), alice.locked_epoch);
     try std.testing.expect((try store.isLocked(allocator, "bob")) != null);
+}
+
+const RocksLikeBackend = struct {
+    pub const cross_process_claims = false;
+};
+
+const SqliteLikeBackend = struct {
+    pub const cross_process_claims = true;
+};
+
+const UndeclaredBackend = struct {};
+
+test "startup refuses binding backends without cross-process claims" {
+    // The configured op backend is the one main() gates on; the outcome
+    // must track its declared capability under any -Dop-storage choice.
+    const op_capable = if (@hasDecl(OpBackendType, "cross_process_claims"))
+        OpBackendType.cross_process_claims
+    else
+        false;
+    if (op_capable) {
+        try requireClaimAtomicity(OpBackendType);
+    } else {
+        try std.testing.expectError(
+            error.ClaimNotCrossProcess,
+            requireClaimAtomicity(OpBackendType),
+        );
+    }
+    try requireClaimAtomicity(SqliteLikeBackend);
+    try std.testing.expectError(
+        error.ClaimNotCrossProcess,
+        requireClaimAtomicity(backend_mod.MemoryBackend),
+    );
+    try std.testing.expectError(
+        error.ClaimNotCrossProcess,
+        requireClaimAtomicity(RocksLikeBackend),
+    );
+    // A backend that never declares the capability counts as unsafe.
+    try std.testing.expectError(
+        error.ClaimNotCrossProcess,
+        requireClaimAtomicity(UndeclaredBackend),
+    );
 }
 
 /// Write "[oidc]\n`body`\n" into the tmp dir and return the file path.

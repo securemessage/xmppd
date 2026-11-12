@@ -286,6 +286,11 @@ pub const LmdbBackend = struct {
     /// the store's compound lock (S9).
     pub const reads_are_snapshot = true;
 
+    /// LMDB serializes writers on the environment's lock file across
+    /// processes, so a WriteBatch claim (get + putIfAbsent) is atomic
+    /// against other daemons holding the same env.
+    pub const cross_process_claims = true;
+
     comptime {
         backend.assertBackend(LmdbBackend);
     }

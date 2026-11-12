@@ -50,3 +50,11 @@ oidc: refusing auto-claim of 'alice': existing account data found; use xmppctl o
 
 If you previously relied on `username_claim`, it no longer exists;
 `localpart_claim` is the replacement.
+
+### Storage backend
+
+First-login binding claims a localpart through a conditional write that
+must hold across every process on `{db}/auth`. RocksDB serializes that
+check inside the process only, so `xmppd-auth-oidc` now refuses to start
+when the operational storage backend is RocksDB. OIDC requires
+`-Dop-storage=lmdb` (the default) or `-Dop-storage=sqlite`.
