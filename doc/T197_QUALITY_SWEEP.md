@@ -747,6 +747,32 @@ targets marked TBD are set from the M5 baseline before Phase 1 merges.
 | Server loop iteration p99 at 10k sessions | not instrumented | TBD from M5 |
 | Cross-worker 1:1 throughput and latency | not measured | TBD from M5 |
 
+### 6.1 M2 rig refresh on master f49fdc1 (2026-11-12)
+
+Server: master f49fdc1 ReleaseSafe on cores 0-7. Driver: xmppc-load from
+v091/measure-m2 (68b0005) on cores 8-18, 8 engines, userland TLS. ECDSA
+P-256, `rate_limit = false`, fresh template rig per cell, one run per cell
+(this table proves the driver at plan scale; D.1 remains the v0.9.0
+three-run median baseline).
+
+| Cell | Result |
+|------|--------|
+| LG10k w4, 10000 distinct-account logins, burst 2000/s | 368 logins/s wall, ramp 27.1 s, 11 temporary-auth-failure, stall 83 ms, ~88 KB/session |
+| C1 w4 peer chat 20000 msg/s | 0 lost of 399804, p50 3.1 ms, p99 51 ms, max 282 ms |
+| C2 w1 peer chat 20000 msg/s | 0 lost of 399886, p50 16.3 ms, p99 264 ms, max 409 ms |
+| P1 w4 directed presence 5000/s | 0 lost of 74954, p50 1.2 ms, p99 3.0 ms |
+| MUC w4 10/100/128 occupants | fanout rx 15107/78420/79840, lost 0/35/143, p99 11.8/3.2/18.2 ms, post_closes 0/5/26 |
+| S1 w4 smstorm 50 reconnects/s + 2000 msg/s | 992 resumes, 992 sm_resumed, resume p50 10.9 ms, lost 86, no crash (S28 fixed) |
+| R1 w4 slowread, 50 readers stop + 5000 msg/s | lost 17900 of 74983 (24%): SM unacked overflow teardown (50 closes), then offline store; wedge-window drops counted, not receipted |
+| Z1 w4 large, bodies cycling 8/16/32/64 KiB, 1000/s | posted 3749 per class, lost 200/3749/3749/3749; server: policy-violation closes + S14 cross-worker slot overflow |
+| chat w4 -to same/-to cross, 500 pairs | workers_seen=4, pairs_same=500 / pairs_cross=500, pairs_unknown=0 |
+| login w4 -scenario login, 200 accounts | 192 churn re-establishments (stop+start, no sm_resume), login lat p50 18.0 ms, p99 26.3 ms, max 27.7 ms |
+
+Slowread revert pair (same cell as R1, drop/bounce/teardown disabled in
+`smTrackOutbound`, `router`, `fanout`): lost 51457 of 74961, rx 23504,
+p50 12.7 s vs 4.5 s; the driver's loss accounting detects the silent
+drop when the server-side guard is removed.
+
 ---
 
 ## 7. v0.9.1 release gate
