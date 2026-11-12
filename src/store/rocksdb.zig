@@ -396,6 +396,24 @@ pub const RocksDbBackend = struct {
         const Claimed = struct { ns: []u8, key: []u8 };
         const max_claims_per_batch = 256;
 
+        /// In-process read under the same serialization putIfAbsent uses:
+        /// claim_mutex is held from the first get or putIfAbsent until the
+        /// batch ends, so a get-then-putIfAbsent pair is atomic against
+        /// other batches in this process (not across processes). Sees
+        /// committed state plus this batch's own putIfAbsent claims; a
+        /// pending plain put() is not modeled.
+        pub fn get(self: *WriteBatch, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+            if (!self.claim_held) {
+                self.backend.claim_mutex.lock();
+                self.claim_held = true;
+            }
+            for (self.claimed.items) |cl| {
+                if (std.mem.eql(u8, cl.ns, ns) and std.mem.eql(u8, cl.key, key))
+                    return try allocator.dupe(u8, "");
+            }
+            return self.backend.get(allocator, ns, key);
+        }
+
         /// In-process conditional insert: the committed-state check runs
         /// under claim_mutex, held until the batch ends, so two batches in
         /// this process cannot both claim the same key. RocksDB WriteBatch

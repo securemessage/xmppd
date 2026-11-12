@@ -423,12 +423,12 @@ pub fn main() !void {
         };
         const iss = remaining_args.items[2];
         const sub = remaining_args.items[3];
-        const claimed = binding_store.bind(iss, sub, lp, .operator, std.time.timestamp()) catch |err| {
+        const claimed = binding_store.bind(allocator, iss, sub, lp, .operator, std.time.timestamp(), null) catch |err| {
             printErr("oidc-link failed\n");
             return err;
         };
         switch (claimed) {
-            .bound => {
+            .bound, .already_bound => {
                 printOut("Bound ");
                 printOut(lp);
                 printOut("\n");
@@ -441,6 +441,7 @@ pub fn main() !void {
                 printErr("subject already bound to another localpart\n");
                 return error.Conflict;
             },
+            .local_account, .unclaimed_data => unreachable,
         }
     } else if (std.mem.eql(u8, command, "oidc-unlink")) {
         if (remaining_args.items.len < 2) {
@@ -508,12 +509,12 @@ pub fn main() !void {
                 printErr("\n");
                 continue;
             };
-            const claimed = binding_store.bind(iss, sub, lp, .operator, std.time.timestamp()) catch {
+            const claimed = binding_store.bind(allocator, iss, sub, lp, .operator, std.time.timestamp(), null) catch {
                 failed += 1;
                 continue;
             };
             switch (claimed) {
-                .bound => ok += 1,
+                .bound, .already_bound => ok += 1,
                 else => {
                     failed += 1;
                     printErr("conflict linking localpart ");

@@ -143,6 +143,7 @@ pub const Entry = struct {
 ///   fn deinit(self: *Iterator) void
 ///
 /// Required on B.WriteBatch:
+///   fn get(self: *WriteBatch, allocator: Allocator, ns: []const u8, key: []const u8) !?[]u8
 ///   fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void
 ///   fn putIfAbsent(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void
 ///   fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void
@@ -163,6 +164,14 @@ pub const Entry = struct {
 /// and give no cross-process guarantee. On LMDB and SQLite the check also
 /// sees earlier writes of the same transaction; on Memory and RocksDB only
 /// committed state plus this batch's own putIfAbsent claims are modeled.
+///
+/// get() reads inside the same serialized scope the batch's writes will
+/// commit through, so a get-then-putIfAbsent pair is one atomic
+/// decide-and-write unit: LMDB and SQLite read inside the write
+/// transaction (and see its earlier writes), Memory and RocksDB take the
+/// backend claim lock on first get or putIfAbsent and hold it until the
+/// batch ends (committed state plus this batch's claims). The returned
+/// slice is allocator-owned; the caller frees it.
 ///
 pub fn assertBackend(comptime B: type) void {
     comptime {
@@ -192,6 +201,8 @@ pub fn assertBackend(comptime B: type) void {
             @compileError("StorageBackend missing: const WriteBatch type");
         if (!@hasDecl(B, "writeBatch"))
             @compileError("StorageBackend missing: writeBatch(*B) !WriteBatch");
+        if (!@hasDecl(B.WriteBatch, "get"))
+            @compileError("StorageBackend.WriteBatch missing: get(...)");
         if (!@hasDecl(B.WriteBatch, "put"))
             @compileError("StorageBackend.WriteBatch missing: put(...)");
         if (!@hasDecl(B.WriteBatch, "putIfAbsent"))
@@ -338,6 +349,32 @@ pub const MemoryBackend = struct {
                 .ns = ns,
                 .key = key,
             } });
+        }
+
+        /// Reads the effective state (committed rows plus this batch's own
+        /// ops replayed in order) under the claim lock, held until the
+        /// batch ends so a get-then-putIfAbsent pair is serialized.
+        pub fn get(self: *WriteBatch, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+            if (!self.claim_held) {
+                self.backend.claim_mutex.lock();
+                self.claim_held = true;
+            }
+            var value: ?[]const u8 = null;
+            if (self.backend.namespaces.get(ns)) |map| {
+                value = map.get(key);
+            }
+            for (self.ops.items) |op| {
+                switch (op) {
+                    .put_op => |p| {
+                        if (std.mem.eql(u8, p.ns, ns) and std.mem.eql(u8, p.key, key)) value = p.value;
+                    },
+                    .delete_op => |d| {
+                        if (std.mem.eql(u8, d.ns, ns) and std.mem.eql(u8, d.key, key)) value = null;
+                    },
+                }
+            }
+            const v = value orelse return null;
+            return try allocator.dupe(u8, v);
         }
 
         /// In-process conditional insert: conflicts on the effective state
@@ -499,6 +536,14 @@ pub const FailBatchBackend = struct {
             _ = key;
             _ = value;
             if (self.owner.fail_ops) return error.MapFull;
+        }
+
+        pub fn get(self: *WriteBatch, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+            _ = allocator;
+            _ = ns;
+            _ = key;
+            if (self.owner.fail_ops) return error.MapFull;
+            return null;
         }
 
         pub fn commit(self: *WriteBatch) !void {

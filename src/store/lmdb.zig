@@ -610,6 +610,20 @@ pub const LmdbBackend = struct {
             };
         }
 
+        /// Reads through the batch's own write transaction: committed
+        /// state plus this txn's earlier writes, serialized with every
+        /// other writer by the env's single-writer lock.
+        pub fn get(self: *WriteBatch, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+            const dbi = try self.resolveDbi(ns);
+            const db = lmdb.Database{ .txn = self.txn, .dbi = dbi };
+            const value = db.get(key) catch |err| {
+                if (err == error.MDB_NOTFOUND) return null;
+                return err;
+            };
+            const v = value orelse return null;
+            return try allocator.dupe(u8, v);
+        }
+
         /// Cross-process conditional insert: MDB_NOOVERWRITE inside the
         /// batch's write transaction fails MDB_KEYEXIST on any key visible
         /// in the txn, committed or written earlier in the same batch.

@@ -17,9 +17,10 @@
 //!
 //! Resolver drives first-login resolution on IdP worker threads: bind
 //! first, and only for unmapped subjects walk suggestion -> PRECIS
-//! preparation -> reverse check -> users row check -> account-data probe
-//! -> atomic claim. Anything present blocks auto-claim and points the
-//! operator at `xmppctl oidc-link`.
+//! preparation -> Store.bind, whose write transaction holds every check
+//! (reverse row, users row, account-data probe) and both index writes as
+//! one serialized decide-and-write unit. Anything present blocks
+//! auto-claim and points the operator at `xmppctl oidc-link`.
 
 const std = @import("std");
 const backend_mod = @import("backend");
@@ -55,6 +56,13 @@ pub const Source = enum(u8) {
     operator = 1,
 };
 
+/// Test seam for the localpart claim race; null in production. When set,
+/// UserStore.addUser and Store.bind call it just before opening the write
+/// transaction that decides and writes the claim, so a test can land a
+/// competing registration or binding inside the window a split
+/// check-then-write sequence would leave open.
+pub var claim_window_hook: ?*const fn () void = null;
+
 pub const StoreError = error{
     IssuerTooLong,
     SubjectTooLong,
@@ -80,7 +88,7 @@ fn forwardKey(buf: *[512]u8, iss: []const u8, sub: []const u8) StoreError![]cons
     return buf[0..need];
 }
 
-fn reverseKey(buf: *[512]u8, localpart: []const u8) StoreError![]const u8 {
+pub fn reverseKey(buf: *[512]u8, localpart: []const u8) StoreError![]const u8 {
     if (localpart.len == 0 or localpart.len > max_localpart_len) return error.LocalpartTooLong;
     buf[0] = rev_prefix;
     @memcpy(buf[1..][0..localpart.len], localpart);
@@ -186,11 +194,36 @@ pub fn Store(comptime Backend: type) type {
             };
         }
 
-        /// Atomically claim (iss, sub) -> localpart with both index rows.
-        /// Which side lost is reported so the caller can log and classify.
-        pub const Claimed = enum { bound, localpart_taken, subject_taken };
+        /// Outcome of a bind attempt; which side lost is reported so the
+        /// caller can log and classify. already_bound means the reverse
+        /// row already maps this localpart to this (iss, sub).
+        pub const Claimed = enum {
+            bound,
+            already_bound,
+            localpart_taken,
+            subject_taken,
+            local_account,
+            unclaimed_data,
+        };
 
-        pub fn bind(self: *Self, iss: []const u8, sub: []const u8, localpart: []const u8, source: Source, bound_at: i64) !Claimed {
+        /// Optional probe run inside the claim transaction before the
+        /// index rows are written; returning true aborts the claim as
+        /// .unclaimed_data. Must be read-only.
+        pub const PreClaimCheck = struct {
+            ctx: *anyopaque,
+            run: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, localpart: []const u8) anyerror!bool,
+        };
+
+        /// Atomically claim (iss, sub) -> localpart with both index rows.
+        /// The reverse-row check, the users-row check (auto claims only;
+        /// operator binds must be able to link provisioned accounts), the
+        /// caller's pre_claim probe and both index writes run inside one
+        /// serialized write transaction, so a registration or a competing
+        /// login cannot split the localpart between a local account and a
+        /// subject.
+        pub fn bind(self: *Self, allocator: std.mem.Allocator, iss: []const u8, sub: []const u8, localpart: []const u8, source: Source, bound_at: i64, pre_claim: ?PreClaimCheck) !Claimed {
+            if (claim_window_hook) |hook| hook();
+
             var kbuf: [512]u8 = undefined;
             var vbuf: [512]u8 = undefined;
             const fkey = try forwardKey(&kbuf, iss, sub);
@@ -199,29 +232,40 @@ pub fn Store(comptime Backend: type) type {
             const rval = try encodeRevValue(&rbuf2, iss, sub, source, bound_at);
 
             var batch = try self.backend.writeBatch();
-            var rev_conflict = false;
-            var fwd_conflict = false;
+            var ended = false;
+            defer if (!ended) batch.abort();
+
+            // The reverse row decides the claim: the same subject keeps
+            // its localpart, a different subject loses.
+            if (try batch.get(allocator, NAMESPACE, rkey)) |row| {
+                defer allocator.free(row);
+                const existing = try decodeRevValue(row);
+                if (std.mem.eql(u8, existing.iss, iss) and std.mem.eql(u8, existing.sub, sub))
+                    return .already_bound;
+                return .localpart_taken;
+            }
+
+            if (source == .auto) {
+                if (try batch.get(allocator, USERS_NS, localpart)) |row| {
+                    allocator.free(row);
+                    return .local_account;
+                }
+            }
+
+            if (pre_claim) |probe| {
+                if (try probe.run(probe.ctx, allocator, localpart)) return .unclaimed_data;
+            }
+
             batch.putIfAbsent(NAMESPACE, rkey, rval) catch |err| switch (err) {
-                error.Conflict => rev_conflict = true,
-                else => {
-                    batch.abort();
-                    return err;
-                },
+                error.Conflict => return .localpart_taken,
+                else => return err,
             };
-            if (!rev_conflict) {
-                batch.putIfAbsent(NAMESPACE, fkey, localpart) catch |err| switch (err) {
-                    error.Conflict => fwd_conflict = true,
-                    else => {
-                        batch.abort();
-                        return err;
-                    },
-                };
-            }
-            if (rev_conflict or fwd_conflict) {
-                batch.abort();
-                return if (rev_conflict) .localpart_taken else .subject_taken;
-            }
+            batch.putIfAbsent(NAMESPACE, fkey, localpart) catch |err| switch (err) {
+                error.Conflict => return .subject_taken,
+                else => return err,
+            };
             try batch.commit();
+            ended = true;
             return .bound;
         }
 
@@ -298,18 +342,6 @@ pub fn normalizeLocalpart(raw: []const u8, out: *[max_localpart_len]u8) ?usize {
     if (prepared.len > max_localpart_len) return null;
     @memcpy(out[0..prepared.len], prepared);
     return prepared.len;
-}
-
-/// True when localpart is bound to an OIDC subject (reverse-index hit).
-/// Registration consults this before creating a users row: a bound
-/// localpart belongs to the subject, never to a local account
-/// (T-52633E2B). Works on any backend exposing the auth env.
-pub fn localpartBound(backend: anytype, allocator: std.mem.Allocator, localpart: []const u8) !bool {
-    var kbuf: [512]u8 = undefined;
-    const key = try reverseKey(&kbuf, localpart);
-    const row = (try backend.get(allocator, NAMESPACE, key)) orelse return false;
-    allocator.free(row);
-    return true;
 }
 
 /// First-login and operator-binding resolution. Generic over the
@@ -412,52 +444,36 @@ pub fn Resolver(comptime Backend: type, comptime ArchiveBackend: type) type {
         }
 
         /// The full first-login claim path for one candidate localpart.
+        /// The reverse-row, users-row and account-data checks all run
+        /// inside bind's write transaction through the pre_claim probe,
+        /// so a registration or a competing login cannot slip between the
+        /// checks and the index writes.
         fn tryClaim(self: *Self, allocator: std.mem.Allocator, iss: []const u8, sub: []const u8, cand: []const u8, lp_out: *[max_localpart_len]u8, lp_len: *usize) anyerror!Resolution {
-            if (self.store.lookupLocalpart(allocator, cand) catch |err| {
-                log.warn("oidc: reverse lookup failed for '{s}': {s}", .{ cand, @errorName(err) });
-                return .unavailable;
-            }) |existing| {
-                defer allocator.free(existing.value);
-                if (std.mem.eql(u8, existing.iss, iss) and std.mem.eql(u8, existing.sub, sub)) {
-                    @memcpy(lp_out[0..cand.len], cand);
-                    lp_len.* = cand.len;
-                    return .{ .bound = cand.len };
-                }
-                log.info("oidc: localpart '{s}' is already bound to another subject", .{cand});
-                return .{ .refused = .localpart_taken };
-            }
-
-            const user_row = self.store.backend.get(allocator, USERS_NS, cand) catch |err| {
-                log.warn("oidc: users lookup failed for '{s}': {s}", .{ cand, @errorName(err) });
-                return .unavailable;
+            const probe = Store(Backend).PreClaimCheck{
+                .ctx = self,
+                .run = accountDataProbe,
             };
-            if (user_row) |v| {
-                allocator.free(v);
-                log.info("oidc: refusing auto-claim of '{s}': provisioned account exists; use xmppctl oidc-link", .{cand});
-                return .{ .refused = .local_account };
-            }
-
-            if (self.accountHasData(allocator, cand) catch |err| {
-                log.warn("oidc: account-data probe failed for '{s}': {s}", .{ cand, @errorName(err) });
-                return .unavailable;
-            }) {
-                log.info("oidc: refusing auto-claim of '{s}': existing account data found; use xmppctl oidc-link", .{cand});
-                return .{ .refused = .unclaimed_data };
-            }
-
-            switch (self.store.bind(iss, sub, cand, .auto, std.time.timestamp()) catch |err| {
+            switch (self.store.bind(allocator, iss, sub, cand, .auto, std.time.timestamp(), probe) catch |err| {
                 log.warn("oidc: bind failed for '{s}': {s}", .{ cand, @errorName(err) });
                 return .unavailable;
             }) {
-                .bound => {
+                .bound, .already_bound => {
                     @memcpy(lp_out[0..cand.len], cand);
                     lp_len.* = cand.len;
                     log.info("oidc: bound sub of iss={s} to localpart '{s}'", .{ iss, cand });
                     return .{ .bound = cand.len };
                 },
                 .localpart_taken => {
-                    log.info("oidc: localpart '{s}' claimed concurrently; refusing", .{cand});
+                    log.info("oidc: localpart '{s}' is already bound to another subject", .{cand});
                     return .{ .refused = .localpart_taken };
+                },
+                .local_account => {
+                    log.info("oidc: refusing auto-claim of '{s}': provisioned account exists; use xmppctl oidc-link", .{cand});
+                    return .{ .refused = .local_account };
+                },
+                .unclaimed_data => {
+                    log.info("oidc: refusing auto-claim of '{s}': existing account data found; use xmppctl oidc-link", .{cand});
+                    return .{ .refused = .unclaimed_data };
                 },
                 .subject_taken => {
                     // Lost the forward race to another login of the same
@@ -470,6 +486,11 @@ pub fn Resolver(comptime Backend: type, comptime ArchiveBackend: type) type {
                     return .{ .bound = winner.len };
                 },
             }
+        }
+
+        fn accountDataProbe(ctx: *anyopaque, allocator: std.mem.Allocator, localpart: []const u8) anyerror!bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.accountHasData(allocator, localpart);
         }
 
         /// Derive the raw localpart suggestion: strip the configured claim
@@ -801,7 +822,7 @@ test "Resolver: an existing account only binds through an operator link" {
 
     // xmppctl oidc-link binds the account to the subject; the next login
     // resolves to the linked localpart.
-    const claimed = try r.store.bind("https://idp.example", "sub-1", "alice", .operator, 1);
+    const claimed = try r.store.bind(testing.allocator, "https://idp.example", "sub-1", "alice", .operator, 1, null);
     try testing.expectEqual(MemStore.Claimed.bound, claimed);
     const out = try r.resolve(testing.allocator, "https://idp.example", "sub-1", "ignored", &lp, &len);
     try testing.expectEqual(out, Resolution{ .bound = 5 });
@@ -817,7 +838,7 @@ test "Resolver: operator bind wins over later auto claims" {
     defer arch.close();
     var r = memResolver(&auth, &op, &arch);
 
-    const claimed = try r.store.bind("https://idp.example", "sub-9", "legacy-acct", .operator, 1);
+    const claimed = try r.store.bind(testing.allocator, "https://idp.example", "sub-9", "legacy-acct", .operator, 1, null);
     try testing.expectEqual(Store(backend_mod.MemoryBackend).Claimed.bound, claimed);
 
     var lp: [max_localpart_len]u8 = undefined;
@@ -990,6 +1011,9 @@ const WriteSpy = struct {
             self.owner.note(ns);
             return self.inner.putIfAbsent(ns, key, value);
         }
+        pub fn get(self: *WriteBatch, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+            return self.inner.get(allocator, ns, key);
+        }
         pub fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void {
             self.owner.note(ns);
             return self.inner.delete(ns, key);
@@ -1024,7 +1048,7 @@ test "write surface: every store write targets only oidc_identities" {
     var lp: [max_localpart_len]u8 = undefined;
     var len: usize = 0;
     _ = try r.resolve(testing.allocator, "https://idp.example", "sub-1", "alice", &lp, &len);
-    _ = try r.store.bind("https://idp.example", "sub-2", "bob", .operator, 1);
+    _ = try r.store.bind(testing.allocator, "https://idp.example", "sub-2", "bob", .operator, 1, null);
     _ = try r.store.unbind(testing.allocator, "bob");
 
     for (auth.writes.items) |ns| {

@@ -1159,6 +1159,7 @@ pub fn build(b: *std.Build) void {
     oidc_identity_store_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
     oidc_identity_store_test_mod.addImport("precis_username", precis_username_mod);
     generic_user_store_test_mod.addImport("oidc_identity_store", oidc_identity_store_test_mod);
+    generic_user_store_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
     auth_handler_test_mod.addImport("oidc_identity_store", oidc_identity_store_test_mod);
 
     const oidc_identity_store_tests = b.addTest(.{

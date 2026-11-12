@@ -287,6 +287,13 @@ pub const SqliteBackend = struct {
             try self.backend.put(ns, key, value);
         }
 
+        /// SELECT inside the batch's IMMEDIATE transaction: committed
+        /// state plus this txn's earlier writes, serialized with other
+        /// writers by the database write lock.
+        pub fn get(self: *WriteBatch, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+            return self.backend.get(allocator, ns, key);
+        }
+
         pub fn putIfAbsent(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
             try self.backend.putIfAbsent(ns, key, value);
         }
