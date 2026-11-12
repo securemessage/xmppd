@@ -989,7 +989,7 @@ pub fn build(b: *std.Build) void {
     // --- SM handoff store tests ---
 
     const sm_handoff_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/sm_handoff.zig"),
+        .root_source_file = b.path("src/core/c2s/sm_handoff.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1366,7 +1366,7 @@ pub fn build(b: *std.Build) void {
     // --- SM state tests ---
 
     const sm_state_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/sm_state.zig"),
+        .root_source_file = b.path("src/core/c2s/sm_state.zig"),
         .target = target,
         .optimize = optimize,
     });

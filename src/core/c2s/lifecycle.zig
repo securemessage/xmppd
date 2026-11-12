@@ -15,16 +15,18 @@ const std = @import("std");
 const xml = @import("xml");
 const xmpp = @import("xmpp");
 
-const server_mod = @import("server.zig");
+const server_mod = @import("../server.zig");
+const c2s_session = @import("session.zig");
+const c2s_sm = @import("sm.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const sm_state = server_mod.sm_state;
-const ChangeList = @import("event_loop.zig").ChangeList;
-const muc_handler = @import("muc_handler.zig");
-const presence_handler = @import("presence_handler.zig");
+const ChangeList = @import("../event_loop.zig").ChangeList;
+const muc_handler = @import("../muc_handler.zig");
+const presence_handler = @import("../presence_handler.zig");
 const lastact_store = @import("last_activity_store");
-const router = @import("router.zig");
-const connection_mod = @import("connection.zig");
+const router = @import("../router.zig");
+const connection_mod = @import("../connection.zig");
 const delivery_queue_mod = @import("delivery_queue");
 
 const log = std.log.scoped(.lifecycle);
@@ -104,7 +106,7 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
     // the original stream-state-machine behavior.
     if (session.stream.state != .features_bind) {
         const action = session.stream.handleBind(resource);
-        server.executeAction(session, action, changes);
+        c2s_session.executeAction(server, session, action, changes);
         return true;
     }
 
@@ -117,13 +119,13 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
     const eff_resource: []const u8 = if (resource.len > 0) resource else "default";
     const local = session.stream.authenticated_jid orelse {
         const action = session.stream.handleBind(resource);
-        server.executeAction(session, action, changes);
+        c2s_session.executeAction(server, session, action, changes);
         return true;
     };
 
     if (sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, eff_resource)) |_| {
         const action = session.stream.handleBind(eff_resource);
-        server.executeAction(session, action, changes);
+        c2s_session.executeAction(server, session, action, changes);
         log.info("connection {d} session established: {s}@{s}/{s}", .{
             session.conn.id, local.local, local.domain, eff_resource,
         });
@@ -136,9 +138,9 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
             // client waits bind-pending until then.
             const existing = sm.findByFullJid(local.local, local.domain, eff_resource);
             if (existing != null and existing.?.worker_id != server.worker_id) {
-                if (!server.startSessionKick(session, local.local, local.domain, eff_resource, existing.?.worker_id, changes)) {
+                if (!c2s_sm.startSessionKick(server, session, local.local, local.domain, eff_resource, existing.?.worker_id, changes)) {
                     log.err("connection {d} session_map bind failed: resource held by another worker, kick unavailable", .{session.conn.id});
-                    server.sendStreamError(session, .conflict);
+                    c2s_session.sendStreamError(server, session, .conflict);
                     forceCloseSession(server, session.conn.id, changes);
                     return false;
                 }
@@ -149,12 +151,12 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
             if (evictStaleResource(server, sm, local.local, local.domain, eff_resource, changes)) {
                 _ = sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, eff_resource) catch |err2| {
                     log.err("connection {d} session_map bind failed after eviction: {}", .{ session.conn.id, err2 });
-                    server.sendStreamError(session, .conflict);
+                    c2s_session.sendStreamError(server, session, .conflict);
                     forceCloseSession(server, session.conn.id, changes);
                     return false;
                 };
                 const action = session.stream.handleBind(eff_resource);
-                server.executeAction(session, action, changes);
+                c2s_session.executeAction(server, session, action, changes);
                 log.info("connection {d} session established (evicted stale resource): {s}@{s}/{s}", .{
                     session.conn.id, local.local, local.domain, eff_resource,
                 });
@@ -165,7 +167,7 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
             // between findByFullJid and evict attempt): retry path handled none
             // of this — close with conflict rather than desync the client.
             log.err("connection {d} session_map bind failed: entry raced away", .{session.conn.id});
-            server.sendStreamError(session, .conflict);
+            c2s_session.sendStreamError(server, session, .conflict);
             forceCloseSession(server, session.conn.id, changes);
             return false;
         }
@@ -209,7 +211,7 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
     const bind_and_finish = struct {
         fn run(srv: *Server, sess: *Session, res: []const u8, changes_: *ChangeList) void {
             const action = sess.stream.handleBind(res);
-            srv.executeAction(sess, action, changes_);
+            c2s_session.executeAction(srv, sess, action, changes_);
             log.info("connection {d} session established (kicked remote resource)", .{sess.conn.id});
             if (sess.conn.hasPendingWrite()) {
                 _ = sess.conn.flushSend() catch {};
@@ -230,7 +232,7 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
         if (err == error.AlreadyBound and session.bind_kick_rounds < MAX_BIND_KICK_ROUNDS) {
             if (sm.findByFullJid(local.local, local.domain, resource)) |entry| {
                 if (entry.worker_id != server.worker_id and
-                    server.startSessionKick(session, local.local, local.domain, resource, entry.worker_id, changes))
+                    c2s_sm.startSessionKick(server, session, local.local, local.domain, resource, entry.worker_id, changes))
                 {
                     return; // parked again — id intentionally survives
                 }
@@ -244,7 +246,7 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
         }
         log.err("connection {d} bind after kick failed: {} (rounds={d})", .{ session.conn.id, err, session.bind_kick_rounds });
         if (err == error.AlreadyBound) {
-            server.sendStreamError(session, .conflict);
+            c2s_session.sendStreamError(server, session, .conflict);
             forceCloseSession(server, session.conn.id, changes);
             return;
         }
@@ -287,7 +289,7 @@ fn evictStaleResource(
     log.warn("evicting stale resource {s}@{s}/{s} (old session {d}) for new bind", .{
         local, domain, resource, old_id,
     });
-    server.sendStreamError(old_session, .conflict);
+    c2s_session.sendStreamError(server, old_session, .conflict);
     old_session.conn.flushSync(); // deliver the conflict before teardown closes the fd
     forceCloseSession(server, old_id, changes);
     return true;
@@ -343,7 +345,7 @@ fn abortAuthIfInFlight(server: *Server, session: *Session) void {
 fn detachSession(server: *Server, id: usize, session: *Session, changes: *ChangeList) void {
     session.sm_detached = true;
     server.detached_count += 1;
-    server.smIdMapInsert(session.sm_id[0..session.sm_id_len], id);
+    c2s_sm.smIdMapInsert(server, session.sm_id[0..session.sm_id_len], id);
     session.sm_detach_time = std.time.timestamp();
 
     // Remove from kqueue and close the fd. Purge instead of staging deletes:
@@ -365,7 +367,7 @@ fn detachSession(server: *Server, id: usize, session: *Session, changes: *Change
 fn destroySession(server: *Server, id: usize, session: *Session, changes: *ChangeList) void {
     if (session.sm_detached and server.detached_count > 0) {
         server.detached_count -= 1;
-        server.smIdMapRemove(session.sm_id[0..session.sm_id_len]);
+        c2s_sm.smIdMapRemove(server, session.sm_id[0..session.sm_id_len]);
     }
 
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
@@ -446,7 +448,7 @@ pub fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
             destroySession(server, i, session, changes);
         } else {
             log.warn("connection {d} outbound queue overflowed: closing stream (resource-constraint)", .{i});
-            server.sendStreamError(session, .resource_constraint);
+            c2s_session.sendStreamError(server, session, .resource_constraint);
             // Flush the stream error before teardown so the client sees it.
             session.conn.flushSync();
             forceCloseSession(server, i, changes);
@@ -1046,7 +1048,7 @@ fn releaseId(server: *Server, id: usize) void {
 // ============================================================================
 
 const posix = std.posix;
-const ChangeListT = @import("event_loop.zig").ChangeList;
+const ChangeListT = @import("../event_loop.zig").ChangeList;
 const SessionMap = @import("session_map").SessionMap;
 const xmpp_lib = @import("xmpp");
 const op_backend = @import("op_backend");
@@ -1121,7 +1123,7 @@ test "T158: detach timer expires sessions at 300s, not before" {
     const id1 = "aaaa1111bbbb2222cccc3333dddd4444";
     @memcpy(&s1.sm_id, id1);
     server.detached_count = 2;
-    server.smIdMapInsert(&s1.sm_id, 1);
+    c2s_sm.smIdMapInsert(&server, &s1.sm_id, 1);
 
     // Session 2: detached only 10 seconds ago — MUST NOT be expired
     const s2 = try makeAuthenticatedSession(&server, 2, "bob");
@@ -1131,7 +1133,7 @@ test "T158: detach timer expires sessions at 300s, not before" {
     s2.sm_id_len = sm_state.SM_ID_HEX_LEN;
     const id2 = "eeee5555ffff6666aaaa7777bbbb8888";
     @memcpy(&s2.sm_id, id2);
-    server.smIdMapInsert(&s2.sm_id, 2);
+    c2s_sm.smIdMapInsert(&server, &s2.sm_id, 2);
 
     // Mark slots 1 and 2 as consumed from the free list (tests bypass normal alloc)
     server.free_count -= 2;
@@ -1564,7 +1566,7 @@ test "T158: detach timer does not expire session at exactly 299s" {
     const id1 = "cccc3333dddd4444eeee5555ffff6666";
     @memcpy(&s1.sm_id, id1);
     server.detached_count = 1;
-    server.smIdMapInsert(&s1.sm_id, 1);
+    c2s_sm.smIdMapInsert(&server, &s1.sm_id, 1);
     server.free_count -= 1;
 
     expireDetachedSessions(&server, &changes);
@@ -1598,7 +1600,7 @@ test "T158: detach timer expires session at exactly 300s" {
     const id1 = "dddd4444eeee5555ffff6666aaaa7777";
     @memcpy(&s1.sm_id, id1);
     server.detached_count = 1;
-    server.smIdMapInsert(&s1.sm_id, 1);
+    c2s_sm.smIdMapInsert(&server, &s1.sm_id, 1);
     server.free_count -= 1;
 
     expireDetachedSessions(&server, &changes);
@@ -2559,4 +2561,42 @@ test "S35: an unsendable stored stanza is dropped and the drain continues" {
     try std.testing.expect(std.mem.indexOf(u8, pending, "id='big'") == null);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(!session.offline_pending);
+}
+
+test "Server: accept and close session" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    // Get bound port
+    var addr: std.c.sockaddr.in = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    _ = std.c.getsockname(server.listener.fd, @ptrCast(&addr), &addr_len);
+
+    // Connect a client
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer posix.close(client_fd);
+
+    var connect_addr = std.c.sockaddr.in{
+        .port = addr.port,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.connect(client_fd, @ptrCast(&connect_addr), @sizeOf(std.c.sockaddr.in)) catch {};
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Accept via the server
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    acceptConnections(&server, &changes);
+
+    // Should have accepted one connection
+    var found: bool = false;
+    for (server.sessions) |slot| {
+        if (slot != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+    try std.testing.expect(changes.count() > 0); // Should have addRead in changelist
 }

@@ -3,7 +3,7 @@
 //! Wraps a TCP connection with an XML reader, S2S stream FSM, and
 //! connection-level state for a single inbound federation session.
 //!
-//! Mirrors `src/core/server.zig`'s Session struct but for `jabber:server`
+//! Mirrors `src/core/c2s/session.zig`'s Session struct but for `jabber:server`
 //! namespace. The xmppd-s2s daemon manages a table of these.
 
 const std = @import("std");
