@@ -24,6 +24,32 @@
 
 const std = @import("std");
 const posix = std.posix;
+const net = @import("net_frame");
+
+/// The IPC transport: all peers read and write frames through lib/net
+/// (ADR-8). FrameReader drains to EAGAIN with a distinct EOF and reports
+/// an oversize header as a protocol error (T328, T329); FrameWriter owns
+/// the bounded send backlog (T257).
+pub const FrameReader = net.FrameReader;
+pub const FrameWriter = net.FrameWriter;
+pub const Frame = net.Frame;
+pub const RecvResult = net.RecvResult;
+pub const WriteResult = net.WriteResult;
+pub const parseFrame = net.parseFrame;
+
+/// Legacy boundary check for callers not yet on FrameReader; an
+/// oversized header collapses to null here while parseFrame/next()
+/// report it as Oversize. Removed when every peer is on FrameReader.
+pub fn readFrame(buf: []const u8) ?Frame {
+    return parseFrame(buf) catch null;
+}
+
+comptime {
+    // The codec below and lib/net framing share one wire contract; a
+    // drift between the two constants is a compile error, not a bug.
+    std.debug.assert(net.HEADER_SIZE == HEADER_SIZE);
+    std.debug.assert(net.MAX_PAYLOAD_SIZE == MAX_PAYLOAD_SIZE);
+}
 
 /// Maximum IPC message payload size (64KB).
 pub const MAX_PAYLOAD_SIZE: u32 = 65536;
@@ -256,6 +282,37 @@ pub const MechanismList = struct {
     pub fn slice(self: *const MechanismList) []const MechanismId {
         return self.mechanisms[0..self.count];
     }
+
+    // Wire shape: count(1B) + count ids; the untyped tail is not sent.
+    pub fn ipcEncodedLen(self: *const MechanismList) usize {
+        return 1 + self.count;
+    }
+
+    pub fn ipcEncode(self: *const MechanismList, buf: []u8, pos: usize) EncodeError!usize {
+        var p = pos;
+        if (p + 1 + self.count > buf.len) return error.BufferTooSmall;
+        buf[p] = self.count;
+        p += 1;
+        for (self.mechanisms[0..self.count]) |m| {
+            buf[p] = @intFromEnum(m);
+            p += 1;
+        }
+        return p;
+    }
+
+    pub fn ipcDecode(data: []const u8, pos: *usize) DecodeError!MechanismList {
+        if (pos.* + 1 > data.len) return error.MessageTooShort;
+        const count = data[pos.*];
+        pos.* += 1;
+        if (count > 8) return error.InvalidEnum;
+        if (pos.* + count > data.len) return error.MessageTooShort;
+        var ml = MechanismList{ .count = count, .mechanisms = undefined };
+        for (0..count) |i| {
+            ml.mechanisms[i] = std.meta.intToEnum(MechanismId, data[pos.* + i]) catch return error.InvalidEnum;
+        }
+        pos.* += count;
+        return ml;
+    }
 };
 
 // ============================================================================
@@ -290,419 +347,231 @@ pub const S2sDeliveryFailed = struct {
 };
 
 // ============================================================================
-// Serialization
+// Serialization — codec generated from the Message union
 // ============================================================================
+
+// Every variant's payload is a struct encoded field by field in
+// declaration order:
+//
+//   u8, bool, enum(u8)   -> 1 byte (bool: 0/1, enum: tag value)
+//   u32                  -> 4 bytes little-endian
+//   []const u8           -> u16 little-endian length + bytes
+//   custom               -> the type's ipcEncodedLen/ipcEncode/ipcDecode
+//
+// The wire format is unchanged from the hand-written codec: identical
+// tags, field order and encodings, including the optional trailing
+// photo_url on auth_success (a struct field with a default decodes as
+// absent when the wire runs out; everything else must consume the
+// payload exactly or it is TrailingBytes).
+
+pub const EncodeError = error{
+    /// The output slice cannot hold the frame/payload.
+    BufferTooSmall,
+    /// A []const u8 field exceeds the u16 wire length.
+    FieldTooLong,
+    /// The assembled payload exceeds MAX_PAYLOAD_SIZE.
+    PayloadTooLarge,
+};
+
+pub const DecodeError = error{
+    /// Fewer bytes than a field (or the tag) needs.
+    MessageTooShort,
+    /// Tag byte does not name a Message variant.
+    UnknownTag,
+    /// A u8 does not map onto its enum (MechanismId, mechanism count>8).
+    InvalidEnum,
+    /// Bytes remain after the last field of the message.
+    TrailingBytes,
+};
+
+/// Payload size in bytes (tag + fields, without the 4-byte header).
+pub fn payloadLen(msg: Message) usize {
+    return switch (msg) {
+        inline else => |p| 1 + payloadEncodedLen(@TypeOf(p), p),
+    };
+}
+
+/// Total frame size in bytes (header + payload); equal to encode()'s
+/// return value for the same message.
+pub fn encodedLen(msg: Message) usize {
+    return HEADER_SIZE + payloadLen(msg);
+}
+
+/// Encode msg's payload (tag + fields) into buf. Returns bytes written.
+/// For the FrameWriter path: begin(encodedLen - HEADER_SIZE), encode the
+/// payload into scratch[HEADER_SIZE..], commit the return value.
+pub fn encodePayload(msg: Message, buf: []u8) EncodeError!usize {
+    var pos: usize = 0;
+    switch (msg) {
+        inline else => |p, tag| {
+            const tag_byte: u8 = @intFromEnum(@field(Tag, @tagName(tag)));
+            if (pos + 1 > buf.len) return error.BufferTooSmall;
+            buf[pos] = tag_byte;
+            pos += 1;
+            pos = try encodeStruct(@TypeOf(p), p, buf, pos);
+        },
+    }
+    if (pos > MAX_PAYLOAD_SIZE) return error.PayloadTooLarge;
+    return pos;
+}
 
 /// Serialize a Message into a length-prefixed wire frame.
 /// Returns the total bytes written (header + payload).
-pub fn encode(msg: Message, buf: []u8) !usize {
-    if (buf.len < HEADER_SIZE + 1) return error.BufferTooSmall;
-
-    // Reserve space for the length header; write payload starting at offset 4
-    var pos: usize = HEADER_SIZE;
-
-    switch (msg) {
-        .auth_request => |req| {
-            buf[pos] = @intFromEnum(Tag.auth_request);
-            pos += 1;
-            // conn_id (4B LE)
-            std.mem.writeInt(u32, buf[pos..][0..4], req.conn_id, .little);
-            pos += 4;
-            // mechanism (1B)
-            buf[pos] = @intFromEnum(req.mechanism);
-            pos += 1;
-            // client_ip (len16 + bytes)
-            pos = try writeField(buf, pos, req.client_ip);
-            // cb_type (1B)
-            buf[pos] = req.cb_type;
-            pos += 1;
-            // cb_data (len16 + bytes)
-            pos = try writeField(buf, pos, req.cb_data);
-            // username_len (2B LE) + username
-            pos = try writeField(buf, pos, req.username);
-            // payload_len (2B LE) + payload
-            pos = try writeField(buf, pos, req.payload);
-        },
-        .auth_challenge => |ch| {
-            buf[pos] = @intFromEnum(Tag.auth_challenge);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], ch.conn_id, .little);
-            pos += 4;
-            pos = try writeField(buf, pos, ch.challenge);
-        },
-        .auth_success => |s| {
-            buf[pos] = @intFromEnum(Tag.auth_success);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], s.conn_id, .little);
-            pos += 4;
-            pos = try writeField(buf, pos, s.username);
-            pos = try writeField(buf, pos, s.server_final);
-            pos = try writeField(buf, pos, s.photo_url);
-        },
-        .auth_failure => |f| {
-            buf[pos] = @intFromEnum(Tag.auth_failure);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], f.conn_id, .little);
-            pos += 4;
-            pos = try writeField(buf, pos, f.reason);
-        },
-        .sasl_response => |r| {
-            buf[pos] = @intFromEnum(Tag.sasl_response);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
-            pos += 4;
-            pos = try writeField(buf, pos, r.payload);
-        },
-        .register_request => |r| {
-            buf[pos] = @intFromEnum(Tag.register_request);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
-            pos += 4;
-            pos = try writeField(buf, pos, r.username);
-            pos = try writeField(buf, pos, r.password);
-            pos = try writeField(buf, pos, r.invite_code);
-            pos = try writeField(buf, pos, r.client_ip);
-        },
-        .register_result => |r| {
-            buf[pos] = @intFromEnum(Tag.register_result);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
-            pos += 4;
-            buf[pos] = if (r.success) 1 else 0;
-            pos += 1;
-            pos = try writeField(buf, pos, r.reason);
-        },
-        .password_change_request => |r| {
-            buf[pos] = @intFromEnum(Tag.password_change_request);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
-            pos += 4;
-            pos = try writeField(buf, pos, r.username);
-            pos = try writeField(buf, pos, r.new_password);
-        },
-        .password_change_result => |r| {
-            buf[pos] = @intFromEnum(Tag.password_change_result);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
-            pos += 4;
-            buf[pos] = if (r.success) 1 else 0;
-            pos += 1;
-            pos = try writeField(buf, pos, r.reason);
-        },
-        .account_delete_request => |r| {
-            buf[pos] = @intFromEnum(Tag.account_delete_request);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
-            pos += 4;
-            pos = try writeField(buf, pos, r.username);
-        },
-        .account_delete_result => |r| {
-            buf[pos] = @intFromEnum(Tag.account_delete_result);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], r.conn_id, .little);
-            pos += 4;
-            buf[pos] = if (r.success) 1 else 0;
-            pos += 1;
-            pos = try writeField(buf, pos, r.reason);
-        },
-        .mechanism_list => |ml| {
-            buf[pos] = @intFromEnum(Tag.mechanism_list);
-            pos += 1;
-            buf[pos] = ml.count;
-            pos += 1;
-            for (ml.mechanisms[0..ml.count]) |m| {
-                buf[pos] = @intFromEnum(m);
-                pos += 1;
-            }
-        },
-        .auth_abort => |a| {
-            buf[pos] = @intFromEnum(Tag.auth_abort);
-            pos += 1;
-            std.mem.writeInt(u32, buf[pos..][0..4], a.conn_id, .little);
-            pos += 4;
-        },
-        .s2s_deliver => |d| {
-            buf[pos] = @intFromEnum(Tag.s2s_deliver);
-            pos += 1;
-            pos = try writeField(buf, pos, d.from_jid);
-            pos = try writeField(buf, pos, d.to_jid);
-            pos = try writeField(buf, pos, d.stanza_xml);
-        },
-        .s2s_inbound => |d| {
-            buf[pos] = @intFromEnum(Tag.s2s_inbound);
-            pos += 1;
-            pos = try writeField(buf, pos, d.from_jid);
-            pos = try writeField(buf, pos, d.to_jid);
-            pos = try writeField(buf, pos, d.stanza_xml);
-        },
-        .s2s_delivery_failed => |d| {
-            buf[pos] = @intFromEnum(Tag.s2s_delivery_failed);
-            pos += 1;
-            pos = try writeField(buf, pos, d.from_jid);
-            pos = try writeField(buf, pos, d.to_jid);
-            pos = try writeField(buf, pos, d.error_type);
-        },
-    }
-
-    // Write the length header (payload size, excluding the 4-byte header itself)
-    const payload_len: u32 = @intCast(pos - HEADER_SIZE);
-    std.mem.writeInt(u32, buf[0..4], payload_len, .little);
-
-    return pos;
+pub fn encode(msg: Message, buf: []u8) EncodeError!usize {
+    if (buf.len < HEADER_SIZE) return error.BufferTooSmall;
+    const payload_len = try encodePayload(msg, buf[HEADER_SIZE..]);
+    std.mem.writeInt(u32, buf[0..HEADER_SIZE], @intCast(payload_len), .little);
+    return HEADER_SIZE + payload_len;
 }
 
-/// Deserialize a payload (after length-prefix header has been stripped) into a Message.
-/// The returned message borrows slices from `payload` — do not free payload while using the message.
-pub fn decode(payload: []const u8) !Message {
+/// Deserialize a payload (after the length-prefix header has been
+/// stripped) into a Message. The returned message borrows slices from
+/// `payload`; do not free payload while using the message.
+pub fn decode(payload: []const u8) DecodeError!Message {
     if (payload.len < 1) return error.MessageTooShort;
-
     const tag_byte = payload[0];
     const data = payload[1..];
 
-    return switch (tag_byte) {
-        @intFromEnum(Tag.auth_request) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort; // conn_id(4) + mechanism(1) + client_ip_len(2) min
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            const mech_byte = data[4];
-            const mechanism = std.meta.intToEnum(MechanismId, mech_byte) catch return error.InvalidMechanism;
-            var pos: usize = 5;
-            const client_ip = try readField(data, &pos);
-            if (pos >= data.len) break :blk error.MessageTooShort;
-            const cb_type = data[pos];
-            pos += 1;
-            const cb_data = try readField(data, &pos);
-            const username = try readField(data, &pos);
-            const req_payload = try readField(data, &pos);
-            break :blk Message{ .auth_request = .{
-                .conn_id = conn_id,
-                .mechanism = mechanism,
-                .client_ip = client_ip,
-                .cb_type = cb_type,
-                .cb_data = cb_data,
-                .username = username,
-                .payload = req_payload,
-            } };
-        },
-        @intFromEnum(Tag.auth_challenge) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort;
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            var pos: usize = 4;
-            const challenge = try readField(data, &pos);
-            break :blk Message{ .auth_challenge = .{
-                .conn_id = conn_id,
-                .challenge = challenge,
-            } };
-        },
-        @intFromEnum(Tag.auth_success) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort;
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            var pos: usize = 4;
-            const username = try readField(data, &pos);
-            const server_final = try readField(data, &pos);
-            const photo_url = if (pos < data.len) try readField(data, &pos) else "";
-            break :blk Message{ .auth_success = .{
-                .conn_id = conn_id,
-                .username = username,
-                .server_final = server_final,
-                .photo_url = photo_url,
-            } };
-        },
-        @intFromEnum(Tag.auth_failure) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort;
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            var pos: usize = 4;
-            const reason = try readField(data, &pos);
-            break :blk Message{ .auth_failure = .{
-                .conn_id = conn_id,
-                .reason = reason,
-            } };
-        },
-        @intFromEnum(Tag.sasl_response) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort;
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            var pos: usize = 4;
-            const resp_payload = try readField(data, &pos);
-            break :blk Message{ .sasl_response = .{
-                .conn_id = conn_id,
-                .payload = resp_payload,
-            } };
-        },
-        @intFromEnum(Tag.register_request) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort;
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            var pos: usize = 4;
-            const username = try readField(data, &pos);
-            const password = try readField(data, &pos);
-            const invite_code = try readField(data, &pos);
-            const client_ip = try readField(data, &pos);
-            break :blk Message{ .register_request = .{
-                .conn_id = conn_id,
-                .username = username,
-                .password = password,
-                .invite_code = invite_code,
-                .client_ip = client_ip,
-            } };
-        },
-        @intFromEnum(Tag.register_result) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort;
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            if (data.len < 5) break :blk error.MessageTooShort;
-            const success = data[4] != 0;
-            var pos: usize = 5;
-            const reason = try readField(data, &pos);
-            break :blk Message{ .register_result = .{
-                .conn_id = conn_id,
-                .success = success,
-                .reason = reason,
-            } };
-        },
-        @intFromEnum(Tag.password_change_request) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort;
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            var pos: usize = 4;
-            const username = try readField(data, &pos);
-            const new_password = try readField(data, &pos);
-            break :blk Message{ .password_change_request = .{
-                .conn_id = conn_id,
-                .username = username,
-                .new_password = new_password,
-            } };
-        },
-        @intFromEnum(Tag.password_change_result) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort;
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            if (data.len < 5) break :blk error.MessageTooShort;
-            const success = data[4] != 0;
-            var pos: usize = 5;
-            const reason = try readField(data, &pos);
-            break :blk Message{ .password_change_result = .{
-                .conn_id = conn_id,
-                .success = success,
-                .reason = reason,
-            } };
-        },
-        @intFromEnum(Tag.account_delete_request) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort;
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            var pos: usize = 4;
-            const username = try readField(data, &pos);
-            break :blk Message{ .account_delete_request = .{
-                .conn_id = conn_id,
-                .username = username,
-            } };
-        },
-        @intFromEnum(Tag.account_delete_result) => blk: {
-            if (data.len < 6) break :blk error.MessageTooShort;
-            const conn_id = std.mem.readInt(u32, data[0..4], .little);
-            if (data.len < 5) break :blk error.MessageTooShort;
-            const success = data[4] != 0;
-            var pos: usize = 5;
-            const reason = try readField(data, &pos);
-            break :blk Message{ .account_delete_result = .{
-                .conn_id = conn_id,
-                .success = success,
-                .reason = reason,
-            } };
-        },
-        @intFromEnum(Tag.mechanism_list) => blk: {
-            if (data.len < 1) break :blk error.MessageTooShort;
-            const count = data[0];
-            if (count > 8) break :blk error.InvalidMechanism;
-            if (data.len < 1 + count) break :blk error.MessageTooShort;
-            var ml = MechanismList{
-                .count = count,
-                .mechanisms = undefined,
-            };
-            for (0..count) |i| {
-                ml.mechanisms[i] = std.meta.intToEnum(MechanismId, data[1 + i]) catch break :blk error.InvalidMechanism;
-            }
-            break :blk Message{ .mechanism_list = ml };
-        },
-        @intFromEnum(Tag.auth_abort) => blk: {
-            if (data.len < 4) break :blk error.MessageTooShort;
-            break :blk Message{ .auth_abort = .{ .conn_id = std.mem.readInt(u32, data[0..4], .little) } };
-        },
-        @intFromEnum(Tag.s2s_deliver) => blk: {
+    inline for (@typeInfo(Message).@"union".fields) |uf| {
+        if (tag_byte == @intFromEnum(@field(Tag, uf.name))) {
             var pos: usize = 0;
-            const from_jid = try readField(data, &pos);
-            const to_jid = try readField(data, &pos);
-            const stanza_xml = try readField(data, &pos);
-            break :blk Message{ .s2s_deliver = .{
-                .from_jid = from_jid,
-                .to_jid = to_jid,
-                .stanza_xml = stanza_xml,
-            } };
-        },
-        @intFromEnum(Tag.s2s_inbound) => blk: {
-            var pos: usize = 0;
-            const from_jid = try readField(data, &pos);
-            const to_jid = try readField(data, &pos);
-            const stanza_xml = try readField(data, &pos);
-            break :blk Message{ .s2s_inbound = .{
-                .from_jid = from_jid,
-                .to_jid = to_jid,
-                .stanza_xml = stanza_xml,
-            } };
-        },
-        @intFromEnum(Tag.s2s_delivery_failed) => blk: {
-            var pos: usize = 0;
-            const from_jid = try readField(data, &pos);
-            const to_jid = try readField(data, &pos);
-            const error_type = try readField(data, &pos);
-            break :blk Message{ .s2s_delivery_failed = .{
-                .from_jid = from_jid,
-                .to_jid = to_jid,
-                .error_type = error_type,
-            } };
-        },
-        else => error.UnknownTag,
-    };
+            const value = try decodeStruct(uf.type, data, &pos);
+            if (pos != data.len) return error.TrailingBytes;
+            return @unionInit(Message, uf.name, value);
+        }
+    }
+    return error.UnknownTag;
 }
 
 // ============================================================================
-// Frame I/O helpers
+// Generated field codecs
 // ============================================================================
 
-/// Read a complete frame from a buffer that may contain partial data.
-/// Returns the payload slice and the total frame size consumed, or null if
-/// the buffer doesn't contain a complete frame yet.
-pub fn readFrame(buf: []const u8) ?struct { payload: []const u8, consumed: usize } {
-    if (buf.len < HEADER_SIZE) return null;
-    const payload_len = std.mem.readInt(u32, buf[0..4], .little);
-    if (payload_len > MAX_PAYLOAD_SIZE) return null; // Invalid/corrupt
-    const total = HEADER_SIZE + payload_len;
-    if (buf.len < total) return null;
-    return .{
-        .payload = buf[HEADER_SIZE..total],
-        .consumed = total,
+fn payloadEncodedLen(comptime T: type, p: T) usize {
+    if (T == []const u8) return 2 + p.len;
+    if (@hasDecl(T, "ipcEncodedLen")) return p.ipcEncodedLen();
+    var n: usize = 0;
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        n += fieldEncodedLen(f.type, @field(p, f.name));
+    }
+    return n;
+}
+
+fn fieldEncodedLen(comptime T: type, v: T) usize {
+    if (T == []const u8) return 2 + v.len;
+    return switch (T) {
+        u8, bool => 1,
+        u32 => 4,
+        else => switch (@typeInfo(T)) {
+            .@"enum" => |e| if (e.tag_type == u8) 1 else @compileError("unsupported IPC enum " ++ @typeName(T)),
+            else => @compileError("unsupported IPC field type " ++ @typeName(T)),
+        },
     };
 }
 
-// ============================================================================
-// Internal helpers
-// ============================================================================
-
-/// Write a length-prefixed field (2-byte LE length + data).
-fn writeField(buf: []u8, start: usize, data: []const u8) !usize {
-    const field_len: u16 = std.math.cast(u16, data.len) orelse return error.FieldTooLong;
-    var pos = start;
-    if (pos + 2 + data.len > buf.len) return error.BufferTooSmall;
-    std.mem.writeInt(u16, buf[pos..][0..2], field_len, .little);
-    pos += 2;
-    @memcpy(buf[pos .. pos + data.len], data);
-    pos += data.len;
+fn encodeStruct(comptime T: type, p: T, buf: []u8, pos0: usize) EncodeError!usize {
+    if (@hasDecl(T, "ipcEncode")) return p.ipcEncode(buf, pos0);
+    var pos = pos0;
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        pos = try encodeField(f.type, buf, pos, @field(p, f.name));
+    }
     return pos;
 }
 
-/// Read a length-prefixed field (2-byte LE length + data). Returns a slice into `data`.
-fn readField(data: []const u8, pos: *usize) ![]const u8 {
-    if (pos.* + 2 > data.len) return error.MessageTooShort;
-    const field_len = std.mem.readInt(u16, data[pos.*..][0..2], .little);
-    pos.* += 2;
-    if (pos.* + field_len > data.len) return error.MessageTooShort;
-    const result = data[pos.* .. pos.* + field_len];
-    pos.* += field_len;
-    return result;
+fn encodeField(comptime T: type, buf: []u8, pos0: usize, v: T) EncodeError!usize {
+    var pos = pos0;
+    if (T == []const u8) {
+        const field_len: u16 = std.math.cast(u16, v.len) orelse return error.FieldTooLong;
+        if (pos + 2 + v.len > buf.len) return error.BufferTooSmall;
+        std.mem.writeInt(u16, buf[pos..][0..2], field_len, .little);
+        pos += 2;
+        @memcpy(buf[pos .. pos + v.len], v);
+        pos += v.len;
+        return pos;
+    }
+    switch (T) {
+        u8 => {
+            if (pos + 1 > buf.len) return error.BufferTooSmall;
+            buf[pos] = v;
+            return pos + 1;
+        },
+        bool => {
+            if (pos + 1 > buf.len) return error.BufferTooSmall;
+            buf[pos] = @intFromBool(v);
+            return pos + 1;
+        },
+        u32 => {
+            if (pos + 4 > buf.len) return error.BufferTooSmall;
+            std.mem.writeInt(u32, buf[pos..][0..4], v, .little);
+            return pos + 4;
+        },
+        else => switch (@typeInfo(T)) {
+            .@"enum" => |e| {
+                if (e.tag_type != u8) @compileError("unsupported IPC enum " ++ @typeName(T));
+                if (pos + 1 > buf.len) return error.BufferTooSmall;
+                buf[pos] = @intFromEnum(v);
+                return pos + 1;
+            },
+            else => @compileError("unsupported IPC field type " ++ @typeName(T)),
+        },
+    }
+}
+
+fn decodeStruct(comptime T: type, data: []const u8, pos: *usize) DecodeError!T {
+    if (@hasDecl(T, "ipcDecode")) return T.ipcDecode(data, pos);
+    var out: T = undefined;
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        if (pos.* >= data.len and f.defaultValue() != null) {
+            // Trailing defaulted field absent from the wire (the
+            // auth_success photo_url a pre-photo_url peer never sends).
+            @field(out, f.name) = f.defaultValue().?;
+        } else {
+            @field(out, f.name) = try decodeField(f.type, data, pos);
+        }
+    }
+    return out;
+}
+
+fn decodeField(comptime T: type, data: []const u8, pos: *usize) DecodeError!T {
+    if (T == []const u8) {
+        if (pos.* + 2 > data.len) return error.MessageTooShort;
+        const field_len = std.mem.readInt(u16, data[pos.*..][0..2], .little);
+        pos.* += 2;
+        if (pos.* + field_len > data.len) return error.MessageTooShort;
+        const v = data[pos.* .. pos.* + field_len];
+        pos.* += field_len;
+        return v;
+    }
+    switch (T) {
+        u8 => {
+            if (pos.* + 1 > data.len) return error.MessageTooShort;
+            const v = data[pos.*];
+            pos.* += 1;
+            return v;
+        },
+        bool => {
+            if (pos.* + 1 > data.len) return error.MessageTooShort;
+            const v = data[pos.*] != 0;
+            pos.* += 1;
+            return v;
+        },
+        u32 => {
+            if (pos.* + 4 > data.len) return error.MessageTooShort;
+            const v = std.mem.readInt(u32, data[pos.*..][0..4], .little);
+            pos.* += 4;
+            return v;
+        },
+        else => switch (@typeInfo(T)) {
+            .@"enum" => |e| {
+                if (e.tag_type != u8) @compileError("unsupported IPC enum " ++ @typeName(T));
+                if (pos.* + 1 > data.len) return error.MessageTooShort;
+                const v = std.meta.intToEnum(T, data[pos.*]) catch return error.InvalidEnum;
+                pos.* += 1;
+                return v;
+            },
+            else => @compileError("unsupported IPC field type " ++ @typeName(T)),
+        },
+    }
 }
 
 // ============================================================================
@@ -897,6 +766,132 @@ test "multiple frames in sequence" {
     const frame2 = readFrame(remaining) orelse return error.NoFrame;
     const decoded2 = try decode(frame2.payload);
     try std.testing.expectEqual(@as(u32, 2), decoded2.auth_failure.conn_id);
+}
+
+fn sampleField(comptime T: type) T {
+    if (T == []const u8) return "sample";
+    if (T == bool) return true;
+    if (T == u8) return 0x42;
+    if (T == u32) return 0xDEADBEEF;
+    return switch (@typeInfo(T)) {
+        .@"enum" => @enumFromInt(1),
+        else => @compileError("no sample for " ++ @typeName(T)),
+    };
+}
+
+fn samplePayload(comptime T: type) T {
+    if (T == MechanismList) return MechanismList.init(&.{ .plain, .scram_sha_256 });
+    var p: T = undefined;
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        @field(p, f.name) = sampleField(f.type);
+    }
+    return p;
+}
+
+test "codec: every Message variant round-trips by offset" {
+    var buf: [MAX_FRAME_SIZE]u8 = undefined;
+    var buf2: [MAX_FRAME_SIZE]u8 = undefined;
+    inline for (@typeInfo(Message).@"union".fields) |uf| {
+        const msg = @unionInit(Message, uf.name, samplePayload(uf.type));
+        const n = try encode(msg, &buf);
+        try std.testing.expectEqual(encodedLen(msg), n);
+        const fr = (try parseFrame(buf[0..n])).?;
+        try std.testing.expectEqual(n, fr.consumed);
+        const back = try decode(fr.payload);
+        // decode then encode must be the identity on the wire bytes.
+        const n2 = try encode(back, &buf2);
+        try std.testing.expectEqualSlices(u8, buf[0..n], buf2[0..n2]);
+    }
+}
+
+test "decode rejects trailing bytes" {
+    var buf: [64]u8 = undefined;
+    const n = try encode(Message{ .auth_abort = .{ .conn_id = 7 } }, &buf);
+    buf[n] = 0xAA; // one stray byte past the payload
+    try std.testing.expectError(error.TrailingBytes, decode(buf[HEADER_SIZE .. n + 1]));
+}
+
+test "parseFrame reports oversize headers" {
+    var buf: [HEADER_SIZE]u8 = undefined;
+    std.mem.writeInt(u32, &buf, MAX_PAYLOAD_SIZE + 1, .little);
+    try std.testing.expectError(error.Oversize, parseFrame(&buf));
+    try std.testing.expect(readFrame(&buf) == null);
+}
+
+test "auth_success without photo_url decodes with default" {
+    // A pre-photo_url peer sends tag + conn_id + username + server_final
+    // only; the defaulted field decodes as absent.
+    var payload: [256]u8 = undefined;
+    var pos: usize = 0;
+    payload[pos] = @intFromEnum(Tag.auth_success);
+    pos += 1;
+    std.mem.writeInt(u32, payload[pos..][0..4], 9, .little);
+    pos += 4;
+    inline for ([_][]const u8{ "user", "sf" }) |f| {
+        std.mem.writeInt(u16, payload[pos..][0..2], @intCast(f.len), .little);
+        pos += 2;
+        @memcpy(payload[pos .. pos + f.len], f);
+        pos += f.len;
+    }
+    const msg = try decode(payload[0..pos]);
+    switch (msg) {
+        .auth_success => |p| {
+            try std.testing.expectEqual(@as(u32, 9), p.conn_id);
+            try std.testing.expectEqualStrings("user", p.username);
+            try std.testing.expectEqualStrings("sf", p.server_final);
+            try std.testing.expectEqualStrings("", p.photo_url);
+        },
+        else => return error.WrongVariant,
+    }
+}
+
+test "encode rejects overlong field and oversized payload" {
+    var small: [8]u8 = undefined;
+    // BufferTooSmall: frame does not fit.
+    try std.testing.expectError(error.BufferTooSmall, encode(
+        Message{ .sasl_response = .{ .conn_id = 1, .payload = "x" } },
+        &small,
+    ));
+    const alloc = std.testing.allocator;
+    const data = try alloc.alloc(u8, 81000);
+    defer alloc.free(data);
+    const out = try alloc.alloc(u8, 81000);
+    defer alloc.free(out);
+    // FieldTooLong: a []const u8 field past the u16 wire length.
+    @memset(data[0..66000], 'a');
+    try std.testing.expectError(error.FieldTooLong, encode(
+        Message{ .sasl_response = .{ .conn_id = 1, .payload = data[0..66000] } },
+        out,
+    ));
+    // PayloadTooLarge: fields individually under u16 but sum over 64 KiB.
+    @memset(data, 'b');
+    try std.testing.expectError(error.PayloadTooLarge, encode(
+        Message{ .auth_request = .{
+            .conn_id = 1,
+            .mechanism = .plain,
+            .client_ip = "ip",
+            .cb_type = 0,
+            .cb_data = data[0..40000],
+            .username = "u",
+            .payload = data[40000..80000],
+        } },
+        out,
+    ));
+}
+
+test "max-size payload round-trips" {
+    const alloc = std.testing.allocator;
+    const data = try alloc.alloc(u8, MAX_PAYLOAD_SIZE);
+    defer alloc.free(data);
+    const buf = try alloc.alloc(u8, MAX_FRAME_SIZE);
+    defer alloc.free(buf);
+    @memset(data, 'z');
+    const msg = Message{ .sasl_response = .{ .conn_id = 1, .payload = data[0 .. MAX_PAYLOAD_SIZE - 1 - 4 - 2] } };
+    const n = try encode(msg, buf);
+    try std.testing.expectEqual(MAX_FRAME_SIZE, n);
+    const fr = (try parseFrame(buf[0..n])).?;
+    const back = try decode(fr.payload);
+    try std.testing.expectEqualStrings(data[0 .. MAX_PAYLOAD_SIZE - 7], back.sasl_response.payload);
 }
 
 test "MechanismId fromName/toName roundtrip" {

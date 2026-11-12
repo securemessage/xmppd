@@ -54,6 +54,22 @@ pub const BeginError = std.mem.Allocator.Error || error{
     Oversize,
 };
 
+/// One-shot boundary parse over a const buffer (peek at queued bytes,
+/// tests, the blocking ctl path). Parses by offset; null means the
+/// buffer does not hold a complete frame yet, NextError.Oversize means
+/// the header's payload_len exceeds MAX_PAYLOAD_SIZE.
+pub fn parseFrame(buf: []const u8) NextError!?Frame {
+    if (buf.len < HEADER_SIZE) return null;
+    const payload_len = std.mem.readInt(u32, buf[0..HEADER_SIZE], .little);
+    if (payload_len > MAX_PAYLOAD_SIZE) return NextError.Oversize;
+    const total = HEADER_SIZE + payload_len;
+    if (buf.len < total) return null;
+    return .{
+        .payload = buf[HEADER_SIZE..total],
+        .consumed = total,
+    };
+}
+
 /// Reads frames from one fd into a caller-owned buffer.
 ///
 /// `consumed` is the deferred-compaction cursor: bytes below it were
@@ -109,16 +125,7 @@ pub const FrameReader = struct {
     /// buffered bytes do not hold one. Parses by offset; the returned
     /// payload borrows `buf`.
     pub fn next(r: *const FrameReader) NextError!?Frame {
-        const avail = r.buf[r.consumed..r.len];
-        if (avail.len < HEADER_SIZE) return null;
-        const payload_len = std.mem.readInt(u32, avail[0..HEADER_SIZE], .little);
-        if (payload_len > MAX_PAYLOAD_SIZE) return NextError.Oversize;
-        const total = HEADER_SIZE + payload_len;
-        if (avail.len < total) return null;
-        return .{
-            .payload = avail[HEADER_SIZE..total],
-            .consumed = total,
-        };
+        return parseFrame(r.buf[r.consumed..r.len]);
     }
 
     /// Mark `n` buffered bytes processed (pass `frame.consumed`).
