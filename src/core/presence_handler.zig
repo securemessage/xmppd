@@ -53,6 +53,17 @@ noinline fn noteJidOverflow(comptime fmt: []const u8, args: anytype) void {
     log.warn(fmt, args);
 }
 
+/// Hot-path info logs: noinline, but NOT cold; they fire on every normal
+/// presence update. They keep the formatter's stack frame out of the
+/// per-stanza callers; the call site holds only the call.
+noinline fn logAvailable(conn_id: usize, local: []const u8, domain: []const u8, resource: []const u8, prio: i8) void {
+    log.info("connection {d} now available: {s}@{s}/{s} (priority={d})", .{ conn_id, local, domain, resource, prio });
+}
+
+noinline fn logUnavailable(local: []const u8, domain: []const u8, resource: []const u8) void {
+    log.info("{s}@{s}/{s} now unavailable", .{ local, domain, resource });
+}
+
 /// Handle a presence stanza from a bound session.
 /// Routes to MUC handler for MUC domain, or dispatches by presence type.
 pub fn handlePresence(server: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
@@ -228,8 +239,8 @@ pub fn dispatchSubscription(server: *Server, session: *Session, ptype: xmpp.Pres
         }
     }
 
-    // noinline handlers keep their multi-KiB stanza buffers out of this
-    // per-stanza frame (they ran inlined at base too).
+    // The handlers stay inlinable: each runs once per stanza and only one of
+    // them runs per call, so their buffers union inside this frame.
     switch (ptype) {
         .subscribe => handleSubscribe(server, session, inner_xml, changes),
         .subscribed => handleSubscribed(server, session, inner_xml, changes),
@@ -313,9 +324,7 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
         // RFC 6121 §3.1.3 rule 4: Deliver pending subscription requests
         deliverPendingSubscriptions(server, session, bound.local, bound.domain, changes);
 
-        log.info("connection {d} now available: {s}@{s}/{s} (priority={d})", .{
-            session.conn.id, bound.local, bound.domain, bound.resource, prio,
-        });
+        logAvailable(session.conn.id, bound.local, bound.domain, bound.resource, prio);
     } else if (std.mem.eql(u8, type_str, "unavailable")) {
         if (server.session_map) |sm| {
             sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, false);
@@ -448,7 +457,7 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
 
     deliverPresenceToSubscribers(server, subscriber_jids, bare_jid, presence_xml, changes);
 
-    log.info("{s}@{s}/{s} now unavailable", .{ local, domain, resource });
+    logUnavailable(local, domain, resource);
 }
 
 /// Send presence probes to contacts we're subscribed to (to get their current status).
@@ -590,7 +599,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
 
 /// RFC 6120 4.9.3.10: a subscription stanza whose over-long `to` would
 /// overflow the 511-byte store key is rejected, not dropped (S4).
-noinline fn rejectOversizeSubscriptionTo(session: *Session, to_str: []const u8, changes: *ChangeList) void {
+fn rejectOversizeSubscriptionTo(session: *Session, to_str: []const u8, changes: *ChangeList) void {
     const jid = session.stream.authenticated_jid orelse return;
     var buf: [4608]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -627,7 +636,7 @@ noinline fn rejectOversizeSubscriptionTo(session: *Session, to_str: []const u8, 
 // ========================================================================
 
 /// Handle <presence type='subscribe' to='contact@host'/> — outbound subscription request.
-noinline fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
+fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
     const roster = server.roster orelse return;
     const bound = session.stream.bound_jid orelse return;
 
@@ -715,7 +724,7 @@ noinline fn handleSubscribe(server: *Server, session: *Session, inner_xml: []con
 }
 
 /// Handle <presence type='subscribed' to='contact@host'/> — approve inbound subscription.
-noinline fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
+fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
     _ = inner_xml;
     const roster = server.roster orelse return;
     const bound = session.stream.bound_jid orelse return;
@@ -867,7 +876,7 @@ noinline fn handleSubscribed(server: *Server, session: *Session, inner_xml: []co
 }
 
 /// Handle <presence type='unsubscribe' to='contact@host'/> — cancel outbound subscription.
-noinline fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
+fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
     _ = inner_xml;
     const roster = server.roster orelse return;
     const bound = session.stream.bound_jid orelse return;
@@ -953,7 +962,7 @@ noinline fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []c
 }
 
 /// Handle <presence type='unsubscribed' to='contact@host'/> — deny/revoke inbound subscription.
-noinline fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
+fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
     _ = inner_xml;
     const roster = server.roster orelse return;
     const bound = session.stream.bound_jid orelse return;

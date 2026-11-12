@@ -72,6 +72,36 @@ noinline fn noteJidOverflowCrossWorker(comptime fmt: []const u8, args: anytype) 
     log.warn(fmt, args);
 }
 
+/// Hot-path info logs: noinline, but NOT cold; they fire on every normal
+/// join. They keep the formatter's stack frame out of the per-stanza
+/// callers; the call site holds only the call.
+noinline fn logJoin(real_jid: []const u8, room_jid: []const u8, nick: []const u8) void {
+    log.info("{s} joined {s} as '{s}'", .{ real_jid, room_jid, nick });
+}
+
+/// Queue a built stanza to a session. A refused send lands on the cold
+/// path: it is logged, and a full write buffer flags the session for
+/// overflow teardown (R1), the same classification deliverToTriple uses.
+fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
+    session.queueSendStanza(stanza) catch |err| {
+        noteQueueDrop(session, stanza, err, what);
+    };
+}
+
+/// Classify and log one refused queueSendStanza on the cold path (R5).
+/// WriteBufferFull is two different refusals, split by noteQueueOverflow:
+/// a stanza longer than the whole buffer is dropped as oversize and the
+/// session lives; a deliverable stanza that cannot fit means a slow reader
+/// and flags overflow teardown (R1).
+noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerror, comptime what: []const u8) void {
+    @branchHint(.cold);
+    if (err == error.WriteBufferFull and server_mod.noteQueueOverflow(session, stanza)) {
+        log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, connection_mod.WRITE_BUF_SIZE });
+        return;
+    }
+    log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
+}
+
 /// Handle a presence stanza addressed to a MUC room JID.
 /// Called when to_domain matches the MUC service host.
 ///
@@ -209,10 +239,22 @@ pub fn handleMucGroupchat(
     // The suffix is bounded to what the fan-out queue can park, so a stanza is
     // never too long to queue after being delivered live.
     var prefix_buf: [fanout.PREFIX_CAPACITY]u8 = undefined;
-    const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse return;
-    var suffix_lease = server.leaseByteScratch() orelse return;
+    const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse {
+        noteJidOverflow("groupchat prefix for '{s}' exceeds {d} bytes; message dropped", .{ from_str, fanout.PREFIX_CAPACITY });
+        return;
+    };
+    var suffix_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; groupchat in '{s}' dropped", .{room_jid});
+        return;
+    };
     defer suffix_lease.release();
-    const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], id_str, inner_xml) orelse return;
+    const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], id_str, inner_xml) orelse {
+        // The inner stanza is wider than the fan-out encoding bound; the
+        // sender gets a policy-violation bounce rather than silence (R5).
+        noteDrop("groupchat to {s} rejected: inner stanza exceeds {d} bytes", .{ room_jid, fanout.SUFFIX_CAPACITY });
+        sendMessageError(server, session, to_local, muc_host, id_str, "policy-violation", changes);
+        return;
+    };
     if (fanout.exceedsWriteBuffer(prefix_len, suffix_len, fanout.longestEncodedRealJid(room), connection_mod.WRITE_BUF_SIZE)) {
         // No occupant could receive it, and queueing it would trip the
         // slow-reader teardown on every session in the room (H5).
@@ -229,7 +271,10 @@ pub fn handleMucGroupchat(
     // One delivery buffer reused for every local occupant. Leased from the
     // per-worker pool instead of taken per delivery so the fan-out loop does
     // not add a 20 KiB frame per recipient (S18).
-    var deliver_lease = server.leaseByteScratch() orelse return;
+    var deliver_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; groupchat in '{s}' not fanned out", .{room_jid});
+        return;
+    };
     defer deliver_lease.release();
 
     // Local fan-out: deliver to occupants on this worker (bounded continuation)
@@ -416,18 +461,26 @@ pub fn handleMucDiscoInfo(
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
-    w.writeAll("<iq type='result' from='") catch return;
-    xml.escapeWrite(w, muc_host) catch return;
-    w.writeAll("' to='") catch return;
-    writeSessionJid(w, session) catch return;
-    w.writeAll("' id='") catch return;
-    xml.escapeWrite(w, iq_id) catch return;
-    w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
-    w.writeAll("<identity category='conference' type='text' name='Chat Rooms'/>") catch return;
-    w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
-    w.writeAll("</query></iq>") catch return;
+    // The reply embeds the requester's own bound JID: when it does not fit
+    // no reply can even be addressed, so the drop is only counted (R5).
+    const reply_xml = stanza: {
+        w.writeAll("<iq type='result' from='") catch break :stanza null;
+        xml.escapeWrite(w, muc_host) catch break :stanza null;
+        w.writeAll("' to='") catch break :stanza null;
+        writeSessionJid(w, session) catch break :stanza null;
+        w.writeAll("' id='") catch break :stanza null;
+        xml.escapeWrite(w, iq_id) catch break :stanza null;
+        w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch break :stanza null;
+        w.writeAll("<identity category='conference' type='text' name='Chat Rooms'/>") catch break :stanza null;
+        w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch break :stanza null;
+        w.writeAll("</query></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("disco#info reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, buf.len });
+        return;
+    };
 
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    queueStanzaOrDrop(session, reply_xml, "disco#info reply");
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -447,61 +500,114 @@ pub fn handleMucDiscoItems(
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
-    w.writeAll("<iq type='result' from='") catch return;
-    xml.escapeWrite(w, muc_host) catch return;
-    w.writeAll("' to='") catch return;
-    writeSessionJid(w, session) catch return;
-    w.writeAll("' id='") catch return;
-    xml.escapeWrite(w, iq_id) catch return;
-    w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#items'>") catch return;
+    // The header embeds the requester's own bound JID: when it does not fit
+    // no reply can even be addressed, so the drop is only counted (R5).
+    const header_ok = stanza: {
+        w.writeAll("<iq type='result' from='") catch break :stanza false;
+        xml.escapeWrite(w, muc_host) catch break :stanza false;
+        w.writeAll("' to='") catch break :stanza false;
+        writeSessionJid(w, session) catch break :stanza false;
+        w.writeAll("' id='") catch break :stanza false;
+        xml.escapeWrite(w, iq_id) catch break :stanza false;
+        w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#items'>") catch break :stanza false;
+        break :stanza true;
+    };
+    if (!header_ok) {
+        noteJidOverflow("disco#items reply header to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, buf.len });
+        return;
+    }
 
-    // List local public rooms (owned by this worker)
+    // List local public rooms (owned by this worker). An item that does not
+    // fit means the whole reply cannot be sent truthfully.
+    var truncated = false;
     var room_ptrs: [256]*const Room = undefined;
     const count = reg.listPublicRooms(&room_ptrs);
     for (room_ptrs[0..count]) |room| {
-        w.writeAll("<item jid='") catch break;
-        xml.escapeWrite(w, room.getJid()) catch break;
-        w.writeAll("' name='") catch break;
-        const name = room.config.getName();
-        if (name.len > 0) {
-            xml.escapeWrite(w, name) catch break;
-        } else {
-            const jid = room.getJid();
-            if (std.mem.indexOfScalar(u8, jid, '@')) |at| {
-                xml.escapeWrite(w, jid[0..at]) catch break;
+        const item_ok = stanza: {
+            w.writeAll("<item jid='") catch break :stanza false;
+            xml.escapeWrite(w, room.getJid()) catch break :stanza false;
+            w.writeAll("' name='") catch break :stanza false;
+            const name = room.config.getName();
+            if (name.len > 0) {
+                xml.escapeWrite(w, name) catch break :stanza false;
             } else {
-                xml.escapeWrite(w, jid) catch break;
+                const jid = room.getJid();
+                if (std.mem.indexOfScalar(u8, jid, '@')) |at| {
+                    xml.escapeWrite(w, jid[0..at]) catch break :stanza false;
+                } else {
+                    xml.escapeWrite(w, jid) catch break :stanza false;
+                }
             }
+            w.writeAll("'/>") catch break :stanza false;
+            break :stanza true;
+        };
+        if (!item_ok) {
+            truncated = true;
+            break;
         }
-        w.writeAll("'/>") catch break;
     }
 
     // List directory entries (rooms from other workers, via broadcast updates)
-    var dir_entries: [256]room_registry.DirectoryEntry = undefined;
-    const dir_count = reg.listDirectory(&dir_entries);
-    for (dir_entries[0..dir_count]) |entry| {
-        // Skip rooms that are also in our local shard (avoid duplicates)
-        if (reg.findByJid(entry.getJid()) != null) continue;
-        w.writeAll("<item jid='") catch break;
-        xml.escapeWrite(w, entry.getJid()) catch break;
-        w.writeAll("' name='") catch break;
-        const dname = entry.getName();
-        if (dname.len > 0) {
-            xml.escapeWrite(w, dname) catch break;
-        } else {
-            const djid = entry.getJid();
-            if (std.mem.indexOfScalar(u8, djid, '@')) |at| {
-                xml.escapeWrite(w, djid[0..at]) catch break;
-            } else {
-                xml.escapeWrite(w, djid) catch break;
+    if (!truncated) {
+        var dir_entries: [256]room_registry.DirectoryEntry = undefined;
+        const dir_count = reg.listDirectory(&dir_entries);
+        for (dir_entries[0..dir_count]) |entry| {
+            // Skip rooms that are also in our local shard (avoid duplicates)
+            if (reg.findByJid(entry.getJid()) != null) continue;
+            const item_ok = stanza: {
+                w.writeAll("<item jid='") catch break :stanza false;
+                xml.escapeWrite(w, entry.getJid()) catch break :stanza false;
+                w.writeAll("' name='") catch break :stanza false;
+                const dname = entry.getName();
+                if (dname.len > 0) {
+                    xml.escapeWrite(w, dname) catch break :stanza false;
+                } else {
+                    const djid = entry.getJid();
+                    if (std.mem.indexOfScalar(u8, djid, '@')) |at| {
+                        xml.escapeWrite(w, djid[0..at]) catch break :stanza false;
+                    } else {
+                        xml.escapeWrite(w, djid) catch break :stanza false;
+                    }
+                }
+                w.writeAll("'/>") catch break :stanza false;
+                break :stanza true;
+            };
+            if (!item_ok) {
+                truncated = true;
+                break;
             }
         }
-        w.writeAll("'/>") catch break;
     }
 
-    w.writeAll("</query></iq>") catch return;
+    if (!truncated) {
+        w.writeAll("</query></iq>") catch {
+            truncated = true;
+        };
+    }
 
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    if (truncated) {
+        // A truncated list is a wrong answer, not a smaller one: reply with
+        // a stanza error instead and count the drop (R5). The header already
+        // fit, so the shorter error form fits too.
+        noteJidOverflow("disco#items reply to connection {d} exceeds {d} bytes; answering resource-constraint", .{ session.conn.id, buf.len });
+        fbs.pos = 0;
+        const err_xml = stanza: {
+            w.writeAll("<iq type='error' from='") catch break :stanza null;
+            xml.escapeWrite(w, muc_host) catch break :stanza null;
+            w.writeAll("' to='") catch break :stanza null;
+            writeSessionJid(w, session) catch break :stanza null;
+            w.writeAll("' id='") catch break :stanza null;
+            xml.escapeWrite(w, iq_id) catch break :stanza null;
+            w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#items'/><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>") catch break :stanza null;
+            break :stanza fbs.getWritten();
+        } orelse {
+            noteJidOverflow("disco#items error reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, buf.len });
+            return;
+        };
+        queueStanzaOrDrop(session, err_xml, "disco#items error reply");
+    } else {
+        queueStanzaOrDrop(session, fbs.getWritten(), "disco#items reply");
+    }
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -544,60 +650,68 @@ pub fn handleRoomDiscoInfo(
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
-    w.writeAll("<iq type='result' from='") catch return;
-    xml.escapeWrite(w, room_jid) catch return;
-    w.writeAll("' to='") catch return;
-    writeSessionJid(w, session) catch return;
-    w.writeAll("' id='") catch return;
-    xml.escapeWrite(w, iq_id) catch return;
-    w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
+    // Same bound-JID class as handleMucDiscoInfo: an overflow means the
+    // reply cannot be addressed, so the drop is only counted (R5).
+    const reply_xml = stanza: {
+        w.writeAll("<iq type='result' from='") catch break :stanza null;
+        xml.escapeWrite(w, room_jid) catch break :stanza null;
+        w.writeAll("' to='") catch break :stanza null;
+        writeSessionJid(w, session) catch break :stanza null;
+        w.writeAll("' id='") catch break :stanza null;
+        xml.escapeWrite(w, iq_id) catch break :stanza null;
+        w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch break :stanza null;
 
-    if (reg.findByJid(room_jid)) |room| {
-        const name = room.config.getName();
-        w.writeAll("<identity category='conference' type='text'") catch return;
-        if (name.len > 0) {
-            w.writeAll(" name='") catch return;
-            xml.escapeWrite(w, name) catch return;
-            w.writeByte('\'') catch return;
-        }
-        w.writeAll("/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
-        if (room.config.moderated) {
-            w.writeAll("<feature var='muc_moderated'/>") catch return;
+        if (reg.findByJid(room_jid)) |room| {
+            const name = room.config.getName();
+            w.writeAll("<identity category='conference' type='text'") catch break :stanza null;
+            if (name.len > 0) {
+                w.writeAll(" name='") catch break :stanza null;
+                xml.escapeWrite(w, name) catch break :stanza null;
+                w.writeByte('\'') catch break :stanza null;
+            }
+            w.writeAll("/>") catch break :stanza null;
+            w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch break :stanza null;
+            if (room.config.moderated) {
+                w.writeAll("<feature var='muc_moderated'/>") catch break :stanza null;
+            } else {
+                w.writeAll("<feature var='muc_unmoderated'/>") catch break :stanza null;
+            }
+            if (room.config.anonymous) {
+                w.writeAll("<feature var='muc_semianonymous'/>") catch break :stanza null;
+            } else {
+                w.writeAll("<feature var='muc_nonanonymous'/>") catch break :stanza null;
+            }
+            if (room.config.persistent) {
+                w.writeAll("<feature var='muc_persistent'/>") catch break :stanza null;
+            } else {
+                w.writeAll("<feature var='muc_temporary'/>") catch break :stanza null;
+            }
+            if (room.config.members_only) {
+                w.writeAll("<feature var='muc_membersonly'/>") catch break :stanza null;
+            } else {
+                w.writeAll("<feature var='muc_open'/>") catch break :stanza null;
+            }
+            if (room.config.password_protected) {
+                w.writeAll("<feature var='muc_passwordprotected'/>") catch break :stanza null;
+            } else {
+                w.writeAll("<feature var='muc_unsecured'/>") catch break :stanza null;
+            }
+            w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch break :stanza null;
         } else {
-            w.writeAll("<feature var='muc_unmoderated'/>") catch return;
+            // Room doesn't exist — still return valid response per XEP-0045
+            w.writeAll("<identity category='conference' type='text'/>") catch break :stanza null;
+            w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch break :stanza null;
+            w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch break :stanza null;
         }
-        if (room.config.anonymous) {
-            w.writeAll("<feature var='muc_semianonymous'/>") catch return;
-        } else {
-            w.writeAll("<feature var='muc_nonanonymous'/>") catch return;
-        }
-        if (room.config.persistent) {
-            w.writeAll("<feature var='muc_persistent'/>") catch return;
-        } else {
-            w.writeAll("<feature var='muc_temporary'/>") catch return;
-        }
-        if (room.config.members_only) {
-            w.writeAll("<feature var='muc_membersonly'/>") catch return;
-        } else {
-            w.writeAll("<feature var='muc_open'/>") catch return;
-        }
-        if (room.config.password_protected) {
-            w.writeAll("<feature var='muc_passwordprotected'/>") catch return;
-        } else {
-            w.writeAll("<feature var='muc_unsecured'/>") catch return;
-        }
-        w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
-    } else {
-        // Room doesn't exist — still return valid response per XEP-0045
-        w.writeAll("<identity category='conference' type='text'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
-    }
 
-    w.writeAll("</query></iq>") catch return;
+        w.writeAll("</query></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("room disco#info reply to connection {d} for '{s}' exceeds {d} bytes; dropped", .{ session.conn.id, room_jid, buf.len });
+        return;
+    };
 
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    queueStanzaOrDrop(session, reply_xml, "room disco#info reply");
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -738,7 +852,7 @@ pub fn handleMucAdminIq(
         return;
     };
 
-    session.queueSendStanza(result_xml) catch return;
+    queueStanzaOrDrop(session, result_xml, "admin result");
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -787,7 +901,7 @@ fn sendIqErrorFromRoomTyped(
         return;
     };
 
-    session.queueSendStanza(err_xml) catch return;
+    queueStanzaOrDrop(session, err_xml, "IQ error reply");
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -834,45 +948,51 @@ pub fn handleMucOwnerGet(
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
-    w.writeAll("<iq type='result' from='") catch return;
-    xml.escapeWrite(w, room_jid) catch return;
-    w.writeAll("' to='") catch return;
-    writeSessionJid(w, session) catch return;
-    w.writeAll("' id='") catch return;
-    xml.escapeWrite(w, iq_id) catch return;
-    w.writeAll("'><query xmlns='http://jabber.org/protocol/muc#owner'>") catch return;
-    w.writeAll("<x xmlns='jabber:x:data' type='form'>") catch return;
-    w.writeAll("<title>Room Configuration</title>") catch return;
+    const form_xml = stanza: {
+        w.writeAll("<iq type='result' from='") catch break :stanza null;
+        xml.escapeWrite(w, room_jid) catch break :stanza null;
+        w.writeAll("' to='") catch break :stanza null;
+        writeSessionJid(w, session) catch break :stanza null;
+        w.writeAll("' id='") catch break :stanza null;
+        xml.escapeWrite(w, iq_id) catch break :stanza null;
+        w.writeAll("'><query xmlns='http://jabber.org/protocol/muc#owner'>") catch break :stanza null;
+        w.writeAll("<x xmlns='jabber:x:data' type='form'>") catch break :stanza null;
+        w.writeAll("<title>Room Configuration</title>") catch break :stanza null;
 
-    // FORM_TYPE (required for proper form identification)
-    w.writeAll("<field var='FORM_TYPE' type='hidden'><value>http://jabber.org/protocol/muc#roomconfig</value></field>") catch return;
+        // FORM_TYPE (required for proper form identification)
+        w.writeAll("<field var='FORM_TYPE' type='hidden'><value>http://jabber.org/protocol/muc#roomconfig</value></field>") catch break :stanza null;
 
-    // Room name
-    w.writeAll("<field var='muc#roomconfig_roomname' type='text-single' label='Room Name'><value>") catch return;
-    xml.escapeWrite(w, room.config.getName()) catch return;
-    w.writeAll("</value></field>") catch return;
+        // Room name
+        w.writeAll("<field var='muc#roomconfig_roomname' type='text-single' label='Room Name'><value>") catch break :stanza null;
+        xml.escapeWrite(w, room.config.getName()) catch break :stanza null;
+        w.writeAll("</value></field>") catch break :stanza null;
 
-    // Room description
-    w.writeAll("<field var='muc#roomconfig_roomdesc' type='text-single' label='Description'><value>") catch return;
-    xml.escapeWrite(w, room.config.getSubject()) catch return;
-    w.writeAll("</value></field>") catch return;
+        // Room description
+        w.writeAll("<field var='muc#roomconfig_roomdesc' type='text-single' label='Description'><value>") catch break :stanza null;
+        xml.escapeWrite(w, room.config.getSubject()) catch break :stanza null;
+        w.writeAll("</value></field>") catch break :stanza null;
 
-    // Boolean fields
-    writeConfigBoolField(w, "muc#roomconfig_persistentroom", "Persistent", room.config.persistent);
-    writeConfigBoolField(w, "muc#roomconfig_publicroom", "Public", room.config.public_room);
-    writeConfigBoolField(w, "muc#roomconfig_membersonly", "Members Only", room.config.members_only);
-    writeConfigBoolField(w, "muc#roomconfig_moderatedroom", "Moderated", room.config.moderated);
-    writeConfigBoolField(w, "muc#roomconfig_passwordprotectedroom", "Password Protected", room.config.password_protected);
-    writeConfigBoolField(w, "muc#roomconfig_allowinvites", "Allow Invites", room.config.allow_invites);
+        // Boolean fields
+        writeConfigBoolField(w, "muc#roomconfig_persistentroom", "Persistent", room.config.persistent) catch break :stanza null;
+        writeConfigBoolField(w, "muc#roomconfig_publicroom", "Public", room.config.public_room) catch break :stanza null;
+        writeConfigBoolField(w, "muc#roomconfig_membersonly", "Members Only", room.config.members_only) catch break :stanza null;
+        writeConfigBoolField(w, "muc#roomconfig_moderatedroom", "Moderated", room.config.moderated) catch break :stanza null;
+        writeConfigBoolField(w, "muc#roomconfig_passwordprotectedroom", "Password Protected", room.config.password_protected) catch break :stanza null;
+        writeConfigBoolField(w, "muc#roomconfig_allowinvites", "Allow Invites", room.config.allow_invites) catch break :stanza null;
 
-    // Password
-    w.writeAll("<field var='muc#roomconfig_roomsecret' type='text-private' label='Password'><value>") catch return;
-    xml.escapeWrite(w, room.config.getPassword()) catch return;
-    w.writeAll("</value></field>") catch return;
+        // Password
+        w.writeAll("<field var='muc#roomconfig_roomsecret' type='text-private' label='Password'><value>") catch break :stanza null;
+        xml.escapeWrite(w, room.config.getPassword()) catch break :stanza null;
+        w.writeAll("</value></field>") catch break :stanza null;
 
-    w.writeAll("</x></query></iq>") catch return;
+        w.writeAll("</x></query></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("config form for '{s}' exceeds {d} bytes; not sent to connection {d}", .{ room_jid, buf.len, session.conn.id });
+        return;
+    };
 
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    queueStanzaOrDrop(session, form_xml, "config form reply");
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -929,15 +1049,23 @@ pub fn handleMucOwnerSet(
     // Apply config to the in-memory room
     room.config = config;
 
-    // Persist or remove from store based on persistent flag
+    // Persist or remove from store based on persistent flag. The room stays
+    // configured in memory either way; a store failure only means the config
+    // will not survive a restart, so it is logged (R5).
     if (server.room_store) |store| {
         if (config.persistent) {
-            store.saveRoom(room_jid, &config) catch {};
+            store.saveRoom(room_jid, &config) catch |err| {
+                noteDrop("room '{s}' config could not be persisted: {s}", .{ room_jid, @errorName(err) });
+            };
             // Ensure owner affiliation is persisted
-            store.setAffiliation(room_jid, member_key, .owner) catch {};
+            store.setAffiliation(room_jid, member_key, .owner) catch |err| {
+                noteDrop("owner affiliation for '{s}' could not be persisted: {s}", .{ room_jid, @errorName(err) });
+            };
         } else if (was_persistent and !config.persistent) {
             // Room changed from persistent to transient — remove from store
-            store.destroyRoom(room_jid) catch {};
+            store.destroyRoom(room_jid) catch |err| {
+                noteDrop("persistent room '{s}' could not be removed from store: {s}", .{ room_jid, @errorName(err) });
+            };
         }
     }
 
@@ -959,7 +1087,7 @@ pub fn handleMucOwnerSet(
         return;
     };
 
-    session.queueSendStanza(result_xml) catch return;
+    queueStanzaOrDrop(session, result_xml, "owner-set result");
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -969,14 +1097,14 @@ pub fn handleMucOwnerSet(
 }
 
 /// Write a boolean form field element.
-fn writeConfigBoolField(w: anytype, var_name: []const u8, label: []const u8, value: bool) void {
-    w.writeAll("<field var='") catch return;
-    xml.escapeWrite(w, var_name) catch return;
-    w.writeAll("' type='boolean' label='") catch return;
-    xml.escapeWrite(w, label) catch return;
-    w.writeAll("'><value>") catch return;
-    w.writeAll(if (value) "1" else "0") catch return;
-    w.writeAll("</value></field>") catch return;
+fn writeConfigBoolField(w: anytype, var_name: []const u8, label: []const u8, value: bool) !void {
+    try w.writeAll("<field var='");
+    try xml.escapeWrite(w, var_name);
+    try w.writeAll("' type='boolean' label='");
+    try xml.escapeWrite(w, label);
+    try w.writeAll("'><value>");
+    try w.writeAll(if (value) "1" else "0");
+    try w.writeAll("</value></field>");
 }
 
 /// Parse a boolean value from a form field in XML. Absent is null; anything
@@ -1204,7 +1332,7 @@ fn handleJoin(
         return;
     };
 
-    log.info("{s} joined {s} as '{s}'", .{ real_jid, room_jid, nick });
+    logJoin(real_jid, room_jid, nick);
 
     // 1. Send existing occupants' presence to the new joiner
     for (&r.occupants) |*slot| {
@@ -1359,7 +1487,7 @@ fn sendOccupantPresence(
         w.writeAll("' to='") catch break :stanza null;
         writeSessionJid(w, target) catch break :stanza null;
         w.writeAll("'>") catch break :stanza null;
-        writeVcardUpdate(w, avatar_hash);
+        writeVcardUpdate(w, avatar_hash) catch break :stanza null;
         w.writeAll("<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch break :stanza null;
         w.writeAll(occ.affiliation.toName()) catch break :stanza null;
         w.writeAll("' role='") catch break :stanza null;
@@ -1412,7 +1540,7 @@ fn sendSelfPresence(
         return;
     };
 
-    session.queueSendStanza(stanza_xml) catch return;
+    queueStanzaOrDrop(session, stanza_xml, "self presence");
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1452,36 +1580,53 @@ fn broadcastOccupantJoin(
         return;
     };
 
+    // Both suffixes are built before anything is sent so a build failure
+    // cannot leave a half-broadcast join behind (R5). They carry only fixed
+    // markup plus the affiliation/role names, so an overflow is not a JID
+    // drop: it is logged on the cold path.
     var suffix_buf: [512]u8 = undefined;
     var suffix_fbs = std.io.fixedBufferStream(&suffix_buf);
     const sw = suffix_fbs.writer();
-    sw.writeAll("'>") catch return;
-    writeVcardUpdate(sw, avatar_hash);
-    sw.writeAll("<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
-    sw.writeAll(affiliation.toName()) catch return;
-    sw.writeAll("' role='") catch return;
-    sw.writeAll(role.toName()) catch return;
-    sw.writeAll("'/></x></presence>") catch return;
-    const suffix = suffix_fbs.getWritten();
-
-    // Multicast to remote workers
-    server.deliverMulticastToWorkers(room, prefix, suffix);
+    const suffix = stanza: {
+        sw.writeAll("'>") catch break :stanza null;
+        writeVcardUpdate(sw, avatar_hash) catch break :stanza null;
+        sw.writeAll("<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch break :stanza null;
+        sw.writeAll(affiliation.toName()) catch break :stanza null;
+        sw.writeAll("' role='") catch break :stanza null;
+        sw.writeAll(role.toName()) catch break :stanza null;
+        sw.writeAll("'/></x></presence>") catch break :stanza null;
+        break :stanza suffix_fbs.getWritten();
+    } orelse {
+        noteDrop("join suffix for '{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ room.getJid(), nick, suffix_buf.len });
+        return;
+    };
 
     // Local fan-out (includes status 110 for the joining user)
     var suffix_110_buf: [512]u8 = undefined;
     var suffix_110_fbs = std.io.fixedBufferStream(&suffix_110_buf);
     const s110w = suffix_110_fbs.writer();
-    s110w.writeAll("'>") catch return;
-    writeVcardUpdate(s110w, avatar_hash);
-    s110w.writeAll("<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
-    s110w.writeAll(affiliation.toName()) catch return;
-    s110w.writeAll("' role='") catch return;
-    s110w.writeAll(role.toName()) catch return;
-    s110w.writeAll("'/><status code='110'/></x></presence>") catch return;
-    const suffix_110 = suffix_110_fbs.getWritten();
+    const suffix_110 = stanza: {
+        s110w.writeAll("'>") catch break :stanza null;
+        writeVcardUpdate(s110w, avatar_hash) catch break :stanza null;
+        s110w.writeAll("<x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch break :stanza null;
+        s110w.writeAll(affiliation.toName()) catch break :stanza null;
+        s110w.writeAll("' role='") catch break :stanza null;
+        s110w.writeAll(role.toName()) catch break :stanza null;
+        s110w.writeAll("'/><status code='110'/></x></presence>") catch break :stanza null;
+        break :stanza suffix_110_fbs.getWritten();
+    } orelse {
+        noteDrop("join status-110 suffix for '{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ room.getJid(), nick, suffix_110_buf.len });
+        return;
+    };
+
+    // Multicast to remote workers
+    server.deliverMulticastToWorkers(room, prefix, suffix);
 
     // One delivery buffer reused for every occupant (S18).
-    var deliver_lease = server.leaseByteScratch() orelse return;
+    var deliver_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; join broadcast for '{s}/{s}' not delivered", .{ room.getJid(), nick });
+        return;
+    };
     defer deliver_lease.release();
 
     for (&room.occupants) |*slot| {
@@ -1521,19 +1666,26 @@ fn broadcastOccupantLeave(
         return;
     };
 
+    // Fixed markup plus the affiliation name only, so an overflow is not a
+    // JID drop: it is logged on the cold path (R5).
     var suffix_buf: [512]u8 = undefined;
     var suffix_fbs = std.io.fixedBufferStream(&suffix_buf);
     const sw = suffix_fbs.writer();
-    sw.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
-    sw.writeAll(removed.affiliation.toName()) catch return;
-    sw.writeAll("' role='none'/>") catch return;
-    if (status_code) |code| {
-        sw.writeAll("<status code='") catch return;
-        sw.writeAll(code) catch return;
-        sw.writeAll("'/>") catch return;
-    }
-    sw.writeAll("</x></presence>") catch return;
-    const suffix = suffix_fbs.getWritten();
+    const suffix = stanza: {
+        sw.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch break :stanza null;
+        sw.writeAll(removed.affiliation.toName()) catch break :stanza null;
+        sw.writeAll("' role='none'/>") catch break :stanza null;
+        if (status_code) |code| {
+            sw.writeAll("<status code='") catch break :stanza null;
+            sw.writeAll(code) catch break :stanza null;
+            sw.writeAll("'/>") catch break :stanza null;
+        }
+        sw.writeAll("</x></presence>") catch break :stanza null;
+        break :stanza suffix_fbs.getWritten();
+    } orelse {
+        noteDrop("leave suffix for '{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ room.getJid(), removed.getNick(), suffix_buf.len });
+        return;
+    };
 
     // Multicast to remote workers
     server.deliverMulticastToWorkers(room, prefix, suffix);
@@ -1542,7 +1694,10 @@ fn broadcastOccupantLeave(
     // so the stanza built for one occupant is dead before the next is built
     // (S18). The self-delivery below uses it too, and the suffixes it reads
     // live in small stack buffers.
-    var deliver_lease = server.leaseByteScratch() orelse return;
+    var deliver_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; leave broadcast for '{s}/{s}' not delivered", .{ room.getJid(), removed.getNick() });
+        return;
+    };
     defer deliver_lease.release();
 
     // Local fan-out to remaining occupants on this worker
@@ -1560,21 +1715,28 @@ fn broadcastOccupantLeave(
     if (removed.session_id != room_registry.REMOTE_OCCUPANT and removed.worker_id == server.worker_id) {
         const self_target = server.sessions[removed.session_id] orelse return;
 
-        // Build suffix with status 110
+        // Build suffix with status 110. The broadcast above already went
+        // out, so a build failure only costs the self-echo; it is logged (R5).
         var suffix_110_buf: [512]u8 = undefined;
         var suffix_110_fbs = std.io.fixedBufferStream(&suffix_110_buf);
         const s110w = suffix_110_fbs.writer();
-        s110w.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch return;
-        s110w.writeAll(removed.affiliation.toName()) catch return;
-        s110w.writeAll("' role='none'/><status code='110'/>") catch return;
-        if (status_code) |code| {
-            s110w.writeAll("<status code='") catch return;
-            s110w.writeAll(code) catch return;
-            s110w.writeAll("'/>") catch return;
-        }
-        s110w.writeAll("</x></presence>") catch return;
+        const suffix_110 = stanza: {
+            s110w.writeAll("' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='") catch break :stanza null;
+            s110w.writeAll(removed.affiliation.toName()) catch break :stanza null;
+            s110w.writeAll("' role='none'/><status code='110'/>") catch break :stanza null;
+            if (status_code) |code| {
+                s110w.writeAll("<status code='") catch break :stanza null;
+                s110w.writeAll(code) catch break :stanza null;
+                s110w.writeAll("'/>") catch break :stanza null;
+            }
+            s110w.writeAll("</x></presence>") catch break :stanza null;
+            break :stanza suffix_110_fbs.getWritten();
+        } orelse {
+            noteDrop("leave status-110 suffix for '{s}/{s}' exceeds {d} bytes; self-echo skipped", .{ room.getJid(), removed.getNick(), suffix_110_buf.len });
+            return;
+        };
 
-        fanout.deliverPrebuiltToSession(self_target, deliver_lease.buf, prefix, removed.getRealJid(), suffix_110_fbs.getWritten(), removed.session_id, changes);
+        fanout.deliverPrebuiltToSession(self_target, deliver_lease.buf, prefix, removed.getRealJid(), suffix_110, removed.session_id, changes);
     }
 }
 
@@ -1713,7 +1875,10 @@ fn sendRoomHistory(
     const result = archive.query(room_jid, .{
         .max = @as(u32, history_max),
         .backward = true,
-    }) catch return;
+    }) catch |err| {
+        noteDrop("history query for '{s}' failed: {s}; join continues without replay", .{ room_jid, @errorName(err) });
+        return;
+    };
     defer {
         for (result.messages) |msg| {
             server.allocator.free(msg.stanza_id);
@@ -1726,7 +1891,10 @@ fn sendRoomHistory(
 
     // One buffer reused per history message: queueSendStanza copies, so a
     // message is dead before the next is built (S18).
-    var hist_lease = server.leaseByteScratch() orelse return;
+    var hist_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; history for '{s}' not replayed", .{room_jid});
+        return;
+    };
     defer hist_lease.release();
 
     // Deliver in chronological order (reverse of backward query)
@@ -1738,35 +1906,55 @@ fn sendRoomHistory(
 
         // Format XEP-0203 delay stamp from unix timestamp
         var delay_buf: [64]u8 = undefined;
-        const delay_str = formatDelayStamp(&delay_buf, msg.timestamp) orelse continue;
+        const delay_str = formatDelayStamp(&delay_buf, msg.timestamp) orelse {
+            noteDrop("history message in '{s}' has an unformattable timestamp {d}; skipped", .{ room_jid, msg.timestamp });
+            continue;
+        };
 
         // The stored stanza is: <message from='room/nick' type='groupchat' ...>body</message>
         // We need to inject to='recipient' and a <delay/> element.
         // Find the first '>' to inject 'to' attribute and append delay before </message>
         const stanza = msg.stanza_xml;
         const close_tag = "</message>";
-        const close_pos = std.mem.lastIndexOf(u8, stanza, close_tag) orelse continue;
-        const first_gt = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
+        const close_pos = std.mem.lastIndexOf(u8, stanza, close_tag) orelse {
+            noteDrop("history message in '{s}' has no </message> close tag; skipped", .{room_jid});
+            continue;
+        };
+        const first_gt = std.mem.indexOfScalar(u8, stanza, '>') orelse {
+            noteDrop("history message in '{s}' has no '>' tag end; skipped", .{room_jid});
+            continue;
+        };
 
         var fbs = std.io.fixedBufferStream(hist_lease.buf);
         const w = fbs.writer();
 
         // Write up to first '>', injecting to='jid'
-        w.writeAll(stanza[0..first_gt]) catch continue;
-        w.writeAll(" to='") catch continue;
-        writeSessionJid(w, session) catch continue;
-        w.writeByte('\'') catch continue;
-        // Write rest of tag opening + body
-        w.writeAll(stanza[first_gt..close_pos]) catch continue;
-        // Append delay stamp
-        w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch continue;
-        xml.escapeWrite(w, room_jid) catch continue;
-        w.writeAll("' stamp='") catch continue;
-        w.writeAll(delay_str) catch continue;
-        w.writeAll("'/>") catch continue;
-        w.writeAll(close_tag) catch continue;
+        const hist_xml = out: {
+            w.writeAll(stanza[0..first_gt]) catch break :out null;
+            w.writeAll(" to='") catch break :out null;
+            writeSessionJid(w, session) catch break :out null;
+            w.writeByte('\'') catch break :out null;
+            // Write rest of tag opening + body
+            w.writeAll(stanza[first_gt..close_pos]) catch break :out null;
+            // Append delay stamp
+            w.writeAll("<delay xmlns='urn:xmpp:delay' from='") catch break :out null;
+            xml.escapeWrite(w, room_jid) catch break :out null;
+            w.writeAll("' stamp='") catch break :out null;
+            w.writeAll(delay_str) catch break :out null;
+            w.writeAll("'/>") catch break :out null;
+            w.writeAll(close_tag) catch break :out null;
+            break :out fbs.getWritten();
+        } orelse {
+            noteJidOverflow("history stanza for connection {d} exceeds {d} bytes; skipped", .{ session.conn.id, hist_lease.buf.len });
+            continue;
+        };
 
-        session.queueSendStanza(fbs.getWritten()) catch continue;
+        session.queueSendStanza(hist_xml) catch |err| {
+            // A refused queue means the session's buffer is full; the rest
+            // of the replay would fail the same way, so stop here (R5).
+            noteQueueDrop(session, hist_xml, err, "room history stanza");
+            break;
+        };
     }
 
     if (session.conn.hasPendingWrite()) {
@@ -1812,15 +2000,23 @@ fn sendRoomSubject(
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
-    w.writeAll("<message from='") catch return;
-    xml.escapeWrite(w, room.getJid()) catch return;
-    w.writeAll("' to='") catch return;
-    writeSessionJid(w, session) catch return;
-    w.writeAll("' type='groupchat'><subject>") catch return;
-    xml.escapeWrite(w, subject) catch return;
-    w.writeAll("</subject></message>") catch return;
+    // The subject embeds the recipient's bound JID: an overflow means the
+    // stanza cannot be addressed, so the drop is only counted (R5).
+    const subj_xml = stanza: {
+        w.writeAll("<message from='") catch break :stanza null;
+        xml.escapeWrite(w, room.getJid()) catch break :stanza null;
+        w.writeAll("' to='") catch break :stanza null;
+        writeSessionJid(w, session) catch break :stanza null;
+        w.writeAll("' type='groupchat'><subject>") catch break :stanza null;
+        xml.escapeWrite(w, subject) catch break :stanza null;
+        w.writeAll("</subject></message>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflow("room subject for '{s}' exceeds {d} bytes; not sent to connection {d}", .{ room.getJid(), buf.len, session.conn.id });
+        return;
+    };
 
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    queueStanzaOrDrop(session, subj_xml, "room subject");
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1859,7 +2055,7 @@ fn sendPresenceError(
         return;
     };
 
-    session.queueSendStanza(stanza_xml) catch return;
+    queueStanzaOrDrop(session, stanza_xml, "presence error");
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1901,7 +2097,7 @@ fn sendMessageError(
         return;
     };
 
-    session.queueSendStanza(stanza_xml) catch return;
+    queueStanzaOrDrop(session, stanza_xml, "message error");
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -1939,7 +2135,10 @@ pub fn processRemoteJoin(
         const room_local = if (std.mem.indexOfScalar(u8, ev.room_jid, '@')) |at| ev.room_jid[0..at] else ev.room_jid;
         config.setName(room_local);
         config.created_at = @intCast(std.time.timestamp());
-        room = reg.createRoom(ev.room_jid, config) catch return;
+        room = reg.createRoom(ev.room_jid, config) catch |err| {
+            noteDrop("room '{s}' could not be created for remote join: {s}", .{ ev.room_jid, @errorName(err) });
+            return;
+        };
     }
     const r = room.?;
     // Detect new room by occupant count — the room may have been pre-created
@@ -1970,7 +2169,9 @@ pub fn processRemoteJoin(
             noteJidOverflowCrossWorker("rejoin presence for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
             return;
         };
-        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, rejoin_xml) catch {};
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, rejoin_xml) catch |err| {
+            noteCrossWorkerDrop("rejoin presence to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
+        };
         return;
     }
 
@@ -2085,7 +2286,10 @@ fn finishRemoteJoin(
             noteJidOverflowCrossWorker("occupant presence '{s}/{s}' for joiner '{s}' exceeds {d} bytes; skipped", .{ r.getJid(), occ.getNick(), ev.real_jid, router.JID_STANZA_MAX });
             continue;
         };
-        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, occ_xml) catch continue;
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, occ_xml) catch |err| {
+            noteCrossWorkerDrop("occupant presence '{s}/{s}' to worker {d} session {d} failed: {s}", .{ r.getJid(), occ.getNick(), ev.worker_id, ev.session_id, @errorName(err) });
+            continue;
+        };
     }
 
     // Broadcast new occupant's presence to ALL occupants (multicast + local)
@@ -2115,7 +2319,9 @@ fn finishRemoteJoin(
             noteJidOverflowCrossWorker("self presence '{s}/{s}' for joiner '{s}' exceeds {d} bytes; not sent", .{ r.getJid(), ev.nick, ev.real_jid, router.JID_STANZA_MAX });
             return;
         };
-        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, self_xml) catch {};
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, self_xml) catch |err| {
+            noteCrossWorkerDrop("self presence to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
+        };
     }
 
     // Room history + subject sent via MPSC unicast
@@ -2125,14 +2331,22 @@ fn finishRemoteJoin(
         var subj_buf: [2048]u8 = undefined;
         var subj_fbs = std.io.fixedBufferStream(&subj_buf);
         const sjw = subj_fbs.writer();
-        sjw.writeAll("<message from='") catch return;
-        xml.escapeWrite(sjw, r.getJid()) catch return;
-        sjw.writeAll("' to='") catch return;
-        xml.escapeWrite(sjw, ev.real_jid) catch return;
-        sjw.writeAll("' type='groupchat'><subject>") catch return;
-        xml.escapeWrite(sjw, subject) catch return;
-        sjw.writeAll("</subject></message>") catch return;
-        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, subj_fbs.getWritten()) catch {};
+        const subj_xml = stanza: {
+            sjw.writeAll("<message from='") catch break :stanza null;
+            xml.escapeWrite(sjw, r.getJid()) catch break :stanza null;
+            sjw.writeAll("' to='") catch break :stanza null;
+            xml.escapeWrite(sjw, ev.real_jid) catch break :stanza null;
+            sjw.writeAll("' type='groupchat'><subject>") catch break :stanza null;
+            xml.escapeWrite(sjw, subject) catch break :stanza null;
+            sjw.writeAll("</subject></message>") catch break :stanza null;
+            break :stanza subj_fbs.getWritten();
+        } orelse {
+            noteJidOverflowCrossWorker("room subject for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, subj_buf.len });
+            return;
+        };
+        ds.deliver(ev.worker_id, @intCast(ev.session_id), ev.generation, subj_xml) catch |err| {
+            noteCrossWorkerDrop("room subject to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
+        };
     }
 }
 
@@ -2201,10 +2415,21 @@ pub fn processRemoteGroupchat(
     };
 
     var prefix_buf: [fanout.PREFIX_CAPACITY]u8 = undefined;
-    const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse return;
-    var suffix_lease = server.leaseByteScratch() orelse return;
+    const prefix_len = fanout.buildPrefix(&prefix_buf, from_str) orelse {
+        noteJidOverflow("remote groupchat prefix for '{s}' exceeds {d} bytes; message dropped", .{ from_str, fanout.PREFIX_CAPACITY });
+        return;
+    };
+    var suffix_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; remote groupchat in '{s}' dropped", .{ev.room_jid});
+        return;
+    };
     defer suffix_lease.release();
-    const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], ev.stanza_id, ev.inner_xml) orelse return;
+    const suffix_len = fanout.buildSuffix(suffix_lease.buf[0..fanout.SUFFIX_CAPACITY], ev.stanza_id, ev.inner_xml) orelse {
+        // The inner stanza is wider than the fan-out encoding bound; the
+        // sender is remote, so the drop is logged here (R5).
+        noteDrop("remote groupchat to {s} rejected: inner stanza exceeds {d} bytes", .{ ev.room_jid, fanout.SUFFIX_CAPACITY });
+        return;
+    };
     if (fanout.exceedsWriteBuffer(prefix_len, suffix_len, fanout.longestEncodedRealJid(room), connection_mod.WRITE_BUF_SIZE)) {
         noteDrop("groupchat to {s} rejected: {d}+{d} bytes cannot fit a recipient's write buffer", .{ ev.room_jid, prefix_len, suffix_len });
         bounceRoomMailboxFull(server, .{ .room_message = ev }, ev.room_jid, changes);
@@ -2218,7 +2443,10 @@ pub fn processRemoteGroupchat(
 
     // One delivery buffer reused for every local occupant (S18), as in
     // handleMucGroupchat.
-    var deliver_lease = server.leaseByteScratch() orelse return;
+    var deliver_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; remote groupchat in '{s}' not fanned out", .{ev.room_jid});
+        return;
+    };
     defer deliver_lease.release();
 
     // Local fan-out (same bounded continuation as handleMucGroupchat)
@@ -2321,58 +2549,69 @@ pub fn processRemoteDiscoInfo(
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
 
-    w.writeAll("<iq type='result' from='") catch return;
-    xml.escapeWrite(w, ev.room_jid) catch return;
-    w.writeAll("' to='") catch return;
-    xml.escapeWrite(w, ev.reply_to_jid) catch return;
-    w.writeAll("' id='") catch return;
-    xml.escapeWrite(w, ev.iq_id) catch return;
-    w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch return;
+    // The reply embeds the requester's remote JID: when it does not fit the
+    // reply cannot be addressed or delivered, which counts against both
+    // counters (R5).
+    const reply_xml = stanza: {
+        w.writeAll("<iq type='result' from='") catch break :stanza null;
+        xml.escapeWrite(w, ev.room_jid) catch break :stanza null;
+        w.writeAll("' to='") catch break :stanza null;
+        xml.escapeWrite(w, ev.reply_to_jid) catch break :stanza null;
+        w.writeAll("' id='") catch break :stanza null;
+        xml.escapeWrite(w, ev.iq_id) catch break :stanza null;
+        w.writeAll("'><query xmlns='http://jabber.org/protocol/disco#info'>") catch break :stanza null;
 
-    if (reg.findByJid(ev.room_jid)) |room| {
-        const name = room.config.getName();
-        w.writeAll("<identity category='conference' type='text'") catch return;
-        if (name.len > 0) {
-            w.writeAll(" name='") catch return;
-            xml.escapeWrite(w, name) catch return;
-            w.writeByte('\'') catch return;
-        }
-        w.writeAll("/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
-        if (room.config.moderated) {
-            w.writeAll("<feature var='muc_moderated'/>") catch return;
+        if (reg.findByJid(ev.room_jid)) |room| {
+            const name = room.config.getName();
+            w.writeAll("<identity category='conference' type='text'") catch break :stanza null;
+            if (name.len > 0) {
+                w.writeAll(" name='") catch break :stanza null;
+                xml.escapeWrite(w, name) catch break :stanza null;
+                w.writeByte('\'') catch break :stanza null;
+            }
+            w.writeAll("/>") catch break :stanza null;
+            w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch break :stanza null;
+            if (room.config.moderated) {
+                w.writeAll("<feature var='muc_moderated'/>") catch break :stanza null;
+            } else {
+                w.writeAll("<feature var='muc_unmoderated'/>") catch break :stanza null;
+            }
+            if (room.config.anonymous) {
+                w.writeAll("<feature var='muc_semianonymous'/>") catch break :stanza null;
+            } else {
+                w.writeAll("<feature var='muc_nonanonymous'/>") catch break :stanza null;
+            }
+            if (room.config.persistent) {
+                w.writeAll("<feature var='muc_persistent'/>") catch break :stanza null;
+            } else {
+                w.writeAll("<feature var='muc_temporary'/>") catch break :stanza null;
+            }
+            if (room.config.members_only) {
+                w.writeAll("<feature var='muc_membersonly'/>") catch break :stanza null;
+            } else {
+                w.writeAll("<feature var='muc_open'/>") catch break :stanza null;
+            }
+            if (room.config.password_protected) {
+                w.writeAll("<feature var='muc_passwordprotected'/>") catch break :stanza null;
+            } else {
+                w.writeAll("<feature var='muc_unsecured'/>") catch break :stanza null;
+            }
+            w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch break :stanza null;
         } else {
-            w.writeAll("<feature var='muc_unmoderated'/>") catch return;
+            w.writeAll("<identity category='conference' type='text'/>") catch break :stanza null;
+            w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch break :stanza null;
+            w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch break :stanza null;
         }
-        if (room.config.anonymous) {
-            w.writeAll("<feature var='muc_semianonymous'/>") catch return;
-        } else {
-            w.writeAll("<feature var='muc_nonanonymous'/>") catch return;
-        }
-        if (room.config.persistent) {
-            w.writeAll("<feature var='muc_persistent'/>") catch return;
-        } else {
-            w.writeAll("<feature var='muc_temporary'/>") catch return;
-        }
-        if (room.config.members_only) {
-            w.writeAll("<feature var='muc_membersonly'/>") catch return;
-        } else {
-            w.writeAll("<feature var='muc_open'/>") catch return;
-        }
-        if (room.config.password_protected) {
-            w.writeAll("<feature var='muc_passwordprotected'/>") catch return;
-        } else {
-            w.writeAll("<feature var='muc_unsecured'/>") catch return;
-        }
-        w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
-    } else {
-        w.writeAll("<identity category='conference' type='text'/>") catch return;
-        w.writeAll("<feature var='http://jabber.org/protocol/muc'/>") catch return;
-        w.writeAll("<feature var='urn:xmpp:mam:2'/>") catch return;
-    }
 
-    w.writeAll("</query></iq>") catch return;
-    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, fbs.getWritten()) catch {};
+        w.writeAll("</query></iq>") catch break :stanza null;
+        break :stanza fbs.getWritten();
+    } orelse {
+        noteJidOverflowCrossWorker("remote disco#info reply to '{s}' exceeds {d} bytes; dropped", .{ ev.reply_to_jid, buf.len });
+        return;
+    };
+    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, reply_xml) catch |err| {
+        noteCrossWorkerDrop("remote disco#info reply to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_session, @errorName(err) });
+    };
 }
 
 /// Process a remote disco#items request.
@@ -2402,7 +2641,10 @@ pub fn handleShadowJoin(server: *Server, ev: actor_message.RoomEvent) void {
     // Find or create shadow room
     var room = reg.findByJid(ev.room_jid);
     if (room == null) {
-        room = reg.createRoom(ev.room_jid, .{ .persistent = false }) catch return;
+        room = reg.createRoom(ev.room_jid, .{ .persistent = false }) catch |err| {
+            noteDrop("shadow room '{s}' could not be created: {s}", .{ ev.room_jid, @errorName(err) });
+            return;
+        };
     }
     const r = room.?;
 
@@ -2420,8 +2662,11 @@ pub fn handleShadowJoin(server: *Server, ev: actor_message.RoomEvent) void {
     const slash_pos = std.mem.indexOfScalar(u8, ev.real_jid, '/') orelse ev.real_jid.len;
     const bare_jid = ev.real_jid[0..slash_pos];
 
-    // Add occupant to shadow (ignore errors — shadow is best-effort)
-    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, ev.generation, .participant, .none) catch {};
+    // Add occupant to shadow. The shadow copy is best-effort fan-out state,
+    // so a failure is only logged (R5); the canonical room keeps working.
+    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, ev.generation, .participant, .none) catch |err| {
+        noteDrop("shadow occupant '{s}' in '{s}' not added: {s}", .{ ev.real_jid, ev.room_jid, @errorName(err) });
+    };
 }
 
 /// Handle shadow_part: remove a local occupant from the shadow room on this worker.
@@ -2539,7 +2784,10 @@ noinline fn sendRoomHistoryRemote(
     const result = archive.query(room_jid, .{
         .max = @as(u32, history_max),
         .backward = true,
-    }) catch return;
+    }) catch |err| {
+        noteDrop("history query for '{s}' failed: {s}; remote join continues without replay", .{ room_jid, @errorName(err) });
+        return;
+    };
     defer {
         for (result.messages) |msg| {
             server.allocator.free(msg.stanza_id);
@@ -2557,12 +2805,21 @@ noinline fn sendRoomHistoryRemote(
         if (msg.stanza_xml.len == 0) continue;
 
         var delay_buf: [64]u8 = undefined;
-        const delay_str = formatDelayStamp(&delay_buf, msg.timestamp) orelse continue;
+        const delay_str = formatDelayStamp(&delay_buf, msg.timestamp) orelse {
+            noteDrop("history message in '{s}' has an unformattable timestamp {d}; skipped", .{ room_jid, msg.timestamp });
+            continue;
+        };
 
         const stanza = msg.stanza_xml;
         const close_tag = "</message>";
-        const close_pos = std.mem.lastIndexOf(u8, stanza, close_tag) orelse continue;
-        const first_gt = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
+        const close_pos = std.mem.lastIndexOf(u8, stanza, close_tag) orelse {
+            noteDrop("history message in '{s}' has no </message> close tag; skipped", .{room_jid});
+            continue;
+        };
+        const first_gt = std.mem.indexOfScalar(u8, stanza, '>') orelse {
+            noteDrop("history message in '{s}' has no '>' tag end; skipped", .{room_jid});
+            continue;
+        };
 
         var buf: [delivery_queue.MAX_PAYLOAD_SIZE]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
@@ -2586,7 +2843,10 @@ noinline fn sendRoomHistoryRemote(
             continue;
         };
 
-        ds.deliver(target_worker, @intCast(target_session), target_generation, hist_xml) catch continue;
+        ds.deliver(target_worker, @intCast(target_session), target_generation, hist_xml) catch |err| {
+            noteCrossWorkerDrop("history stanza to worker {d} session {d} failed: {s}", .{ target_worker, target_session, @errorName(err) });
+            continue;
+        };
     }
 }
 
@@ -2707,16 +2967,16 @@ fn getAvatarHash(server: *Server, bare_jid: []const u8) ?[]const u8 {
 /// Write XEP-0153 vcard-temp:x:update element with avatar photo hash.
 /// The hash comes from client-published metadata; anything that is not a
 /// hex digest is refused so it cannot carry markup into presence (S1).
-fn writeVcardUpdate(w: anytype, avatar_hash: ?[]const u8) void {
+fn writeVcardUpdate(w: anytype, avatar_hash: ?[]const u8) !void {
     const hash = avatar_hash orelse return;
     if (hash.len == 0 or hash.len > 64) return;
     for (hash) |c| {
         const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
         if (!is_hex) return;
     }
-    w.writeAll("<x xmlns='vcard-temp:x:update'><photo>") catch return;
-    w.writeAll(hash) catch return;
-    w.writeAll("</photo></x>") catch return;
+    try w.writeAll("<x xmlns='vcard-temp:x:update'><photo>");
+    try w.writeAll(hash);
+    try w.writeAll("</photo></x>");
 }
 
 // ============================================================================
@@ -2831,10 +3091,7 @@ fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id:
         if (!sm.getGenerationById(worker, @intCast(session_id), generation)) return;
         const session = server.sessions[session_id] orelse return;
         session.queueSendStanza(stanza) catch |err| {
-            if (err == error.WriteBufferFull) {
-                session.sm_overflow = true;
-                noteDrop("local MUC delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
-            }
+            noteQueueDrop(session, stanza, err, "local MUC delivery");
             return;
         };
         if (session.conn.hasPendingWrite()) {
@@ -2931,7 +3188,9 @@ pub fn processRemoteAdminAction(
     };
 
     const ds = server.delivery_system orelse return;
-    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, result_xml) catch {};
+    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, result_xml) catch |err| {
+        noteCrossWorkerDrop("admin result to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_session, @errorName(err) });
+    };
 }
 
 /// Process a remote MUC MAM query on the owning worker (T112).
@@ -2990,11 +3249,16 @@ pub fn processRemoteMamQuery(
 
     // Send each result message via MPSC unicast
     for (response.messages) |msg| {
-        ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, msg.xml) catch continue;
+        ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, msg.xml) catch |err| {
+            noteCrossWorkerDrop("MAM result to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_session, @errorName(err) });
+            continue;
+        };
     }
 
     // Send the fin IQ
-    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, response.fin_iq) catch {};
+    ds.deliver(ev.reply_to_worker, @intCast(ev.reply_to_session), ev.reply_to_generation, response.fin_iq) catch |err| {
+        noteCrossWorkerDrop("MAM fin to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_session, @errorName(err) });
+    };
 }
 
 /// Broadcast a room directory update to all other workers.
@@ -3018,7 +3282,9 @@ fn broadcastDirectoryUpdate(server: *Server, room_jid: []const u8, room_name: []
     var w: u16 = 0;
     while (w < wc) : (w += 1) {
         if (w == server.worker_id) continue;
-        ds.deliver(w, delivery_queue.ROOM_ACTOR_SENTINEL, 0, buf[0..len]) catch {};
+        ds.deliver(w, delivery_queue.ROOM_ACTOR_SENTINEL, 0, buf[0..len]) catch |err| {
+            noteCrossWorkerDrop("directory update for '{s}' to worker {d} failed: {s}", .{ room_jid, w, @errorName(err) });
+        };
     }
 }
 
@@ -3043,7 +3309,9 @@ fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8,
         noteJidOverflowCrossWorker("IQ error '{s}' for '{s}' exceeds {d} bytes; not sent", .{ error_type, room_jid, router.JID_STANZA_MAX });
         return;
     };
-    ds.deliver(target_worker, @intCast(target_session), target_generation, err_xml) catch {};
+    ds.deliver(target_worker, @intCast(target_session), target_generation, err_xml) catch |err| {
+        noteCrossWorkerDrop("IQ error '{s}' to worker {d} session {d} failed: {s}", .{ error_type, target_worker, target_session, @errorName(err) });
+    };
 }
 
 test "S6: self-kick is rejected and the room survives actor processing" {
@@ -3176,11 +3444,11 @@ test "S1: a wrong room secret of the same decoded length is still refused" {
 test "S1: vcard update photo requires a hex hash" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    writeVcardUpdate(fbs.writer(), "0123456789abcdef0123456789abcdef01234567");
+    try writeVcardUpdate(fbs.writer(), "0123456789abcdef0123456789abcdef01234567");
     try std.testing.expect(std.mem.indexOf(u8, fbs.getWritten(), "<photo>0123456789abcdef") != null);
 
     fbs.reset();
-    writeVcardUpdate(fbs.writer(), "x'</photo><message from='admin@localhost'/>");
+    try writeVcardUpdate(fbs.writer(), "x'</photo><message from='admin@localhost'/>");
     try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
 }
 
@@ -3578,7 +3846,7 @@ test "T413: replaced-resource delivery drops are counted" {
     defer registry.deinit();
     server.room_registry = &registry;
     server.muc_host = "conference.localhost";
-    var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
+    var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 3);
     defer delivery_sys.deinit();
     server.delivery_system = &delivery_sys;
     server.worker_id = 0;
@@ -3600,12 +3868,15 @@ test "T413: replaced-resource delivery drops are counted" {
     _ = queue.drain(&initial, StanzaCollector.onDelivery);
     for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(1, 1, "fill");
 
+    // The takeover joins from worker 2 so only the replaced-resource notice
+    // aimed at the full worker-1 queue is counted; the joiner's own replies
+    // (self-presence, subject) are counted drops too and must not land here.
     const drops_before = delivery_queue.cross_worker_drops.load(.monotonic);
     processRemoteJoin(&server, .{
         .room_jid = "room@conference.localhost",
         .real_jid = "eve@localhost/laptop",
         .nick = "eve",
-        .worker_id = 1,
+        .worker_id = 2,
         .session_id = 9,
         .generation = 2,
     }, &changes);
@@ -4121,6 +4392,43 @@ test "S4: an over-long remote presence error JID is counted, never silent" {
     try std.testing.expectEqual(@as(usize, 0), collector.stanzas.items.len);
 }
 
+test "R5: an over-long remote disco#info requester JID is counted, never silent" {
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var registry = RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+
+    const drops_before = router.jid_overflow_drops.load(.monotonic);
+    const xw_before = delivery_queue.cross_worker_drops.load(.monotonic);
+
+    // A requester JID wider than the reply buffer: the reply cannot be
+    // built or delivered, so the skip must land on both counters instead of
+    // vanishing (R5).
+    var change_buf: [16]std.posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    processRemoteDiscoInfo(&server, .{
+        .room_jid = "room@conference.localhost",
+        .iq_id = "d1",
+        .reply_to_worker = 1,
+        .reply_to_session = 7,
+        .reply_to_generation = 1,
+        .reply_to_jid = "a" ** (4096 + 64),
+    }, &changes);
+
+    try std.testing.expectEqual(drops_before + 1, router.jid_overflow_drops.load(.monotonic));
+    try std.testing.expectEqual(xw_before + 1, delivery_queue.cross_worker_drops.load(.monotonic));
+
+    var collector = StanzaCollector{ .allocator = allocator };
+    defer collector.deinit();
+    _ = delivery_sys.getQueue(1).drain(&collector, StanzaCollector.onDelivery);
+    try std.testing.expectEqual(@as(usize, 0), collector.stanzas.items.len);
+}
+
 test "S4: a near-maximum remote join conflict error is delivered whole" {
     const allocator = std.testing.allocator;
     var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
@@ -4274,4 +4582,64 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
         .generation = 1,
     }, &changes);
     try std.testing.expectEqual(occupants_before, room.occupant_count);
+}
+
+test "R-385: an oversized queued iq result keeps the session and answers resource-constraint" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    session.iq_to = "conference.localhost";
+
+    // A reply longer than the whole write buffer: queueSend refuses it even
+    // with the buffer empty, so this is oversize, not a slow reader.
+    const stanza = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 32);
+    defer allocator.free(stanza);
+    const head = "<iq type='result' from='conference.localhost' to='alice@localhost/mobile' id='big1'><query>";
+    @memcpy(stanza[0..head.len], head);
+    @memset(stanza[head.len .. stanza.len - 5], 'x');
+    @memcpy(stanza[stanza.len - 5 ..], "</iq>");
+
+    const drops_before = delivery_queue.oversize_queue_drops.load(.monotonic);
+    queueStanzaOrDrop(&session, stanza, "oversize iq result");
+
+    try std.testing.expect(!session.sm_overflow);
+    try std.testing.expectEqual(drops_before + 1, delivery_queue.oversize_queue_drops.load(.monotonic));
+
+    _ = session.conn.flushSend() catch {};
+    var wire: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &wire) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "id='big1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "resource-constraint") != null);
+}
+
+test "R-385: a full buffer on a deliverable stanza still flags overflow teardown" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+
+    @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
+    session.conn.write_start = 0;
+    session.conn.write_end = connection_mod.WRITE_BUF_SIZE;
+
+    const drops_before = delivery_queue.oversize_queue_drops.load(.monotonic);
+    queueStanzaOrDrop(&session, "<iq type='result' id='q1'/>", "small iq result");
+
+    try std.testing.expect(session.sm_overflow);
+    try std.testing.expectEqual(drops_before, delivery_queue.oversize_queue_drops.load(.monotonic));
 }
