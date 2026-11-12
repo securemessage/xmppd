@@ -42,6 +42,10 @@ pub var offline_hold_bounces = std.atomic.Value(u64).init(0);
 /// connection write even unstamped. Dropping keeps one oversized row from
 /// parking the user's whole queue.
 pub var offline_drain_drops = std.atomic.Value(u64).init(0);
+/// Stanzas queueSend refused because they can never fit the write buffer,
+/// counted apart from the slow-reader overflow teardown. The session stays
+/// up; iq results are answered with resource-constraint instead.
+pub var oversize_queue_drops = std.atomic.Value(u64).init(0);
 
 /// Sentinel value for target_session_id indicating a multicast delivery.
 /// When the consumer sees this, it interprets the payload as a MUC multicast

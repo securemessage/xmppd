@@ -1306,6 +1306,8 @@ pub fn build(b: *std.Build) void {
     fanout_test_mod.addImport("xml", xml_mod);
     fanout_test_mod.addImport("room_registry", room_registry_test_mod);
     fanout_test_mod.addImport("room_store", room_store_test_mod);
+    fanout_test_mod.addImport("delivery_queue", delivery_queue_test_mod);
+    fanout_test_mod.addImport("ssl", ssl_test_mod);
 
     const fanout_tests = b.addTest(.{
         .name = "fanout-tests",
@@ -2032,6 +2034,12 @@ pub fn build(b: *std.Build) void {
     const run_archive_queue_tests = b.addRunArtifact(archive_queue_tests);
 
     // --- Test step ---
+
+    // Targeted steps for single-artifact runs (revert checks, debugging).
+    const test_server_step = b.step("test-server", "Run only the server module tests");
+    test_server_step.dependOn(&run_server_tests.step);
+    const test_fanout_step = b.step("test-fanout", "Run only the fanout tests");
+    test_fanout_step.dependOn(&run_fanout_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
     // A green test suite must also prove every install artifact compiles.

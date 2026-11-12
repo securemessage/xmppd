@@ -84,14 +84,21 @@ noinline fn logJoin(real_jid: []const u8, room_jid: []const u8, nick: []const u8
 /// overflow teardown (R1), the same classification deliverToTriple uses.
 fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
     session.queueSendStanza(stanza) catch |err| {
-        noteQueueDrop(session, err, what);
+        noteQueueDrop(session, stanza, err, what);
     };
 }
 
 /// Classify and log one refused queueSendStanza on the cold path (R5).
-noinline fn noteQueueDrop(session: *Session, err: anyerror, comptime what: []const u8) void {
+/// WriteBufferFull is two different refusals, split by noteQueueOverflow:
+/// a stanza longer than the whole buffer is dropped as oversize and the
+/// session lives; a deliverable stanza that cannot fit means a slow reader
+/// and flags overflow teardown (R1).
+noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerror, comptime what: []const u8) void {
     @branchHint(.cold);
-    if (err == error.WriteBufferFull) session.sm_overflow = true;
+    if (err == error.WriteBufferFull and server_mod.noteQueueOverflow(session, stanza)) {
+        log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, connection_mod.WRITE_BUF_SIZE });
+        return;
+    }
     log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
 }
 
@@ -1942,7 +1949,7 @@ fn sendRoomHistory(
         session.queueSendStanza(hist_xml) catch |err| {
             // A refused queue means the session's buffer is full; the rest
             // of the replay would fail the same way, so stop here (R5).
-            noteQueueDrop(session, err, "room history stanza");
+            noteQueueDrop(session, hist_xml, err, "room history stanza");
             break;
         };
     }
@@ -3078,10 +3085,7 @@ fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id:
         if (!sm.getGenerationById(worker, @intCast(session_id), generation)) return;
         const session = server.sessions[session_id] orelse return;
         session.queueSendStanza(stanza) catch |err| {
-            if (err == error.WriteBufferFull) {
-                session.sm_overflow = true;
-                noteDrop("local MUC delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
-            }
+            noteQueueDrop(session, stanza, err, "local MUC delivery");
             return;
         };
         if (session.conn.hasPendingWrite()) {
@@ -4512,4 +4516,64 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
         .generation = 1,
     }, &changes);
     try std.testing.expectEqual(occupants_before, room.occupant_count);
+}
+
+test "R-385: an oversized queued iq result keeps the session and answers resource-constraint" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    session.iq_to = "conference.localhost";
+
+    // A reply longer than the whole write buffer: queueSend refuses it even
+    // with the buffer empty, so this is oversize, not a slow reader.
+    const stanza = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 32);
+    defer allocator.free(stanza);
+    const head = "<iq type='result' from='conference.localhost' to='alice@localhost/mobile' id='big1'><query>";
+    @memcpy(stanza[0..head.len], head);
+    @memset(stanza[head.len .. stanza.len - 5], 'x');
+    @memcpy(stanza[stanza.len - 5 ..], "</iq>");
+
+    const drops_before = delivery_queue.oversize_queue_drops.load(.monotonic);
+    queueStanzaOrDrop(&session, stanza, "oversize iq result");
+
+    try std.testing.expect(!session.sm_overflow);
+    try std.testing.expectEqual(drops_before + 1, delivery_queue.oversize_queue_drops.load(.monotonic));
+
+    _ = session.conn.flushSend() catch {};
+    var wire: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &wire) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "type='error'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "id='big1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "resource-constraint") != null);
+}
+
+test "R-385: a full buffer on a deliverable stanza still flags overflow teardown" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    defer session.deinit();
+
+    @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
+    session.conn.write_start = 0;
+    session.conn.write_end = connection_mod.WRITE_BUF_SIZE;
+
+    const drops_before = delivery_queue.oversize_queue_drops.load(.monotonic);
+    queueStanzaOrDrop(&session, "<iq type='result' id='q1'/>", "small iq result");
+
+    try std.testing.expect(session.sm_overflow);
+    try std.testing.expectEqual(drops_before, delivery_queue.oversize_queue_drops.load(.monotonic));
 }

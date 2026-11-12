@@ -22,6 +22,8 @@
 const std = @import("std");
 const xml = @import("xml");
 const room_registry = @import("room_registry");
+const delivery_queue_mod = @import("delivery_queue");
+const connection_mod = @import("connection.zig");
 const jid_bounds = @import("jid_bounds.zig");
 const Room = room_registry.Room;
 const Occupant = room_registry.Occupant;
@@ -246,8 +248,15 @@ pub fn deliverToSession(
     }
     session.conn.queueSend(data) catch |err| {
         if (err == error.WriteBufferFull) {
-            session.sm_overflow = true;
-            log.warn("local delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
+            // Two cases share the error (noteQueueOverflow): a stanza that
+            // can never fit is an oversize drop, not a slow reader.
+            if (data.len <= connection_mod.WRITE_BUF_SIZE) {
+                session.sm_overflow = true;
+                log.warn("local delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
+            } else {
+                _ = delivery_queue_mod.oversize_queue_drops.fetchAdd(1, .monotonic);
+                log.warn("local delivery to session {d} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session_id, data.len, connection_mod.WRITE_BUF_SIZE });
+            }
         }
         return;
     };
@@ -466,11 +475,13 @@ test "encodeMulticastPayload rejects overflow" {
 const MockConn = struct {
     fd: std.posix.fd_t = 7,
     closed: bool = false,
+    fail_full: bool = false,
     sent: [1024]u8 = undefined,
     sent_len: usize = 0,
 
     pub fn queueSend(self: *MockConn, data: []const u8) !void {
         if (self.closed) return error.ConnectionClosed;
+        if (self.fail_full) return error.WriteBufferFull;
         @memcpy(self.sent[self.sent_len .. self.sent_len + data.len], data);
         self.sent_len += data.len;
     }
@@ -564,4 +575,24 @@ test "deliverPrebuiltToSession: detached occupant is not delivered live" {
         "<message to='bob@example.com'/>",
         session.tracked[0..session.tracked_len],
     );
+}
+
+test "deliverToSession: oversized stanza keeps the session, full buffer flags it" {
+    var session = MockSession{};
+    session.conn.fail_full = true;
+    var changes = MockChanges{};
+
+    const drops_before = delivery_queue_mod.oversize_queue_drops.load(.monotonic);
+
+    // A stanza longer than the whole write buffer is an oversize drop, not
+    // a slow reader: the session stays up and the drop is counted.
+    const big = "x" ** (connection_mod.WRITE_BUF_SIZE + 1);
+    deliverToSession(&session, big, 3, &changes);
+    try std.testing.expect(!session.sm_overflow);
+    try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.oversize_queue_drops.load(.monotonic));
+
+    // A deliverable stanza refused by a full buffer is the slow-reader case.
+    deliverToSession(&session, "<presence/>", 3, &changes);
+    try std.testing.expect(session.sm_overflow);
+    try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.oversize_queue_drops.load(.monotonic));
 }
