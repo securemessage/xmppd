@@ -2173,6 +2173,9 @@ pub fn build(b: *std.Build) void {
     test_server_step.dependOn(&run_server_tests.step);
     const test_fanout_step = b.step("test-fanout", "Run only the fanout tests");
     test_fanout_step.dependOn(&run_fanout_tests.step);
+    const test_master_step = b.step("test-master", "Run only the master supervisor tests");
+    test_master_step.dependOn(&run_master_tests.step);
+    test_master_step.dependOn(&run_supervisor_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
     // A green test suite must also prove every install artifact compiles.

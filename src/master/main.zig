@@ -27,6 +27,7 @@ pub const std_options = xmppd_log.std_options;
 
 const posix = std.posix;
 const Supervisor = @import("supervisor.zig").Supervisor;
+const procinfo = @import("procinfo.zig");
 const event_loop_mod = @import("event_loop");
 const EventLoop = event_loop_mod.EventLoop;
 const ChangeList = event_loop_mod.ChangeList;
@@ -314,7 +315,7 @@ pub fn main() !void {
         };
         for (orphan_spec) |spec| {
             const p = std.fmt.bufPrint(&orphan_buf, "{s}/{s}", .{ run_dir, spec.file }) catch continue;
-            cleanupOrphan(p, spec.exe);
+            procinfo.cleanupOrphan(p, spec.exe);
         }
     }
 
@@ -538,7 +539,7 @@ pub fn main() !void {
     var pid_path_buf: [4096]u8 = undefined;
     const auth_pid = try auth_sup.spawnChild();
     try loop.addProcess(auth_pid);
-    writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "auth.pid"), auth_pid, "xmppd-auth");
+    procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "auth.pid"), auth_pid, "xmppd-auth");
     log.info("auth daemon started, waiting for socket", .{});
 
     // Brief delay for auth daemon to bind its socket
@@ -548,7 +549,7 @@ pub fn main() !void {
     if (s2s_enabled) {
         const s2s_pid = try s2s_sup.spawnChild();
         try loop.addProcess(s2s_pid);
-        writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "s2s.pid"), s2s_pid, "xmppd-s2s");
+        procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "s2s.pid"), s2s_pid, "xmppd-s2s");
         log.info("s2s daemon started, waiting for socket", .{});
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
@@ -556,7 +557,7 @@ pub fn main() !void {
     // Spawn xmppd-core
     const core_pid = try core_sup.spawnChild();
     try loop.addProcess(core_pid);
-    writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "core.pid"), core_pid, "xmppd-core");
+    procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "core.pid"), core_pid, "xmppd-core");
 
     // Timer idents for restart backoff
     const AUTH_UDATA: usize = 1;
@@ -614,7 +615,7 @@ pub fn main() !void {
                             continue;
                         };
                         loop.addProcess(new_pid) catch {};
-                        writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "auth.pid"), new_pid, "xmppd-auth");
+                        procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "auth.pid"), new_pid, "xmppd-auth");
                     } else if (t.ident == CORE_UDATA) {
                         const new_pid = core_sup.spawnChild() catch |err| {
                             log.err("failed to respawn core: {}", .{err});
@@ -622,7 +623,7 @@ pub fn main() !void {
                             continue;
                         };
                         loop.addProcess(new_pid) catch {};
-                        writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "core.pid"), new_pid, "xmppd-core");
+                        procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "core.pid"), new_pid, "xmppd-core");
                     } else if (t.ident == S2S_UDATA) {
                         const new_pid = s2s_sup.spawnChild() catch |err| {
                             log.err("failed to respawn s2s: {}", .{err});
@@ -630,7 +631,7 @@ pub fn main() !void {
                             continue;
                         };
                         loop.addProcess(new_pid) catch {};
-                        writeChildPid(try pidFilePath(&pid_path_buf, run_dir, "s2s.pid"), new_pid, "xmppd-s2s");
+                        procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "s2s.pid"), new_pid, "xmppd-s2s");
                     }
                 },
                 .signal => |s| {
@@ -656,9 +657,9 @@ pub fn main() !void {
     }
 
     // Clean up child PID files on graceful shutdown
-    removeChildPid(try pidFilePath(&pid_path_buf, run_dir, "auth.pid"));
-    removeChildPid(try pidFilePath(&pid_path_buf, run_dir, "s2s.pid"));
-    removeChildPid(try pidFilePath(&pid_path_buf, run_dir, "core.pid"));
+    procinfo.removeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "auth.pid"));
+    procinfo.removeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "s2s.pid"));
+    procinfo.removeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "core.pid"));
 
     log.info("xmppd master shutdown complete", .{});
 }
@@ -728,156 +729,6 @@ fn decideRunUserWith(username: ?[]const u8, euid: posix.uid_t, lookup: RunUserLo
     return ids;
 }
 
-/// Build `{run_dir}/{file}` into `buf` for the child pid-file paths
-/// (T259: nothing under /var/run/xmppd is hardcoded anymore).
-fn pidFilePath(buf: []u8, run_dir: []const u8, file: []const u8) ![]const u8 {
-    if (run_dir.len + 1 + file.len > buf.len) return error.PathTooLong;
-    return std.fmt.bufPrint(buf, "{s}/{s}", .{ run_dir, file }) catch unreachable;
-}
-
-/// The child's kernel-reported start time in seconds, or null when the pid
-/// has no kinfo. writeChildPid records 0 for null; a stored 0 never matches
-/// a live process's ki_start, so the orphan-kill identity check spares it.
-fn childStartSec(pid: posix.pid_t) ?i64 {
-    var kp: KinfoProc = undefined;
-    if (!lookupKinfoProc(pid, &kp)) return null;
-    return kp.ki_start.tv_sec;
-}
-
-/// Write a child PID file for orphan detection on restart. Contents: a
-/// line "PID START_TIME_SEC COMMBASE". Read by cleanupOrphan against live
-/// kinfo_proc. (T259: run_dir-scoped, failures are logged.)
-fn writeChildPid(path: []const u8, pid: posix.pid_t, base: []const u8) void {
-    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
-        log.err("writeChildPid {s}: {}", .{ path, err });
-        return;
-    };
-    defer file.close();
-    const start_opt = childStartSec(pid);
-    if (start_opt == null) {
-        log.warn("writeChildPid {s}: no kinfo for pid {d}; recording start 0", .{ path, pid });
-    }
-    const start_sec = start_opt orelse 0;
-    var buf: [80]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d} {d} {s}\n", .{ pid, start_sec, base }) catch return;
-    file.writeAll(s) catch |err| log.err("writeChildPid write {s}: {}", .{ path, err });
-}
-
-/// Remove a child PID file (called during clean shutdown).
-fn removeChildPid(path: []const u8) void {
-    std.fs.cwd().deleteFile(path) catch {};
-}
-
-/// FreeBSD kinfo_proc slice for the orphan sanity check (T259).
-/// Layout probed from /usr/include/sys/user.h on 15.1 amd64: ppid at 76,
-/// start at 336, comm at 447, sizeof 1088. Returned by the
-/// { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid } sysctl.
-/// Absent from zig's std.c for this version, so declare it.
-extern "c" fn sysctl(mib: [*c]const c_int, miblen: c_uint, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
-const KinfoProc = extern struct {
-    _pad0: [76]u8,
-    ki_ppid: c_int,
-    _pad1: [256]u8,
-    ki_start: extern struct { tv_sec: c_long, tv_usec: c_long },
-    _pad2: [95]u8,
-    ki_comm: [20]u8,
-    _pad3: [621]u8,
-};
-
-comptime {
-    std.debug.assert(@sizeOf(KinfoProc) == 1088);
-    std.debug.assert(@offsetOf(KinfoProc, "ki_ppid") == 76);
-    std.debug.assert(@offsetOf(KinfoProc, "ki_start") == 336);
-    std.debug.assert(@offsetOf(KinfoProc, "ki_comm") == 447);
-}
-
-/// Live-process identity via kern.proc.pid.X (T259). Handles the
-/// `/usr/include/sys/user.h` ABI directly rather than kern.proc.pathname:
-/// PATHNAME returns ENOENT once a pkg upgrade has replaced the binary,
-/// while ki_comm survives. ki_start distinguishes pid recycling.
-fn lookupKinfoProc(pid: posix.pid_t, out: *KinfoProc) bool {
-    // { CTL_KERN=1, KERN_PROC=14, KERN_PROC_PID=1, pid }
-    const mib = [_]c_int{ 1, 14, 1, pid };
-    var len: usize = @sizeOf(KinfoProc);
-    if (sysctl(&mib, mib.len, @ptrCast(out), &len, null, 0) != 0) return false;
-    if (len < @offsetOf(KinfoProc, "ki_comm") + 20) return false;
-    return true;
-}
-
-/// True when pid currently runs a binary whose comm starts with
-/// expected_basename AND was started at expected_start_sec (epoch).
-/// An orphan passes a further constraint handled in cleanupOrphan: the
-/// process must have been reparented to init (ppid==1).
-fn procMatchesIdentity(pid: posix.pid_t, expected_basename: []const u8, expected_start_sec: i64) bool {
-    var kp: KinfoProc = undefined;
-    if (!lookupKinfoProc(pid, &kp)) return false;
-    if (kp.ki_start.tv_sec != expected_start_sec) return false;
-    const comm = std.mem.sliceTo(&kp.ki_comm, 0);
-    return std.mem.startsWith(u8, comm, expected_basename);
-}
-
-/// Identity triple-check for the orphan-kill: matches comm+start AND the
-/// process is a child of init (ppid==1, orphans get reparented there).
-fn procIsOrphanMatch(pid: posix.pid_t, expected_basename: []const u8, expected_start_sec: i64) bool {
-    if (!procMatchesIdentity(pid, expected_basename, expected_start_sec)) return false;
-    var kp: KinfoProc = undefined;
-    if (!lookupKinfoProc(pid, &kp)) return false;
-    return kp.ki_ppid == 1;
-}
-
-/// Check for an orphaned child process from a previous master instance.
-/// PID files now live under run_dir and hold "PID START_SEC BASE". Kill
-/// only when the live process still matches comm + start time + ppid==1,
-/// so a recycled pid or a pkg-upgraded binary can never take a stray
-/// SIGKILL (T259). identity is re-verified before SIGKILL too.
-fn cleanupOrphan(path: []const u8, expected_basename: []const u8) void {
-    const file = std.fs.cwd().openFile(path, .{}) catch return;
-    defer file.close();
-
-    var buf: [80]u8 = undefined;
-    const n = posix.read(file.handle, &buf) catch return;
-    if (n == 0) return;
-
-    const trimmed = std.mem.trimRight(u8, buf[0..n], "\n \t\r");
-    var parts = std.mem.tokenizeScalar(u8, trimmed, ' ');
-    const pid = std.fmt.parseInt(posix.pid_t, parts.next() orelse return, 10) catch return;
-    const start_field = parts.next() orelse "0"; // old one-field files: no start time
-    const pid_start = std.fmt.parseInt(i64, start_field, 10) catch 0;
-    if (pid <= 1) return;
-
-    const alive = std.c.kill(pid, 0) == 0;
-    if (!alive) {
-        std.fs.cwd().deleteFile(path) catch {};
-        return;
-    }
-
-    // Old-format one-line pid files have no start time: there is no safe
-    // tie-break against a recycled pid, so clean up the file and move on.
-    if (pid_start == 0) {
-        log.warn("pid file {s} has no start time; orphan guessing stoppers here, NOT killing pid={d}", .{ path, pid });
-        std.fs.cwd().deleteFile(path) catch {};
-        return;
-    }
-    if (!procIsOrphanMatch(pid, expected_basename, pid_start)) {
-        log.warn("pid file {s} references pid={d} that is not our child: NOT killing it", .{ path, pid });
-        std.fs.cwd().deleteFile(path) catch {};
-        return;
-    }
-
-    log.warn("killing orphaned child pid={d} from {s}", .{ pid, path });
-    _ = std.c.kill(pid, posix.SIG.TERM);
-    std.Thread.sleep(2 * std.time.ns_per_s);
-
-    // Re-verify before the kill escalation: a fresh process on the same
-    // pid number between SIGTERM and SIGKILL must not eat it.
-    if (std.c.kill(pid, 0) == 0 and procIsOrphanMatch(pid, expected_basename, pid_start)) {
-        log.warn("orphan pid={d} did not exit, sending SIGKILL", .{pid});
-        _ = std.c.kill(pid, posix.SIG.KILL);
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
-
-    std.fs.cwd().deleteFile(path) catch {};
-}
 
 fn printUsage() void {
     const usage =
@@ -986,43 +837,6 @@ fn detectCpuCount() u16 {
         return @intCast(@min(ncpu, 64));
     }
     return 1;
-}
-
-test "lookupKinfoProc/procMatchesIdentity: live process facts for self; identity mismatch rejected (T259)" {
-    const self_pid = std.c.getpid();
-    var kp: KinfoProc = undefined;
-    try std.testing.expect(lookupKinfoProc(self_pid, &kp));
-
-    // comm of this test binary is "master-tests".
-    const comm = std.mem.sliceTo(&kp.ki_comm, 0);
-    try std.testing.expectEqualStrings("master-tests", comm);
-    try std.testing.expect(procMatchesIdentity(self_pid, "master-tests", kp.ki_start.tv_sec));
-    try std.testing.expect(!procMatchesIdentity(self_pid, "xmppd-core", kp.ki_start.tv_sec));
-    try std.testing.expect(!procMatchesIdentity(self_pid, "master-tests", kp.ki_start.tv_sec + 1));
-    // A pid surely not ours must not match at all.
-    try std.testing.expect(!procMatchesIdentity(1, "xmppd-core", kp.ki_start.tv_sec));
-}
-
-fn lookupKinfoProcChecked(pid: posix.pid_t) bool {
-    var kp: KinfoProc = undefined;
-    return lookupKinfoProc(pid, &kp);
-}
-
-test "lookupKinfoProc returns false for a pid that does not exist" {
-    try std.testing.expect(!lookupKinfoProcChecked(-1));
-}
-
-test "childStartSec: live pid has a start time; a dead pid returns null (T259)" {
-    // writeChildPid must not silently store start 0 for a pid it cannot
-    // look up; the null return is what makes the warn path reachable.
-    try std.testing.expect(childStartSec(std.c.getpid()) != null);
-    try std.testing.expect(childStartSec(-1) == null);
-}
-
-test "pidFilePath builds run_dir-relative path" {
-    var buf: [4096]u8 = undefined;
-    const p = try pidFilePath(&buf, "/var/run/xmppd", "auth.pid");
-    try std.testing.expectEqualStrings("/var/run/xmppd/auth.pid", p);
 }
 
 test "resolveRunUser: a missing user is a startup failure, not a root fallback (C5)" {
