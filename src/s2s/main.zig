@@ -4366,7 +4366,11 @@ test "S2sDaemon: an exhausted outbound slot table answers the pending verify inv
 
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
-    daemon.deliverResolution(&cl, rig.conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1" }}));
+    // A live listener keeps the connect in flight; a dead port can refuse
+    // inside connect(2) and exhaust the list for the wrong reason.
+    const live = try silentListener(false);
+    defer posix.close(live.fd);
+    daemon.deliverResolution(&cl, rig.conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = live.port }}));
 
     try expectInitiationFailure(&daemon, rig, "to='them.example'", "outbound-slots-exhausted");
     // The failed conn leaves the pool so the next delivery starts fresh.
@@ -7378,6 +7382,23 @@ fn nsFixtureSocket() !struct { fd: posix.fd_t, port: u16 } {
     return .{ .fd = fd, .port = std.net.Address.initPosix(@alignCast(&actual)).getPort() };
 }
 
+/// A loopback TCP listener that never accepts or answers: a connect to it
+/// completes or stays pending but never refuses, so a fabricated target's
+/// conn stays armed while the test inspects it. A dead loopback port can
+/// refuse synchronously inside connect(2), which frees the conn the test
+/// is still holding.
+fn silentListener(v6: bool) !struct { fd: posix.fd_t, port: u16 } {
+    const addr = try std.net.Address.parseIp(if (v6) "::1" else "127.0.0.1", 0);
+    const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    errdefer posix.close(fd);
+    try posix.bind(fd, &addr.any, addr.getOsSockLen());
+    try posix.listen(fd, 16);
+    var actual: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    var alen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    try posix.getsockname(fd, @ptrCast(&actual), &alen);
+    return .{ .fd = fd, .port = std.net.Address.initPosix(@ptrCast(@alignCast(&actual))).getPort() };
+}
+
 test "S2sDaemon: a resolution connects the first TLSA-usable target" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
@@ -7389,10 +7410,14 @@ test "S2sDaemon: a resolution connects the first TLSA-usable target" {
     var cl = ChangeList.init(&scratch);
 
     // Target 0's TLSA lookup failed: a temporary failure of that target,
-    // skipped outright. Target 1 is an IPv6 address: v6 connects too.
+    // skipped outright. Target 1 is an IPv6 address: v6 connects too. The
+    // listener keeps the connect in flight; a dead port can refuse inside
+    // connect(2) and free the conn under this test's feet.
+    const l6 = try silentListener(true);
+    defer posix.close(l6.fd);
     const res = try fabricateResolution(alloc, &.{
         .{ .addr = "10.9.9.9", .status = .lookup_failed },
-        .{ .addr = "::1" },
+        .{ .addr = "::1", .port = l6.port },
     });
     daemon.deliverResolution(&cl, conn, .resolved, res);
 
@@ -7415,9 +7440,15 @@ test "S2sDaemon: a connect deadline advances to the next target" {
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
 
+    // Both targets are live listeners: the connects never refuse, so the
+    // conn stays armed for the deadline to abort.
+    const l1 = try silentListener(false);
+    defer posix.close(l1.fd);
+    const l2 = try silentListener(false);
+    defer posix.close(l2.fd);
     const res = try fabricateResolution(alloc, &.{
-        .{ .addr = "127.0.0.1", .port = 5269 },
-        .{ .addr = "127.0.0.1", .port = 5270 },
+        .{ .addr = "127.0.0.1", .port = l1.port },
+        .{ .addr = "127.0.0.1", .port = l2.port },
     });
     daemon.deliverResolution(&cl, conn, .resolved, res);
     try std.testing.expectEqual(@as(usize, 0), conn.target_idx);
@@ -7430,7 +7461,7 @@ test "S2sDaemon: a connect deadline advances to the next target" {
     try std.testing.expectEqual(@as(usize, 1), conn.target_idx);
     try std.testing.expect(conn.fd >= 0);
     try std.testing.expect(conn.deadline_ident != 0 and conn.deadline_ident != ident0);
-    try std.testing.expectEqual(@as(u16, 5270), conn.target_port);
+    try std.testing.expectEqual(l2.port, conn.target_port);
 }
 
 test "S2sDaemon: targets that all failed TLSA lookup bounce temporary" {
@@ -7619,7 +7650,10 @@ test "S2sDaemon: a deadline on the last target releases the outbound slot" {
     const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
-    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 5269 }}));
+    // A live listener keeps the connect in flight so the conn stays armed.
+    const live = try silentListener(false);
+    defer posix.close(live.fd);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = live.port }}));
     const slot = daemon.findOutboundSlot(conn).?;
     daemon.handleConnectDeadline(&cl, conn.deadline_ident);
     try std.testing.expect(daemon.pool.connections.get("them.example") == null);
@@ -7989,7 +8023,10 @@ test "S2sDaemon: a timer ident below the deadline base never reaches the connect
     const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
-    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 5269 }}));
+    // A live listener keeps the connect in flight so the conn stays armed.
+    const live = try silentListener(false);
+    defer posix.close(live.fd);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = live.port }}));
     try std.testing.expect(conn.deadline_ident >= CONNECT_DEADLINE_IDENT_BASE);
     try std.testing.expect(conn.fd >= 0);
 
