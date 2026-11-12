@@ -21,6 +21,7 @@ const posix = std.posix;
 const OpBackendType = @import("op_backend").Backend;
 const ArchiveBackendType = @import("archive_backend").Backend;
 const migrate_precis = @import("migrate_precis");
+const migrate_archive = @import("migrate_archive");
 const user_store_mod = @import("user_store");
 const UserStore = user_store_mod.UserStore(OpBackendType);
 const lock_store_mod = @import("lock_store");
@@ -139,6 +140,10 @@ pub fn main() !void {
             return error.InvalidArgs;
         }
         return runMigratePrecis(allocator, db_path, run_dir, apply, hosted_domains.items, forced);
+    }
+
+    if (std.mem.eql(u8, command, "migrate-archive")) {
+        return runMigrateArchive(allocator, db_path, run_dir, apply, hosted_domains.items);
     }
 
     if (raw and std.mem.eql(u8, command, "deluser")) {
@@ -603,6 +608,110 @@ fn runMigratePrecis(
     printOut(line);
 }
 
+/// Reports a post-commit journal cleanup failure: the migration ops are
+/// durable, but the named journal artifact remains and a rerun replays.
+fn reportCleanupFailure(allocator: std.mem.Allocator, cleanup_path: *const std.ArrayListUnmanaged(u8), err: anyerror) !void {
+    if (cleanup_path.items.len == 0) return;
+    const msg = try std.fmt.allocPrint(allocator, "migration applied, cleanup failed: {s} ({s})\n", .{ cleanup_path.items, @errorName(err) });
+    defer allocator.free(msg);
+    printErr(msg);
+}
+
+fn runMigrateArchive(
+    allocator: std.mem.Allocator,
+    db_path: []const u8,
+    run_dir: []const u8,
+    apply: bool,
+    hosted_domains: []const []const u8,
+) !void {
+    // The master and its children are detected through their pid files. A
+    // dry run is offline too: it must observe a quiescent, complete keyspace.
+    migrate_precis.assertOffline(run_dir) catch |err| {
+        printErr("xmppd is running; stop all daemons before migrate-archive\n");
+        return err;
+    };
+
+    var archive_path_buf: [1024]u8 = undefined;
+    const archive_path = try std.fmt.bufPrint(&archive_path_buf, "{s}/archive", .{db_path});
+    var archive = try ArchiveBackendType.open(archive_path, .{ .create = false });
+    defer archive.close();
+
+    var cleanup_path: std.ArrayListUnmanaged(u8) = .{};
+    defer cleanup_path.deinit(allocator);
+
+    if (try migrate_archive.journalPending(allocator, db_path)) {
+        if (!apply) {
+            printErr("a migrate-archive recovery is pending; rerun with --apply to finish it\n");
+            return error.RecoveryPending;
+        }
+        const resumed = migrate_archive.resumeMigration(allocator, &archive, db_path, &cleanup_path) catch |err| {
+            if (err == error.JournalDigestMismatch) {
+                printErr("migration journal is torn or does not match the marker; restore the archive from backup, or delete migrate-archive.pending and migrate-archive.resume and rerun the dry run\n");
+            }
+            try reportCleanupFailure(allocator, &cleanup_path, err);
+            return err;
+        };
+        var resumed_buf: [96]u8 = undefined;
+        const resumed_line = try std.fmt.bufPrint(&resumed_buf, "resumed {d} ops\n", .{resumed});
+        printOut(resumed_line);
+        return;
+    }
+
+    var plan = try migrate_archive.planMigration(allocator, &archive, hosted_domains);
+    defer plan.deinit();
+    var out_buf: [0]u8 = .{};
+    var stdout = std.fs.File.stdout().writer(&out_buf);
+    var err_buf: [0]u8 = .{};
+    var stderr = std.fs.File.stderr().writer(&err_buf);
+    try printArchivePlan(allocator, &plan, &stdout.interface, &stderr.interface);
+    if (!apply) {
+        printOut("dry run: no changes applied (use --apply to migrate)\n");
+        return;
+    }
+
+    migrate_archive.applyPlan(allocator, &archive, &plan, db_path, &cleanup_path) catch |err| {
+        try reportCleanupFailure(allocator, &cleanup_path, err);
+        return err;
+    };
+    var count_buf: [96]u8 = undefined;
+    const line = try std.fmt.bufPrint(&count_buf, "applied {d} ops\n", .{plan.ops.items.len});
+    printOut(line);
+}
+
+fn printArchivePlan(
+    allocator: std.mem.Allocator,
+    plan: *const migrate_archive.Plan,
+    out: *std.Io.Writer,
+    errw: *std.Io.Writer,
+) !void {
+    for (plan.ops.items) |op| {
+        try out.writeAll(@tagName(op.kind));
+        try out.writeAll(" archive by_contact ");
+        if (op.old_key) |old| {
+            const old_hex = try migrate_precis.hexKey(allocator, old);
+            defer allocator.free(old_hex);
+            try out.writeAll(old_hex);
+            try out.writeAll(" -> ");
+        }
+        const new_hex = try migrate_precis.hexKey(allocator, op.new_key);
+        defer allocator.free(new_hex);
+        try out.writeAll(new_hex);
+        try out.writeAll("\n");
+    }
+    for (plan.issues.items) |issue| {
+        const key_hex = try migrate_precis.hexKey(allocator, issue.key);
+        defer allocator.free(key_hex);
+        try errw.writeAll(@tagName(issue.kind));
+        try errw.writeAll(" archive by_contact ");
+        try errw.writeAll(key_hex);
+        try errw.writeAll(" ");
+        const detail = try escapeBytesAlloc(allocator, issue.detail);
+        defer allocator.free(detail);
+        try errw.writeAll(detail);
+        try errw.writeAll("\n");
+    }
+}
+
 fn printMigrationPlan(
     allocator: std.mem.Allocator,
     plan: *const migrate_precis.Plan,
@@ -917,6 +1026,9 @@ fn printUsage() void {
         \\  migrate-precis  Plan RFC 7622 key renames (dry run unless --apply)
         \\                  Requires --hosted-domain DOMAIN (repeatable)
         \\                  --rename OLD NEW explicitly renames one stored localpart
+        \\  migrate-archive Rebuild the MAM by_contact index on the v2 key
+        \\                  format (dry run unless --apply). --hosted-domain
+        \\                  distinguishes local senders from s2s wire forms.
         \\  invite create   Create invitation code [--max-uses N] [--expires HOURS]
         \\  invite list     List all invitation codes
         \\  invite revoke   Revoke an invitation code
@@ -926,7 +1038,7 @@ fn printUsage() void {
         \\  --auth-socket PATH  Auth daemon IPC socket (default: /var/run/xmppd/auth.sock)
         \\  --password PASS     Provide password on command line (non-interactive)
         \\  --password-file F   Read password from file (first line, trailing newline stripped)
-        \\  --apply             Apply migrate-precis renames (default is a dry run)
+        \\  --apply             Apply migrate-precis/migrate-archive ops (default is a dry run)
         \\  --raw               deluser: exact source localpart; requires --hosted-domain
         \\  --run-dir PATH      Daemon pid-file directory (default: /var/run/xmppd)
         \\  --hosted-domain D   Hosted account domain; repeat for each domain

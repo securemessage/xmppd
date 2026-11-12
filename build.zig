@@ -1901,6 +1901,15 @@ pub fn build(b: *std.Build) void {
     ctl_migrate_precis_mod.addImport("backend", ctl_backend_mod);
     ctl_migrate_precis_mod.addImport("precis_username", precis_username_mod);
 
+    const ctl_migrate_archive_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/migrate_archive.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ctl_migrate_archive_mod.addImport("backend", ctl_backend_mod);
+    ctl_migrate_archive_mod.addImport("xml", xml_mod);
+
     const ctl_user_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/user_store.zig"),
         .target = target,
@@ -1937,6 +1946,7 @@ pub fn build(b: *std.Build) void {
     ctl_mod.addImport("op_backend", ctl_op_backend_mod);
     ctl_mod.addImport("archive_backend", ctl_archive_backend_mod);
     ctl_mod.addImport("migrate_precis", ctl_migrate_precis_mod);
+    ctl_mod.addImport("migrate_archive", ctl_migrate_archive_mod);
     ctl_mod.addImport("precis_username", precis_username_mod);
     ctl_mod.addImport("backend", ctl_backend_mod);
     ctl_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
@@ -1961,6 +1971,7 @@ pub fn build(b: *std.Build) void {
     ctl_test_mod.addImport("op_backend", ctl_op_backend_mod);
     ctl_test_mod.addImport("archive_backend", ctl_archive_backend_mod);
     ctl_test_mod.addImport("migrate_precis", ctl_migrate_precis_mod);
+    ctl_test_mod.addImport("migrate_archive", ctl_migrate_archive_mod);
     ctl_test_mod.addImport("precis_username", precis_username_mod);
     ctl_test_mod.addImport("backend", ctl_backend_mod);
     ctl_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
@@ -1986,6 +1997,40 @@ pub fn build(b: *std.Build) void {
         .root_module = migrate_precis_test_mod,
     });
     const run_migrate_precis_tests = b.addRunArtifact(migrate_precis_tests);
+
+    const migrate_archive_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/ctl/migrate_archive.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    migrate_archive_test_mod.addImport("backend", backend_test_mod);
+    migrate_archive_test_mod.addImport("xml", xml_test_mod);
+    const migrate_archive_tests = b.addTest(.{
+        .name = "migrate-archive-tests",
+        .root_module = migrate_archive_test_mod,
+    });
+    const run_migrate_archive_tests = b.addRunArtifact(migrate_archive_tests);
+
+    // Archive store against the real LMDB/RocksDB/SQLite backends: S32
+    // same-second keys and the migrate-archive rekey/rebuild.
+    const archive_store_real_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/archive_store_real_backend_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    archive_store_real_test_mod.addImport("backend", backend_test_mod);
+    archive_store_real_test_mod.addImport("archive_store", archive_store_test_mod);
+    archive_store_real_test_mod.addImport("migrate_archive", migrate_archive_test_mod);
+    archive_store_real_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
+    archive_store_real_test_mod.addImport("rocksdb_backend", rocksdb_backend_test_mod);
+    archive_store_real_test_mod.addImport("sqlite_backend", sqlite_backend_test_mod);
+    const archive_store_real_tests = b.addTest(.{
+        .name = "archive-store-real-tests",
+        .root_module = archive_store_real_test_mod,
+    });
+    const run_archive_store_real_tests = b.addRunArtifact(archive_store_real_tests);
 
     const migrate_precis_backend_test_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/migrate_precis_backends_test.zig"),
@@ -2157,6 +2202,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_archive_queue_tests.step);
     test_step.dependOn(&run_migrate_precis_tests.step);
     test_step.dependOn(&run_migrate_precis_backend_tests.step);
+    test_step.dependOn(&run_migrate_archive_tests.step);
+    test_step.dependOn(&run_archive_store_real_tests.step);
     test_step.dependOn(&run_auth_main_tests.step);
     test_step.dependOn(&precis_frame_check.step);
     test_step.dependOn(&precis_frame_self_test.step);

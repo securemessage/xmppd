@@ -362,7 +362,7 @@ test "ArchiveWriteQueue: enqueue/pop roundtrip with C-owned deep copy" {
     var src_owner = [_]u8{ 'a', 'l', 'i', 'c', 'e' };
     q.enqueue(&src_owner, "bob@localhost", "sid1", 1200, "<message/>");
     // mutate the source after enqueue to prove the deep copy
-    src_owner = [_]u8{ 'x' } ** 5;
+    src_owner = [_]u8{'x'} ** 5;
 
     var job = q.pop().?;
     defer job.deinit();
@@ -630,6 +630,19 @@ fn reopenSurvival(comptime BackendMod: type) !void {
     const g1b = try store2.getMessage("room@conf.test.dev", 1700000001, "g-1");
     try std.testing.expect(g1b != null);
     alloc.free(g1b.?);
+
+    // The contact index survives the reopen too: a `with`-filtered MAM
+    // query reaches the same row through by_contact, not only by id.
+    const with_result = try store2.query("alice@test.dev", .{ .with = "bob@test.dev" });
+    defer {
+        for (with_result.messages) |msg| {
+            alloc.free(msg.stanza_id);
+            if (msg.stanza_xml.len > 0) alloc.free(@constCast(msg.stanza_xml));
+        }
+        alloc.free(with_result.messages);
+    }
+    try std.testing.expectEqual(@as(usize, 1), with_result.messages.len);
+    try std.testing.expectEqualStrings("m-1", with_result.messages[0].stanza_id);
 }
 
 // N1 regression on real LMDB: a put that fails inside a write txn must

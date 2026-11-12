@@ -283,7 +283,10 @@ pub fn handleMucGroupchat(
     // Store in archive for room history replay (T44)
     if (server.archive != null) {
         const timestamp: u64 = @intCast(std.time.timestamp());
-        const stanza_id = if (id_str.len > 0) id_str else "muc";
+        var sid_buf: [32]u8 = undefined;
+        // The stanza id keys both archive rows, so a fixed literal would
+        // keep the same-second overwrite alive for id-less groupchat.
+        const stanza_id = if (id_str.len > 0) id_str else server.generateStanzaId(&sid_buf);
         // Build full stanza XML: <message from='room/nick' type='groupchat' id='...'>inner</message>
         // The fan-out above has finished, so its buffer is given back first
         // rather than held across the archive build.
@@ -2267,7 +2270,10 @@ pub fn processRemoteGroupchat(
     // Archive
     if (server.archive != null) {
         const timestamp: u64 = @intCast(std.time.timestamp());
-        const stanza_id = if (ev.stanza_id.len > 0) ev.stanza_id else "muc";
+        var sid_buf: [32]u8 = undefined;
+        // The stanza id keys both archive rows, so a fixed literal would
+        // keep the same-second overwrite alive for id-less groupchat.
+        const stanza_id = if (ev.stanza_id.len > 0) ev.stanza_id else server.generateStanzaId(&sid_buf);
         // The fan-out above has finished and the stanza is rebuilt from
         // ev.inner_xml, so both of its buffers are given back first.
         deliver_lease.release();
@@ -3939,6 +3945,66 @@ test "H5: an oversized groupchat body is rejected with a bounce, not a room tear
     var buf: [256]u8 = undefined;
     const n = posix.read(bob_fds[1], &buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+// S32: an id-less groupchat must not archive under a fixed stanza id. The
+// stanza id keys both archive rows, so the old "muc" literal collapsed two
+// same-second messages onto one primary key and one by_contact row.
+test "S32: id-less groupchat messages archive under minted stanza ids" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    const ArchBackend = @import("archive_backend").Backend;
+    const ArchiveStore = @import("archive_store").ArchiveStore(ArchBackend);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("archive");
+    const arch_path = try tmp.dir.realpathAlloc(allocator, "archive");
+    defer allocator.free(arch_path);
+    var arch_db = try ArchBackend.open(arch_path, .{});
+    defer arch_db.close();
+    var arch_store = ArchiveStore.init(&arch_db, allocator);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var reg = RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    server.muc_host = "conference.localhost";
+    server.worker_id = 0;
+    server.archive = &arch_store;
+
+    const room = try reg.createRoom("arena@conference.localhost", .{ .persistent = false });
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const alice = try allocator.create(Session);
+    alice.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    alice.stream.state = .active;
+    alice.stream.authenticated = true;
+    server.sessions[0] = alice;
+    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", 0, 0, 1, .participant, .member);
+
+    var scratch: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&scratch);
+
+    handleMucGroupchat(&server, alice, "arena", "<body>one</body>", "", &changes);
+    handleMucGroupchat(&server, alice, "arena", "<body>two</body>", "", &changes);
+
+    const result = try arch_store.query("arena@conference.localhost", .{});
+    defer {
+        for (result.messages) |msg| {
+            allocator.free(msg.stanza_id);
+            if (msg.stanza_xml.len > 0) allocator.free(@constCast(msg.stanza_xml));
+        }
+        allocator.free(result.messages);
+    }
+    try std.testing.expectEqual(@as(usize, 2), result.messages.len);
+    for (result.messages) |msg| {
+        try std.testing.expect(!std.mem.eql(u8, msg.stanza_id, "muc"));
+    }
+    try std.testing.expect(!std.mem.eql(u8, result.messages[0].stanza_id, result.messages[1].stanza_id));
 }
 
 // H5 sizing must use the escaped recipient JID, not its raw length. A real

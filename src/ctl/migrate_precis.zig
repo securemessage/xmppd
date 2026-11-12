@@ -845,11 +845,26 @@ fn rewriteEntry(
             const second_rel = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
             const second_sep = first_sep + 1 + second_rel;
             const owner = new_key[0..first_sep];
-            const ts8 = new_key[second_sep + 1 ..];
+            // The timestamp occupies the first 8 tail bytes in both key
+            // formats; v2 then carries the stanza id after a NUL.
+            const tail = new_key[second_sep + 1 ..];
             const source_sep = std.mem.indexOfScalar(u8, key, 0) orelse 0;
             const source_owner = key[0..source_sep];
-            if (lookupRekeyId(ctx.identities.plan, source_owner, owner, ts8, value)) |new_id| {
-                rewrite.new_value = try allocator.dupe(u8, new_id);
+            if (tail.len >= 8) {
+                const ts8 = tail[0..8];
+                if (lookupRekeyId(ctx.identities.plan, source_owner, owner, ts8, value)) |new_id| {
+                    rewrite.new_value = try allocator.dupe(u8, new_id);
+                    // A v2 row names the stanza id in its key too: keep key
+                    // and value pointing at the same row after a rekey.
+                    if (tail.len > 9 and tail[8] == 0) {
+                        const base_len = second_sep + 1 + 8 + 1;
+                        const replaced = try allocator.alloc(u8, base_len + new_id.len);
+                        @memcpy(replaced[0..base_len], new_key[0..base_len]);
+                        @memcpy(replaced[base_len..], new_id);
+                        allocator.free(new_key);
+                        rewrite.new_key = replaced;
+                    }
+                }
             }
         }
     } else if (std.mem.eql(u8, namespace, NS_ROOM_AFFILIATIONS)) {
