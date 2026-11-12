@@ -13,6 +13,7 @@ const xml = @import("xml");
 const sasl = @import("sasl");
 const session_map = @import("session_map");
 const delivery_queue = @import("delivery_queue");
+const ipc = @import("ipc_protocol");
 
 const GPA = std.heap.c_allocator;
 
@@ -26,6 +27,8 @@ pub fn main() !void {
     try benchSessionMapLookup();
     try benchPbkdf2();
     try benchScramExchange();
+    try benchIpcCodec();
+    try benchIpcFrames();
 }
 
 fn rateLine(comptime fmt: []const u8, args: anytype) void {
@@ -207,4 +210,96 @@ fn benchScramExchange() !void {
     }
     const seconds = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
     rateLine("scram_verify_exchange ops={d} seconds={d:.3} ops_per_s={d:.0}", .{ count, seconds, @as(f64, @floatFromInt(count)) / seconds });
+}
+
+// -- IPC codec: encode+decode round-trip over a representative mix ----------
+
+fn ipcMessageMix() [5]ipc.Message {
+    const stanza = "<message from='m2u-17@localhost/load-3' to='m2u-88@remote/lab-1' type='chat' id='v091-0042'><body>the quick brown fox jumps over the lazy dog while the carrier-grade server chews stanzas</body></message>";
+    return .{
+        .{ .auth_request = .{
+            .conn_id = 42,
+            .mechanism = .scram_sha_256,
+            .client_ip = "192.168.1.100",
+            .cb_type = 0,
+            .cb_data = "",
+            .username = "m2u-17",
+            .payload = "n,,n=m2u-17,r=3rfcNHYJY1ZVvWb7l9KqP",
+        } },
+        .{ .auth_challenge = .{
+            .conn_id = 42,
+            .challenge = "r=3rfcNHYJY1ZVvWb7l9KqPf2hR6YkKq1yS1xT0w==,s=QSXCR+Q6sek8bf92,i=4096",
+        } },
+        .{ .sasl_response = .{
+            .conn_id = 42,
+            .payload = "c=biws,r=3rfcNHYJY1ZVvWb7l9KqPf2hR6YkKq1yS1xT0w==,p=3r2t9N5x0eVlE4B1b3lC1rQ6M8k=",
+        } },
+        .{ .auth_success = .{
+            .conn_id = 42,
+            .username = "m2u-17",
+            .server_final = "v=UQ6aD8b3m0V9n2eY9P6n4K8x7L5c1dF3s2A0h9G8j7I=",
+        } },
+        .{ .s2s_deliver = .{
+            .from_jid = "m2u-17@localhost/load-3",
+            .to_jid = "m2u-88@remote/lab-1",
+            .stanza_xml = stanza,
+        } },
+    };
+}
+
+fn benchIpcCodec() !void {
+    const messages = ipcMessageMix();
+    const buf = try GPA.alloc(u8, ipc.MAX_FRAME_SIZE);
+    defer GPA.free(buf);
+
+    var timer = try std.time.Timer.start();
+    var ops: u64 = 0;
+    var bytes: u64 = 0;
+    var i: usize = 0;
+    while (true) {
+        const n = try ipc.encode(messages[i % messages.len], buf);
+        i += 1;
+        std.mem.doNotOptimizeAway(try ipc.decode(buf[ipc.HEADER_SIZE..n]));
+        ops += 1;
+        bytes += n;
+        if (timer.read() >= 2 * std.time.ns_per_s) break;
+    }
+    const seconds = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    const mb = @as(f64, @floatFromInt(bytes)) / (1024 * 1024);
+    rateLine("ipc_codec ops={d} seconds={d:.3} mb_per_s={d:.1} ops_per_s={d:.0}", .{ ops, seconds, mb / seconds, @as(f64, @floatFromInt(ops)) / seconds });
+}
+
+// -- IPC frame parse: parseFrame+decode over a pre-encoded stream ------------
+
+fn benchIpcFrames() !void {
+    const stanza = "<presence from='m2u-17@remote/lab-1' to='m2u-88@localhost'><show>away</show></presence>";
+    const msg = ipc.Message{ .s2s_inbound = .{
+        .from_jid = "m2u-17@remote/lab-1",
+        .to_jid = "m2u-88@localhost",
+        .stanza_xml = stanza,
+    } };
+
+    const stream = try GPA.alloc(u8, 4 << 20);
+    defer GPA.free(stream);
+    var len: usize = 0;
+    while (len + ipc.MAX_FRAME_SIZE <= stream.len) {
+        len += try ipc.encode(msg, stream[len..]);
+    }
+
+    var timer = try std.time.Timer.start();
+    var frames: u64 = 0;
+    var bytes: u64 = 0;
+    while (true) {
+        var pos: usize = 0;
+        while (try ipc.parseFrame(stream[pos..len])) |f| {
+            std.mem.doNotOptimizeAway(try ipc.decode(f.payload));
+            pos += f.consumed;
+            frames += 1;
+            bytes += f.consumed;
+        }
+        if (timer.read() >= 2 * std.time.ns_per_s) break;
+    }
+    const seconds = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    const mb = @as(f64, @floatFromInt(bytes)) / (1024 * 1024);
+    rateLine("ipc_frames frames={d} seconds={d:.3} mb_per_s={d:.1} frames_per_s={d:.0}", .{ frames, seconds, mb / seconds, @as(f64, @floatFromInt(frames)) / seconds });
 }

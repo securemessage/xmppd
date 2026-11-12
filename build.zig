@@ -2236,6 +2236,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    const bench_net_frame_mod = b.createModule(.{
+        .root_source_file = b.path("lib/net/frame.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_ipc_protocol_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc/protocol.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_ipc_protocol_mod.addImport("net_frame", bench_net_frame_mod);
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/bench.zig"),
         .target = target,
@@ -2245,6 +2256,7 @@ pub fn build(b: *std.Build) void {
     bench_mod.addImport("sasl", bench_sasl_mod);
     bench_mod.addImport("session_map", bench_session_map_mod);
     bench_mod.addImport("delivery_queue", bench_delivery_mod);
+    bench_mod.addImport("ipc_protocol", bench_ipc_protocol_mod);
     const bench_exe = b.addExecutable(.{
         .name = "xmppd-bench",
         .root_module = bench_mod,
