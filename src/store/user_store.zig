@@ -93,6 +93,10 @@ pub fn UserStore(comptime Backend: type) type {
             if (oidc_ids.claim_window_hook) |hook| hook();
 
             var kbuf: [512]u8 = undefined;
+            // A reverseKey error means the localpart is empty or exceeds
+            // max_localpart_len; bindings enforce the same bound, so no
+            // reverse row can exist for it and the check is safely skipped.
+            // The users-row putIfAbsent below still decides the claim.
             const rkey = oidc_ids.reverseKey(&kbuf, username) catch null;
 
             var batch = try self.backend.writeBatch();

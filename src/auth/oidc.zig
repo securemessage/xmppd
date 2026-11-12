@@ -605,8 +605,8 @@ pub const OidcStore = struct {
         };
         jwt.validateAudience(&parsed.claims, self.config.client_id) catch {
             log.info(
-                "JWT: audience mismatch: got '{s}', expected '{s}'",
-                .{ parsed.claims.aud, self.config.client_id },
+                "JWT: audience mismatch: {d} aud value(s), azp='{s}', expected '{s}'",
+                .{ parsed.claims.aud.len, parsed.claims.azp, self.config.client_id },
             );
             return .invalid;
         };
@@ -1688,7 +1688,7 @@ test "OidcStore: suggestionClaim selects per localpart_claim" {
     const claims = jwt.JwtClaims{
         .sub = "s-1",
         .iss = "https://idp.example/",
-        .aud = "xmppd",
+        .aud = &.{"xmppd"},
         .exp = 1,
         .preferred_username = "alice",
         .email = "alice@us.example",
