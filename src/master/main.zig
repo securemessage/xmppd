@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const xmppd_log = @import("xmppd_log");
+const root_allocator = @import("root_allocator");
 pub const std_options = xmppd_log.std_options;
 
 const posix = std.posix;
@@ -45,9 +46,9 @@ comptime {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var root = root_allocator.Root.init();
+    defer root.deinit();
+    const allocator = root.allocator();
 
     // Parse command-line arguments
     var args = try std.process.argsWithAllocator(allocator);

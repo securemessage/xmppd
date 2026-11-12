@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const xmppd_log = @import("xmppd_log");
+const root_allocator = @import("root_allocator");
 pub const std_options = xmppd_log.std_options;
 
 const Server = @import("worker/worker.zig").Server;
@@ -65,9 +66,9 @@ pub fn main() !void {
     // EVFILT_SIGNAL knote still records it and dumps its counters.
     metrics.blockUsr1();
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var root = root_allocator.Root.init();
+    defer root.deinit();
+    const allocator = root.allocator();
 
     // Parse command-line arguments
     var args = try std.process.argsWithAllocator(allocator);

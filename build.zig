@@ -6,13 +6,32 @@ const std = @import("std");
 /// git tag without the leading 'v').
 const version = "0.9.0";
 
+/// Root allocator kinds for the daemons (ADR-7, Q1): DebugAllocator in
+/// Debug builds and tests, libc jemalloc in release builds, the SMP
+/// allocator as a measurement alternative. Selected with -Dallocator.
+const AllocatorKind = enum { debug, c, smp };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     const version_options = b.addOptions();
     version_options.addOption([]const u8, "version", version);
+    const allocator_kind: AllocatorKind = b.option(AllocatorKind, "allocator", "Root allocator for the daemons: debug|c|smp (default: debug in Debug builds, c in release)") orelse switch (optimize) {
+        .Debug => .debug,
+        else => .c,
+    };
+    version_options.addOption([]const u8, "allocator", @tagName(allocator_kind));
     const build_options_mod = version_options.createModule();
+
+    // ADR-7/Q1: shared root-allocator selection for the daemon mains.
+    const root_allocator_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/root_allocator.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    root_allocator_mod.addImport("build_options", build_options_mod);
 
     const op_storage = b.option([]const u8, "op-storage", "Operational storage backend: lmdb (default), rocksdb, sqlite") orelse "lmdb";
     const archive_storage = b.option([]const u8, "archive-storage", "Archive storage backend: rocksdb (default), lmdb, sqlite") orelse "rocksdb";
@@ -495,6 +514,12 @@ pub fn build(b: *std.Build) void {
         .root_module = dns_async_mod,
     });
     const run_dns_async_tests = b.addRunArtifact(dns_async_tests);
+
+    const root_allocator_tests = b.addTest(.{
+        .name = "root-allocator-tests",
+        .root_module = root_allocator_mod,
+    });
+    const run_root_allocator_tests = b.addRunArtifact(root_allocator_tests);
 
     // --- Core daemon tests ---
 
@@ -1128,6 +1153,7 @@ pub fn build(b: *std.Build) void {
     s2s_main_test_mod.addImport("dns_async", dns_async_mod);
     s2s_main_test_mod.addImport("xmpp", xmpp_mod);
     s2s_main_test_mod.addImport("test_support", test_support_mod);
+    s2s_main_test_mod.addImport("root_allocator", root_allocator_mod);
     s2s_main_test_mod.linkSystemLibrary("ssl", .{});
     s2s_main_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -1625,6 +1651,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("config", config_mod);
     core_mod.addImport("xmppd_log", xmppd_log_mod);
     core_mod.addImport("build_options", build_options_mod);
+    core_mod.addImport("root_allocator", root_allocator_mod);
     core_mod.linkSystemLibrary("ssl", .{});
     core_mod.linkSystemLibrary("crypto", .{});
 
@@ -1644,6 +1671,7 @@ pub fn build(b: *std.Build) void {
     master_mod.addImport("config", config_mod);
     master_mod.addImport("xmppd_log", xmppd_log_mod);
     master_mod.addImport("build_options", build_options_mod);
+    master_mod.addImport("root_allocator", root_allocator_mod);
 
     const master_exe = b.addExecutable(.{
         .name = "xmppd",
@@ -1765,6 +1793,7 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("config", config_mod);
     auth_mod.addImport("backend", auth_backend_mod);
     auth_mod.addImport("xmppd_log", xmppd_log_mod);
+    auth_mod.addImport("root_allocator", root_allocator_mod);
 
     const auth_exe = b.addExecutable(.{
         .name = "xmppd-auth",
@@ -1879,6 +1908,7 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("backend", auth_backend_mod);
     oidc_main_mod.addImport("oidc_identity_store", oidc_ids_mod);
     oidc_main_mod.addImport("xmppd_log", xmppd_log_mod);
+    oidc_main_mod.addImport("root_allocator", root_allocator_mod);
     oidc_main_mod.linkSystemLibrary("ssl", .{});
     oidc_main_mod.linkSystemLibrary("crypto", .{});
 
@@ -1942,6 +1972,7 @@ pub fn build(b: *std.Build) void {
     s2s_main_mod.addImport("dns_async", dns_async_mod);
     s2s_main_mod.addImport("xmpp", xmpp_mod);
     s2s_main_mod.addImport("xmppd_log", xmppd_log_mod);
+    s2s_main_mod.addImport("root_allocator", root_allocator_mod);
     s2s_main_mod.linkSystemLibrary("ssl", .{});
     s2s_main_mod.linkSystemLibrary("crypto", .{});
 
@@ -2037,6 +2068,7 @@ pub fn build(b: *std.Build) void {
     ctl_mod.addImport("precis_username", precis_username_mod);
     ctl_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     ctl_mod.addImport("xmppd_log", xmppd_log_mod);
+    ctl_mod.addImport("root_allocator", root_allocator_mod);
 
     const ctl_exe = b.addExecutable(.{
         .name = "xmppctl",
@@ -2063,6 +2095,7 @@ pub fn build(b: *std.Build) void {
     ctl_test_mod.addImport("precis_username", precis_username_mod);
     ctl_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     ctl_test_mod.addImport("xmppd_log", xmppd_log_mod);
+    ctl_test_mod.addImport("root_allocator", root_allocator_mod);
 
     const ctl_tests = b.addTest(.{
         .name = "xmppctl-tests",
@@ -2191,6 +2224,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_dns_tests.step);
     test_step.dependOn(&run_wire_tests.step);
     test_step.dependOn(&run_dns_async_tests.step);
+    test_step.dependOn(&run_root_allocator_tests.step);
     test_step.dependOn(&run_xmppc_tests.step);
     test_step.dependOn(&run_socketpair_tests.step);
     test_step.dependOn(&run_alloc_bound_tests.step);
