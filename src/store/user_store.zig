@@ -15,6 +15,7 @@ const std = @import("std");
 const sasl = @import("sasl");
 const backend_mod = @import("backend");
 const precis = @import("precis_username");
+const oidc_ids = @import("oidc_identity_store");
 
 const log = std.log.scoped(.user_store);
 
@@ -79,18 +80,42 @@ pub fn UserStore(comptime Backend: type) type {
         }
 
         /// Add a new user. Derives SCRAM credentials from the password.
-        /// Returns error.UserExists if the username is taken.
+        /// Returns error.UserExists if the username is taken and
+        /// error.OidcBound when the localpart belongs to an OIDC subject.
+        /// The OIDC reverse-index check and the users row claim run inside
+        /// one serialized write transaction, so a first OIDC login or a
+        /// second registration cannot slip between the checks and the
+        /// write (T-52633E2B).
         pub fn addUser(self: *Self, allocator: std.mem.Allocator, username: []const u8, password: []const u8) !void {
-            // Check for duplicate
-            const existing = try self.backend.get(allocator, NAMESPACE, username);
-            if (existing) |v| {
-                allocator.free(v);
-                return error.UserExists;
-            }
-
             const creds = try sasl.StoredCredentials.generate(password, 4096);
             const value = serializeCredentials(creds);
-            try self.backend.put(NAMESPACE, username, &value);
+
+            if (oidc_ids.claim_window_hook) |hook| hook();
+
+            var kbuf: [512]u8 = undefined;
+            const rkey = oidc_ids.reverseKey(&kbuf, username) catch null;
+
+            var batch = try self.backend.writeBatch();
+            var ended = false;
+            defer if (!ended) batch.abort();
+
+            // A localpart bound to an OIDC (iss, sub) belongs to that
+            // subject; a local users row would hand a password credential
+            // into the bound account.
+            if (rkey) |key| {
+                if (try batch.get(allocator, oidc_ids.NAMESPACE, key)) |row| {
+                    allocator.free(row);
+                    log.info("refusing local registration of OIDC-bound localpart '{s}'", .{username});
+                    return error.OidcBound;
+                }
+            }
+
+            batch.putIfAbsent(NAMESPACE, username, &value) catch |err| switch (err) {
+                error.Conflict => return error.UserExists,
+                else => return err,
+            };
+            try batch.commit();
+            ended = true;
             log.info("added user: {s}", .{username});
         }
 
@@ -168,6 +193,7 @@ fn deserializeCredentials(data: []const u8) ?sasl.StoredCredentials {
 // ============================================================================
 
 const MemoryBackend = backend_mod.MemoryBackend;
+const lmdb_backend_mod = @import("lmdb_backend");
 const TestStore = UserStore(MemoryBackend);
 
 test "UserStore: add and lookup" {
@@ -192,6 +218,20 @@ test "UserStore: duplicate user rejected" {
 
     try store.addUser(std.testing.allocator, "alice", "pass");
     try std.testing.expectError(error.UserExists, store.addUser(std.testing.allocator, "alice", "other"));
+}
+
+test "UserStore: addUser refuses an OIDC-bound localpart (T-52633E2B)" {
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestStore.init(&db);
+
+    var ids = oidc_ids.Store(MemoryBackend).init(&db);
+    _ = try ids.bind(std.testing.allocator, "https://idp.example", "sub-1", "bound-lp", .auto, 1, null);
+
+    try std.testing.expectError(error.OidcBound, store.addUser(std.testing.allocator, "bound-lp", "pw"));
+    // No users row was created and an unbound name still registers.
+    try std.testing.expect((try store.lookup(std.testing.allocator, "bound-lp")) == null);
+    try store.addUser(std.testing.allocator, "free-lp", "pw");
 }
 
 test "UserStore: remove user" {
@@ -288,4 +328,200 @@ test "serializeCredentials roundtrip" {
     try std.testing.expectEqualSlices(u8, &creds.stored_key, &back.stored_key);
     try std.testing.expectEqualSlices(u8, &creds.server_key, &back.server_key);
     try std.testing.expectEqual(creds.iteration_count, back.iteration_count);
+}
+
+// ============================================================================
+// Claim-window races (local registration vs OIDC first login)
+// ============================================================================
+//
+// claim_window_hook lands the queued competing operation at the point a
+// split check-then-write sequence left open between its checks and its
+// write: the holder's hook call runs the interloper to completion
+// (disarming first, so the interloper's own hook call is a no-op), then
+// the holder opens the write transaction that now must see the
+// interloper's committed rows.
+
+var window_interloper: ?*const fn () void = null;
+
+fn windowDispatch() void {
+    const f = window_interloper orelse return;
+    window_interloper = null;
+    f();
+}
+
+fn armWindow(interloper: *const fn () void) void {
+    window_interloper = interloper;
+    oidc_ids.claim_window_hook = windowDispatch;
+}
+
+test "addUser: an OIDC binding inside the registration window refuses the users row" {
+    const S = struct {
+        var db: *MemoryBackend = undefined;
+        var op: *MemoryBackend = undefined;
+        var arch: *MemoryBackend = undefined;
+        fn interloper() void {
+            var r = oidc_ids.Resolver(MemoryBackend, MemoryBackend){
+                .store = oidc_ids.Store(MemoryBackend).init(db),
+                .op_backend = op,
+                .archive_backend = arch,
+                .user_domain = "morante.dev",
+            };
+            var lp: [oidc_ids.max_localpart_len]u8 = undefined;
+            var len: usize = 0;
+            _ = r.resolve(std.testing.allocator, "https://idp.example", "sub-1", "alice", &lp, &len) catch unreachable;
+        }
+    };
+    defer oidc_ids.claim_window_hook = null;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var arch = try MemoryBackend.open("", .{});
+    defer arch.close();
+    S.db = &db;
+    S.op = &op;
+    S.arch = &arch;
+
+    var store = TestStore.init(&db);
+    armWindow(S.interloper);
+    try std.testing.expectError(error.OidcBound, store.addUser(std.testing.allocator, "alice", "pw"));
+
+    // The subject's binding stands and no users row was created.
+    var ids = oidc_ids.Store(MemoryBackend).init(&db);
+    const bound = try ids.lookupSubject(std.testing.allocator, "https://idp.example", "sub-1");
+    defer if (bound) |v| std.testing.allocator.free(v);
+    try std.testing.expect(bound != null);
+    try std.testing.expect((try store.lookup(std.testing.allocator, "alice")) == null);
+}
+
+test "Resolver: IBR inside the bind window refuses the auto-claim" {
+    const S = struct {
+        var db: *MemoryBackend = undefined;
+        fn interloper() void {
+            var users = TestStore.init(db);
+            users.addUser(std.testing.allocator, "alice", "pw") catch {};
+        }
+    };
+    defer oidc_ids.claim_window_hook = null;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var op = try MemoryBackend.open("", .{});
+    defer op.close();
+    var arch = try MemoryBackend.open("", .{});
+    defer arch.close();
+    S.db = &db;
+
+    var r = oidc_ids.Resolver(MemoryBackend, MemoryBackend){
+        .store = oidc_ids.Store(MemoryBackend).init(&db),
+        .op_backend = &op,
+        .archive_backend = &arch,
+        .user_domain = "morante.dev",
+    };
+    armWindow(S.interloper);
+    var lp: [oidc_ids.max_localpart_len]u8 = undefined;
+    var len: usize = 0;
+    const out = try r.resolve(std.testing.allocator, "https://idp.example", "sub-1", "alice", &lp, &len);
+    try std.testing.expectEqual(out, oidc_ids.Resolution{ .refused = .local_account });
+
+    // The account row stands and the subject gained no binding rows.
+    var store = TestStore.init(&db);
+    try std.testing.expect((try store.lookup(std.testing.allocator, "alice")) != null);
+    const stray = try r.store.lookupSubject(std.testing.allocator, "https://idp.example", "sub-1");
+    defer if (stray) |v| std.testing.allocator.free(v);
+    try std.testing.expect(stray == null);
+}
+
+test "addUser: a second registration inside the window loses and never overwrites" {
+    const S = struct {
+        var db: *MemoryBackend = undefined;
+        fn interloper() void {
+            var users = TestStore.init(db);
+            users.addUser(std.testing.allocator, "alice", "first") catch {};
+        }
+    };
+    defer oidc_ids.claim_window_hook = null;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    S.db = &db;
+
+    var store = TestStore.init(&db);
+    armWindow(S.interloper);
+    try std.testing.expectError(error.UserExists, store.addUser(std.testing.allocator, "alice", "second"));
+
+    // The interloper's credentials survive: a blind put() would have
+    // overwritten them.
+    const creds = (try store.lookup(std.testing.allocator, "alice")).?;
+    const rederived = try sasl.StoredCredentials.derive("first", creds.salt, 4096);
+    try std.testing.expectEqualSlices(u8, &creds.stored_key, &rederived.stored_key);
+}
+
+test "claim window: real LMDB serializes the OIDC claim against a registration" {
+    const Lmdb = lmdb_backend_mod.Backend;
+    const S = struct {
+        var auth: *Lmdb = undefined;
+        fn interloper() void {
+            var users = UserStore(Lmdb).init(auth);
+            users.addUser(std.heap.c_allocator, "alice", "pw") catch {};
+        }
+    };
+    defer oidc_ids.claim_window_hook = null;
+
+    const path = "/home/admin/tmp/xmppd-test-oidcwin-lmdb1";
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+    try std.fs.cwd().makePath(path);
+    var auth = try Lmdb.open(path, .{ .create = false, .map_size = 16 * 1024 * 1024 });
+    defer auth.close();
+    S.auth = &auth;
+
+    var r = oidc_ids.Resolver(Lmdb, Lmdb){
+        .store = oidc_ids.Store(Lmdb).init(&auth),
+        .user_domain = "morante.dev",
+    };
+    armWindow(S.interloper);
+    var lp: [oidc_ids.max_localpart_len]u8 = undefined;
+    var len: usize = 0;
+    const out = try r.resolve(std.heap.c_allocator, "https://idp.example", "sub-1", "alice", &lp, &len);
+    try std.testing.expectEqual(out, oidc_ids.Resolution{ .refused = .local_account });
+
+    const stray = try r.store.lookupSubject(std.heap.c_allocator, "https://idp.example", "sub-1");
+    defer if (stray) |v| std.heap.c_allocator.free(v);
+    try std.testing.expect(stray == null);
+}
+
+test "claim window: real LMDB serializes a registration against the OIDC claim" {
+    const Lmdb = lmdb_backend_mod.Backend;
+    const S = struct {
+        var auth: *Lmdb = undefined;
+        fn interloper() void {
+            var r = oidc_ids.Resolver(Lmdb, Lmdb){
+                .store = oidc_ids.Store(Lmdb).init(auth),
+                .user_domain = "morante.dev",
+            };
+            var lp: [oidc_ids.max_localpart_len]u8 = undefined;
+            var len: usize = 0;
+            _ = r.resolve(std.heap.c_allocator, "https://idp.example", "sub-1", "alice", &lp, &len) catch unreachable;
+        }
+    };
+    defer oidc_ids.claim_window_hook = null;
+
+    const path = "/home/admin/tmp/xmppd-test-oidcwin-lmdb2";
+    std.fs.cwd().deleteTree(path) catch {};
+    defer std.fs.cwd().deleteTree(path) catch {};
+    try std.fs.cwd().makePath(path);
+    var auth = try Lmdb.open(path, .{ .create = false, .map_size = 16 * 1024 * 1024 });
+    defer auth.close();
+    S.auth = &auth;
+
+    var store = UserStore(Lmdb).init(&auth);
+    armWindow(S.interloper);
+    try std.testing.expectError(error.OidcBound, store.addUser(std.heap.c_allocator, "alice", "pw"));
+
+    const bound = try store.backend.get(std.heap.c_allocator, oidc_ids.NAMESPACE, "lalice");
+    defer if (bound) |v| std.heap.c_allocator.free(v);
+    try std.testing.expect(bound != null);
+    try std.testing.expect((try store.lookup(std.heap.c_allocator, "alice")) == null);
 }

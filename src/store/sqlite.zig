@@ -29,6 +29,11 @@ pub const SqliteBackend = struct {
     /// created at open(); the lock covers only test/unknown names.
     table_lock: std.Thread.Mutex = .{},
 
+    /// WriteBatch runs inside BEGIN IMMEDIATE, so a claim's get +
+    /// putIfAbsent is serialized against every other process holding the
+    /// same database file.
+    pub const cross_process_claims = true;
+
     comptime {
         backend.assertBackend(SqliteBackend);
     }
@@ -105,11 +110,11 @@ pub const SqliteBackend = struct {
         return result;
     }
 
-    pub fn put(self: *SqliteBackend, ns: []const u8, key: []const u8, value: []const u8) !void {
+    fn insert(self: *SqliteBackend, ns: []const u8, key: []const u8, value: []const u8, verb: []const u8) !void {
         try self.ensureTable(ns);
 
         var sql_buf: [256]u8 = undefined;
-        const sql = std.fmt.bufPrint(&sql_buf, "INSERT OR REPLACE INTO \"{s}\" (key, value) VALUES (?, ?)", .{ns}) catch
+        const sql = std.fmt.bufPrint(&sql_buf, "{s} INTO \"{s}\" (key, value) VALUES (?, ?)", .{ verb, ns }) catch
             return error.NameTooLong;
         var sql_z: [256]u8 = undefined;
         @memcpy(sql_z[0..sql.len], sql);
@@ -126,7 +131,22 @@ pub const SqliteBackend = struct {
         if (rc != c.SQLITE_OK) return error.SqliteBindFailed;
 
         rc = c.sqlite3_step(stmt.?);
-        if (rc != c.SQLITE_DONE) return error.SqliteStepFailed;
+        if (rc != c.SQLITE_DONE) {
+            if (@as(u8, @truncate(@as(u32, @intCast(rc)))) == c.SQLITE_CONSTRAINT) return error.Conflict;
+            return error.SqliteStepFailed;
+        }
+    }
+
+    pub fn put(self: *SqliteBackend, ns: []const u8, key: []const u8, value: []const u8) !void {
+        try self.insert(ns, key, value, "INSERT OR REPLACE");
+    }
+
+    /// Conditional insert: plain INSERT, so a duplicate primary key reports
+    /// error.Conflict at insert time. Called from WriteBatch.putIfAbsent,
+    /// which runs inside the batch's IMMEDIATE transaction: the write lock
+    /// is already held, so the check is atomic across processes.
+    pub fn putIfAbsent(self: *SqliteBackend, ns: []const u8, key: []const u8, value: []const u8) !void {
+        try self.insert(ns, key, value, "INSERT");
     }
 
     pub fn delete(self: *SqliteBackend, ns: []const u8, key: []const u8) !void {
@@ -270,6 +290,17 @@ pub const SqliteBackend = struct {
 
         pub fn put(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
             try self.backend.put(ns, key, value);
+        }
+
+        /// SELECT inside the batch's IMMEDIATE transaction: committed
+        /// state plus this txn's earlier writes, serialized with other
+        /// writers by the database write lock.
+        pub fn get(self: *WriteBatch, allocator: std.mem.Allocator, ns: []const u8, key: []const u8) !?[]u8 {
+            return self.backend.get(allocator, ns, key);
+        }
+
+        pub fn putIfAbsent(self: *WriteBatch, ns: []const u8, key: []const u8, value: []const u8) !void {
+            try self.backend.putIfAbsent(ns, key, value);
         }
 
         pub fn delete(self: *WriteBatch, ns: []const u8, key: []const u8) !void {
@@ -702,6 +733,29 @@ test "SqliteBackend: a failed COMMIT that leaves the txn open is rolled back" {
     const bob = try db.get(std.testing.allocator, users, "bob");
     defer if (bob) |v| std.testing.allocator.free(v);
     try std.testing.expectEqualStrings("b", bob.?);
+}
+
+test "SqliteBackend: putIfAbsent conflicts on committed and same-batch keys" {
+    const path = "/tmp/xmppd-test-sqlite-putifabsent.db";
+    cleanDb(path);
+    defer cleanDb(path);
+
+    var db = try SqliteBackend.open(path, .{});
+    defer db.close();
+
+    var b1 = try db.writeBatch();
+    try b1.putIfAbsent("users", "alice", "v1");
+    // The plain INSERT inside the open txn sees its own earlier insert.
+    try std.testing.expectError(error.Conflict, b1.putIfAbsent("users", "alice", "v2"));
+    try b1.commit();
+
+    var b2 = try db.writeBatch();
+    defer b2.abort();
+    try std.testing.expectError(error.Conflict, b2.putIfAbsent("users", "alice", "v3"));
+    // A constraint error inside the txn does not lose the row.
+    const got = try db.get(std.testing.allocator, "users", "alice");
+    defer std.testing.allocator.free(got.?);
+    try std.testing.expectEqualStrings("v1", got.?);
 }
 
 test "SqliteBackend: reopen preserves data" {

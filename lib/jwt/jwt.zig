@@ -44,6 +44,9 @@ pub const JwtClaims = struct {
     aud: []const u8,
     exp: i64,
     preferred_username: []const u8,
+    /// Display data only: email is never an identity claim (OIDC Core 5.7).
+    email: []const u8 = "",
+    email_verified: bool = false,
     picture: []const u8,
 };
 
@@ -52,6 +55,9 @@ pub const JwtClaims = struct {
 pub const DecodeBuffer = struct {
     header: [512]u8 = undefined,
     payload: [4096]u8 = undefined,
+    /// Claim-parse arena: unescaped strings borrow the payload bytes, so
+    /// this only carries escaped values and container nodes.
+    claims_scratch: [8192]u8 = undefined,
 };
 
 /// A parsed (but not yet verified) JWT.
@@ -105,7 +111,7 @@ pub fn parse(token: []const u8, buf: *DecodeBuffer) JwtError!Jwt {
     ) orelse return JwtError.InvalidBase64;
     const payload_json = buf.payload[0..payload_len];
 
-    const claims = parseClaims(payload_json) orelse return JwtError.InvalidJson;
+    const claims = parseClaims(payload_json, &buf.claims_scratch) orelse return JwtError.InvalidJson;
 
     return Jwt{
         .header_b64 = header_b64,
@@ -268,15 +274,40 @@ fn parseHeader(json: []const u8) ?JwtHeader {
     };
 }
 
-fn parseClaims(json: []const u8) ?JwtClaims {
+/// Wire view of the claim set. Parsed with std.json so only top-level
+/// keys bind identity, string escapes decode, and a repeated claim is a
+/// parse error instead of first-match-wins. aud stays untyped: OIDC
+/// allows a string or an array, and a non-string aud carries no audience
+/// here (same as before).
+const ClaimsJson = struct {
+    sub: ?[]const u8 = null,
+    iss: ?[]const u8 = null,
+    aud: ?std.json.Value = null,
+    exp: ?i64 = null,
+    preferred_username: ?[]const u8 = null,
+    email: ?[]const u8 = null,
+    email_verified: ?bool = null,
+    picture: ?[]const u8 = null,
+};
+
+fn parseClaims(json: []const u8, scratch: []u8) ?JwtClaims {
+    var fba = std.heap.FixedBufferAllocator.init(scratch);
+    const wire = std.json.parseFromSliceLeaky(ClaimsJson, fba.allocator(), json, .{
+        .ignore_unknown_fields = true,
+        .duplicate_field_behavior = .@"error",
+    }) catch return null;
     return JwtClaims{
-        .sub = extractStringField(json, "\"sub\"") orelse "",
-        .iss = extractStringField(json, "\"iss\"") orelse "",
-        .aud = extractStringField(json, "\"aud\"") orelse "",
-        .exp = extractIntField(json, "\"exp\"") orelse 0,
-        .preferred_username = extractStringField(json, "\"preferred_username\"") orelse
-            extractStringField(json, "\"email\"") orelse "",
-        .picture = extractStringField(json, "\"picture\"") orelse "",
+        .sub = wire.sub orelse "",
+        .iss = wire.iss orelse "",
+        .aud = if (wire.aud) |v| switch (v) {
+            .string => |s| s,
+            else => "",
+        } else "",
+        .exp = wire.exp orelse 0,
+        .preferred_username = wire.preferred_username orelse "",
+        .email = wire.email orelse "",
+        .email_verified = wire.email_verified orelse false,
+        .picture = wire.picture orelse "",
     };
 }
 
@@ -301,26 +332,6 @@ fn extractStringField(json: []const u8, key: []const u8) ?[]const u8 {
 
     if (i >= after_key.len) return null;
     return after_key[value_start..i];
-}
-
-/// Extract an integer value from a JSON object by key.
-fn extractIntField(json: []const u8, key: []const u8) ?i64 {
-    const key_pos = std.mem.indexOf(u8, json, key) orelse return null;
-    const after_key = json[key_pos + key.len ..];
-
-    // Skip ':' and whitespace
-    var i: usize = 0;
-    while (i < after_key.len and
-        (after_key[i] == ':' or after_key[i] == ' ' or after_key[i] == '\t')) : (i += 1)
-    {}
-
-    if (i >= after_key.len) return null;
-
-    const num_start = i;
-    while (i < after_key.len and (after_key[i] >= '0' and after_key[i] <= '9')) : (i += 1) {}
-
-    if (i == num_start) return null;
-    return std.fmt.parseInt(i64, after_key[num_start..i], 10) catch null;
 }
 
 // ============================================================================
@@ -424,6 +435,39 @@ test "parse: claims stay valid after the call returns" {
     try std.testing.expectEqualStrings("alice", jwt.claims.preferred_username);
 }
 
+test "parse: email is never merged into preferred_username" {
+    const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0";
+    // {"sub":"s1","iss":"https://idp.example","exp":9999999999,"email":"victim@example.com","email_verified":true}
+    const payload = "eyJzdWIiOiJzMSIsImlzcyI6Imh0dHBzOi8vaWRwLmV4YW1wbGUiLCJleHAiOjk5OTk5OTk5OTksImVtYWlsIjoidmljdGltQGV4YW1wbGUuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWV9";
+    const sig = "dGVzdA";
+
+    var token_buf: [1024]u8 = undefined;
+    const token = std.fmt.bufPrint(&token_buf, "{s}.{s}.{s}", .{ header, payload, sig }) catch unreachable;
+
+    var decode: DecodeBuffer = undefined;
+    const parsed = try parse(token, &decode);
+
+    try std.testing.expectEqualStrings("", parsed.claims.preferred_username);
+    try std.testing.expectEqualStrings("victim@example.com", parsed.claims.email);
+    try std.testing.expect(parsed.claims.email_verified);
+}
+
+test "parse: email_verified absent and false stay false" {
+    const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5In0";
+    // {"sub":"s2","iss":"https://idp.example","exp":9999999999,"email":"mallory@example.com","email_verified":false}
+    const payload = "eyJzdWIiOiJzMiIsImlzcyI6Imh0dHBzOi8vaWRwLmV4YW1wbGUiLCJleHAiOjk5OTk5OTk5OTksImVtYWlsIjoibWFsbG9yeUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjpmYWxzZX0";
+    const sig = "dGVzdA";
+
+    var token_buf: [1024]u8 = undefined;
+    const token = std.fmt.bufPrint(&token_buf, "{s}.{s}.{s}", .{ header, payload, sig }) catch unreachable;
+
+    var decode: DecodeBuffer = undefined;
+    const parsed = try parse(token, &decode);
+
+    try std.testing.expectEqualStrings("mallory@example.com", parsed.claims.email);
+    try std.testing.expect(!parsed.claims.email_verified);
+}
+
 test "parse: invalid format" {
     var decode: DecodeBuffer = undefined;
     try std.testing.expectError(JwtError.InvalidFormat, parse("no-dots", &decode));
@@ -491,11 +535,49 @@ test "extractStringField: basic" {
     try std.testing.expect(extractStringField(json, "\"nonexistent\"") == null);
 }
 
-test "extractIntField: basic" {
-    const json = "{\"exp\":1234567890,\"iat\":1234567800}";
-    try std.testing.expectEqual(@as(i64, 1234567890), extractIntField(json, "\"exp\"").?);
-    try std.testing.expectEqual(@as(i64, 1234567800), extractIntField(json, "\"iat\"").?);
-    try std.testing.expect(extractIntField(json, "\"nonexistent\"") == null);
+test "parseClaims: a nested act.sub does not shadow the top-level sub" {
+    // RFC 8693 delegation nests act.sub; identity is the top-level claim
+    // only, so the inner sub must never be extracted.
+    var scratch: [8192]u8 = undefined;
+    const claims = parseClaims(
+        "{\"act\":{\"sub\":\"mallory\"},\"sub\":\"alice\",\"iss\":\"https://idp.example\"}",
+        &scratch,
+    ).?;
+    try std.testing.expectEqualStrings("alice", claims.sub);
+}
+
+test "parseClaims: string escapes are decoded" {
+    var scratch: [8192]u8 = undefined;
+    const claims = parseClaims(
+        "{\"sub\":\"ali\\\"ce\",\"iss\":\"https://idp.example\"}",
+        &scratch,
+    ).?;
+    try std.testing.expectEqualStrings("ali\"ce", claims.sub);
+}
+
+test "parseClaims: a duplicate identity claim rejects the payload" {
+    var scratch: [8192]u8 = undefined;
+    try std.testing.expect(parseClaims(
+        "{\"sub\":\"a\",\"sub\":\"b\",\"iss\":\"https://idp.example\"}",
+        &scratch,
+    ) == null);
+    try std.testing.expect(parseClaims(
+        "{\"sub\":\"s\",\"iss\":\"https://one.example\",\"iss\":\"https://two.example\"}",
+        &scratch,
+    ) == null);
+}
+
+test "parseClaims: email_verified must be a JSON boolean" {
+    var scratch: [8192]u8 = undefined;
+    try std.testing.expect(parseClaims(
+        "{\"sub\":\"s\",\"email_verified\":\"true\"}",
+        &scratch,
+    ) == null);
+    const claims = parseClaims(
+        "{\"sub\":\"s\",\"email_verified\":true}",
+        &scratch,
+    ).?;
+    try std.testing.expect(claims.email_verified);
 }
 
 // Real RSA keys (public modulus only) and tokens they signed, generated

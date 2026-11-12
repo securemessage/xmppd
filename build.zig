@@ -757,6 +757,15 @@ pub fn build(b: *std.Build) void {
     });
     server_invite_store_mod.addImport("backend", server_backend_mod);
     server_test_mod.addImport("invite_store", server_invite_store_mod);
+    const server_oidc_identity_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/oidc_identity_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_oidc_identity_mod.addImport("backend", server_backend_mod);
+    server_oidc_identity_mod.addImport("precis_username", precis_username_mod);
+    server_test_mod.addImport("oidc_identity_store", server_oidc_identity_mod);
+    server_user_store_mod.addImport("oidc_identity_store", server_oidc_identity_mod);
     server_test_mod.addImport("build_options", build_options_mod);
     server_test_mod.linkSystemLibrary("ssl", .{});
     server_test_mod.linkSystemLibrary("crypto", .{});
@@ -1156,6 +1165,27 @@ pub fn build(b: *std.Build) void {
 
     const run_lmdb_backend_tests = b.addRunArtifact(lmdb_backend_tests);
 
+    // --- OIDC identity store tests ---
+
+    const oidc_identity_store_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/oidc_identity_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    oidc_identity_store_test_mod.addImport("backend", backend_test_mod);
+    oidc_identity_store_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
+    oidc_identity_store_test_mod.addImport("precis_username", precis_username_mod);
+    generic_user_store_test_mod.addImport("oidc_identity_store", oidc_identity_store_test_mod);
+    generic_user_store_test_mod.addImport("lmdb_backend", lmdb_backend_test_mod);
+    auth_handler_test_mod.addImport("oidc_identity_store", oidc_identity_store_test_mod);
+
+    const oidc_identity_store_tests = b.addTest(.{
+        .name = "oidc-identity-store-tests",
+        .root_module = oidc_identity_store_test_mod,
+    });
+
+    const run_oidc_identity_store_tests = b.addRunArtifact(oidc_identity_store_tests);
+
     // --- Archive store tests ---
 
     const archive_store_test_mod = b.createModule(.{
@@ -1538,6 +1568,7 @@ pub fn build(b: *std.Build) void {
     oidc_store_test_mod.addImport("http", http_test_mod);
     oidc_store_test_mod.addImport("jwt", jwt_test_mod);
     oidc_store_test_mod.addImport("ssl", ssl_mod);
+    oidc_store_test_mod.addImport("oidc_identity_store", oidc_identity_store_test_mod);
     oidc_store_test_mod.linkSystemLibrary("ssl", .{});
     oidc_store_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -1653,6 +1684,10 @@ pub fn build(b: *std.Build) void {
     });
 
     const auth_op_backend_mod = createBackendMod(b, op_storage, target, optimize, auth_backend_mod, lmdb_dep);
+    const auth_archive_backend_mod = if (std.mem.eql(u8, archive_storage, op_storage))
+        auth_op_backend_mod
+    else
+        createBackendMod(b, archive_storage, target, optimize, auth_backend_mod, lmdb_dep);
 
     const auth_user_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/user_store.zig"),
@@ -1777,6 +1812,23 @@ pub fn build(b: *std.Build) void {
     oidc_store_mod.addImport("http", http_mod);
     oidc_store_mod.addImport("jwt", jwt_mod);
     oidc_store_mod.addImport("ssl", ssl_mod);
+    // The identity store's production wiring: the auth backend module and
+    // an lmdb.zig module for its test block (reusing the op module when it
+    // is already lmdb avoids a duplicate-module clash).
+    const oidc_ids_lmdb_mod = if (std.mem.eql(u8, op_storage, "lmdb"))
+        auth_op_backend_mod
+    else
+        createBackendMod(b, "lmdb", target, optimize, auth_backend_mod, lmdb_dep);
+    const oidc_ids_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/oidc_identity_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    oidc_ids_mod.addImport("backend", auth_backend_mod);
+    oidc_ids_mod.addImport("lmdb_backend", oidc_ids_lmdb_mod);
+    oidc_ids_mod.addImport("precis_username", precis_username_mod);
+    auth_user_store_mod.addImport("oidc_identity_store", oidc_ids_mod);
+    oidc_store_mod.addImport("oidc_identity_store", oidc_ids_mod);
     oidc_store_mod.linkSystemLibrary("ssl", .{});
     oidc_store_mod.linkSystemLibrary("crypto", .{});
 
@@ -1825,6 +1877,9 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("config", config_mod);
     oidc_main_mod.addImport("lock_store", auth_lock_store_mod);
     oidc_main_mod.addImport("op_backend", auth_op_backend_mod);
+    oidc_main_mod.addImport("archive_backend", auth_archive_backend_mod);
+    oidc_main_mod.addImport("backend", auth_backend_mod);
+    oidc_main_mod.addImport("oidc_identity_store", oidc_ids_mod);
     oidc_main_mod.addImport("xmppd_log", xmppd_log_mod);
     oidc_main_mod.linkSystemLibrary("ssl", .{});
     oidc_main_mod.linkSystemLibrary("crypto", .{});
@@ -1909,6 +1964,19 @@ pub fn build(b: *std.Build) void {
         ctl_op_backend_mod
     else
         createBackendMod(b, archive_storage, target, optimize, ctl_backend_mod, lmdb_dep);
+
+    const ctl_ids_lmdb_mod = if (std.mem.eql(u8, op_storage, "lmdb"))
+        ctl_op_backend_mod
+    else
+        createBackendMod(b, "lmdb", target, optimize, ctl_backend_mod, lmdb_dep);
+    const ctl_ids_mod = b.createModule(.{
+        .root_source_file = b.path("src/store/oidc_identity_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ctl_ids_mod.addImport("backend", ctl_backend_mod);
+    ctl_ids_mod.addImport("lmdb_backend", ctl_ids_lmdb_mod);
+    ctl_ids_mod.addImport("precis_username", precis_username_mod);
     const ctl_migrate_precis_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/migrate_precis.zig"),
         .target = target,
@@ -1935,6 +2003,7 @@ pub fn build(b: *std.Build) void {
     ctl_user_store_mod.addImport("sasl", sasl_mod);
     ctl_user_store_mod.addImport("backend", ctl_backend_mod);
     ctl_user_store_mod.addImport("precis_username", precis_username_mod);
+    ctl_user_store_mod.addImport("oidc_identity_store", ctl_ids_mod);
 
     const ctl_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/main.zig"),
@@ -1962,10 +2031,11 @@ pub fn build(b: *std.Build) void {
     ctl_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_mod.addImport("op_backend", ctl_op_backend_mod);
     ctl_mod.addImport("archive_backend", ctl_archive_backend_mod);
+    ctl_mod.addImport("backend", ctl_backend_mod);
+    ctl_mod.addImport("oidc_identity_store", ctl_ids_mod);
     ctl_mod.addImport("migrate_precis", ctl_migrate_precis_mod);
     ctl_mod.addImport("migrate_archive", ctl_migrate_archive_mod);
     ctl_mod.addImport("precis_username", precis_username_mod);
-    ctl_mod.addImport("backend", ctl_backend_mod);
     ctl_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     ctl_mod.addImport("xmppd_log", xmppd_log_mod);
 
@@ -1987,10 +2057,11 @@ pub fn build(b: *std.Build) void {
     ctl_test_mod.addImport("invite_store", ctl_invite_store_mod);
     ctl_test_mod.addImport("op_backend", ctl_op_backend_mod);
     ctl_test_mod.addImport("archive_backend", ctl_archive_backend_mod);
+    ctl_test_mod.addImport("backend", ctl_backend_mod);
+    ctl_test_mod.addImport("oidc_identity_store", ctl_ids_mod);
     ctl_test_mod.addImport("migrate_precis", ctl_migrate_precis_mod);
     ctl_test_mod.addImport("migrate_archive", ctl_migrate_archive_mod);
     ctl_test_mod.addImport("precis_username", precis_username_mod);
-    ctl_test_mod.addImport("backend", ctl_backend_mod);
     ctl_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     ctl_test_mod.addImport("xmppd_log", xmppd_log_mod);
 
@@ -2187,6 +2258,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_s2s_main_tests.step);
     test_step.dependOn(&run_backend_tests.step);
     test_step.dependOn(&run_lmdb_backend_tests.step);
+    test_step.dependOn(&run_oidc_identity_store_tests.step);
     test_step.dependOn(&run_rocksdb_backend_tests.step);
     test_step.dependOn(&run_sqlite_backend_tests.step);
     test_step.dependOn(&run_generic_user_store_tests.step);

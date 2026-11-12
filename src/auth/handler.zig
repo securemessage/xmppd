@@ -948,10 +948,12 @@ pub fn AuthHandler(comptime Store: type) type {
             // Create the user (canonical name: conflicts are canonical-name
             // conflicts).
             self.store.addUser(self.allocator, canon_username, req.password) catch |err| {
-                const reason: []const u8 = switch (err) {
-                    error.UserExists => "conflict",
-                    else => "internal-server-error",
-                };
+                // A bound localpart is taken by the OIDC subject; the
+                // client-visible failure is the same as a taken name.
+                const reason: []const u8 = if (err == error.UserExists or err == error.OidcBound)
+                    "conflict"
+                else
+                    "internal-server-error";
                 log.info("registration failed for '{s}': {s}", .{ canon_username, reason });
                 return protocol.Message{ .register_result = regResult{
                     .conn_id = req.conn_id,
@@ -1047,6 +1049,7 @@ fn hashUsername(username: []const u8) u64 {
 // ============================================================================
 
 const backend_mod = @import("backend");
+const oidc_ids = @import("oidc_identity_store");
 const user_store_mod = @import("user_store");
 const MemoryBackend = backend_mod.MemoryBackend;
 const TestUserStore = user_store_mod.UserStore(MemoryBackend);
@@ -3236,6 +3239,43 @@ test "AuthHandler: registration conflict is on the canonical name" {
     if (kdup != .register_result) return error.UnexpectedReply;
     try std.testing.expect(!kdup.register_result.success);
     try std.testing.expectEqualStrings("conflict", kdup.register_result.reason);
+}
+
+test "AuthHandler: registration of an OIDC-bound localpart is refused" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    // A reverse-index row ('l' ++ localpart) binds the name to a subject.
+    try db.put(oidc_ids.NAMESPACE, "lbound-lp", "row");
+
+    var store = TestUserStore.init(&db);
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 2,
+    });
+    defer limiter.deinit();
+    var handler = TestHandler.init(allocator, &store);
+    handler.setRateLimiter(&limiter);
+    handler.reg_config = .{ .enabled = true, .require_invite = false };
+    defer handler.deinit();
+
+    const reply = handleSync(&handler, .{ .register_request = .{
+        .conn_id = 320,
+        .username = "bound-lp",
+        .password = "pw",
+        .invite_code = "",
+        .client_ip = "10.0.0.30",
+    } }) orelse return error.NoResponse;
+    if (reply != .register_result) return error.UnexpectedReply;
+    try std.testing.expect(!reply.register_result.success);
+    try std.testing.expectEqualStrings("conflict", reply.register_result.reason);
+    // No account credential was created under the bound name.
+    try std.testing.expect((try store.lookup(allocator, "bound-lp")) == null);
 }
 
 test "AuthHandler: password change resolves the RFC 7622 account name" {
