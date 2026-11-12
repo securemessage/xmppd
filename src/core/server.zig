@@ -79,6 +79,8 @@ pub const sub_cache_mod = @import("subscription_cache.zig");
 pub const caps_mod = @import("caps.zig");
 const router = @import("router.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
+const stanza_writer = @import("stanza/writer.zig");
+const stanza_facts = @import("stanza/facts.zig");
 const room_registry_mod = @import("room_registry");
 const room_mailbox_mod = @import("room_mailbox");
 const RoomRegistry = room_registry_mod.RoomRegistry;
@@ -2815,7 +2817,7 @@ pub const Server = struct {
         // Decode base64 from XML into raw SASL payload
         const b64_data = session.sasl_buf[0..session.sasl_buf_len];
         var decoded_buf: [3072]u8 = undefined;
-        const decoded = b64Decode(b64_data, &decoded_buf) orelse {
+        const decoded = stanza_writer.b64Decode(b64_data, &decoded_buf) orelse {
             log.warn("connection {d} invalid base64 in SASL auth", .{session.conn.id});
             const fail_action = session.stream.saslFailure("not-authorized");
             self.executeAction(session, fail_action, changes);
@@ -2871,7 +2873,7 @@ pub const Server = struct {
         // Decode base64
         const b64_data = session.sasl_buf[0..session.sasl_buf_len];
         var decoded_buf: [3072]u8 = undefined;
-        const decoded = b64Decode(b64_data, &decoded_buf) orelse {
+        const decoded = stanza_writer.b64Decode(b64_data, &decoded_buf) orelse {
             log.warn("connection {d} invalid base64 in SASL response", .{session.conn.id});
             const fail_action = session.stream.saslFailure("not-authorized");
             self.executeAction(session, fail_action, changes);
@@ -3084,7 +3086,7 @@ pub const Server = struct {
                 const w = fbs.writer();
                 const challenge_xml = stanza: {
                     w.writeAll("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch break :stanza null;
-                    b64EncodeWrite(w, m.challenge) catch break :stanza null;
+                    stanza_writer.b64EncodeWrite(w, m.challenge) catch break :stanza null;
                     w.writeAll("</challenge>") catch break :stanza null;
                     break :stanza fbs.getWritten();
                 } orelse {
@@ -3405,7 +3407,7 @@ pub const Server = struct {
         var lease = self.leaseByteScratch() orelse return false;
         defer lease.release();
         var fbs = std.io.fixedBufferStream(lease.buf);
-        writeS2sError(fbs.writer(), tag_name, local_to, remote_from, stanza_id) catch {
+        stanza_writer.writeS2sError(fbs.writer(), tag_name, local_to, remote_from, stanza_id) catch {
             log.warn("S2S bounce for {s} dropped: serialization failed", .{remote_from});
             return false;
         };
@@ -3459,7 +3461,7 @@ pub const Server = struct {
 
         var buf: [1024]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
-        writeCrossWorkerError(fbs.writer(), tag_name, recipient_bare, sender_full, stanza_id) catch {
+        stanza_writer.writeCrossWorkerError(fbs.writer(), tag_name, recipient_bare, sender_full, stanza_id) catch {
             log.warn("cross-worker bounce for {s} dropped: serialization failed", .{sender_full});
             return;
         };
@@ -3550,7 +3552,7 @@ pub const Server = struct {
                 const s2s_archive_ts: u64 = @intCast(std.time.timestamp());
 
                 if (target_count == 0) {
-                    const parts = extractStanzaParts(m.stanza_xml);
+                    const parts = stanza_facts.extractStanzaParts(m.stanza_xml);
                     if (parts.is_message and std.mem.eql(u8, parts.msg_type, "groupchat")) {
                         log.warn("S2S groupchat to {s}: recipient unavailable, bouncing", .{m.to_jid});
                         self.bounceS2sInbound(m.from_jid, m.to_jid, "message", parts.msg_id);
@@ -3604,7 +3606,7 @@ pub const Server = struct {
                     return;
                 }
 
-                const live_parts = extractStanzaParts(m.stanza_xml);
+                const live_parts = stanza_facts.extractStanzaParts(m.stanza_xml);
                 // Archive S2S inbound messages delivered to online recipients (T81)
                 if (self.archive != null) {
                     if (live_parts.is_message and std.mem.indexOf(u8, live_parts.inner_xml, "<body") != null) archive_msg: {
@@ -3743,7 +3745,7 @@ pub const Server = struct {
         _ = self;
         if (session.stanza_overflow) return;
         var fbs = std.io.fixedBufferStream(session.stanza_buf[session.stanza_buf_len..]);
-        writeStanzaOpenTag(fbs.writer(), elem) catch {
+        stanza_writer.writeStanzaOpenTag(fbs.writer(), elem) catch {
             session.stanza_overflow = true;
             return;
         };
@@ -3755,7 +3757,7 @@ pub const Server = struct {
         _ = self;
         if (session.stanza_overflow) return;
         var fbs = std.io.fixedBufferStream(session.stanza_buf[session.stanza_buf_len..]);
-        xmlEscapeWrite(fbs.writer(), text) catch {
+        stanza_writer.xmlEscapeWrite(fbs.writer(), text) catch {
             session.stanza_overflow = true;
             return;
         };
@@ -3767,7 +3769,7 @@ pub const Server = struct {
         _ = self;
         if (session.stanza_overflow) return;
         var fbs = std.io.fixedBufferStream(session.stanza_buf[session.stanza_buf_len..]);
-        writeStanzaCloseTag(fbs.writer(), name) catch {
+        stanza_writer.writeStanzaCloseTag(fbs.writer(), name) catch {
             session.stanza_overflow = true;
             return;
         };
@@ -3805,7 +3807,7 @@ pub const Server = struct {
             try w.writeByte(' ');
             try w.writeAll(attr.name);
             try w.writeAll("='");
-            try xmlEscapeWrite(w, attr.value);
+            try stanza_writer.xmlEscapeWrite(w, attr.value);
             try w.writeByte('\'');
         }
 
@@ -3837,7 +3839,7 @@ pub const Server = struct {
         }
         if (session.vcard_overflow) return;
         var fbs = std.io.fixedBufferStream(session.vcard_buf[session.vcard_buf_len..]);
-        xmlEscapeWrite(fbs.writer(), text) catch {
+        stanza_writer.xmlEscapeWrite(fbs.writer(), text) catch {
             session.vcard_overflow = true;
             return;
         };
@@ -4255,7 +4257,7 @@ pub const Server = struct {
                 if (!c.session_map.getGenerationById(c.server.worker_id, local_session_id, generation)) return;
 
                 const target_session = c.server.sessions[local_session_id] orelse return;
-                const parts = extractStanzaParts(payload);
+                const parts = stanza_facts.extractStanzaParts(payload);
                 // XEP-0280 sections 2 and 7: a carbon copy reaches only a
                 // Carbons-enabled resource, live or not at all. The producer
                 // tags the slot so the same per-session policy the local
@@ -4278,7 +4280,7 @@ pub const Server = struct {
                         c.queue.current_slot_receipt_ts
                     else
                         @intCast(std.time.timestamp());
-                    const from_jid = extractAttrValue(payload, "from");
+                    const from_jid = stanza_facts.extractAttrValue(payload, "from");
                     const bound = target_session.stream.bound_jid orelse {
                         log.warn("cross-worker message to session {d} has no bound recipient for its offline hold", .{local_session_id});
                         return;
@@ -5573,249 +5575,6 @@ pub const Server = struct {
         }
     }
 };
-
-// ============================================================================
-// Base64 helpers for SASL XML payloads
-// ============================================================================
-
-/// Re-encode text for XML output. The XML parser decodes entities (&amp; → &),
-/// so when serializing parsed content back to XML we must re-encode them.
-fn xmlEscapeWrite(writer: anytype, text: []const u8) !void {
-    return xml.escapeWrite(writer, text);
-}
-
-/// Write a child element opening tag, re-emitting namespace declarations the
-/// reader resolved away. Fills the writer until it is out of space, returning
-/// the fixed-buffer error so the caller can mark the stanza bad.
-fn writeStanzaOpenTag(w: anytype, elem: xml.Element) !void {
-    try w.writeByte('<');
-    try w.writeAll(elem.name);
-
-    // Reconstruct namespace declaration if element uses a non-default namespace.
-    // The reader resolves xmlns declarations into namespace_uri but doesn't
-    // include them in the attributes array, so we must re-emit them.
-    if (elem.namespace_uri.len > 0 and !std.mem.eql(u8, elem.namespace_uri, xml.ns.client)) {
-        if (elem.prefix.len > 0) {
-            try w.writeAll(" xmlns:");
-            try w.writeAll(elem.prefix);
-            try w.writeAll("='");
-            try xml.escapeWrite(w, elem.namespace_uri);
-            try w.writeByte('\'');
-        } else {
-            try w.writeAll(" xmlns='");
-            try xml.escapeWrite(w, elem.namespace_uri);
-            try w.writeByte('\'');
-        }
-    }
-
-    for (elem.attributes) |attr| {
-        try w.writeByte(' ');
-        try w.writeAll(attr.name);
-        try w.writeAll("='");
-        try xmlEscapeWrite(w, attr.value);
-        try w.writeByte('\'');
-    }
-
-    if (elem.self_closing) {
-        try w.writeAll("/>");
-    } else {
-        try w.writeByte('>');
-    }
-}
-
-fn writeStanzaCloseTag(w: anytype, name: []const u8) !void {
-    try w.writeAll("</");
-    try w.writeAll(name);
-    try w.writeByte('>');
-}
-
-/// Decode base64 into a fixed buffer. Returns the decoded slice or null on error.
-fn b64Decode(input: []const u8, output: []u8) ?[]const u8 {
-    if (input.len == 0) return output[0..0];
-    const decoder = std.base64.standard.Decoder;
-    const upper_bound = decoder.calcSizeUpperBound(input.len) catch return null;
-    if (upper_bound > output.len) return null;
-    decoder.decode(output[0..upper_bound], input) catch return null;
-    // calcSizeUpperBound doesn't account for '=' padding — subtract padding
-    // chars to get the actual decoded length.
-    var decoded_len = upper_bound;
-    if (input[input.len - 1] == '=') decoded_len -= 1;
-    if (input.len >= 2 and input[input.len - 2] == '=') decoded_len -= 1;
-    return output[0..decoded_len];
-}
-
-/// Base64-encode data and write directly to a writer.
-fn b64EncodeWrite(writer: anytype, data: []const u8) !void {
-    const encoder = std.base64.standard.Encoder;
-    var buf: [4096]u8 = undefined;
-    const enc_len = encoder.calcSize(data.len);
-    if (enc_len > buf.len) return error.BufferTooSmall;
-    const encoded = encoder.encode(buf[0..enc_len], data);
-    try writer.writeAll(encoded);
-}
-
-// ============================================================================
-// S2S stanza parsing helpers
-// ============================================================================
-
-const StanzaParts = struct {
-    is_message: bool,
-    is_iq: bool,
-    msg_type: []const u8,
-    msg_id: []const u8,
-    inner_xml: []const u8,
-};
-
-/// Extract the inner XML content, type attribute, and id attribute from a
-/// complete stanza XML string (e.g., "<message from='a' to='b' type='chat'
-/// id='1'><body>hello</body></message>"). Used for S2S offline storage to
-/// avoid double-wrapping.
-fn extractStanzaParts(stanza: []const u8) StanzaParts {
-    var result = StanzaParts{
-        .is_message = false,
-        .is_iq = false,
-        .msg_type = "",
-        .msg_id = "",
-        .inner_xml = "",
-    };
-
-    if (stanza.len < 3 or stanza[0] != '<') return result;
-
-    // Find end of tag name (first space or '>' or '/')
-    var i: usize = 1;
-    while (i < stanza.len and stanza[i] != ' ' and stanza[i] != '>' and stanza[i] != '/') : (i += 1) {}
-    const tag_name = stanza[1..i];
-    result.is_message = std.mem.eql(u8, tag_name, "message");
-    result.is_iq = std.mem.eql(u8, tag_name, "iq");
-
-    // Find end of opening tag — scan for first '>' that's not inside an attr value
-    var in_quote: bool = false;
-    var quote_char: u8 = 0;
-    var opening_end: usize = 0;
-    var self_closing = false;
-    var j: usize = i;
-    while (j < stanza.len) : (j += 1) {
-        if (in_quote) {
-            if (stanza[j] == quote_char) in_quote = false;
-        } else if (stanza[j] == '\'' or stanza[j] == '"') {
-            in_quote = true;
-            quote_char = stanza[j];
-        } else if (stanza[j] == '>') {
-            if (j > 0 and stanza[j - 1] == '/') self_closing = true;
-            opening_end = j;
-            break;
-        }
-    }
-
-    if (opening_end == 0) return result;
-
-    // Extract type and id attributes from the opening tag
-    const tag_portion = stanza[0 .. opening_end + 1];
-    result.msg_type = extractAttrValue(tag_portion, "type");
-    result.msg_id = extractAttrValue(tag_portion, "id");
-
-    if (self_closing) {
-        result.inner_xml = "";
-        return result;
-    }
-
-    // Inner XML is everything between '>' of opening tag and '</' of closing tag
-    const inner_start = opening_end + 1;
-
-    // Find closing tag: search backwards for "</"
-    var k: usize = stanza.len;
-    while (k > inner_start + 1) {
-        k -= 1;
-        if (stanza[k] == '/' and k > 0 and stanza[k - 1] == '<') {
-            result.inner_xml = stanza[inner_start .. k - 1];
-            return result;
-        }
-    }
-
-    // No closing tag found — return everything after the opening tag
-    result.inner_xml = stanza[inner_start..];
-    return result;
-}
-
-/// Serialize an S2S service-unavailable bounce. msg_id is the raw on-wire
-/// attribute value from extractAttrValue: it is decoded and then escaped once,
-/// so an entity in the id is not double-escaped and a quote cannot break the
-/// attribute (G7). from/to are plain JIDs and are escaped once. Serialization
-/// errors propagate so the caller can log them.
-fn writeS2sBounce(w: anytype, local_to: []const u8, remote_from: []const u8, msg_id: []const u8) !void {
-    return writeS2sError(w, "message", local_to, remote_from, msg_id);
-}
-
-/// Serialize a service-unavailable bounce for a stanza whose sender lives on
-/// the local server. Mirrors `writeS2sError`: the id is decoded and escaped
-/// once so an entity in the id is not double-escaped (G7).
-fn writeCrossWorkerError(w: anytype, tag_name: []const u8, recipient: []const u8, sender: []const u8, stanza_id: []const u8) !void {
-    try w.writeByte('<');
-    try w.writeAll(tag_name);
-    try w.writeAll(" type='error' from='");
-    try xml.escapeWrite(w, recipient);
-    try w.writeAll("' to='");
-    try xml.escapeWrite(w, sender);
-    try w.writeByte('\'');
-    if (stanza_id.len > 0) {
-        try w.writeAll(" id='");
-        var id_buf: [1024]u8 = undefined;
-        var id_fbs = std.io.fixedBufferStream(&id_buf);
-        try xml.decodeWrite(id_fbs.writer(), stanza_id);
-        try xml.escapeWrite(w, id_fbs.getWritten());
-        try w.writeByte('\'');
-    }
-    try w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></");
-    try w.writeAll(tag_name);
-    try w.writeByte('>');
-}
-
-fn writeS2sError(w: anytype, tag_name: []const u8, local_to: []const u8, remote_from: []const u8, stanza_id: []const u8) !void {
-    try w.writeByte('<');
-    try w.writeAll(tag_name);
-    try w.writeAll(" type='error' from='");
-    try xml.escapeWrite(w, local_to);
-    try w.writeAll("' to='");
-    try xml.escapeWrite(w, remote_from);
-    try w.writeByte('\'');
-    if (stanza_id.len > 0) {
-        try w.writeAll(" id='");
-        var id_buf: [1024]u8 = undefined;
-        var id_fbs = std.io.fixedBufferStream(&id_buf);
-        try xml.decodeWrite(id_fbs.writer(), stanza_id);
-        try xml.escapeWrite(w, id_fbs.getWritten());
-        try w.writeByte('\'');
-    }
-    try w.writeAll("><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></");
-    try w.writeAll(tag_name);
-    try w.writeByte('>');
-}
-
-/// Extract the value of an attribute from an XML opening tag string.
-/// Returns an empty slice if the attribute is not found.
-fn extractAttrValue(tag: []const u8, attr_name: []const u8) []const u8 {
-    // Search for ' attr_name=' or ' attr_name="'
-    var pos: usize = 0;
-    while (pos + attr_name.len + 2 < tag.len) {
-        if (tag[pos] == ' ' and
-            pos + 1 + attr_name.len + 1 < tag.len and
-            std.mem.eql(u8, tag[pos + 1 .. pos + 1 + attr_name.len], attr_name) and
-            tag[pos + 1 + attr_name.len] == '=')
-        {
-            const val_start_idx = pos + 1 + attr_name.len + 1;
-            if (val_start_idx >= tag.len) return "";
-            const quote = tag[val_start_idx];
-            if (quote != '\'' and quote != '"') return "";
-            const val_start = val_start_idx + 1;
-            var val_end = val_start;
-            while (val_end < tag.len and tag[val_end] != quote) : (val_end += 1) {}
-            return tag[val_start..val_end];
-        }
-        pos += 1;
-    }
-    return "";
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -7614,37 +7373,6 @@ test "Server: direct TLS skips STARTTLS features" {
     try std.testing.expect(std.mem.indexOf(u8, response, "<starttls") == null);
 }
 
-test "extractStanzaParts: message with body" {
-    const stanza = "<message from='alice@remote.test' to='bob@local.test' type='chat' id='msg1'><body>hello</body></message>";
-    const parts = extractStanzaParts(stanza);
-    try std.testing.expect(parts.is_message);
-    try std.testing.expectEqualStrings("chat", parts.msg_type);
-    try std.testing.expectEqualStrings("msg1", parts.msg_id);
-    try std.testing.expectEqualStrings("<body>hello</body>", parts.inner_xml);
-}
-
-test "extractStanzaParts: self-closing presence" {
-    const stanza = "<presence from='alice@remote.test' to='bob@local.test' type='subscribe'/>";
-    const parts = extractStanzaParts(stanza);
-    try std.testing.expect(!parts.is_message);
-    try std.testing.expectEqualStrings("subscribe", parts.msg_type);
-    try std.testing.expectEqualStrings("", parts.inner_xml);
-}
-
-test "extractStanzaParts: message with no type" {
-    const stanza = "<message from='a@b' to='c@d'><body>hi</body></message>";
-    const parts = extractStanzaParts(stanza);
-    try std.testing.expect(parts.is_message);
-    try std.testing.expectEqualStrings("", parts.msg_type);
-    try std.testing.expectEqualStrings("<body>hi</body>", parts.inner_xml);
-}
-
-test "extractAttrValue: finds attribute" {
-    try std.testing.expectEqualStrings("chat", extractAttrValue("<message type='chat'>", "type"));
-    try std.testing.expectEqualStrings("msg1", extractAttrValue("<message from='a' id='msg1' to='b'>", "id"));
-    try std.testing.expectEqualStrings("", extractAttrValue("<message from='a'>", "type"));
-}
-
 test "cross-thread delivery: enqueue and drain" {
     const allocator = std.testing.allocator;
 
@@ -7992,9 +7720,11 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "sm_handoff.zig", @embedFile("sm_handoff.zig"), 0 },
         .{ "sm_state.zig", @embedFile("sm_state.zig"), 0 },
         .{ "subscription_cache.zig", @embedFile("subscription_cache.zig"), 0 },
+        .{ "stanza/facts.zig", @embedFile("stanza/facts.zig"), 0 },
+        .{ "stanza/writer.zig", @embedFile("stanza/writer.zig"), 0 },
     };
-    if (cases.len != 25) {
-        log.err("S15 ratchet: covers {d} core files, expected 25", .{cases.len});
+    if (cases.len != 27) {
+        log.err("S15 ratchet: covers {d} core files, expected 27", .{cases.len});
         return error.RatchetCoverage;
     }
     inline for (cases) |case| {
@@ -10471,7 +10201,7 @@ test "G7: the S2S bounce escapes the id once and from/to once" {
     var fbs = std.io.fixedBufferStream(&buf);
     // msg_id is the raw on-wire form: an entity is decoded then escaped once,
     // not double-escaped. from/to are plain JIDs, escaped once.
-    try writeS2sBounce(fbs.writer(), "b&b@localhost", "carol@example.com/res", "a&amp;b");
+    try stanza_writer.writeS2sBounce(fbs.writer(), "b&b@localhost", "carol@example.com/res", "a&amp;b");
     const out = fbs.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, out, "id='a&amp;b'") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "a&amp;amp;") == null);
@@ -10483,7 +10213,7 @@ test "G7: the S2S bounce escapes the id once and from/to once" {
 test "G7: a single quote in the id cannot break the bounce attribute" {
     var buf: [2048]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try writeS2sBounce(fbs.writer(), "bob@localhost", "carol@example.com", "x'y");
+    try stanza_writer.writeS2sBounce(fbs.writer(), "bob@localhost", "carol@example.com", "x'y");
     const out = fbs.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, out, "id='x&apos;y'") != null);
 }
