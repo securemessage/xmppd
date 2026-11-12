@@ -5774,6 +5774,30 @@ fn drainTlsPeer(peer: *SslConn, buf: []u8) usize {
     return total;
 }
 
+/// Wait for the readable event the daemon's kqueue would deliver on a
+/// conn fd. A peer close lands in the socket buffer asynchronously, so a
+/// handler driven right after close() can see WouldBlock where production
+/// simply gets the event again; waiting on the fd first makes a single
+/// drive deterministic.
+fn waitFdReadable(fd: posix.fd_t, timeout_ms: u32) !bool {
+    const kq = try posix.kqueue();
+    defer posix.close(kq);
+    const ch = [1]posix.Kevent{.{
+        .ident = @intCast(fd),
+        .filter = std.c.EVFILT.READ,
+        .flags = std.c.EV.ADD,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    var ev: [1]posix.Kevent = undefined;
+    var ts: posix.timespec = .{
+        .sec = @intCast(timeout_ms / 1000),
+        .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms),
+    };
+    return (try posix.kevent(kq, &ch, &ev, &ts)) != 0;
+}
+
 /// A TLS-protected outbound link to a test peer. The conn owns its fd;
 /// deinit frees the peer SSL object and closes the peer fd.
 const TestTlsLink = struct {
@@ -6573,9 +6597,12 @@ test "S2sDaemon: a callback conn torn down with pending exchanges answers them i
     try std.testing.expectEqual(@as(usize, 1), cb.conn.pendingVerifyCount());
 
     // The peer goes away while the verdict is still in flight: the conn is
-    // torn down and the exchange must be answered, not left waiting.
+    // torn down and the exchange must be answered, not left waiting. The
+    // FIN reaches conn.fd asynchronously; production hears it as a fresh
+    // readable event, so wait for that edge before driving the handler.
     posix.close(cb.peer_fd);
     cb.peer_fd = -1;
+    try std.testing.expect(try waitFdReadable(cb.conn.fd, 5000));
     handleOutboundReadable(&daemon, &cl, 0);
     try std.testing.expect(daemon.outbound[0] == null);
 
