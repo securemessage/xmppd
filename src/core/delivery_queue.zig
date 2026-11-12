@@ -29,12 +29,11 @@ pub const MAX_PAYLOAD_SIZE = 4080;
 
 /// Cross-worker stanzas that could not be handed to the delivery system,
 /// most often because they exceeded the 4080-byte slot (S14). Atomic: every
-/// worker increments it; the M1 metrics task can export it later.
+/// worker increments it; the M1 SIGUSR1 dump exports it.
 pub var cross_worker_drops = std.atomic.Value(u64).init(0);
 
-/// Delivery outcomes for the metrics work that follows this release (M1,
-/// PR #13). Nothing exports them yet. All are process-wide and incremented by
-/// multiple workers.
+/// Delivery outcomes. All are process-wide, incremented by multiple
+/// workers, and read out by the M1 SIGUSR1 dump.
 pub var s2s_bounces = std.atomic.Value(u64).init(0);
 pub var offline_not_stored = std.atomic.Value(u64).init(0);
 pub var offline_hold_bounces = std.atomic.Value(u64).init(0);
@@ -46,6 +45,15 @@ pub var offline_drain_drops = std.atomic.Value(u64).init(0);
 /// counted apart from the slow-reader overflow teardown. The session stays
 /// up; iq results are answered with resource-constraint instead.
 pub var oversize_queue_drops = std.atomic.Value(u64).init(0);
+
+/// M1 (App. C): cross-worker ring drops. Module-global because this file
+/// is its own build module; the M1 SIGUSR1 dump reads them from the
+/// server side (same pattern as room_mailbox.mailbox_drops). Drop paths
+/// only: a shared atomic here is cold. Envelopes are counted per
+/// producing worker through DeliverySystem.envelope_hook instead, so the
+/// hottest cross-worker path carries no process-wide atomic.
+pub var ring_drops_full = std.atomic.Value(u64).init(0);
+pub var ring_drops_payload = std.atomic.Value(u64).init(0);
 
 /// Sentinel value for target_session_id indicating a multicast delivery.
 /// When the consumer sees this, it interprets the payload as a MUC multicast
@@ -160,7 +168,10 @@ pub const MpscQueue = struct {
         receipt_ts: u64,
         kind: DeliveryKind,
     ) !void {
-        if (payload.len > MAX_PAYLOAD_SIZE) return error.PayloadTooLarge;
+        if (payload.len > MAX_PAYLOAD_SIZE) {
+            _ = ring_drops_payload.fetchAdd(1, .monotonic);
+            return error.PayloadTooLarge;
+        }
 
         // CAS loop to reserve a slot
         while (true) {
@@ -169,6 +180,7 @@ pub const MpscQueue = struct {
 
             // Check if queue is full
             if (current_tail -% current_head >= QUEUE_SLOTS) {
+                _ = ring_drops_full.fetchAdd(1, .monotonic);
                 return error.QueueFull;
             }
 
@@ -306,6 +318,10 @@ pub const DeliverySystem = struct {
     states: []WorkerState,
     worker_count: u16,
     allocator: std.mem.Allocator,
+    /// Optional hook invoked once per accepted envelope (M1). The server
+    /// sets it to count envelopes in the producing worker's own counter
+    /// block; this module cannot see src/core/metrics.zig itself.
+    envelope_hook: ?*const fn () void = null,
 
     /// Initialize the delivery system for N workers.
     pub fn init(allocator: std.mem.Allocator, worker_count: u16) !DeliverySystem {
@@ -412,6 +428,7 @@ pub const DeliverySystem = struct {
     ) !void {
         if (target_worker >= self.worker_count) return error.InvalidWorker;
         try self.queues[target_worker].enqueueDelivery(target_session_id, target_generation, payload, hold_token, receipt_ts, kind);
+        if (self.envelope_hook) |h| h();
     }
 
     /// Wake a worker after one or more enqueue() calls (T130). One pipe

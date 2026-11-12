@@ -90,6 +90,7 @@ const actor_message = @import("message.zig");
 pub const sm_state = @import("sm_state.zig");
 const sm_handoff = @import("sm_handoff.zig");
 const block_store_mod = @import("block_store");
+const metrics = @import("metrics.zig");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const pep_store_mod = @import("pep_store");
 const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
@@ -1493,6 +1494,10 @@ pub const Server = struct {
         var change_buf: [CHANGE_BUF_SIZE]posix.Kevent = undefined;
         var changes = initLoopChangeList(&change_buf);
 
+        // M1: per-worker counters live on this thread; SIGUSR1 dumps them.
+        metrics.bind(self.worker_id);
+        try self.loop.addSignal(posix.SIG.USR1);
+
         // Initial registration: listener for read
         try changes.addRead(self.listener.fd, LISTENER_UDATA);
 
@@ -1542,8 +1547,12 @@ pub const Server = struct {
             // T238 proof obligation (safe builds): nothing staged may
             // reference an fd purged by a same-iteration close.
             changes.assertNoPurgedEntries();
+            const staged_changes = changes.count();
             const events = try self.loop.submitAndPoll(changes.slice(), null);
             changes.reset();
+
+            // M1: time event processing only, not the blocked kevent wait.
+            var iter_timer = std.time.Timer.start() catch null;
 
             // Process MPSC wake pipe first (if in event batch) to deliver cross-thread
             // messages before any session-closing events in the same batch.
@@ -1596,7 +1605,28 @@ pub const Server = struct {
             // S10: single point of truth for IPC write interest; heals
             // any re-arm lost while handling this batch.
             self.reconcileIpcWriteInterest(&changes);
+
+            if (iter_timer) |*t| metrics.recordIteration(t.read());
+            if (metrics.get()) |c| {
+                metrics.bump(&c.kevent_events, events.len);
+                metrics.bump(&c.kevent_changes, staged_changes);
+            }
         }
+    }
+
+    /// M1: SIGUSR1 handler — dump this worker's counters (own thread).
+    fn dumpMetrics(self: *Server) void {
+        metrics.dump(self.worker_id, .{
+            .room_mailbox_drops = room_mailbox_mod.mailbox_drops.load(.monotonic),
+            .ring_drops_full = delivery_queue_mod.ring_drops_full.load(.monotonic),
+            .ring_drops_payload = delivery_queue_mod.ring_drops_payload.load(.monotonic),
+            .jid_overflow_drops = router.jid_overflow_drops.load(.monotonic),
+            .cross_worker_drops = delivery_queue_mod.cross_worker_drops.load(.monotonic),
+            .s2s_bounces = delivery_queue_mod.s2s_bounces.load(.monotonic),
+            .offline_not_stored = delivery_queue_mod.offline_not_stored.load(.monotonic),
+            .offline_hold_bounces = delivery_queue_mod.offline_hold_bounces.load(.monotonic),
+            .offline_drain_drops = delivery_queue_mod.offline_drain_drops.load(.monotonic),
+        });
     }
 
     /// Stop the server (callable from signal handler or test).
@@ -1665,6 +1695,8 @@ pub const Server = struct {
                 .signal => |s| {
                     if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
                         self.running = false;
+                    } else if (s.signo == posix.SIG.USR1) {
+                        self.dumpMetrics();
                     }
                 },
                 .timer => |t| {
@@ -4168,6 +4200,7 @@ pub const Server = struct {
     /// then drain per-room mailboxes.
     fn handleDeliveryWake(self: *Server, changes: *ChangeList) void {
         const ds = self.delivery_system orelse return;
+        if (metrics.get()) |c| metrics.bump(&c.wakes, 1);
         ds.drainPipe(self.worker_id);
         self.drainDeliveryQueue(changes);
         _ = self.drainRoomMailboxes(changes);
@@ -7487,6 +7520,60 @@ test "Server: E1 a non-stream root closes with not-well-formed" {
     try expectBadRootBounded("<foo xmlns='jabber:client'>");
 }
 
+test "Server: M1 counters track client traffic through the read path" {
+    metrics.bind(9);
+    defer metrics.current = null;
+    const c = metrics.get().?;
+    const base_in = c.bytes_in.load(.monotonic);
+    const base_out = c.bytes_out.load(.monotonic);
+
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    server.handleReadable(1, &changes);
+    try std.testing.expect(server.sessions[1] != null);
+
+    // Client bytes were counted on recv; the features reply was counted
+    // on flush.
+    try std.testing.expect(c.bytes_in.load(.monotonic) >= base_in + stream_open.len);
+    try std.testing.expect(c.bytes_out.load(.monotonic) > base_out);
+
+    // The drop counters are bumped at their choke points, not per session.
+    const base_full = c.drop_send_buffer_full.load(.monotonic);
+    const big = [_]u8{'x'} ** (16384 + 1);
+    try std.testing.expectError(error.WriteBufferFull, session.conn.queueSend(&big));
+    try std.testing.expectEqual(base_full + 1, c.drop_send_buffer_full.load(.monotonic));
+}
+
+test "Server: M1 SIGUSR1 dump runs against a live worker block" {
+    metrics.bind(10);
+    defer metrics.current = null;
+    const c = metrics.get().?;
+    metrics.bump(&c.stanzas_message, 3);
+    metrics.bump(&c.wakes, 2);
+    metrics.recordIteration(500);
+    // Exercises the dump formatting against a bound worker; output goes to
+    // the test log.
+    metrics.dump(10, .{
+        .room_mailbox_drops = 1,
+        .ring_drops_full = 2,
+        .ring_drops_payload = 3,
+    });
+    try std.testing.expectEqual(@as(u64, 3), c.stanzas_message.load(.monotonic));
+}
+
 test "Server: direct TLS skips STARTTLS features" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
@@ -7868,12 +7955,12 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         "conn.queue" ++ "SendWithFlush(",
     };
     const cases = .{
-        .{ "connection.zig", @embedFile("connection.zig"), 14 }, // Connection layer self-tests; no Session.
+        .{ "connection.zig", @embedFile("connection.zig"), 17 }, // Connection layer self-tests incl. the M1 counter test; no Session.
         .{ "fanout.zig", @embedFile("fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
         .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
         .{ "router.zig", @embedFile("router.zig"), 2 }, // one comment; queueSendWithFlush is tracked.
         .{ "session_lifecycle.zig", @embedFile("session_lifecycle.zig"), 0 },
-        .{ "server.zig", @embedFile("server.zig"), 26 }, // stream/SASL/SM nonzas + queueSendStanza itself.
+        .{ "server.zig", @embedFile("server.zig"), 27 }, // stream/SASL/SM nonzas + queueSendStanza itself + M1 counter self-test.
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), 0 },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig"), 0 },
         .{ "message.zig", @embedFile("message.zig"), 0 },
@@ -7883,8 +7970,10 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "archive_queue.zig", @embedFile("archive_queue.zig"), 0 },
         .{ "delivery_queue.zig", @embedFile("delivery_queue.zig"), 0 },
         .{ "event_loop.zig", @embedFile("event_loop.zig"), 0 },
+        .{ "jid_bounds.zig", @embedFile("jid_bounds.zig"), 0 },
         .{ "listener.zig", @embedFile("listener.zig"), 0 },
         .{ "main.zig", @embedFile("main.zig"), 0 },
+        .{ "metrics.zig", @embedFile("metrics.zig"), 0 },
         .{ "offline_store.zig", @embedFile("offline_store.zig"), 0 },
         .{ "room_mailbox.zig", @embedFile("room_mailbox.zig"), 0 },
         .{ "room_registry.zig", @embedFile("room_registry.zig"), 0 },
@@ -7894,8 +7983,8 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "sm_state.zig", @embedFile("sm_state.zig"), 0 },
         .{ "subscription_cache.zig", @embedFile("subscription_cache.zig"), 0 },
     };
-    if (cases.len != 23) {
-        log.err("S15 ratchet: covers {d} core files, expected 23", .{cases.len});
+    if (cases.len != 25) {
+        log.err("S15 ratchet: covers {d} core files, expected 25", .{cases.len});
         return error.RatchetCoverage;
     }
     inline for (cases) |case| {

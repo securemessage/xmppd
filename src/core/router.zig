@@ -25,6 +25,7 @@ const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
 const muc_handler = @import("muc_handler.zig");
 const fanout = @import("fanout.zig");
+const metrics = @import("metrics.zig");
 const connection_mod = @import("connection.zig");
 const offline_store = @import("generic_offline_store");
 const ipc_protocol = @import("ipc_protocol");
@@ -181,16 +182,28 @@ fn hasPrivateHint(allocator: std.mem.Allocator, inner_xml: []const u8) bool {
 pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) void {
     defer session.resetStanza();
 
+    if (metrics.get()) |c| switch (session.stanza_kind) {
+        .message => metrics.bump(&c.stanzas_message, 1),
+        .presence => metrics.bump(&c.stanzas_presence, 1),
+        .iq => metrics.bump(&c.stanzas_iq, 1),
+        .none => {},
+    };
+
     const to_str = session.stanza_to;
     const id_str = session.stanza_id;
     const type_str = session.stanza_type;
     const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
 
-    if (to_str.len == 0) return;
+    // App. C: missing or invalid 'to' drops the stanza silently.
+    if (to_str.len == 0) {
+        if (metrics.get()) |c| metrics.bump(&c.drop_no_route, 1);
+        return;
+    }
 
     // Parse target JID
     const to_jid = xmpp.Jid.parse(to_str) catch {
         noteDrop("connection {d} stanza with invalid 'to': {s}", .{ session.conn.id, to_str });
+        if (metrics.get()) |c| metrics.bump(&c.drop_no_route, 1);
         return;
     };
 

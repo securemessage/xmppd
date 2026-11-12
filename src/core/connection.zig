@@ -31,6 +31,7 @@
 const std = @import("std");
 const posix = std.posix;
 const ssl = @import("ssl");
+const metrics = @import("metrics.zig");
 
 /// Create a non-blocking Unix socketpair. Used in tests.
 fn makeSocketPair() ![2]posix.fd_t {
@@ -197,6 +198,7 @@ pub const Connection = struct {
             return switch (result) {
                 .ok => |n| blk: {
                     self.read_end += n;
+                    if (metrics.get()) |c| metrics.bump(&c.bytes_in, n);
                     break :blk n;
                 },
                 .want_read => error.WouldBlock,
@@ -217,6 +219,7 @@ pub const Connection = struct {
         if (n == 0) return 0; // EOF — peer closed
 
         self.read_end += n;
+        if (metrics.get()) |c| metrics.bump(&c.bytes_in, n);
         return n;
     }
 
@@ -243,7 +246,10 @@ pub const Connection = struct {
         // T155: refuse to buffer for a closed connection. Without this the data
         // lands in write_buf, hasPendingWrite() then reports true, and the
         // caller arms kqueue on a dead fd. Mirrors S2sSession.queueSend.
-        if (self.closed) return error.ConnectionClosed;
+        if (self.closed) {
+            if (metrics.get()) |c| metrics.bump(&c.drop_send_closed, 1);
+            return error.ConnectionClosed;
+        }
 
         const space = WRITE_BUF_SIZE - self.write_end;
         if (data.len > space) {
@@ -251,6 +257,7 @@ pub const Connection = struct {
             self.compactWriteBuf();
             const space_after = WRITE_BUF_SIZE - self.write_end;
             if (data.len > space_after) {
+                if (metrics.get()) |c| metrics.bump(&c.drop_send_buffer_full, 1);
                 return error.WriteBufferFull;
             }
         }
@@ -325,6 +332,7 @@ pub const Connection = struct {
                         self.write_start = 0;
                         self.write_end = 0;
                     }
+                    if (metrics.get()) |c| metrics.bump(&c.bytes_out, n);
                     break :blk n;
                 },
                 .want_read, .want_write => blk: {
@@ -355,6 +363,7 @@ pub const Connection = struct {
             self.write_end = 0;
         }
 
+        if (metrics.get()) |c| metrics.bump(&c.bytes_out, n);
         return n;
     }
 
@@ -617,6 +626,38 @@ test "Connection: queueSend on closed connection is rejected (T155)" {
     // Critically, the rejected data must not leave the connection looking
     // writable — callers gate `changes.addWrite(conn.fd, ..)` on this.
     try std.testing.expect(!conn.hasPendingWrite());
+}
+
+test "Connection: M1 counters track bytes and queueSend drops" {
+    metrics.bind(7);
+    defer metrics.current = null;
+    const c = metrics.get().?;
+    const base_in = c.bytes_in.load(.monotonic);
+    const base_out = c.bytes_out.load(.monotonic);
+    const base_closed = c.drop_send_closed.load(.monotonic);
+    const base_full = c.drop_send_buffer_full.load(.monotonic);
+
+    const fds = try makeSocketPair();
+    // fds[0] is closed by conn.close() below; do not double-close.
+    defer posix.close(fds[1]);
+
+    var conn = Connection.init(fds[0], 1);
+
+    try conn.queueSend("hello");
+    _ = try conn.flushSend();
+    try std.testing.expectEqual(base_out + 5, c.bytes_out.load(.monotonic));
+
+    _ = try posix.write(fds[1], "ping");
+    _ = try conn.recv();
+    try std.testing.expectEqual(base_in + 4, c.bytes_in.load(.monotonic));
+
+    const big = [_]u8{'x'} ** (WRITE_BUF_SIZE + 1);
+    try std.testing.expectError(error.WriteBufferFull, conn.queueSend(&big));
+    try std.testing.expectEqual(base_full + 1, c.drop_send_buffer_full.load(.monotonic));
+
+    conn.close();
+    try std.testing.expectError(error.ConnectionClosed, conn.queueSend("x"));
+    try std.testing.expectEqual(base_closed + 1, c.drop_send_closed.load(.monotonic));
 }
 
 test "Connection: a closed connection with a full buffer is not pending (S28)" {
