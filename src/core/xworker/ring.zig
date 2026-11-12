@@ -10,8 +10,11 @@
 //!   then set `slot.ready.store(true, .release)` to publish.
 //! - **Consumer** (owning worker): reads slots from `head` to `tail`, checking `ready`
 //!   flag before reading payload. Advances `head` after processing.
-//! - **Wakeup**: producer writes 1 byte to the target worker's pipe after enqueue.
-//!   Consumer's kqueue fires EVFILT_READ on the pipe read end.
+//! - **Wakeup**: producer writes 1 byte to the target worker's pipe after
+//!   enqueue, but only on the `wake_pending` false->true edge (Q2). The
+//!   consumer clears the flag after draining pipe bytes and before the
+//!   queue drain that follows, so a burst costs one byte per drain cycle
+//!   instead of one write per stanza and no wakeup is lost.
 //!
 //! ## ABA Protection
 //!
@@ -263,8 +266,10 @@ pub const WakePipe = struct {
     /// Create a new pipe pair for wakeup signaling.
     pub fn init() !WakePipe {
         const fds = try posix.pipe();
-        // Set non-blocking on read end (avoid blocking in drain)
+        // Non-blocking both ends: reads drain to EAGAIN; a write that sees
+        // a full pipe means a wake is already signaled.
         _ = std.c.fcntl(fds[0], std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
+        _ = std.c.fcntl(fds[1], std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
         return .{ .rd = fds[0], .wr = fds[1] };
     }
 
@@ -275,8 +280,13 @@ pub const WakePipe = struct {
     }
 
     /// Write 1 byte to wake the consumer (called by producer after enqueue).
-    pub fn wake(self: *const WakePipe) void {
-        _ = posix.write(self.wr, &[1]u8{1}) catch {};
+    /// A full pipe already reads as a pending wake, so EAGAIN reports as a
+    /// successful signal; only real failures (e.g. a torn-down fd) error.
+    pub fn wake(self: *const WakePipe) !void {
+        _ = posix.write(self.wr, &[1]u8{1}) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return err,
+        };
     }
 
     /// Drain all pending bytes from the pipe (called by consumer on EVFILT_READ).
@@ -290,10 +300,20 @@ pub const WakePipe = struct {
     }
 };
 
+/// Pipe writes that failed on a wake_pending edge; the flag was cleared so
+/// the next delivery retries. Process-wide like the other drop counters.
+pub var wake_write_failed = std.atomic.Value(u64).init(0);
+
 /// Per-worker processing state for coalesced signaling optimization.
 pub const WorkerState = struct {
     /// 1 when worker is inside event processing loop, 0 when idle in kevent().
     is_processing: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    /// Q2 wake coalescing: true while a wake byte is queued for or in
+    /// flight to this worker. Producers write the pipe only on the
+    /// false->true edge; the consumer clears it in drainPipe after the
+    /// byte drain and before the queue drain that follows.
+    wake_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Check if the target worker is currently active (skip pipe write if so).
     pub fn isActive(self: *const WorkerState) bool {
@@ -393,9 +413,6 @@ pub const DeliverySystem = struct {
     ) !void {
         try self.enqueueDelivery(target_worker, target_session_id, target_generation, payload, hold_token, receipt_ts, kind);
 
-        // Always wake the target worker: coalesced signaling is unsafe because
-        // the target may finish processing and enter kevent() between our isActive
-        // check and the pipe write. The pipe drainPipe() handles duplicate wakes.
         self.wakeWorker(target_worker);
     }
 
@@ -431,11 +448,24 @@ pub const DeliverySystem = struct {
         if (self.envelope_hook) |h| h();
     }
 
-    /// Wake a worker after one or more enqueue() calls (T130). One pipe
-    /// write for the whole batch instead of one per stanza.
+    /// Wake a worker after one or more enqueue() calls (T130). Coalesced
+    /// (Q2): only the wake_pending false->true edge writes the pipe. The
+    /// consumer's clear is a read-modify-write too, so this swap and that
+    /// one are totally ordered on the flag: if this swap lands first, the
+    /// consumer's swap reads the true it published and the drain that
+    /// follows acquires the slot; if it lands second, this swap reads
+    /// false and a byte goes out. A skipped write is never a lost wakeup.
     pub fn wakeWorker(self: *DeliverySystem, target_worker: u16) void {
         if (target_worker >= self.worker_count) return;
-        self.pipes[target_worker].wake();
+        const state = &self.states[target_worker];
+        if (state.wake_pending.swap(true, .seq_cst)) return;
+        self.pipes[target_worker].wake() catch {
+            // Clear so the next delivery retries the byte instead of
+            // coalescing into a signal that never arrived.
+            state.wake_pending.store(false, .seq_cst);
+            _ = wake_write_failed.fetchAdd(1, .monotonic);
+            log.err("delivery wake write to worker {d} failed", .{target_worker});
+        };
     }
 
     /// Get the pipe read fd for a specific worker (for kqueue registration).
@@ -454,8 +484,17 @@ pub const DeliverySystem = struct {
     }
 
     /// Drain the pipe for a specific worker (called on EVFILT_READ).
+    /// Clears wake_pending after the byte drain and before the queue
+    /// drain the caller runs next. The clear is a read-modify-write, so
+    /// it and the producer's swap(true) are totally ordered on the flag:
+    /// if the producer's swap lands first, this swap reads its true and
+    /// the drain acquires the published slot; if it lands second, the
+    /// producer reads false and writes the next byte. A plain store
+    /// would give no synchronizes-with edge and could lose a wakeup on
+    /// weakly ordered hardware.
     pub fn drainPipe(self: *const DeliverySystem, worker_id: u16) void {
         self.pipes[worker_id].drainPipe();
+        _ = self.states[worker_id].wake_pending.swap(false, .seq_cst);
     }
 };
 
@@ -628,9 +667,159 @@ test "WakePipe: init and deinit" {
     defer pipe.deinit();
 
     // Write should not block
-    pipe.wake();
+    try pipe.wake();
     // Drain should consume the byte
     pipe.drainPipe();
+}
+
+test "DeliverySystem: a burst of deliveries costs one pipe byte (Q2)" {
+    // Goal: prove the wake is edge-triggered. Multiple deliveries while
+    // wake_pending is set must collapse to a single byte in the pipe;
+    // clearing the flag by draining re-arms the edge.
+    var sys = try DeliverySystem.init(std.testing.allocator, 2);
+    defer sys.deinit();
+
+    var buf: [8]u8 = undefined;
+    try sys.deliver(1, 1, 1, "a");
+    try sys.deliver(1, 2, 1, "b");
+    try sys.deliver(1, 3, 1, "c");
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(sys.getPipeReadFd(1), &buf));
+    try std.testing.expectError(error.WouldBlock, posix.read(sys.getPipeReadFd(1), &buf));
+
+    // Consumer cycle: byte drain clears the flag, queue drain follows.
+    sys.drainPipe(1);
+    try std.testing.expect(!sys.getState(1).wake_pending.load(.seq_cst));
+
+    // A delivery after the clear writes a fresh byte.
+    try sys.deliver(1, 4, 1, "d");
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(sys.getPipeReadFd(1), &buf));
+}
+
+test "DeliverySystem: a publish inside the clear-then-drain window still wakes" {
+    // Goal: no lost wakeup when a delivery lands between the consumer's
+    // flag clear and its queue drain. Sequence: producer wakes, consumer
+    // drains pipe + flag, producer publishes again — the edge must write
+    // a byte, and the slot must be visible to the drain that follows.
+    var sys = try DeliverySystem.init(std.testing.allocator, 2);
+    defer sys.deinit();
+
+    try sys.deliver(1, 1, 1, "first");
+    sys.drainPipe(1); // consumes the byte, clears wake_pending
+
+    try sys.deliver(1, 2, 1, "second");
+
+    // The second publish saw flag=false and wrote: pipe is readable again.
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(sys.getPipeReadFd(1), &buf));
+
+    const Ctx = struct { count: *u32 };
+    var count: u32 = 0;
+    const ctx = Ctx{ .count = &count };
+    const handler = struct {
+        fn handle(c: Ctx, _: u32, _: u32, _: []const u8) void {
+            c.count.* += 1;
+        }
+    }.handle;
+    _ = sys.getQueue(1).drain(ctx, handler);
+    try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+test "DeliverySystem: racing producers lose no wakeups" {
+    // Goal: a kqueue-waiting consumer must see every delivery under
+    // contention. Three producers stream deliveries while the consumer
+    // sleeps on the pipe and drains on each event: the loop's real
+    // pattern. The verdict is deterministic: once the producers join,
+    // every accepted slot is published, so a slot still pending with no
+    // readable wake byte and wake_pending == false can never be reached.
+    // That is a lost wake by construction, no timing involved.
+    const PRODUCERS = 3;
+    const PER_PRODUCER = 2000;
+
+    var sys = try DeliverySystem.init(std.testing.allocator, 2);
+    defer sys.deinit();
+
+    var produced = std.atomic.Value(u32).init(0);
+    var producers_done = std.atomic.Value(u32).init(0);
+    const producer = struct {
+        fn run(ds: *DeliverySystem, n: usize, sent: *std.atomic.Value(u32), done: *std.atomic.Value(u32)) void {
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                // QueueFull drops are legitimate backpressure; only slots
+                // that landed are owed a wake.
+                ds.deliverDelivery(1, 0, 0, "race", 0, 0, .stanza) catch |err| switch (err) {
+                    error.QueueFull => continue,
+                    error.InvalidWorker, error.PayloadTooLarge => unreachable,
+                };
+                _ = sent.fetchAdd(1, .release);
+            }
+            _ = done.fetchAdd(1, .release);
+        }
+    }.run;
+
+    var threads: [PRODUCERS]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, producer, .{ &sys, PER_PRODUCER, &produced, &producers_done });
+
+    const consumer = struct {
+        fn run(ds: *DeliverySystem, producer_threads: []std.Thread, done: *std.atomic.Value(u32)) !struct { consumed: usize, lost: usize } {
+            const kq = try posix.kqueue();
+            defer posix.close(kq);
+            const reg = [1]posix.Kevent{.{
+                .ident = @intCast(ds.getPipeReadFd(1)),
+                .filter = std.c.EVFILT.READ,
+                .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+            }};
+            var events: [1]posix.Kevent = undefined;
+            _ = try posix.kevent(kq, &reg, events[0..0], null);
+
+            var consumed: usize = 0;
+            const Ctx = struct { count: *usize };
+            const ctx = Ctx{ .count = &consumed };
+            const handler = struct {
+                fn handle(c: Ctx, _: u32, _: u32, _: []const u8) void {
+                    c.count.* += 1;
+                }
+            }.handle;
+
+            // Coverage phase: drain on each pipe event while producers
+            // run. The 100 ms wait only re-polls the done flag; nothing
+            // here decides pass or fail.
+            const deadline = std.time.milliTimestamp() + 15000;
+            const ts = std.c.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+            while (done.load(.acquire) != PRODUCERS and std.time.milliTimestamp() < deadline) {
+                _ = try posix.kevent(kq, &.{}, &events, &ts);
+                ds.drainPipe(1);
+                _ = ds.getQueue(1).drain(ctx, handler);
+            }
+            try std.testing.expectEqual(@as(u32, PRODUCERS), done.load(.acquire));
+
+            // Join the producers first: every accepted slot is now
+            // published. The verdict is one final consumer pass: a
+            // zero-timeout wait on the pipe, then drain the pipe and
+            // the queue. A slot still pending with no readable byte
+            // and wake_pending == false is a lost wake by construction.
+            for (producer_threads) |t| t.join();
+            const zero = std.c.timespec{ .sec = 0, .nsec = 0 };
+            const nev = try posix.kevent(kq, &.{}, &events, &zero);
+            const queue = ds.getQueue(1);
+            var lost: usize = 0;
+            if (queue.hasPending() and nev == 0 and !ds.getState(1).wake_pending.load(.seq_cst)) {
+                lost = queue.tail.load(.acquire) -% queue.head;
+            }
+            ds.drainPipe(1);
+            consumed += queue.drain(ctx, handler);
+            return .{ .consumed = consumed, .lost = lost };
+        }
+    }.run;
+
+    const result = try consumer(&sys, &threads, &producers_done);
+
+    // Every slot that survived the bounded queue was consumed: a lost
+    // wake would strand its slot in the ring past the join.
+    try std.testing.expectEqual(produced.load(.acquire), result.consumed);
+    try std.testing.expectEqual(@as(usize, 0), result.lost);
 }
 
 test "WorkerState: active and idle" {
