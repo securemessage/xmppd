@@ -28,6 +28,7 @@ pub const std_options = xmppd_log.std_options;
 const posix = std.posix;
 const Supervisor = @import("supervisor.zig").Supervisor;
 const procinfo = @import("procinfo.zig");
+const net = @import("net");
 const runtime_mod = @import("runtime.zig");
 const Runtime = runtime_mod.Runtime;
 const ChildCtl = runtime_mod.ChildCtl;
@@ -54,6 +55,8 @@ pub fn main() !void {
 
     var host: []const u8 = "localhost";
     var port: []const u8 = "5222";
+    var bind_address: []const u8 = "0.0.0.0";
+    var s2s_bind_address: ?[]const u8 = null;
     var cert_path: ?[]const u8 = null;
     var key_path: ?[]const u8 = null;
     var core_path: []const u8 = "xmppd-core";
@@ -84,6 +87,11 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--port")) {
             port = args.next() orelse {
                 log.err("--port requires a value", .{});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--bind")) {
+            bind_address = args.next() orelse {
+                log.err("--bind requires a value", .{});
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--cert")) {
@@ -167,6 +175,9 @@ pub fn main() !void {
         if (std.mem.eql(u8, port, "5222")) {
             if (c.get("server", "c2s_port")) |v| port = v;
         }
+        if (std.mem.eql(u8, bind_address, "0.0.0.0")) {
+            if (c.get("server", "bind_address")) |v| bind_address = v;
+        }
         if (std.mem.eql(u8, db_path, "/var/db/xmppd/users.db")) {
             if (c.get("server", "db_path")) |v| db_path = v;
         }
@@ -197,6 +208,7 @@ pub fn main() !void {
         if (std.mem.eql(u8, s2s_port, "5269")) {
             if (c.get("s2s", "port")) |v| s2s_port = v;
         }
+        if (c.get("s2s", "bind_address")) |v| s2s_bind_address = v;
 
         // [muc] section (s2s federation to= served-host check)
         if (c.get("muc", "host")) |v| muc_host_cfg = v;
@@ -362,21 +374,22 @@ pub fn main() !void {
         const c2s_port_num = std.fmt.parseInt(u16, port, 10) catch 5222;
         var i: u16 = 0;
         while (i < workers) : (i += 1) {
-            c2s_listen_fds[i] = bindListenerSocket("0.0.0.0", c2s_port_num, true) catch |err| {
-                log.err("failed to bind C2S port {s} (socket {d}): {}", .{ port, i, err });
+            c2s_listen_fds[i] = bindC2s(bind_address, c2s_port_num) catch |err| {
+                log.err("failed to bind C2S {s}:{s} (socket {d}): {}", .{ bind_address, port, i, err });
                 return error.BindFailed;
             };
             c2s_fd_count += 1;
         }
-        log.info("bound {d} C2S listener sockets on port {s} (SO_REUSEPORT_LB)", .{ c2s_fd_count, port });
+        log.info("bound {d} C2S listener sockets on {s}:{s} (SO_REUSEPORT_LB)", .{ c2s_fd_count, bind_address, port });
     }
     if (s2s_enabled) {
         const s2s_port_num = std.fmt.parseInt(u16, s2s_port, 10) catch 5269;
-        s2s_listen_fd = bindListenerSocket("0.0.0.0", s2s_port_num, false) catch |err| {
-            log.err("failed to bind S2S port {s}: {}", .{ s2s_port, err });
+        const s2s_addr = s2s_bind_address orelse bind_address;
+        s2s_listen_fd = bindS2s(s2s_addr, s2s_port_num) catch |err| {
+            log.err("failed to bind S2S {s}:{s}: {}", .{ s2s_addr, s2s_port, err });
             return error.BindFailed;
         };
-        log.info("bound S2S listener fd={d} port={s}", .{ s2s_listen_fd, s2s_port });
+        log.info("bound S2S listener fd={d} {s}:{s}", .{ s2s_listen_fd, s2s_addr, s2s_port });
     }
     defer {
         var i: u16 = 0;
@@ -631,6 +644,7 @@ fn printUsage() void {
         \\Options:
         \\  --host HOST        XMPP server hostname (default: localhost)
         \\  --port PORT        STARTTLS port (default: 5222)
+        \\  --bind ADDR        c2s/s2s listen address literal (default: 0.0.0.0)
         \\  --cert PATH        TLS certificate file (PEM)
         \\  --key PATH         TLS private key file (PEM)
         \\  --core-path PATH   Path to xmppd-core binary (default: xmppd-core)
@@ -661,56 +675,15 @@ fn printVersion() void {
     stdout.interface.writeAll(line) catch {};
 }
 
-/// Bind a non-blocking, SO_REUSEADDR TCP socket on the given address and port.
-/// When `reuseport` is true, also sets SO_REUSEPORT_LB (FreeBSD 12+) to enable
-/// kernel-level load balancing of incoming TCP connections across sockets via
-/// 4-tuple Toeplitz hash. Falls back to SO_REUSEPORT on non-FreeBSD platforms.
-///
-/// Note: FreeBSD's SO_REUSEPORT (without _LB) does NOT distribute TCP connections —
-/// it preserves historic POSIX behavior and delivers all to one socket.
-/// SO_REUSEPORT_LB was introduced in FreeBSD 12.0 specifically for this purpose.
-fn bindListenerSocket(address: []const u8, bind_port: u16, reuseport: bool) !posix.fd_t {
-    // CLOEXEC on every master-bound listener (S7): only children
-    // explicitly granted a fd (via applyFdPass mapping them onto 3..N)
-    // may hold them; anything spawn elsewhere after fork never inherits.
-    const fd = try posix.socket(
-        posix.AF.INET,
-        posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
-        0,
-    );
-    errdefer posix.close(fd);
+/// c2s listeners share lib/net's bindTcp (V16): bind_address literals and
+/// IPv6 are honored, REUSEPORT_LB load-balances accepts across workers.
+fn bindC2s(address: []const u8, bind_port: u16) !posix.fd_t {
+    return net.bindTcp(&.{ .address = address, .port = bind_port, .reuse_port_lb = true });
+}
 
-    const one: c_int = 1;
-    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
-    if (reuseport) {
-        // FreeBSD: SO_REUSEPORT_LB for actual TCP load balancing (4-tuple hash).
-        // Linux/others: SO_REUSEPORT already does load balancing.
-        if (comptime @hasDecl(posix.SO, "REUSEPORT_LB")) {
-            try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT_LB, std.mem.asBytes(&one));
-        } else {
-            try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one));
-        }
-    }
-
-    var addr = std.c.sockaddr.in{
-        .port = std.mem.nativeToBig(u16, bind_port),
-        .addr = 0, // INADDR_ANY
-    };
-    _ = address;
-
-    posix.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch |err| {
-        return switch (err) {
-            error.AddressInUse => error.AddressInUse,
-            error.AccessDenied => error.PermissionDenied,
-            else => error.SystemResources,
-        };
-    };
-
-    // Backlog sized for connect bursts (T32): 128 overflowed the box's
-    // syncache at only a few hundred connects/sec while workers churn
-    // handshakes. Clamped by kern.ipc.soacceptqueue.
-    posix.listen(fd, 4096) catch return error.SystemResources;
-    return fd;
+/// One s2s listener per master: no REUSEPORT_LB.
+fn bindS2s(address: []const u8, bind_port: u16) !posix.fd_t {
+    return net.bindTcp(&.{ .address = address, .port = bind_port, .reuse_port_lb = false });
 }
 
 /// Detect the number of CPU cores available.
@@ -810,4 +783,29 @@ test "decideRunUser: a uid-0 alias is refused by uid, not by name" {
     if (ids.uid == 0) {
         try std.testing.expectError(error.RunUserIsRoot, decideRunUser("toor", 0));
     }
+}
+
+fn boundFamily(fd: posix.fd_t) posix.sa_family_t {
+    var ss: posix.sockaddr.storage = undefined;
+    var len: posix.socklen_t = @sizeOf(@TypeOf(ss));
+    posix.getsockname(fd, @ptrCast(&ss), &len) catch return 0;
+    return ss.family;
+}
+
+test "bindC2s/bindS2s honor the address literal, including IPv6" {
+    const c2s4 = try bindC2s("127.0.0.1", 0);
+    defer posix.close(c2s4);
+    try std.testing.expectEqual(@as(posix.sa_family_t, posix.AF.INET), boundFamily(c2s4));
+
+    const s2s4 = try bindS2s("127.0.0.1", 0);
+    defer posix.close(s2s4);
+    try std.testing.expectEqual(@as(posix.sa_family_t, posix.AF.INET), boundFamily(s2s4));
+
+    const c2s6 = bindC2s("::1", 0) catch return error.SkipZigTest;
+    defer posix.close(c2s6);
+    try std.testing.expectEqual(@as(posix.sa_family_t, posix.AF.INET6), boundFamily(c2s6));
+
+    // The old helper ignored its address argument: a DNS name must be
+    // rejected, not resolved.
+    try std.testing.expectError(error.InvalidAddress, bindC2s("example.invalid", 0));
 }
