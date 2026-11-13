@@ -56,7 +56,7 @@ src/ctl/migrate_precis.zig	catch continue	1
 src/ctl/migrate_precis.zig	catch return	6
 src/ctl/migrate_precis.zig	catch {}	2
 src/ctl/migrate_precis_backends_test.zig	catch {}	1
-src/ipc/client.zig	catch {}	3
+src/ipc/client.zig	catch {}	2
 src/ipc/protocol.zig	catch return	1
 src/ipc/server.zig	catch {}	6
 src/log.zig	catch return	7

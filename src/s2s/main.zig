@@ -3486,11 +3486,11 @@ fn closeIpcClientLane(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) v
 fn handleIpcReadable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) void {
     const client = daemon.ipc.getClient(ipc_slot) orelse return;
 
-    const n = client.recv() catch {
+    const rr = client.recv() catch {
         closeIpcClientLane(daemon, batch, ipc_slot);
         return;
     };
-    if (n == 0) {
+    if (rr == .eof) {
         // EOF — core disconnected
         log.info("core disconnected from IPC slot={d}", .{ipc_slot});
         closeIpcClientLane(daemon, batch, ipc_slot);
@@ -3830,7 +3830,7 @@ test "S2sDaemon: G4 a 16 KiB stanza is forwarded whole through IPC" {
 
     try std.testing.expect(daemon.getInbound(0) != null);
     const ipc = daemon.ipc.getClient(0).?;
-    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const frame = (try protocol.parseFrame(ipc.unsentBytes())) orelse return error.NoIPCFrame;
     const msg = try protocol.decode(frame.payload);
     const expected = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
         "<message xmlns='jabber:server' from='b.example' to='alice@a.example'><body xmlns='jabber:server'>",
@@ -3870,7 +3870,7 @@ test "F6: inbound S2S stanza to= on the local domain is prepared before forwardi
 
     try std.testing.expect(daemon.getInbound(0) != null);
     const ipc = daemon.ipc.getClient(0).?;
-    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const frame = (try protocol.parseFrame(ipc.unsentBytes())) orelse return error.NoIPCFrame;
     const msg = try protocol.decode(frame.payload);
     try std.testing.expectEqualStrings("naplestb@localhost", msg.s2s_inbound.to_jid);
     try std.testing.expectEqualStrings("Peer@Remote.Example", msg.s2s_inbound.from_jid);
@@ -3908,11 +3908,11 @@ test "F6: an unprepareable inbound to= drops only that stanza" {
     try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='peer@remote.example' to='@localhost'><body>x</body></message>");
     try std.testing.expect(daemon.getInbound(0) != null);
     const ipc = daemon.ipc.getClient(0).?;
-    try std.testing.expectEqual(ipc.send_list.items.len, ipc.send_start);
+    try std.testing.expectEqual(@as(usize, 0), ipc.pendingSendBytes());
 
     // The stream still forwards a following valid stanza.
     try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='peer@remote.example' to='juliet@localhost'><body>y</body></message>");
-    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const frame = (try protocol.parseFrame(ipc.unsentBytes())) orelse return error.NoIPCFrame;
     const msg = try protocol.decode(frame.payload);
     try std.testing.expectEqualStrings("juliet@localhost", msg.s2s_inbound.to_jid);
 }
@@ -3977,10 +3977,10 @@ test "F6: an over-long inbound to= drops only that stanza" {
     try feedInboundForTest(&daemon, &batch, peer_fd, &stanza);
     try std.testing.expect(daemon.getInbound(0) != null);
     const ipc = daemon.ipc.getClient(0).?;
-    try std.testing.expectEqual(ipc.send_list.items.len, ipc.send_start);
+    try std.testing.expectEqual(@as(usize, 0), ipc.pendingSendBytes());
 
     try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='peer@remote.example' to='juliet@localhost'><body>y</body></message>");
-    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const frame = (try protocol.parseFrame(ipc.unsentBytes())) orelse return error.NoIPCFrame;
     const msg = try protocol.decode(frame.payload);
     try std.testing.expectEqualStrings("juliet@localhost", msg.s2s_inbound.to_jid);
 }
@@ -4024,7 +4024,7 @@ test "F6: a JID-length inbound to= forwards intact" {
     try feedInboundForTest(&daemon, &batch, peer_fd, wire);
 
     const ipc = daemon.ipc.getClient(0).?;
-    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const frame = (try protocol.parseFrame(ipc.unsentBytes())) orelse return error.NoIPCFrame;
     const msg = try protocol.decode(frame.payload);
     var want_buf: [1100]u8 = undefined;
     const want = try std.fmt.bufPrint(&want_buf, "{s}@localhost", .{&local});
@@ -4420,7 +4420,7 @@ test "S2sDaemon: an oversize stanza is delivery-failed instead of wedging the qu
     try std.testing.expect(std.mem.indexOf(u8, got, "after") != null);
 
     // The bounce reached the core client as a delivery-failed notice.
-    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const frame = (try protocol.parseFrame(client.unsentBytes())) orelse return error.NoDeliveryFailedNotice;
     const notice = try protocol.decode(frame.payload);
     try std.testing.expectEqualStrings("stanza-too-large", notice.s2s_delivery_failed.error_type);
     try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
@@ -4454,7 +4454,7 @@ test "S2sDaemon: an initiation failure answers every queued stanza" {
 
     // The queued stanza is failed back to its sender instead of vanishing
     // with the connection.
-    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const frame = (try protocol.parseFrame(client.unsentBytes())) orelse return error.NoDeliveryFailedNotice;
     const notice = try protocol.decode(frame.payload);
     try std.testing.expectEqualStrings("remote-server-not-found", notice.s2s_delivery_failed.error_type);
     try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
@@ -4578,7 +4578,7 @@ fn expectInitiationFailure(daemon: *S2sDaemon, rig: anytype, expected_to: ?[]con
     try std.testing.expectEqual(@as(usize, 0), drainPeer(rig.other_peer, &other));
 
     const client = &daemon.ipc.clients[0];
-    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const frame = (try protocol.parseFrame(client.unsentBytes())) orelse return error.NoDeliveryFailedNotice;
     const notice = try protocol.decode(frame.payload);
     try std.testing.expectEqualStrings(reason, notice.s2s_delivery_failed.error_type);
     try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
@@ -4651,7 +4651,7 @@ test "S2sDaemon: a connect failure keeps the queue and arms a retry" {
     var rbuf: [256]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), drainPeer(rig.submitter_peer, &rbuf));
     const client = &daemon.ipc.clients[0];
-    try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
+    try std.testing.expect((try protocol.parseFrame(client.unsentBytes())) == null);
 }
 
 test "S2sDaemon: a DNS failure answers the pending verify remote-server-not-found" {
@@ -4706,7 +4706,7 @@ test "S2sDaemon: a temporary resolution failure keeps the queue and arms a retry
     var rbuf: [256]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), drainPeer(rig.submitter_peer, &rbuf));
     const client = &daemon.ipc.clients[0];
-    try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
+    try std.testing.expect((try protocol.parseFrame(client.unsentBytes())) == null);
 }
 
 test "S2sDaemon: a stanza for a domain in backoff joins the queue" {
@@ -4915,7 +4915,7 @@ test "S2sDaemon: a full pending queue bounces the overflow stanza" {
     try std.testing.expectEqual(before + 1, outbound_queue_overflows.load(.monotonic));
     try std.testing.expectEqual(OutboundConnection.MAX_PENDING_STANZAS, conn.pendingCount());
     const client = &daemon.ipc.clients[0];
-    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const frame = (try protocol.parseFrame(client.unsentBytes())) orelse return error.NoDeliveryFailedNotice;
     const notice = try protocol.decode(frame.payload);
     try std.testing.expectEqualStrings("resource-constraint", notice.s2s_delivery_failed.error_type);
 }
@@ -6939,8 +6939,8 @@ test "S2sDaemon: a db:result error verdict on our key bounces only that pair" {
     try std.testing.expect(ob.conn.hasPendingVerify());
 
     const client = &daemon.ipc.clients[0];
-    const first_len = client.send_list.items.len;
-    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const first_len = client.unsentBytes().len;
+    const frame = (try protocol.parseFrame(client.unsentBytes())) orelse return error.NoDeliveryFailedNotice;
     const notice = try protocol.decode(frame.payload);
     try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
     try std.testing.expectEqualStrings("a@us.example", notice.s2s_delivery_failed.from_jid);
@@ -6948,7 +6948,7 @@ test "S2sDaemon: a db:result error verdict on our key bounces only that pair" {
 
     // New stanzas for the dead pair bounce at once, never queue.
     daemon.handleDelivery(&cl, "a@us.example", "b@them.example", "<message to='b@them.example'><body>y</body></message>");
-    const frame2 = protocol.readFrame(client.send_list.items[first_len..]) orelse return error.NoDeliveryFailedNotice;
+    const frame2 = (try protocol.parseFrame(client.unsentBytes()[first_len..])) orelse return error.NoDeliveryFailedNotice;
     const notice2 = try protocol.decode(frame2.payload);
     try std.testing.expectEqualStrings("remote-server-timeout", notice2.s2s_delivery_failed.error_type);
     try std.testing.expectEqual(@as(usize, 0), ob.conn.pendingCount());
@@ -6983,7 +6983,7 @@ test "S2sDaemon: a db:result error verdict with nothing left closes the conn" {
     try std.testing.expect(daemon.outbound[0] == null);
     try std.testing.expect(daemon.pool.connections.get("them.example") == null);
     const client = &daemon.ipc.clients[0];
-    const frame = protocol.readFrame(client.send_list.items[client.send_start..]) orelse return error.NoDeliveryFailedNotice;
+    const frame = (try protocol.parseFrame(client.unsentBytes())) orelse return error.NoDeliveryFailedNotice;
     const notice = try protocol.decode(frame.payload);
     try std.testing.expectEqualStrings("remote-server-timeout", notice.s2s_delivery_failed.error_type);
 }
@@ -7960,7 +7960,7 @@ test "F6: inbound S2S to= on the MUC host passes through unchanged" {
     // in @memcpy).
     try feedInboundForTest(&daemon, &batch, peer_fd, "<message from='Peer@remote.example' to='BigRoom@conference.localhost/Nick' type='groupchat'><body>hi</body></message>");
     const ipc = daemon.ipc.getClient(0).?;
-    const frame = protocol.readFrame(ipc.send_list.items[ipc.send_start..]) orelse return error.NoIPCFrame;
+    const frame = (try protocol.parseFrame(ipc.unsentBytes())) orelse return error.NoIPCFrame;
     const msg = try protocol.decode(frame.payload);
     try std.testing.expectEqualStrings("BigRoom@conference.localhost/Nick", msg.s2s_inbound.to_jid);
 }
@@ -8208,7 +8208,7 @@ test "S2sDaemon: targets that all failed TLSA lookup bounce temporary" {
     try std.testing.expectEqual(@as(usize, 1), conn.pendingCount());
     try std.testing.expect(conn.retry_ident != 0);
     const client = &daemon.ipc.clients[0];
-    try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
+    try std.testing.expect((try protocol.parseFrame(client.unsentBytes())) == null);
 }
 
 test "S2sDaemon: a TLSA SERVFAIL skips the target and fails temporary" {
@@ -8252,7 +8252,7 @@ test "S2sDaemon: a TLSA SERVFAIL skips the target and fails temporary" {
     try std.testing.expectEqual(@as(usize, 1), conn.pendingCount());
 
     const client = &daemon.ipc.clients[0];
-    try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
+    try std.testing.expect((try protocol.parseFrame(client.unsentBytes())) == null);
 }
 
 test "S2sDaemon: a silent nameserver leaves the loop responsive" {
@@ -8294,7 +8294,7 @@ test "S2sDaemon: a silent nameserver leaves the loop responsive" {
     try std.testing.expect(conn1.dns_key == 0);
 
     const client = &daemon.ipc.clients[0];
-    try std.testing.expect(protocol.readFrame(client.send_list.items[client.send_start..]) == null);
+    try std.testing.expect((try protocol.parseFrame(client.unsentBytes())) == null);
 }
 
 test "S2sDaemon: an inbound DANE lookup defers then releases features" {

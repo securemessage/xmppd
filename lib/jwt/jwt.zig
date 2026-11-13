@@ -41,7 +41,12 @@ pub const JwtHeader = struct {
 pub const JwtClaims = struct {
     sub: []const u8,
     iss: []const u8,
-    aud: []const u8,
+    /// Audience values (OIDC Core 2: aud is a string or an array). A
+    /// string claim lands as a one-element slice; empty means absent.
+    aud: []const []const u8 = &.{},
+    /// Authorized party (OIDC Core 3.1.3.7): must equal client_id when
+    /// aud has more than one value; a present azp must always match.
+    azp: []const u8 = "",
     exp: i64,
     preferred_username: []const u8,
     /// Display data only: email is never an identity claim (OIDC Core 5.7).
@@ -240,10 +245,16 @@ pub fn validateIssuer(claims: *const JwtClaims, expected: []const u8) JwtError!v
     }
 }
 
-/// Validate audience claim.
+/// Validate the audience claim (OIDC Core 3.1.3.7): expected must be an
+/// aud value; with more than one audience the azp claim must be present
+/// and equal expected. A present azp must always match expected.
 pub fn validateAudience(claims: *const JwtClaims, expected: []const u8) JwtError!void {
     if (claims.aud.len == 0) return; // No audience claim -- skip validation
-    if (!std.mem.eql(u8, claims.aud, expected)) {
+    for (claims.aud) |a| {
+        if (std.mem.eql(u8, a, expected)) break;
+    } else return JwtError.InvalidAudience;
+    if (claims.aud.len > 1 and claims.azp.len == 0) return JwtError.InvalidAudience;
+    if (claims.azp.len > 0 and !std.mem.eql(u8, claims.azp, expected)) {
         return JwtError.InvalidAudience;
     }
 }
@@ -276,13 +287,14 @@ fn parseHeader(json: []const u8) ?JwtHeader {
 
 /// Wire view of the claim set. Parsed with std.json so only top-level
 /// keys bind identity, string escapes decode, and a repeated claim is a
-/// parse error instead of first-match-wins. aud stays untyped: OIDC
-/// allows a string or an array, and a non-string aud carries no audience
-/// here (same as before).
+/// parse error instead of first-match-wins. aud stays untyped on the
+/// wire (OIDC allows a string or an array) and is normalized into a
+/// value slice below; any other shape is a malformed claim.
 const ClaimsJson = struct {
     sub: ?[]const u8 = null,
     iss: ?[]const u8 = null,
     aud: ?std.json.Value = null,
+    azp: ?[]const u8 = null,
     exp: ?i64 = null,
     preferred_username: ?[]const u8 = null,
     email: ?[]const u8 = null,
@@ -292,17 +304,34 @@ const ClaimsJson = struct {
 
 fn parseClaims(json: []const u8, scratch: []u8) ?JwtClaims {
     var fba = std.heap.FixedBufferAllocator.init(scratch);
-    const wire = std.json.parseFromSliceLeaky(ClaimsJson, fba.allocator(), json, .{
+    const alloc = fba.allocator();
+    const wire = std.json.parseFromSliceLeaky(ClaimsJson, alloc, json, .{
         .ignore_unknown_fields = true,
         .duplicate_field_behavior = .@"error",
     }) catch return null;
+    const aud: []const []const u8 = if (wire.aud) |v| switch (v) {
+        .string => |s| blk: {
+            const one = alloc.alloc([]const u8, 1) catch return null;
+            one[0] = s;
+            break :blk one;
+        },
+        .array => |arr| blk: {
+            const list = alloc.alloc([]const u8, arr.items.len) catch return null;
+            for (arr.items, 0..) |item, i| {
+                list[i] = switch (item) {
+                    .string => |s| s,
+                    else => return null, // aud members must be strings
+                };
+            }
+            break :blk list;
+        },
+        else => return null, // aud must be a string or a string array
+    } else &.{};
     return JwtClaims{
         .sub = wire.sub orelse "",
         .iss = wire.iss orelse "",
-        .aud = if (wire.aud) |v| switch (v) {
-            .string => |s| s,
-            else => "",
-        } else "",
+        .aud = aud,
+        .azp = wire.azp orelse "",
         .exp = wire.exp orelse 0,
         .preferred_username = wire.preferred_username orelse "",
         .email = wire.email orelse "",
@@ -396,7 +425,8 @@ test "parse: JWT structure" {
     try std.testing.expectEqualStrings("test-key", jwt.header.kid);
     try std.testing.expectEqualStrings("alice", jwt.claims.sub);
     try std.testing.expectEqualStrings("https://auth.example.com", jwt.claims.iss);
-    try std.testing.expectEqualStrings("xmppd", jwt.claims.aud);
+    try std.testing.expectEqual(@as(usize, 1), jwt.claims.aud.len);
+    try std.testing.expectEqualStrings("xmppd", jwt.claims.aud[0]);
     try std.testing.expectEqual(@as(i64, 9999999999), jwt.claims.exp);
     try std.testing.expectEqualStrings("alice", jwt.claims.preferred_username);
 }
@@ -478,7 +508,7 @@ test "validateExpiry: not expired" {
     const claims = JwtClaims{
         .sub = "",
         .iss = "",
-        .aud = "",
+        .aud = &.{},
         .exp = 9999999999,
         .preferred_username = "",
         .picture = "",
@@ -490,7 +520,7 @@ test "validateExpiry: expired" {
     const claims = JwtClaims{
         .sub = "",
         .iss = "",
-        .aud = "",
+        .aud = &.{},
         .exp = 1000000000,
         .preferred_username = "",
         .picture = "",
@@ -502,7 +532,7 @@ test "validateIssuer: match" {
     const claims = JwtClaims{
         .sub = "",
         .iss = "https://auth.example.com",
-        .aud = "",
+        .aud = &.{},
         .exp = 0,
         .preferred_username = "",
         .picture = "",
@@ -514,7 +544,7 @@ test "validateIssuer: mismatch" {
     const claims = JwtClaims{
         .sub = "",
         .iss = "https://wrong.com",
-        .aud = "",
+        .aud = &.{},
         .exp = 0,
         .preferred_username = "",
         .picture = "",
@@ -523,6 +553,101 @@ test "validateIssuer: mismatch" {
         JwtError.InvalidIssuer,
         validateIssuer(&claims, "https://auth.example.com"),
     );
+}
+
+test "validateAudience: array aud containing the client_id passes" {
+    // OIDC Core 3.1.3.7: an aud array must contain the client_id; a
+    // single extra audience makes azp mandatory and equal.
+    var claims = JwtClaims{
+        .sub = "",
+        .iss = "",
+        .aud = &.{ "other", "xmppd" },
+        .azp = "xmppd",
+        .exp = 0,
+        .preferred_username = "",
+        .picture = "",
+    };
+    try validateAudience(&claims, "xmppd");
+}
+
+fn b64urlJson(buf: []u8, json: []const u8) []const u8 {
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    return enc.encode(buf[0..enc.calcSize(json.len)], json);
+}
+
+test "validateAudience: array aud without the client_id fails" {
+    // Driven through parse() so a codec that drops array aud (the old
+    // "non-string aud carries no audience" path) turns this into an
+    // accept and fails the test.
+    var h: [64]u8 = undefined;
+    var p: [256]u8 = undefined;
+    var token_buf: [512]u8 = undefined;
+    const token = try std.fmt.bufPrint(&token_buf, "{s}.{s}.c2ln", .{
+        b64urlJson(&h, "{\"alg\":\"RS256\"}"),
+        b64urlJson(&p, "{\"sub\":\"s\",\"aud\":[\"other\",\"third\"],\"azp\":\"xmppd\"}"),
+    });
+    var decode: DecodeBuffer = undefined;
+    const parsed = try parse(token, &decode);
+    try std.testing.expectError(
+        JwtError.InvalidAudience,
+        validateAudience(&parsed.claims, "xmppd"),
+    );
+}
+
+test "validateAudience: multiple audiences require a matching azp" {
+    const aud: []const []const u8 = &.{ "xmppd", "other" };
+    var claims = JwtClaims{
+        .sub = "",
+        .iss = "",
+        .aud = aud,
+        .exp = 0,
+        .preferred_username = "",
+        .picture = "",
+    };
+    // azp absent.
+    try std.testing.expectError(JwtError.InvalidAudience, validateAudience(&claims, "xmppd"));
+    // azp present but naming a different party.
+    claims.azp = "other";
+    try std.testing.expectError(JwtError.InvalidAudience, validateAudience(&claims, "xmppd"));
+}
+
+test "validateAudience: a present azp must equal the client_id" {
+    var claims = JwtClaims{
+        .sub = "",
+        .iss = "",
+        .aud = &.{"xmppd"},
+        .azp = "someone-else",
+        .exp = 0,
+        .preferred_username = "",
+        .picture = "",
+    };
+    try std.testing.expectError(JwtError.InvalidAudience, validateAudience(&claims, "xmppd"));
+    claims.azp = "xmppd";
+    try validateAudience(&claims, "xmppd");
+}
+
+test "parseClaims: aud array keeps every value and azp lands" {
+    var scratch: [8192]u8 = undefined;
+    const claims = parseClaims(
+        "{\"sub\":\"s\",\"aud\":[\"xmppd\",\"other\"],\"azp\":\"xmppd\"}",
+        &scratch,
+    ).?;
+    try std.testing.expectEqual(@as(usize, 2), claims.aud.len);
+    try std.testing.expectEqualStrings("xmppd", claims.aud[0]);
+    try std.testing.expectEqualStrings("other", claims.aud[1]);
+    try std.testing.expectEqualStrings("xmppd", claims.azp);
+}
+
+test "parseClaims: aud must be a string or a string array" {
+    var scratch: [8192]u8 = undefined;
+    try std.testing.expect(parseClaims(
+        "{\"sub\":\"s\",\"aud\":[\"xmppd\",7]}",
+        &scratch,
+    ) == null);
+    try std.testing.expect(parseClaims(
+        "{\"sub\":\"s\",\"aud\":7}",
+        &scratch,
+    ) == null);
 }
 
 test "extractStringField: basic" {

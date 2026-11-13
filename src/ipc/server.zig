@@ -41,6 +41,13 @@ const Xucred = extern struct {
     cr_pid: std.c.pid_t,
 };
 
+const so_nosigpipe: c_int = 0x0800; // SO_NOSIGPIPE (FreeBSD)
+
+fn setNoSigpipe(fd: posix.fd_t) !void {
+    const one: c_int = 1;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, so_nosigpipe, std.mem.asBytes(&one));
+}
+
 /// Whether an IPC peer may connect: root, the daemon's own uid, or any
 /// peer group (effective or supplementary) equal to the daemon's gid.
 /// Fails closed when LOCAL_PEERCRED is unavailable.
@@ -78,121 +85,79 @@ const CLIENT_SEND_CAP: usize = 4 << 20;
 /// A connected IPC client (one xmppd-core process).
 pub const IpcConn = struct {
     fd: posix.fd_t = -1,
-    /// Receive buffer, heap-allocated by IpcServer.accept (or tests) with
-    /// RECV_BUF_SIZE bytes. Empty slice when inactive.
-    recv_buf: []u8 = &.{},
-    recv_len: usize = 0,
-    /// Bytes consumed by the last nextMessage() — compacted on the next call.
-    recv_consumed: usize = 0,
-    /// Growable (heap) response backlog: [0..send_start] consumed,
-    /// [send_start..len) unsent. Allocated lazily from `alloc`.
-    send_list: std.ArrayListUnmanaged(u8) = .{},
-    send_start: usize = 0,
+    /// lib/net receive side (ADR-8): the parser over the heap buffer
+    /// IpcServer.accept (or tests) allocates with RECV_BUF_SIZE bytes.
+    /// reader.buf is the empty slice while the slot is inactive.
+    reader: protocol.FrameReader = .{ .buf = &.{} },
+    /// lib/net send side: responses encode in place into a bounded
+    /// backlog (CLIENT_SEND_CAP) and drain to EAGAIN.
+    writer: protocol.FrameWriter = .{},
     /// Set when the slot is activated (IpcServer.accept) or by tests.
     alloc: ?std.mem.Allocator = null,
     active: bool = false,
 
-    /// Read data from the socket. Returns 0 on EOF.
-    pub fn recv(self: *IpcConn) !usize {
-        self.compactRecvBuf();
-        const space = self.recv_buf.len - self.recv_len;
-        if (space == 0) return error.BufferFull;
-
-        const n = posix.read(self.fd, self.recv_buf[self.recv_len .. self.recv_len + space]) catch |err| {
-            return switch (err) {
-                error.WouldBlock => @as(usize, 0),
-                else => error.ReadFailed,
-            };
-        };
-
-        self.recv_len += n;
-        return n;
+    /// Pull bytes into the frame buffer until EAGAIN, full, or EOF.
+    /// .eof is the peer's orderly shutdown; .would_block moved nothing:
+    /// a stale readable event must not read as a hangup (T329).
+    pub fn recv(self: *IpcConn) (error{BufferNotAllocated} || posix.ReadError)!protocol.RecvResult {
+        // accept() always allocates; an empty buffer names an
+        // uninitialized slot, and .full on it would wedge the lane
+        // instead of dying loudly.
+        if (self.reader.buf.len == 0) return error.BufferNotAllocated;
+        return self.reader.recv(self.fd);
     }
 
     /// Extract the next complete message from the recv buffer.
     /// Returns null if no complete frame is available.
     /// The returned Message borrows from the recv buffer — process it
     /// before calling nextMessage() or recv() again.
-    pub fn nextMessage(self: *IpcConn) !?protocol.Message {
-        // Apply deferred compaction from the previous call
-        self.compactRecvBuf();
-
-        const data = self.recv_buf[0..self.recv_len];
-        const frame = protocol.readFrame(data) orelse return null;
-
+    pub fn nextMessage(self: *IpcConn) (protocol.NextError || protocol.DecodeError)!?protocol.Message {
+        const frame = try self.reader.next() orelse return null;
         const msg = try protocol.decode(frame.payload);
-
-        // Defer compaction — the returned msg borrows from recv_buf.
-        self.recv_consumed = frame.consumed;
-
+        // consume() only moves the cursor; the decoded slices stay valid
+        // until the next recv() compacts the consumed prefix away.
+        self.reader.consume(frame.consumed);
         return msg;
     }
 
-    /// Apply deferred compaction: shift unconsumed data to the front.
-    fn compactRecvBuf(self: *IpcConn) void {
-        if (self.recv_consumed == 0) return;
-        const remaining = self.recv_len - self.recv_consumed;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[self.recv_consumed..self.recv_len]);
-        }
-        self.recv_len = remaining;
-        self.recv_consumed = 0;
-    }
-
     /// Queue a response message for sending. Grows the backlog buffer on
-    /// demand; returns SendBufferFull only past CLIENT_SEND_CAP.
-    pub fn queueSend(self: *IpcConn, msg: protocol.Message) !void {
+    /// demand; begin() refuses with BacklogFull past CLIENT_SEND_CAP.
+    pub fn queueSend(self: *IpcConn, msg: protocol.Message) (error{NoAllocator} || protocol.BeginError || protocol.EncodeError)!void {
         const alloc = self.alloc orelse return error.NoAllocator;
 
-        // Encode directly into the backlog: no 64 KiB stack scratch on an
-        // event-loop thread (T257). The cap overflow or encode error
-        // extends nothing (items.len is only bumped on success).
-        var unsent = self.send_list.items.len - self.send_start;
-        // Reclaim the consumed prefix FIRST so the new frame always lands
-        // immediately behind the unsent tail.
-        if (self.send_start >= unsent or self.send_start >= 4096) {
-            std.mem.copyForwards(u8, self.send_list.items, self.send_list.items[self.send_start..]);
-            self.send_list.items.len = unsent;
-            self.send_start = 0;
-        }
-        try self.send_list.ensureUnusedCapacity(alloc, protocol.MAX_FRAME_SIZE);
-        const frame_len = protocol.encode(msg, self.send_list.unusedCapacitySlice()) catch |err| {
+        // Encode in place into the backlog: no 64 KiB stack scratch on an
+        // event-loop thread (T257). Nothing is queued on error.
+        const scratch = self.writer.begin(alloc, protocol.payloadLen(msg), CLIENT_SEND_CAP) catch |err| {
+            log.err("failed to queue a {s} frame for the wire ({}): dropping it", .{ @tagName(msg), err });
+            return err;
+        };
+        const payload_len = protocol.encodePayload(msg, scratch[protocol.HEADER_SIZE..]) catch |err| {
             log.err("failed to encode a {s} frame for the wire ({}): dropping it", .{ @tagName(msg), err });
             return err;
         };
-        unsent = self.send_list.items.len;
-        if (unsent + frame_len > CLIENT_SEND_CAP) return error.SendBufferFull;
-        self.send_list.items.len += frame_len;
+        self.writer.commit(payload_len);
     }
 
-    /// Flush the send buffer. Returns bytes written.
-    pub fn flush(self: *IpcConn) !usize {
-        const items = self.send_list.items;
-        if (self.send_start >= items.len) return 0;
-
-        const n = posix.write(self.fd, items[self.send_start..]) catch |err| {
-            return switch (err) {
-                error.WouldBlock => @as(usize, 0),
-                else => error.WriteFailed,
-            };
-        };
-
-        self.send_start += n;
-        if (self.send_start == self.send_list.items.len) {
-            self.send_start = 0;
-            self.send_list.clearRetainingCapacity();
-        }
-        return n;
+    /// Flush the send backlog until it empties or the fd says EAGAIN.
+    pub fn flush(self: *IpcConn) (error{NoAllocator} || posix.WriteError)!protocol.WriteResult {
+        if (self.writer.pending() == 0) return .drained;
+        const alloc = self.alloc orelse return error.NoAllocator;
+        return self.writer.drain(alloc, self.fd);
     }
 
     /// Returns true if there is unsent data.
     pub fn hasPendingSend(self: *const IpcConn) bool {
-        return self.send_start < self.send_list.items.len;
+        return self.writer.pending() > 0;
     }
 
     /// Unflushed bytes — the intake throttle keys on this.
     pub fn pendingSendBytes(self: *const IpcConn) usize {
-        return self.send_list.items.len - self.send_start;
+        return self.writer.pending();
+    }
+
+    /// Queued-but-unsent bytes (tests).
+    pub fn unsentBytes(self: *const IpcConn) []const u8 {
+        return self.writer.unsentBytes();
     }
 
     pub fn close(self: *IpcConn) void {
@@ -201,14 +166,13 @@ pub const IpcConn = struct {
             self.fd = -1;
         }
         if (self.alloc) |a| {
-            self.send_list.deinit(a);
-            if (self.recv_buf.len > 0) a.free(self.recv_buf);
-            self.recv_buf = &.{};
+            self.writer.deinit(a);
+            if (self.reader.buf.len > 0) a.free(self.reader.buf);
             self.alloc = null;
         }
+        self.writer = .{};
+        self.reader = .{ .buf = &.{} };
         self.active = false;
-        self.recv_len = 0;
-        self.send_start = 0;
     }
 };
 
@@ -272,6 +236,14 @@ pub const IpcServer = struct {
             };
         };
 
+        // A core that died between our read events turns the next reply
+        // write into SIGPIPE; suppress it per-socket so flush() returns
+        // the error instead of the process dying before it lands.
+        setNoSigpipe(client_fd) catch {
+            posix.close(client_fd);
+            return error.AcceptFailed;
+        };
+
         // Peer credentials gate (T258): root, the daemon's own uid,
         // OR membership in the daemon's group through ANY of the peer's
         // groups (LOCAL_PEERCRED cr_groups; getpeereid's effective gid made
@@ -295,7 +267,7 @@ pub const IpcServer = struct {
                 slot.* = IpcConn{};
                 slot.fd = client_fd;
                 slot.alloc = self.allocator;
-                slot.recv_buf = recv_buf;
+                slot.reader = protocol.FrameReader.init(recv_buf);
                 slot.active = true;
                 log.info("IPC client connected, slot={d} fd={d}", .{ i, client_fd });
                 return i;
@@ -394,8 +366,8 @@ test "IpcServer: listen, accept, send/receive" {
     std.Thread.sleep(10 * std.time.ns_per_ms);
 
     // Server receives
-    const n = try conn.recv();
-    try std.testing.expect(n > 0);
+    const rr = try conn.recv();
+    try std.testing.expectEqual(protocol.RecvResult.data, rr);
 
     const msg = try conn.nextMessage() orelse return error.NoMessage;
     try std.testing.expectEqual(@as(u32, 1), msg.auth_request.conn_id);
@@ -411,7 +383,7 @@ test "IpcConn: queueSend buffers past the old 16KiB cap without dropping the cli
     conn.fd = -1; // buffer-only; never flushed
     conn.alloc = std.testing.allocator;
     conn.active = true;
-    defer if (conn.alloc) |a| conn.send_list.deinit(a);
+    defer if (conn.alloc) |a| conn.writer.deinit(a);
 
     var queued: usize = 0;
     while (queued < 2000) : (queued += 1) {
@@ -439,7 +411,7 @@ test "IpcConn: a payload over the old 8 KiB receive buffer arrives through a rea
     var conn = IpcConn{
         .fd = fds[1],
         .alloc = alloc,
-        .recv_buf = try alloc.alloc(u8, RECV_BUF_SIZE),
+        .reader = protocol.FrameReader.init(try alloc.alloc(u8, RECV_BUF_SIZE)),
     };
     defer conn.close();
 
@@ -448,7 +420,7 @@ test "IpcConn: a payload over the old 8 KiB receive buffer arrives through a rea
     @memset(big, 's');
 
     // Encode into a heap scratch the size of one frame (the production
-    // path does this via send_list.unusedCapacitySlice).
+    // path does this via FrameWriter.begin scratch).
     const scratch = try alloc.alloc(u8, protocol.MAX_FRAME_SIZE);
     defer alloc.free(scratch);
     const frame_len = try protocol.encode(.{ .s2s_inbound = .{
@@ -466,6 +438,38 @@ test "IpcConn: a payload over the old 8 KiB receive buffer arrives through a rea
     try std.testing.expectEqualStrings("eve@them.example", msg.s2s_inbound.from_jid);
 }
 
+test "IpcConn: recv reports would_block, eof and data distinctly (T329)" {
+    // Regression: recv() once folded WouldBlock and EOF into the same 0,
+    // so a stale readable event read as a hangup and the caller closed a
+    // healthy lane. The result must distinguish them.
+    const alloc = std.testing.allocator;
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds) != 0)
+        return error.SocketPairFailed;
+    defer posix.close(fds[0]);
+
+    var conn = IpcConn{
+        .fd = fds[1],
+        .alloc = alloc,
+        .reader = protocol.FrameReader.init(try alloc.alloc(u8, RECV_BUF_SIZE)),
+    };
+    defer conn.close();
+
+    try std.testing.expectEqual(protocol.RecvResult.would_block, try conn.recv());
+
+    var frame_buf: [64]u8 = undefined;
+    const frame_len = try protocol.encode(.{ .auth_abort = .{ .conn_id = 3 } }, &frame_buf);
+    _ = try posix.write(fds[0], frame_buf[0..frame_len]);
+    try std.testing.expectEqual(protocol.RecvResult.data, try conn.recv());
+    const msg = try conn.nextMessage() orelse return error.NoMessage;
+    try std.testing.expectEqual(@as(u32, 3), msg.auth_abort.conn_id);
+
+    // Orderly peer shutdown: eof, latched on every later call.
+    posix.shutdown(fds[0], .both) catch {};
+    try std.testing.expectEqual(protocol.RecvResult.eof, try conn.recv());
+    try std.testing.expectEqual(protocol.RecvResult.eof, try conn.recv());
+}
+
 test "IpcConn: frames larger than the old 4 KiB encode buffer are deliverable (T257)" {
     // Regression: encode used a 4096-byte scratch while the wire protocol
     // allows 64 KiB; an 8 KiB s2s_inbound stanza failed encode and the
@@ -474,7 +478,7 @@ test "IpcConn: frames larger than the old 4 KiB encode buffer are deliverable (T
     conn.fd = -1;
     conn.alloc = std.testing.allocator;
     conn.active = true;
-    defer if (conn.alloc) |a| conn.send_list.deinit(a);
+    defer if (conn.alloc) |a| conn.writer.deinit(a);
 
     const big = try std.testing.allocator.alloc(u8, 8192);
     defer std.testing.allocator.free(big);
@@ -590,7 +594,7 @@ test "IpcConn: queueSend and flush" {
     const n = try posix.read(fds[1], &buf);
     try std.testing.expect(n > 0);
 
-    const frame = protocol.readFrame(buf[0..n]) orelse return error.NoFrame;
+    const frame = (try protocol.parseFrame(buf[0..n])) orelse return error.NoFrame;
     const msg = try protocol.decode(frame.payload);
     try std.testing.expectEqual(@as(u32, 10), msg.auth_success.conn_id);
 }
