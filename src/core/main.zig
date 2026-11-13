@@ -41,6 +41,7 @@ const ArchiveBackendMod = @import("archive_backend");
 const ArchiveBackendType = ArchiveBackendMod.Backend;
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const room_registry_mod = @import("room_registry");
+const muc_actor = @import("muc/actor.zig");
 const RoomRegistry = room_registry_mod.RoomRegistry;
 const room_store_mod = @import("room_store");
 const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
@@ -84,7 +85,7 @@ pub fn main() !void {
     var config_path: ?[]const u8 = null;
     var listen_fd_str: ?[]const u8 = null;
     var max_sessions: usize = @import("server.zig").DEFAULT_MAX_SESSIONS;
-    var fan_out_batch_size: u8 = @import("fanout.zig").DEFAULT_BATCH_SIZE;
+    var fan_out_batch_size: u8 = @import("muc/fanout.zig").DEFAULT_BATCH_SIZE;
     // 0 = SessionMap default (256). T198/Sonya: raise for many-resources-per-account deployments.
     var max_resources_per_account: usize = 0;
     var oidc_import_avatar: bool = false;
@@ -213,7 +214,7 @@ pub fn main() !void {
             max_sessions = std.fmt.parseInt(usize, v, 10) catch @import("server.zig").DEFAULT_MAX_SESSIONS;
         }
         if (c.get("core", "fan_out_batch_size")) |v| {
-            fan_out_batch_size = std.fmt.parseInt(u8, v, 10) catch @import("fanout.zig").DEFAULT_BATCH_SIZE;
+            fan_out_batch_size = std.fmt.parseInt(u8, v, 10) catch @import("muc/fanout.zig").DEFAULT_BATCH_SIZE;
         }
         if (c.get("core", "max_resources_per_account")) |v| {
             max_resources_per_account = std.fmt.parseInt(usize, v, 10) catch 0;
@@ -556,7 +557,7 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
         // Load persistent rooms from store (T105), only rooms owned by
         // this worker (S19).
         if (ctx.room_store) |store| {
-            const loaded = room_registry_mod.loadPersistentRooms(reg, store, server.getWorkerCount(), worker_id);
+            const loaded = room_registry_mod.loadPersistentRooms(reg, store, muc_actor.getWorkerCount(server), worker_id);
             if (loaded > 0) {
                 log.info("worker {d}: loaded {d} persistent rooms", .{ worker_id, loaded });
             }

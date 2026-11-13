@@ -42,7 +42,7 @@ const archive_queue_mod = @import("archive_queue");
 const vcard_store_mod = @import("vcard_store");
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const iq_handler = @import("../iq_handler.zig");
-const muc_handler = @import("../muc_handler.zig");
+const muc_handler = @import("../muc/handler.zig");
 const presence_handler = @import("../presence/handler.zig");
 pub const sub_cache_mod = @import("../subscription_cache.zig");
 pub const caps_mod = @import("../caps.zig");
@@ -55,7 +55,8 @@ const room_mailbox_mod = @import("room_mailbox");
 const RoomRegistry = room_registry_mod.RoomRegistry;
 const room_store_mod = @import("room_store");
 const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
-const fanout_mod = @import("../fanout.zig");
+const fanout_mod = @import("../muc/fanout.zig");
+const muc_actor = @import("../muc/actor.zig");
 const FanoutQueue = fanout_mod.FanoutQueue;
 const actor_message = @import("../xworker/envelope.zig");
 pub const sm_state = @import("sm_state.zig");
@@ -185,9 +186,9 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     // T177: SM-IDs embed the owning worker id (sm_state.generateSmId).
     // A resume arriving on the wrong worker goes through the cross-worker
     // handoff instead of failing item-not-found.
-    if (self.getWorkerCount() > 1) {
+    if (muc_actor.getWorkerCount(self) > 1) {
         if (sm_state.workerIdFromSmId(previd)) |owner| {
-            if (owner != self.worker_id and owner < self.getWorkerCount()) {
+            if (owner != self.worker_id and owner < muc_actor.getWorkerCount(self)) {
                 startCrossWorkerResume(self,session, previd, h_value, owner, changes);
                 return;
             }
@@ -198,9 +199,9 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     const detached_id = findDetachedSession(self,previd) orelse {
         // T177: prefix routed here but the session was handed off —
         // follow the redirect breadcrumb instead of failing.
-        if (self.getWorkerCount() > 1) {
+        if (muc_actor.getWorkerCount(self) > 1) {
             if (smRedirectLookup(self,previd)) |target| {
-                if (target != self.worker_id and target < self.getWorkerCount()) {
+                if (target != self.worker_id and target < muc_actor.getWorkerCount(self)) {
                     startCrossWorkerResume(self,session, previd, h_value, target, changes);
                     return;
                 }
@@ -472,7 +473,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
         // breadcrumb, preserving the original requester addressing.
         if (req.hops < MAX_SM_REDIRECT_HOPS) {
             if (smRedirectLookup(self,req.previd)) |target| {
-                if (target != self.worker_id and target < self.getWorkerCount()) {
+                if (target != self.worker_id and target < muc_actor.getWorkerCount(self)) {
                     log.info("cross-worker SM resume: {s} relocated to worker {d}, forwarding (hop {d})", .{
                         req.previd, target, req.hops + 1,
                     });
@@ -941,11 +942,11 @@ pub fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const 
             .new_session_id = @intCast(session.conn.id),
             .new_generation = generation,
         };
-        const owner = room_registry_mod.roomOwner(room_jid, self.getWorkerCount());
+        const owner = room_registry_mod.roomOwner(room_jid, muc_actor.getWorkerCount(self));
         if (owner == self.worker_id) {
             muc_handler.handleOccupantMove(self, move);
         } else {
-            self.enqueueRoomActorMessage(owner, .{ .room_occupant_move = move });
+            muc_actor.enqueueRoomActorMessage(self, owner, .{ .room_occupant_move = move });
         }
     }
 }

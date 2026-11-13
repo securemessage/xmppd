@@ -29,7 +29,7 @@ const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
 const stanza_facts = @import("../stanza/facts.zig");
 const stanza_writer = @import("../stanza/writer.zig");
-const fanout_mod = @import("../fanout.zig");
+const fanout_mod = @import("../muc/fanout.zig");
 const room_registry_mod = @import("room_registry");
 const metrics = @import("../metrics.zig");
 const offline_store_mod = @import("generic_offline_store");
@@ -38,6 +38,7 @@ const OpBackendMod = @import("op_backend");
 const OpBackendType = OpBackendMod.Backend;
 const ArchiveBackendMod = @import("archive_backend");
 const router = @import("router.zig");
+const muc_actor = @import("../muc/actor.zig");
 
 const log = std.log.scoped(.xmppd);
 
@@ -184,7 +185,7 @@ pub fn handleDeliveryWake(self: *Server, changes: *ChangeList) void {
     if (metrics.get()) |c| metrics.bump(&c.wakes, 1);
     ds.drainPipe(self.worker_id);
     drainDeliveryQueue(self, changes);
-    _ = self.drainRoomMailboxes(changes);
+    _ = muc_actor.drainRoomMailboxes(self, changes);
 }
 
 /// Drain all pending deliveries from this worker's MPSC queue.
@@ -212,7 +213,7 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
 
             // Room actor message: decode and dispatch to local room shard
             if (local_session_id == delivery_queue_mod.ROOM_ACTOR_SENTINEL) {
-                c.server.handleRoomActorMessage(payload, c.changes);
+                muc_actor.handleRoomActorMessage(c.server, payload, c.changes);
                 return;
             }
 

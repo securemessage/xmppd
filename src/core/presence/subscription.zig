@@ -7,6 +7,7 @@
 const server_mod = @import("../server.zig");
 const Server = server_mod.Server;
 const sub_cache_mod = server_mod.sub_cache_mod;
+const muc_actor = @import("../muc/actor.zig");
 
 /// Invalidate a bare JID's subscription-cache entry locally AND on all
 /// other workers. The sub_cache is per-worker memory with a 30s TTL —
@@ -15,11 +16,11 @@ const sub_cache_mod = server_mod.sub_cache_mod;
 /// silently skipped: e2e-subscription Test 7 at workers>1).
 pub fn invalidateSubCache(self: *Server, bare_jid: []const u8) void {
     self.sub_cache.invalidate(sub_cache_mod.hashBareJid(bare_jid));
-    const wc = self.getWorkerCount();
+    const wc = muc_actor.getWorkerCount(self);
     if (wc <= 1) return;
     var w: u16 = 0;
     while (w < wc) : (w += 1) {
         if (w == self.worker_id) continue;
-        self.enqueueRoomActorMessage(w, .{ .invalidate_subscription = .{ .bare_jid = bare_jid } });
+        muc_actor.enqueueRoomActorMessage(self, w, .{ .invalidate_subscription = .{ .bare_jid = bare_jid } });
     }
 }

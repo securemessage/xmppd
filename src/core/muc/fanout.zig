@@ -23,12 +23,12 @@ const std = @import("std");
 const xml = @import("xml");
 const room_registry = @import("room_registry");
 const delivery_queue_mod = @import("delivery_queue");
-const connection_mod = @import("connection.zig");
-const address = @import("routing/address.zig");
+const connection_mod = @import("../connection.zig");
+const address = @import("../routing/address.zig");
 const Room = room_registry.Room;
 const Occupant = room_registry.Occupant;
 const RoomRegistry = room_registry.RoomRegistry;
-const ChangeList = @import("event_loop.zig").ChangeList;
+const ChangeList = @import("../event_loop.zig").ChangeList;
 
 const log = std.log.scoped(.fanout);
 

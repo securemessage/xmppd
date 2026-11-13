@@ -73,9 +73,10 @@ const archive_queue_mod = @import("archive_queue");
 const vcard_store_mod = @import("vcard_store");
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const iq_handler = @import("iq_handler.zig");
-const muc_handler = @import("muc_handler.zig");
+const muc_handler = @import("muc/handler.zig");
 const presence_handler = @import("presence/handler.zig");
 const presence_sub = @import("presence/subscription.zig");
+const muc_actor = @import("muc/actor.zig");
 pub const sub_cache_mod = @import("subscription_cache.zig");
 pub const caps_mod = @import("caps.zig");
 const router = @import("routing/router.zig");
@@ -87,7 +88,7 @@ const room_mailbox_mod = @import("room_mailbox");
 const RoomRegistry = room_registry_mod.RoomRegistry;
 const room_store_mod = @import("room_store");
 const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
-const fanout_mod = @import("fanout.zig");
+const fanout_mod = @import("muc/fanout.zig");
 const FanoutQueue = fanout_mod.FanoutQueue;
 const actor_message = @import("xworker/envelope.zig");
 pub const sm_state = @import("c2s/sm_state.zig");
@@ -1033,7 +1034,7 @@ pub const Server = struct {
                 ds.getState(self.worker_id).setIdle();
                 if (ds.getQueue(self.worker_id).hasPending()) {
                     routing_deliver.drainDeliveryQueue(self, &changes);
-                    _ = self.drainRoomMailboxes(&changes);
+                    _ = muc_actor.drainRoomMailboxes(self, &changes);
                     // Self-wake only for MPSC queue CAS race (producer reserved
                     // slot but hasn't stored ready=true yet). Room mailboxes
                     // don't need self-wake — they only grow from MPSC deliveries
@@ -1043,7 +1044,7 @@ pub const Server = struct {
                     }
                 } else {
                     // No MPSC pending, but drain room mailboxes opportunistically
-                    _ = self.drainRoomMailboxes(&changes);
+                    _ = muc_actor.drainRoomMailboxes(self, &changes);
                 }
             }
 
@@ -2013,188 +2014,6 @@ pub const Server = struct {
     // ========================================================================
 
     // ========================================================================
-    // Cross-thread delivery (MPSC queue consumer)
-    // ========================================================================
-
-
-
-
-    /// Handle a room actor message from the MPSC queue.
-    /// Room-targeted messages (join, part, groupchat, disco) are pushed into the
-    /// target room's per-room mailbox for fair scheduling. Non-room messages
-    /// (shadow updates, session close) are dispatched immediately.
-    pub fn handleRoomActorMessage(self: *Server, payload: []const u8, changes: *ChangeList) void {
-        const msg = actor_message.decode(payload) orelse {
-            log.warn("malformed room actor message ({d} bytes)", .{payload.len});
-            return;
-        };
-
-        switch (msg) {
-            .room_join, .room_part, .room_message, .room_disco_info, .room_disco_items, .room_admin, .room_mam_query => {
-                // Extract room_jid to find target room's mailbox
-                const room_jid = switch (msg) {
-                    .room_join, .room_part => |ev| ev.room_jid,
-                    .room_message => |ev| ev.room_jid,
-                    .room_disco_info, .room_disco_items => |ev| ev.room_jid,
-                    .room_admin => |ev| ev.room_jid,
-                    .room_mam_query => |ev| ev.room_jid,
-                    else => unreachable,
-                };
-                const reg = self.room_registry orelse return;
-                // Find room — for room_join, the room may not exist yet.
-                // processRemoteJoin will create it (with proper is_new_room logic).
-                var room = reg.findByJid(room_jid);
-                if (room == null) {
-                    if (std.meta.activeTag(msg) == .room_join) {
-                        // Create a minimal room so the mailbox exists for enqueue
-                        room = reg.createRoom(room_jid, .{ .persistent = false }) catch return;
-                        // Mark that processRemoteJoin should treat this as new
-                        room.?.occupant_count = 0;
-                    } else {
-                        log.debug("room actor msg for unknown room: {s}", .{room_jid});
-                        return;
-                    }
-                }
-                const r = room.?;
-                r.mailbox.enqueue(payload) catch {
-                    _ = room_mailbox_mod.mailbox_drops.fetchAdd(1, .monotonic);
-                    log.warn("room mailbox full for {s} — bouncing to sender (S16)", .{room_jid});
-                    muc_handler.bounceRoomMailboxFull(self, msg, room_jid, changes);
-                };
-            },
-            .room_directory_update => |ev| {
-                muc_handler.handleRoomDirectoryUpdate(self, ev);
-            },
-            .invalidate_subscription => |ev| {
-                // Cross-worker cache invalidation — local invalidate only;
-                // do NOT re-broadcast (would cascade).
-                self.sub_cache.invalidate(sub_cache_mod.hashBareJid(ev.bare_jid));
-            },
-            .shadow_join => |ev| {
-                muc_handler.handleShadowJoin(self, ev);
-            },
-            .shadow_part => |ev| {
-                muc_handler.handleShadowPart(self, ev);
-            },
-            .room_occupant_move => |ev| {
-                // T177: immediate dispatch (see handleOccupantMove) — the move
-                // only mutates a delivery triple, so mailbox ordering with
-                // queued join/part/message traffic is not required.
-                muc_handler.handleOccupantMove(self, ev);
-            },
-            .session_closed => |ev| {
-                var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-                const real_jid = router.buildFullJid(ev.local, ev.domain, ev.resource, &jid_buf) catch {
-                    noteDrop("session_closed for {s}@{s}: full JID exceeds {d} bytes; room cleanup skipped", .{ ev.local, ev.domain, router.FULL_JID_MAX });
-                    return;
-                };
-                // local_only=true: this is already a broadcast from the originating
-                // worker. Do NOT re-broadcast to avoid infinite cascade.
-                muc_handler.handleSessionCloseLocal(self, real_jid, changes);
-            },
-            else => {
-                log.warn("unexpected actor message tag in room dispatch: 0x{x:0>2}", .{msg.tag()});
-            },
-        }
-    }
-
-    /// Drain per-room mailboxes with round-robin fair scheduling.
-    /// Called after drainDeliveryQueue in the event loop. Processes one message
-    /// per room per iteration, bounded to MAX_DRAIN_PER_TICK total messages to
-    /// prevent infinite spinning when cross-thread traffic generates responses.
-    /// Returns true if there are still pending messages (caller should self-wake).
-    pub fn drainRoomMailboxes(self: *Server, changes: *ChangeList) bool {
-        const reg = self.room_registry orelse return false;
-        const MAX_DRAIN_PER_TICK: usize = 32;
-        var processed: usize = 0;
-        var any_pending = false;
-
-        for (&reg.rooms) |*slot| {
-            if (processed >= MAX_DRAIN_PER_TICK) {
-                any_pending = true;
-                break;
-            }
-            const room = slot.* orelse continue;
-            if (!room.active) continue;
-            if (!room.mailbox.hasPending()) continue;
-            const payload = room.mailbox.dequeue() orelse continue;
-            self.processRoomMailboxMessage(room, payload, changes);
-            processed += 1;
-        }
-
-        // Deferred room cleanup: destroy empty transient rooms AFTER all mailbox
-        // processing. This is the single destruction point — avoids ordering
-        // conflicts between session_closed (immediate) and room_part (mailbox),
-        // and avoids use-after-free of decoded payload slices during processing.
-        muc_handler.cleanupEmptyRooms(self);
-
-        // Check if any room still has pending messages
-        if (!any_pending) {
-            for (&reg.rooms) |*slot| {
-                const room = slot.* orelse continue;
-                if (room.active and room.mailbox.hasPending()) {
-                    any_pending = true;
-                    break;
-                }
-            }
-        }
-        return any_pending;
-    }
-
-    /// Process a single message from a room's mailbox.
-    fn processRoomMailboxMessage(self: *Server, room: *room_registry_mod.Room, payload: []const u8, changes: *ChangeList) void {
-        const msg = actor_message.decode(payload) orelse return;
-        switch (msg) {
-            .room_join => |ev| {
-                muc_handler.processRemoteJoin(self, ev, changes);
-            },
-            .room_part => |ev| {
-                muc_handler.processRemotePart(self, ev, changes);
-            },
-            .room_message => |ev| {
-                muc_handler.processRemoteGroupchat(self, ev, changes);
-            },
-            .room_disco_info => |ev| {
-                muc_handler.processRemoteDiscoInfo(self, ev, changes);
-            },
-            .room_disco_items => |ev| {
-                muc_handler.processRemoteDiscoItems(self, ev, changes);
-            },
-            .room_admin => |ev| {
-                muc_handler.processRemoteAdminAction(self, ev, changes);
-            },
-            .room_mam_query => |ev| {
-                muc_handler.processRemoteMamQuery(self, ev, changes);
-            },
-            else => {
-                _ = room;
-                log.warn("unexpected message in room mailbox: 0x{x:0>2}", .{msg.tag()});
-            },
-        }
-    }
-
-    /// Enqueue a room actor message to the owning worker via MPSC.
-    /// Used by muc_handler when a MUC operation lands on a non-owning worker.
-    pub fn enqueueRoomActorMessage(self: *Server, target_worker: u16, msg: actor_message.Message) void {
-        const ds = self.delivery_system orelse return;
-        var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
-        const len = actor_message.encode(&buf, msg) orelse {
-            log.warn("room actor message encode failed", .{});
-            return;
-        };
-        ds.deliver(target_worker, delivery_queue_mod.ROOM_ACTOR_SENTINEL, 0, buf[0..len]) catch |err| {
-            log.warn("room actor enqueue to worker {d} failed: {}", .{ target_worker, err });
-        };
-    }
-
-    /// Get the number of workers (for room ownership computation).
-    pub fn getWorkerCount(self: *const Server) u16 {
-        if (self.delivery_system) |ds| return ds.worker_count;
-        return 1;
-    }
-
-
-    // ========================================================================
     // XEP-0198: Stream Management
     // ========================================================================
 };
@@ -2610,7 +2429,7 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
     };
     const cases = .{
         .{ "connection.zig", @embedFile("connection.zig"), 17 }, // Connection layer self-tests incl. the M1 counter test; no Session.
-        .{ "fanout.zig", @embedFile("fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
+        .{ "muc/fanout.zig", @embedFile("muc/fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
         .{ "presence/handler.zig", @embedFile("presence/handler.zig"), 0 },
         .{ "presence/subscription.zig", @embedFile("presence/subscription.zig"), 0 },
         .{ "presence/broadcast.zig", @embedFile("presence/broadcast.zig"), 0 },
@@ -2621,7 +2440,8 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "c2s/session.zig", @embedFile("c2s/session.zig"), 13 }, // queueSendStanza itself + stream/SASL nonzas.
         .{ "c2s/sm.zig", @embedFile("c2s/sm.zig"), 9 }, // SM enable/resume/failed nonzas.
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), 0 },
-        .{ "muc_handler.zig", @embedFile("muc_handler.zig"), 0 },
+        .{ "muc/handler.zig", @embedFile("muc/handler.zig"), 0 },
+        .{ "muc/actor.zig", @embedFile("muc/actor.zig"), 0 },
         .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig"), 0 },
         .{ "caps.zig", @embedFile("caps.zig"), 0 },
         // Remaining core files (S15): a raw send added here must be caught
@@ -2634,8 +2454,8 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "main.zig", @embedFile("main.zig"), 0 },
         .{ "metrics.zig", @embedFile("metrics.zig"), 0 },
         .{ "offline_store.zig", @embedFile("offline_store.zig"), 0 },
-        .{ "room_mailbox.zig", @embedFile("room_mailbox.zig"), 0 },
-        .{ "room_registry.zig", @embedFile("room_registry.zig"), 0 },
+        .{ "muc/mailbox.zig", @embedFile("muc/mailbox.zig"), 0 },
+        .{ "muc/registry.zig", @embedFile("muc/registry.zig"), 0 },
         .{ "roster_store.zig", @embedFile("roster_store.zig"), 0 },
         .{ "session_map.zig", @embedFile("session_map.zig"), 0 },
         .{ "c2s/sm_handoff.zig", @embedFile("c2s/sm_handoff.zig"), 0 },
@@ -2644,8 +2464,8 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "stanza/facts.zig", @embedFile("stanza/facts.zig"), 0 },
         .{ "stanza/writer.zig", @embedFile("stanza/writer.zig"), 0 },
     };
-    if (cases.len != 32) {
-        log.err("S15 ratchet: covers {d} core files, expected 32", .{cases.len});
+    if (cases.len != 33) {
+        log.err("S15 ratchet: covers {d} core files, expected 33", .{cases.len});
         return error.RatchetCoverage;
     }
     inline for (cases) |case| {
@@ -4358,9 +4178,10 @@ test "S10: IPC write interest lives only in server.zig" {
         .{ "presence/handler.zig", @embedFile("presence/handler.zig") },
         .{ "presence/subscription.zig", @embedFile("presence/subscription.zig") },
         .{ "presence/broadcast.zig", @embedFile("presence/broadcast.zig") },
-        .{ "muc_handler.zig", @embedFile("muc_handler.zig") },
+        .{ "muc/handler.zig", @embedFile("muc/handler.zig") },
+        .{ "muc/actor.zig", @embedFile("muc/actor.zig") },
         .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig") },
-        .{ "fanout.zig", @embedFile("fanout.zig") },
+        .{ "muc/fanout.zig", @embedFile("muc/fanout.zig") },
         .{ "caps.zig", @embedFile("caps.zig") },
     };
     inline for (cases) |case| {
@@ -4433,9 +4254,10 @@ test "S10: the IPC reconnect timers are armed in exactly one place" {
         .{ "presence/handler.zig", @embedFile("presence/handler.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "presence/subscription.zig", @embedFile("presence/subscription.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "presence/broadcast.zig", @embedFile("presence/broadcast.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "muc_handler.zig", @embedFile("muc_handler.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "muc/handler.zig", @embedFile("muc/handler.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "muc/actor.zig", @embedFile("muc/actor.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "fanout.zig", @embedFile("fanout.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "muc/fanout.zig", @embedFile("muc/fanout.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "caps.zig", @embedFile("caps.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "event_loop.zig", @embedFile("event_loop.zig"), @as(usize, 0), @as(usize, 0) },
     };

@@ -26,18 +26,19 @@ const RoomConfig = room_store.RoomConfig;
 const Role = room_store.Role;
 const Affiliation = room_store.Affiliation;
 
-const connection_mod = @import("connection.zig");
-const server_mod = @import("server.zig");
+const connection_mod = @import("../connection.zig");
+const server_mod = @import("../server.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
-const ChangeList = @import("event_loop.zig").ChangeList;
+const ChangeList = @import("../event_loop.zig").ChangeList;
 const fanout = @import("fanout.zig");
 const FanoutQueue = fanout.FanoutQueue;
-const router = @import("routing/router.zig");
+const router = @import("../routing/router.zig");
 const PendingFanout = fanout.PendingFanout;
-const actor_message = @import("xworker/envelope.zig");
+const actor_message = @import("../xworker/envelope.zig");
 const delivery_queue = @import("delivery_queue");
-const routing_deliver = @import("routing/deliver.zig");
+const routing_deliver = @import("../routing/deliver.zig");
+const muc_actor = @import("actor.zig");
 
 const log = std.log.scoped(.muc);
 
@@ -127,7 +128,7 @@ pub fn handleMucPresence(
     // Build room JID for ownership check
     var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, to_local, muc_host) orelse return;
-    const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
+    const owner = room_registry.roomOwner(room_jid, muc_actor.getWorkerCount(server));
 
     if (owner != server.worker_id and server.delivery_system != null) {
         // Route to owning worker via MPSC
@@ -137,7 +138,7 @@ pub fn handleMucPresence(
         const join_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
 
         if (std.mem.eql(u8, type_str, "unavailable")) {
-            server.enqueueRoomActorMessage(owner, .{ .room_part = .{
+            muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_part = .{
                 .room_jid = room_jid,
                 .real_jid = real_jid,
                 .nick = to_resource,
@@ -146,7 +147,7 @@ pub fn handleMucPresence(
                 .generation = join_gen,
             } });
         } else if (type_str.len == 0) {
-            server.enqueueRoomActorMessage(owner, .{ .room_join = .{
+            muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_join = .{
                 .room_jid = room_jid,
                 .real_jid = real_jid,
                 .nick = to_resource,
@@ -184,7 +185,7 @@ pub fn handleMucGroupchat(
     // Build room JID
     var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, to_local, muc_host) orelse return;
-    const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
+    const owner = room_registry.roomOwner(room_jid, muc_actor.getWorkerCount(server));
 
     // One sender JID serves both the remote-owner route and the local
     // lookup; building it twice also doubled the stack buffer.
@@ -194,7 +195,7 @@ pub fn handleMucGroupchat(
 
     if (owner != server.worker_id and server.delivery_system != null) {
         // Route to owning worker via MPSC
-        server.enqueueRoomActorMessage(owner, .{ .room_message = .{
+        muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_message = .{
             .room_jid = room_jid,
             .from_jid = sender_jid,
             .inner_xml = inner_xml,
@@ -627,7 +628,7 @@ pub fn handleRoomDiscoInfo(
 
     var room_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
-    const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
+    const owner = room_registry.roomOwner(room_jid, muc_actor.getWorkerCount(server));
 
     if (owner != server.worker_id and server.delivery_system != null) {
         var reply_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
@@ -636,7 +637,7 @@ pub fn handleRoomDiscoInfo(
         // T173: capture the requester's ABA generation here, where its session
         // is live — the reply's ds.deliver() validates it.
         const reply_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
-        server.enqueueRoomActorMessage(owner, .{ .room_disco_info = .{
+        muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_disco_info = .{
             .room_jid = room_jid,
             .iq_id = iq_id,
             .reply_to_worker = server.worker_id,
@@ -734,7 +735,7 @@ pub fn handleMucAdminIq(
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     // Ownership routing
-    const owner = room_registry.roomOwner(room_jid, server.getWorkerCount());
+    const owner = room_registry.roomOwner(room_jid, muc_actor.getWorkerCount(server));
     if (owner != server.worker_id) {
         // Route to owning worker
         const req_bound = session.stream.bound_jid orelse return;
@@ -748,7 +749,7 @@ pub fn handleMucAdminIq(
         // is live — the reply's ds.deliver() validates it.
         const reply_gen: u32 = if (server.session_map) |sm| sm.getGeneration(req_bound.local, req_bound.domain, req_bound.resource) orelse 0 else 0;
 
-        server.enqueueRoomActorMessage(owner, .{ .room_admin = .{
+        muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_admin = .{
             .room_jid = room_jid,
             .actor_jid = req_jid,
             .target_nick = target_nick,
@@ -811,7 +812,7 @@ pub fn handleMucAdminIq(
         broadcastOccupantLeave(server, room, &removed, muc_host, "307", changes);
         // T114: Send shadow_part to the kicked occupant's worker
         if (removed.worker_id != server.worker_id) {
-            server.enqueueRoomActorMessage(removed.worker_id, .{ .shadow_part = .{
+            muc_actor.enqueueRoomActorMessage(server, removed.worker_id, .{ .shadow_part = .{
                 .room_jid = room_jid,
                 .real_jid = removed.getRealJid(),
                 .nick = removed.getNick(),
@@ -1395,7 +1396,7 @@ pub fn handleSessionClose(server: *Server, real_jid: []const u8, changes: *Chang
         var i: u16 = 0;
         while (i < ds.worker_count) : (i += 1) {
             if (i == server.worker_id) continue;
-            server.enqueueRoomActorMessage(i, .{ .session_closed = .{
+            muc_actor.enqueueRoomActorMessage(server, i, .{ .session_closed = .{
                 .local = local,
                 .domain = domain,
                 .resource = resource,
@@ -1765,7 +1766,7 @@ fn collapseOccupant(
     if (before.session_id == room_registry.REMOTE_OCCUPANT) return true;
     notifyReplacedResource(server, r, &before, changes);
     if (before.worker_id != server.worker_id) {
-        server.enqueueRoomActorMessage(before.worker_id, .{ .shadow_part = .{
+        muc_actor.enqueueRoomActorMessage(server, before.worker_id, .{ .shadow_part = .{
             .room_jid = r.getJid(),
             .real_jid = before.getRealJid(),
             .nick = before.getNick(),
@@ -2254,7 +2255,7 @@ fn finishRemoteJoin(
     const muc_host = server.muc_host orelse return;
 
     // Send shadow_join to the remote worker so multicast fan-out works
-    server.enqueueRoomActorMessage(ev.worker_id, .{ .shadow_join = .{
+    muc_actor.enqueueRoomActorMessage(server, ev.worker_id, .{ .shadow_join = .{
         .room_jid = ev.room_jid,
         .real_jid = ev.real_jid,
         .nick = ev.nick,
@@ -2366,7 +2367,7 @@ pub fn processRemotePart(
     log.info("{s} left {s} (remote, worker {d})", .{ ev.real_jid, ev.room_jid, ev.worker_id });
 
     // Send shadow_part to the remote worker
-    server.enqueueRoomActorMessage(ev.worker_id, .{ .shadow_part = .{
+    muc_actor.enqueueRoomActorMessage(server, ev.worker_id, .{ .shadow_part = .{
         .room_jid = ev.room_jid,
         .real_jid = ev.real_jid,
         .nick = ev.nick,
@@ -2722,7 +2723,7 @@ pub fn handleOccupantMove(server: *Server, ev: actor_message.RoomOccupantMove) v
 
     // Cross-worker move: the old worker's shadow copy is stale — remove it.
     if (old_worker != ev.new_worker_id and old_worker != server.worker_id) {
-        server.enqueueRoomActorMessage(old_worker, .{ .shadow_part = .{
+        muc_actor.enqueueRoomActorMessage(server, old_worker, .{ .shadow_part = .{
             .room_jid = ev.room_jid,
             .real_jid = ev.real_jid,
             .nick = "",
@@ -2740,7 +2741,7 @@ pub fn handleOccupantMove(server: *Server, ev: actor_message.RoomOccupantMove) v
     if (ev.new_worker_id != server.worker_id) {
         const idx = room.findByRealJid(ev.real_jid).?;
         const occ = room.occupants[idx].?;
-        server.enqueueRoomActorMessage(ev.new_worker_id, .{ .shadow_join = .{
+        muc_actor.enqueueRoomActorMessage(server, ev.new_worker_id, .{ .shadow_join = .{
             .room_jid = room.getJid(),
             .real_jid = ev.real_jid,
             .nick = occ.getNick(),
@@ -2755,7 +2756,7 @@ pub fn handleOccupantMove(server: *Server, ev: actor_message.RoomOccupantMove) v
 /// room/occupant no longer exists to update in place.
 fn shadowCleanOldWorker(server: *Server, ev: actor_message.RoomOccupantMove) void {
     if (ev.old_worker_id == server.worker_id) return; // canonical lives here; nothing to sweep
-    server.enqueueRoomActorMessage(ev.old_worker_id, .{ .shadow_part = .{
+    muc_actor.enqueueRoomActorMessage(server, ev.old_worker_id, .{ .shadow_part = .{
         .room_jid = ev.room_jid,
         .real_jid = ev.real_jid,
         .nick = "",
@@ -3150,7 +3151,7 @@ pub fn processRemoteAdminAction(
         // T114: Send shadow_part to the kicked occupant's worker so it removes the
         // stale shadow entry. Without this, the shadow room retains a ghost occupant.
         if (removed.worker_id != server.worker_id) {
-            server.enqueueRoomActorMessage(removed.worker_id, .{ .shadow_part = .{
+            muc_actor.enqueueRoomActorMessage(server, removed.worker_id, .{ .shadow_part = .{
                 .room_jid = ev.room_jid,
                 .real_jid = removed.getRealJid(),
                 .nick = removed.getNick(),
@@ -3219,7 +3220,7 @@ pub fn processRemoteMamQuery(
 
     // Parse timestamps from ISO text
     const mam_handler = @import("mam_handler");
-    const parseTs = @import("iq_handler.zig").parseTimestamp;
+    const parseTs = @import("../iq_handler.zig").parseTimestamp;
     const start_ts = if (ev.start.len > 0) parseTs(ev.start) else null;
     const end_ts = if (ev.end_field.len > 0) parseTs(ev.end_field) else null;
 
@@ -3266,7 +3267,7 @@ pub fn processRemoteMamQuery(
 /// Called when a canonical (non-shadow) public room is created or destroyed.
 fn broadcastDirectoryUpdate(server: *Server, room_jid: []const u8, room_name: []const u8, active: bool) void {
     const ds = server.delivery_system orelse return;
-    const wc = server.getWorkerCount();
+    const wc = muc_actor.getWorkerCount(server);
     if (wc <= 1) return;
 
     var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;

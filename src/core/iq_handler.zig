@@ -20,8 +20,8 @@ const std = @import("std");
 const xml = @import("xml");
 const build_options = @import("build_options");
 const mam_handler = @import("mam_handler");
-const muc_handler = @import("muc_handler.zig");
-const fanout = @import("fanout.zig");
+const muc_handler = @import("muc/handler.zig");
+const fanout = @import("muc/fanout.zig");
 const connection_mod = @import("connection.zig");
 const room_registry_mod = @import("room_registry");
 const actor_message = @import("xworker/envelope.zig");
@@ -92,6 +92,7 @@ const SessionEntry = session_map_mod.SessionEntry;
 const router = @import("routing/router.zig");
 const presence_sub = @import("presence/subscription.zig");
 const presence_bcast = @import("presence/broadcast.zig");
+const muc_actor = @import("muc/actor.zig");
 
 /// RSM namespace URI.
 const ns_rsm = "http://jabber.org/protocol/rsm";
@@ -1447,7 +1448,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
     }
 
     // Ownership routing (T112): MAM archives live on the owning worker
-    const owner = room_registry_mod.roomOwner(room_jid, server.getWorkerCount());
+    const owner = room_registry_mod.roomOwner(room_jid, muc_actor.getWorkerCount(server));
     if (owner != server.worker_id) {
         // Route to owning worker — they have the archive data
         log.info("routing MAM query for room {s} to owning worker {d} (from {d})", .{ room_jid, owner, server.worker_id });
@@ -1462,7 +1463,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
         // is live — the reply's ds.deliver() validates it.
         const reply_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
 
-        server.enqueueRoomActorMessage(owner, .{ .room_mam_query = .{
+        muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_mam_query = .{
             .room_jid = room_jid,
             .iq_id = iq_id,
             .query_id = if (session.mam_query_id.len > 0) session.mam_query_id else iq_id,

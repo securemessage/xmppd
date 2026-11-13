@@ -700,12 +700,12 @@ pub fn build(b: *std.Build) void {
     });
     server_room_store_mod.addImport("backend", server_backend_mod);
     const server_room_registry_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/room_registry.zig"),
+        .root_source_file = b.path("src/core/muc/registry.zig"),
         .target = target,
         .optimize = optimize,
     });
     const server_room_mailbox_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/room_mailbox.zig"),
+        .root_source_file = b.path("src/core/muc/mailbox.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1313,7 +1313,7 @@ pub fn build(b: *std.Build) void {
     // --- Room mailbox tests ---
 
     const room_mailbox_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/room_mailbox.zig"),
+        .root_source_file = b.path("src/core/muc/mailbox.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1329,7 +1329,7 @@ pub fn build(b: *std.Build) void {
     // --- Room registry tests ---
 
     const room_registry_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/room_registry.zig"),
+        .root_source_file = b.path("src/core/muc/registry.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1346,7 +1346,7 @@ pub fn build(b: *std.Build) void {
     // --- Fan-out tests ---
 
     const fanout_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/fanout.zig"),
+        .root_source_file = b.path("src/core/fanout_tests.zig"),
         .target = target,
         .optimize = optimize,
     });
