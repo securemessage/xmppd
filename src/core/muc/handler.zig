@@ -3220,7 +3220,7 @@ pub fn processRemoteMamQuery(
 
     // Parse timestamps from ISO text
     const mam_handler = @import("mam_handler");
-    const parseTs = @import("../iq_handler.zig").parseTimestamp;
+    const parseTs = @import("../iq/dispatch.zig").parseTimestamp;
     const start_ts = if (ev.start.len > 0) parseTs(ev.start) else null;
     const end_ts = if (ev.end_field.len > 0) parseTs(ev.end_field) else null;
 

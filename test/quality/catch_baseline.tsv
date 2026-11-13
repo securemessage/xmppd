@@ -23,10 +23,6 @@ src/core/c2s/sm_state.zig	catch return	2
 src/core/connection.zig	catch return	4
 src/core/connection.zig	catch {}	6
 src/core/event_loop.zig	catch {}	1
-src/core/iq_handler.zig	catch continue	52
-src/core/iq_handler.zig	catch false	2
-src/core/iq_handler.zig	catch return	194
-src/core/iq_handler.zig	catch {}	6
 src/core/listener.zig	catch return	2
 src/core/listener.zig	catch {}	1
 src/core/main.zig	catch return	1
@@ -51,8 +47,6 @@ src/core/routing/deliver.zig	catch {}	24
 src/core/routing/router.zig	catch false	2
 src/core/routing/router.zig	catch return	54
 src/core/routing/router.zig	catch {}	20
-src/core/server.zig	catch return	8
-src/core/server.zig	catch {}	32
 src/core/stanza/writer.zig	catch return	2
 src/core/xworker/envelope.zig	catch return	100
 src/core/xworker/ring.zig	catch return	1
@@ -92,3 +86,9 @@ src/store/roster_store.zig	catch continue	2
 src/store/sqlite.zig	catch return	2
 src/store/sqlite.zig	catch {}	3
 src/store/user_store.zig	catch return	1
+
+src/core/iq/dispatch.zig	catch false	2
+src/core/iq/dispatch.zig	catch return	6
+src/core/iq/dispatch.zig	catch {}	2
+src/core/server.zig	catch return	8
+src/core/server.zig	catch {}	31
