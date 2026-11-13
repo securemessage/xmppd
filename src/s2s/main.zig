@@ -894,11 +894,15 @@ pub const S2sDaemon = struct {
         });
     }
 
-    /// Disarm the conn's retry backoff deadline if one is armed.
+    /// Disarm the conn's retry backoff deadline if one is armed. A failed
+    /// disarm is safe to only log: the one-shot fires later, matches no
+    /// conn's retry_ident and handleRetryDeadline drops it as stale.
     fn clearRetryDeadline(self: *S2sDaemon, batch: *ChangeList, conn: *OutboundConnection) void {
         _ = self;
         if (conn.retry_ident == 0) return;
-        batch.removeTimer(conn.retry_ident) catch {};
+        batch.removeTimer(conn.retry_ident) catch {
+            log.warn("outbound {s}: retry timer disarm failed (ident {d}); a stale fire is ignored", .{ conn.remote_domain, conn.retry_ident });
+        };
         conn.retry_ident = 0;
     }
 
@@ -4810,6 +4814,77 @@ test "S2sDaemon: a queue that outlives its lifetime bounces remote-server-timeou
     // answered and the conn leaves the pool.
     test_now_ms.store(1_000_000 + 121_000, .monotonic);
     daemon.deliverResolution(&cl, rig.conn, .failed, null);
+    try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-timeout", "remote-server-timeout");
+    try std.testing.expect(daemon.pool.connections.get("them.example") == null);
+}
+
+/// The delay staged for a retry ident: the armed EVFILT_TIMER's data
+/// carries the one-shot interval in milliseconds.
+fn stagedRetryDelayMs(cl: *const ChangeList, ident: usize) ?u32 {
+    for (cl.slice()) |ev| {
+        if (ev.filter == std.c.EVFILT.TIMER and
+            ev.ident == ident and
+            (ev.flags & std.c.EV.ADD) != 0) return @intCast(ev.data);
+    }
+    return null;
+}
+
+test "S2sDaemon: the retry backoff walks 5, 15, 45 s capped by the queue lifetime" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.now_ms = testNowMs;
+    test_now_ms.store(1_000_000, .monotonic);
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // Each temporary failure re-arms the one-shot at the next backoff
+    // step; the schedule clamps at the last entry (ADR-13).
+    const expected = [_]u32{ 5_000, 15_000, 45_000, 45_000 };
+    for (expected) |delay| {
+        cl = ChangeList.init(&scratch);
+        daemon.deliverResolution(&cl, rig.conn, .failed, null);
+        try std.testing.expect(rig.conn.retry_ident != 0);
+        try std.testing.expectEqual(delay, stagedRetryDelayMs(&cl, rig.conn.retry_ident).?);
+    }
+
+    // Nearer the lifetime's end than the next step: the arm is capped by
+    // the remaining budget (119 s in leaves 1 s, not another 45 s).
+    test_now_ms.store(1_000_000 + 119_000, .monotonic);
+    cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, rig.conn, .failed, null);
+    try std.testing.expectEqual(@as(u32, 1_000), stagedRetryDelayMs(&cl, rig.conn.retry_ident).?);
+}
+
+test "S2sDaemon: a retry deadline past the queue lifetime bounces remote-server-timeout" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.now_ms = testNowMs;
+    test_now_ms.store(1_000_000, .monotonic);
+
+    const rig = try makeVerifyRig(alloc, &daemon, "them.example");
+    defer posix.close(rig.submitter_peer);
+    defer posix.close(rig.other_peer);
+    makeBufferOnlyClient(&daemon, alloc);
+
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+    daemon.deliverResolution(&cl, rig.conn, .failed, null);
+    const ident = rig.conn.retry_ident;
+    try std.testing.expect(ident != 0);
+
+    // The one-shot fires after the queue already outlived its lifetime:
+    // the stanzas and the pending verify are answered and the conn
+    // leaves the pool instead of resolving again.
+    test_now_ms.store(1_000_000 + QUEUE_LIFETIME_MS + 1, .monotonic);
+    daemon.handleTimerEvent(&cl, ident);
     try expectInitiationFailure(&daemon, rig, "to='them.example'", "remote-server-timeout", "remote-server-timeout");
     try std.testing.expect(daemon.pool.connections.get("them.example") == null);
 }
