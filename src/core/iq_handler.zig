@@ -90,6 +90,8 @@ const ChangeList = @import("event_loop.zig").ChangeList;
 const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;
 const router = @import("routing/router.zig");
+const presence_sub = @import("presence/subscription.zig");
+const presence_bcast = @import("presence/broadcast.zig");
 
 /// RSM namespace URI.
 const ns_rsm = "http://jabber.org/protocol/rsm";
@@ -1057,12 +1059,12 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
         roster.removeItem(bare_jid, item_jid) catch |err| {
             noteDrop("roster remove '{s}' for '{s}' failed: {s}", .{ item_jid, bare_jid, @errorName(err) });
         };
-        server.invalidateSubCache(bare_jid);
+        presence_sub.invalidateSubCache(server, bare_jid);
         result_sub = .remove;
 
         // Send unsubscribe/unsubscribed to contact and update contact's roster.
         if (old_entry) |entry| {
-            const presence_handler = @import("presence_handler.zig");
+            const presence_handler = @import("presence/handler.zig");
             const to_jid_parsed = @import("xmpp").Jid.parse(item_jid) catch null;
 
             // If we had subscription TO the contact, send unsubscribe
@@ -1083,7 +1085,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                         if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
                             presence_handler.deliverPresenceToTarget(server, to_jid.local, to_jid.domain, uxml, changes);
                         } else {
-                            server.sendPresenceViaS2s(bare_jid, item_jid, uxml, changes);
+                            presence_bcast.sendPresenceViaS2s(server, bare_jid, item_jid, uxml, changes);
                         }
                     }
                 } else {
@@ -1103,7 +1105,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                             roster.setItem(item_jid, bare_jid, "", new_sub, contact_entry.ask) catch |err| {
                                 noteDrop("contact roster update failed for {s}: {s}", .{ item_jid, @errorName(err) });
                             };
-                            server.invalidateSubCache(item_jid);
+                            presence_sub.invalidateSubCache(server, item_jid);
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, contact_entry.ask, changes);
                         }
                     }
@@ -1128,7 +1130,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                         if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
                             presence_handler.deliverPresenceToTarget(server, to_jid.local, to_jid.domain, uxml, changes);
                         } else {
-                            server.sendPresenceViaS2s(bare_jid, item_jid, uxml, changes);
+                            presence_bcast.sendPresenceViaS2s(server, bare_jid, item_jid, uxml, changes);
                         }
                     }
                 } else {
@@ -1148,7 +1150,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
                             roster.setItem(item_jid, bare_jid, "", new_sub, false) catch |err| {
                                 noteDrop("contact roster update failed for {s}: {s}", .{ item_jid, @errorName(err) });
                             };
-                            server.invalidateSubCache(item_jid);
+                            presence_sub.invalidateSubCache(server, item_jid);
                             pushRosterItem(server, to_jid.local, to_jid.domain, bare_jid, "", new_sub, false, changes);
                         }
                     }
@@ -1169,7 +1171,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
             sendIqError(server, session, iq_id, "internal-server-error");
             return;
         };
-        server.invalidateSubCache(bare_jid);
+        presence_sub.invalidateSubCache(server, bare_jid);
     }
 
     // Ack with result

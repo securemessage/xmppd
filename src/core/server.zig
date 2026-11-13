@@ -74,7 +74,8 @@ const vcard_store_mod = @import("vcard_store");
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
 const iq_handler = @import("iq_handler.zig");
 const muc_handler = @import("muc_handler.zig");
-const presence_handler = @import("presence_handler.zig");
+const presence_handler = @import("presence/handler.zig");
+const presence_sub = @import("presence/subscription.zig");
 pub const sub_cache_mod = @import("subscription_cache.zig");
 pub const caps_mod = @import("caps.zig");
 const router = @import("routing/router.zig");
@@ -1680,7 +1681,7 @@ pub const Server = struct {
                 if (item.entry.name.len > 0) self.allocator.free(item.entry.name);
             }
             self.allocator.free(items);
-            self.invalidateSubCache(bare_jid);
+            presence_sub.invalidateSubCache(self, bare_jid);
         }
 
         // Remove vCard
@@ -1710,43 +1711,6 @@ pub const Server = struct {
     // ========================================================================
     // S2S IPC — federation stanza forwarding
     // ========================================================================
-
-    /// Forward a pre-built presence stanza to a remote domain via S2S IPC.
-    /// Used by subscription/presence handlers where the stanza XML is already built.
-    pub fn forwardPresenceXmlToS2s(self: *Server, session: *Session, from_str: []const u8, to_str: []const u8, stanza_xml: []const u8, changes: *ChangeList) void {
-        _ = changes; // Write interest: reconcileIpcWriteInterest (S10).
-        if (!self.s2s_ipc.connected) {
-            log.info("connection {d} presence to remote {s} — no S2S daemon", .{ session.conn.id, to_str });
-            return;
-        }
-
-        self.s2s_ipc.send(.{ .s2s_deliver = .{
-            .from_jid = from_str,
-            .to_jid = to_str,
-            .stanza_xml = stanza_xml,
-        } }) catch {
-            log.err("connection {d} failed to forward presence to S2S", .{session.conn.id});
-            return;
-        };
-        // Write interest: reconcileIpcWriteInterest (S10).
-    }
-
-    /// Forward a pre-built presence stanza to a remote domain via S2S IPC.
-    /// Variant without a session reference — used by broadcast presence.
-    pub fn sendPresenceViaS2s(self: *Server, from_str: []const u8, to_str: []const u8, stanza_xml: []const u8, changes: *ChangeList) void {
-        _ = changes; // Write interest: reconcileIpcWriteInterest (S10).
-        if (!self.s2s_ipc.connected) return;
-
-        self.s2s_ipc.send(.{ .s2s_deliver = .{
-            .from_jid = from_str,
-            .to_jid = to_str,
-            .stanza_xml = stanza_xml,
-        } }) catch return;
-        // Write interest: reconcileIpcWriteInterest (S10).
-    }
-
-
-
 
     fn handleS2sIpcReadable(self: *Server, changes: *ChangeList) void {
         const rr = self.s2s_ipc.recv() catch {
@@ -2209,22 +2173,6 @@ pub const Server = struct {
         }
     }
 
-    /// Invalidate a bare JID's subscription-cache entry locally AND on all
-    /// other workers. The sub_cache is per-worker memory with a 30s TTL —
-    /// a roster/subscription change on one worker must not leave the others
-    /// serving a stale subscriber list (cross-worker presence broadcast was
-    /// silently skipped: e2e-subscription Test 7 at workers>1).
-    pub fn invalidateSubCache(self: *Server, bare_jid: []const u8) void {
-        self.sub_cache.invalidate(sub_cache_mod.hashBareJid(bare_jid));
-        const wc = self.getWorkerCount();
-        if (wc <= 1) return;
-        var w: u16 = 0;
-        while (w < wc) : (w += 1) {
-            if (w == self.worker_id) continue;
-            self.enqueueRoomActorMessage(w, .{ .invalidate_subscription = .{ .bare_jid = bare_jid } });
-        }
-    }
-
     /// Enqueue a room actor message to the owning worker via MPSC.
     /// Used by muc_handler when a MUC operation lands on a non-owning worker.
     pub fn enqueueRoomActorMessage(self: *Server, target_worker: u16, msg: actor_message.Message) void {
@@ -2663,7 +2611,9 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
     const cases = .{
         .{ "connection.zig", @embedFile("connection.zig"), 17 }, // Connection layer self-tests incl. the M1 counter test; no Session.
         .{ "fanout.zig", @embedFile("fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
-        .{ "presence_handler.zig", @embedFile("presence_handler.zig"), 0 },
+        .{ "presence/handler.zig", @embedFile("presence/handler.zig"), 0 },
+        .{ "presence/subscription.zig", @embedFile("presence/subscription.zig"), 0 },
+        .{ "presence/broadcast.zig", @embedFile("presence/broadcast.zig"), 0 },
         .{ "routing/router.zig", @embedFile("routing/router.zig"), 2 }, // one comment; queueSendWithFlush is tracked.
         .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig"), 0 },
         .{ "server.zig", @embedFile("server.zig"), 4 }, // stream/SASL/SM nonzas + M1 counter self-test.
@@ -2694,8 +2644,8 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "stanza/facts.zig", @embedFile("stanza/facts.zig"), 0 },
         .{ "stanza/writer.zig", @embedFile("stanza/writer.zig"), 0 },
     };
-    if (cases.len != 30) {
-        log.err("S15 ratchet: covers {d} core files, expected 30", .{cases.len});
+    if (cases.len != 32) {
+        log.err("S15 ratchet: covers {d} core files, expected 32", .{cases.len});
         return error.RatchetCoverage;
     }
     inline for (cases) |case| {
@@ -4405,7 +4355,9 @@ test "S10: IPC write interest lives only in server.zig" {
         .{ "iq_handler.zig", @embedFile("iq_handler.zig") },
         .{ "routing/router.zig", @embedFile("routing/router.zig") },
         .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig") },
-        .{ "presence_handler.zig", @embedFile("presence_handler.zig") },
+        .{ "presence/handler.zig", @embedFile("presence/handler.zig") },
+        .{ "presence/subscription.zig", @embedFile("presence/subscription.zig") },
+        .{ "presence/broadcast.zig", @embedFile("presence/broadcast.zig") },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig") },
         .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig") },
         .{ "fanout.zig", @embedFile("fanout.zig") },
@@ -4478,7 +4430,9 @@ test "S10: the IPC reconnect timers are armed in exactly one place" {
         .{ "iq_handler.zig", @embedFile("iq_handler.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "routing/router.zig", @embedFile("routing/router.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "presence_handler.zig", @embedFile("presence_handler.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "presence/handler.zig", @embedFile("presence/handler.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "presence/subscription.zig", @embedFile("presence/subscription.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "presence/broadcast.zig", @embedFile("presence/broadcast.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "muc_handler.zig", @embedFile("muc_handler.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig"), @as(usize, 0), @as(usize, 0) },
         .{ "fanout.zig", @embedFile("fanout.zig"), @as(usize, 0), @as(usize, 0) },

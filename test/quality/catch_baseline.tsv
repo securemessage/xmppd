@@ -39,10 +39,11 @@ src/core/muc_handler.zig	catch {}	30
 src/core/offline_store.zig	catch continue	1
 src/core/offline_store.zig	catch return	21
 src/core/offline_store.zig	catch {}	1
-src/core/presence_handler.zig	catch continue	6
-src/core/presence_handler.zig	catch false	1
-src/core/presence_handler.zig	catch return	14
-src/core/presence_handler.zig	catch {}	13
+src/core/presence/broadcast.zig	catch return	1
+src/core/presence/handler.zig	catch continue	6
+src/core/presence/handler.zig	catch false	1
+src/core/presence/handler.zig	catch return	14
+src/core/presence/handler.zig	catch {}	13
 src/core/roster_store.zig	catch return	14
 src/core/roster_store.zig	catch {}	2
 src/core/routing/deliver.zig	catch return	2
@@ -50,7 +51,7 @@ src/core/routing/deliver.zig	catch {}	24
 src/core/routing/router.zig	catch false	2
 src/core/routing/router.zig	catch return	54
 src/core/routing/router.zig	catch {}	20
-src/core/server.zig	catch return	10
+src/core/server.zig	catch return	9
 src/core/server.zig	catch {}	32
 src/core/stanza/writer.zig	catch return	2
 src/core/xworker/envelope.zig	catch return	100
