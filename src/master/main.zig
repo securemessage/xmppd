@@ -35,6 +35,14 @@ const config_mod = @import("config");
 
 const log = std.log.scoped(.xmppd);
 
+// Test decls are collected only from files reachable through analyzed
+// decls, and main() is never analyzed under `zig test`: pull the imported
+// files in so procinfo and runtime tests run under master-tests.
+comptime {
+    _ = procinfo;
+    _ = Runtime;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -536,7 +544,7 @@ pub fn main() !void {
     children_buf[child_count] = .{ .name = "core", .pid_file = "core.pid", .exe_base = "xmppd-core", .sup = &core_sup };
     child_count += 1;
 
-    var rt = try Runtime.init(allocator, children_buf[0..child_count], run_dir);
+    var rt = try Runtime.init(allocator, children_buf[0..child_count], run_dir, .{});
     defer rt.deinit();
 
     // Spawn xmppd-auth first (must be ready before core connects)
