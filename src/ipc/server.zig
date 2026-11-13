@@ -41,6 +41,13 @@ const Xucred = extern struct {
     cr_pid: std.c.pid_t,
 };
 
+const so_nosigpipe: c_int = 0x0800; // SO_NOSIGPIPE (FreeBSD)
+
+fn setNoSigpipe(fd: posix.fd_t) !void {
+    const one: c_int = 1;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, so_nosigpipe, std.mem.asBytes(&one));
+}
+
 /// Whether an IPC peer may connect: root, the daemon's own uid, or any
 /// peer group (effective or supplementary) equal to the daemon's gid.
 /// Fails closed when LOCAL_PEERCRED is unavailable.
@@ -227,6 +234,14 @@ pub const IpcServer = struct {
                 error.WouldBlock => null,
                 else => error.AcceptFailed,
             };
+        };
+
+        // A core that died between our read events turns the next reply
+        // write into SIGPIPE; suppress it per-socket so flush() returns
+        // the error instead of the process dying before it lands.
+        setNoSigpipe(client_fd) catch {
+            posix.close(client_fd);
+            return error.AcceptFailed;
         };
 
         // Peer credentials gate (T258): root, the daemon's own uid,

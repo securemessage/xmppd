@@ -26,11 +26,12 @@ const RECV_BUF_SIZE = protocol.MAX_FRAME_SIZE;
 /// up to this cap (T32 measured ~50 in-flight auth requests in bursts).
 const SEND_CAP: usize = 4 << 20;
 
-/// Error set for send(): the link state checks plus the codec and the
-/// bounded writer.
-pub const SendError = error{ NotConnected, NoAllocator } || protocol.BeginError || protocol.EncodeError;
 /// Error set for flush(): the writer drain plus the owner checks.
 pub const FlushError = error{ NotConnected, NoAllocator } || posix.WriteError;
+/// Error set for send(): flush plus the codec and the bounded writer.
+/// The flush attempt is reported so a caller never sees success for a
+/// frame whose write just failed.
+pub const SendError = FlushError || protocol.BeginError || protocol.EncodeError;
 /// Error set for recv(): the link state checks, the lazy buffer
 /// allocation, plus the reader's read errors.
 pub const RecvError = error{ NotConnected, NoAllocator } || std.mem.Allocator.Error || posix.ReadError;
@@ -70,6 +71,10 @@ pub const IpcClient = struct {
 
         const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
         errdefer posix.close(sock);
+        // A peer that died between our read events turns the next write
+        // into SIGPIPE; suppress it per-socket so flush() can return the
+        // error instead of the process dying before it lands.
+        try setNoSigpipe(sock);
 
         // Build sockaddr_un
         var addr: std.c.sockaddr.un = std.mem.zeroes(std.c.sockaddr.un);
@@ -138,8 +143,11 @@ pub const IpcClient = struct {
         };
         self.writer.commit(payload_len);
 
-        // Try to flush immediately
-        _ = self.flush() catch {};
+        // Try to flush immediately; a write failure already dropped
+        // `connected` inside flush(). Propagate it: the caller's catch
+        // fails the exchange rather than reporting success for a frame
+        // that may never reach the wire.
+        _ = try self.flush();
     }
 
     /// Flush the send backlog to the socket until it empties or the fd
@@ -205,11 +213,23 @@ pub const IpcClient = struct {
 // Tests
 // ============================================================================
 
-/// Create a Unix socketpair for testing.
+const so_nosigpipe: c_int = 0x0800; // SO_NOSIGPIPE (FreeBSD)
+
+fn setNoSigpipe(fd: posix.fd_t) !void {
+    const one: c_int = 1;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, so_nosigpipe, std.mem.asBytes(&one));
+}
+
+/// Create a Unix socketpair for testing. SO_NOSIGPIPE on both ends so a
+/// dead-peer write surfaces EPIPE instead of killing the test process.
 fn makeUnixSocketPair() ![2]posix.fd_t {
     var fds: [2]posix.fd_t = undefined;
     const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds);
     if (rc != 0) return error.SocketPairFailed;
+    errdefer posix.close(fds[0]);
+    errdefer posix.close(fds[1]);
+    try setNoSigpipe(fds[0]);
+    try setNoSigpipe(fds[1]);
     return fds;
 }
 
@@ -245,6 +265,37 @@ test "IpcClient: send and receive over socketpair" {
     const decoded = try protocol.decode(frame.payload);
     try std.testing.expectEqual(@as(u32, 5), decoded.auth_request.conn_id);
     try std.testing.expectEqualStrings("test", decoded.auth_request.username);
+}
+
+test "IpcClient: send reports a dead peer instead of returning success" {
+    const fds = try makeUnixSocketPair();
+    posix.close(fds[1]); // peer is gone before the first write
+
+    var client = IpcClient{};
+    client.fd = fds[0];
+    client.connected = true;
+    client.alloc = std.testing.allocator;
+    defer client.deinit();
+    defer client.close();
+
+    const msg = protocol.Message{ .auth_request = .{
+        .conn_id = 5,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "test",
+        .payload = "initial-data",
+    } };
+    // The write has nowhere to go: the FIRST send must surface the flush
+    // failure. A swallowed error would report success here and only show
+    // up as NotConnected on the next call.
+    client.send(msg) catch |err| {
+        try std.testing.expect(err != error.NotConnected);
+        try std.testing.expect(!client.connected);
+        return;
+    };
+    return error.SendReportedSuccessOnDeadPeer;
 }
 
 test "IpcClient: receive message from peer" {
