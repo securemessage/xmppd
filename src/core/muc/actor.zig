@@ -5,10 +5,10 @@
 //! drain round-robin, and enqueue/getWorkerCount are the producer side.
 
 const std = @import("std");
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const sub_cache_mod = server_mod.sub_cache_mod;
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 const actor_message = @import("../xworker/envelope.zig");
 const room_registry_mod = @import("room_registry");
 const room_mailbox_mod = @import("room_mailbox");

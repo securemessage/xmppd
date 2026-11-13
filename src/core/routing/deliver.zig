@@ -10,11 +10,11 @@ const posix = std.posix;
 const xml = @import("xml");
 const xmpp = @import("xmpp");
 const ipc_protocol = @import("ipc_protocol");
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const TestIpcListener = server_mod.TestIpcListener;
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 const c2s_session = @import("../c2s/session.zig");
 const makeSocketPair = c2s_session.makeSocketPair;
 const c2s_sm = @import("../c2s/sm.zig");
@@ -31,7 +31,7 @@ const stanza_facts = @import("../stanza/facts.zig");
 const stanza_writer = @import("../stanza/writer.zig");
 const fanout_mod = @import("../muc/fanout.zig");
 const room_registry_mod = @import("room_registry");
-const metrics = @import("../metrics.zig");
+const metrics = @import("../worker/metrics.zig");
 const offline_store_mod = @import("generic_offline_store");
 const GenericOfflineStore = offline_store_mod.GenericOfflineStore;
 const OpBackendMod = @import("op_backend");
@@ -219,7 +219,7 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
 
             // SM resume handoff actor message (T177)
             if (local_session_id == delivery_queue_mod.SM_ACTOR_SENTINEL) {
-                c2s_sm.handleSmActorMessage(c.server,payload, c.changes);
+                c2s_sm.handleSmActorMessage(c.server, payload, c.changes);
                 return;
             }
 
@@ -1192,7 +1192,7 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     target.sm_unacked = queue;
     server.sessions[5] = target;
     server.detached_count = 1;
-    c2s_sm.smIdMapInsert(&server,&target.sm_id, 5);
+    c2s_sm.smIdMapInsert(&server, &target.sm_id, 5);
     const bob_gen = try sm.bind(0, 5, "bob", "localhost", "desktop");
 
     const payload = "<message from='alice@localhost/mobile' to='bob@localhost' id='h3-1' type='chat'><body>live</body></message>";

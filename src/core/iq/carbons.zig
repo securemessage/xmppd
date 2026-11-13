@@ -9,7 +9,7 @@
 const std = @import("std");
 const posix = std.posix;
 const xmpp = @import("xmpp");
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const OpBackendMod = @import("op_backend");
@@ -20,7 +20,7 @@ const session_map_mod = @import("session_map");
 const SessionMap = session_map_mod.SessionMap;
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 const c2s_session = @import("../c2s/session.zig");
 const makeSocketPair = c2s_session.makeSocketPair;
 const router = @import("../routing/router.zig");

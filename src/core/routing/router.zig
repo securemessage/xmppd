@@ -14,18 +14,18 @@ const std = @import("std");
 const xml = @import("xml");
 const xmpp = @import("xmpp");
 
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const StanzaKind = server_mod.StanzaKind;
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 
 const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
 const muc_handler = @import("../muc/handler.zig");
 const fanout = @import("../muc/fanout.zig");
-const metrics = @import("../metrics.zig");
+const metrics = @import("../worker/metrics.zig");
 const connection_mod = @import("../connection.zig");
 const offline_store_mod = @import("generic_offline_store");
 const ipc_protocol = @import("ipc_protocol");

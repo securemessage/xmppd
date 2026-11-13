@@ -75,7 +75,7 @@ noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerror, 
 }
 
 // Types from server.zig — imported via the parent module's compilation unit.
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const precis = @import("precis_username");
 
 /// Per-thread registration preparation scratch, shared by this worker's
@@ -86,7 +86,7 @@ const Server = server_mod.Server;
 const MamCollecting = server_mod.MamCollecting;
 const generic_roster = @import("roster_store");
 const GenericRosterStore = generic_roster.RosterStore(server_mod.OpBackendType);
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;
 const router = @import("../routing/router.zig");

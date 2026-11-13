@@ -12,12 +12,12 @@ const xml = @import("xml");
 const xmpp = @import("xmpp");
 const sasl = @import("sasl");
 const precis = @import("precis_username");
-const EventLoop = @import("../event_loop.zig").EventLoop;
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const EventLoop = @import("../worker/loop.zig").EventLoop;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 const Connection = @import("../connection.zig").Connection;
 pub const connection_mod = @import("../connection.zig");
 const Listener = @import("../listener.zig").Listener;
-const Event = @import("../event_loop.zig").Event;
+const Event = @import("../worker/loop.zig").Event;
 
 const ssl = @import("ssl");
 const IpcClient = @import("ipc_client").IpcClient;
@@ -63,12 +63,12 @@ const actor_message = @import("../xworker/envelope.zig");
 pub const sm_state = @import("sm_state.zig");
 const sm_handoff = @import("sm_handoff.zig");
 const block_store_mod = @import("block_store");
-const metrics = @import("../metrics.zig");
+const metrics = @import("../worker/metrics.zig");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const pep_store_mod = @import("pep_store");
 const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
 
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const c2s_sm = @import("sm.zig");
 
@@ -199,7 +199,6 @@ pub fn headAttr(head: []const u8, name: []const u8) ?[]const u8 {
     }
     return null;
 }
-
 
 /// True when a session's fd is gone but the session still exists: it was
 /// detached for SM resume, or closed, after kevent returned this batch.
@@ -641,7 +640,7 @@ pub fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes
         // won't help here since handleReadable needs a kqueue trigger.
         // Force an immediate drain to handle the pipelined case.
         if (session.conn.tlsPending() > 0) {
-            handleReadable(self,id, changes);
+            handleReadable(self, id, changes);
         }
         if (self.sessions[id] != null and !session.conn.isClosed()) {
             changes.addRead(session.conn.fd, id) catch {};
@@ -719,7 +718,7 @@ pub fn handleReadable(self: *Server, id: usize, changes: *ChangeList) void {
         // one, is a protocol violation (RFC 6120 5.4.3.2).
         if (session.stream.state == .starttls_pending) {
             log.info("connection {d} plaintext while STARTTLS pending: policy-violation", .{id});
-            sendStreamError(self,session, .policy_violation);
+            sendStreamError(self, session, .policy_violation);
             session.conn.flushSync();
             session_lifecycle.forceCloseSession(self, id, changes);
             return;
@@ -739,7 +738,7 @@ pub fn handleReadable(self: *Server, id: usize, changes: *ChangeList) void {
                 // Client-side protocol violation, not a server fault.
                 log.warn("connection {d} XML parse error: {}", .{ id, err });
                 // Resource limits are policy violations, not malformed XML.
-                sendStreamError(self,session, if (xml.isResourceLimit(err))
+                sendStreamError(self, session, if (xml.isResourceLimit(err))
                     .policy_violation
                 else
                     .not_well_formed);
@@ -753,13 +752,13 @@ pub fn handleReadable(self: *Server, id: usize, changes: *ChangeList) void {
 
             if (session.reader.depth > MAX_ELEMENT_DEPTH) {
                 log.warn("connection {d} exceeded max depth ({d})", .{ id, MAX_ELEMENT_DEPTH });
-                sendStreamError(self,session, .policy_violation);
+                sendStreamError(self, session, .policy_violation);
                 session_lifecycle.forceCloseSession(self, id, changes);
                 return;
             }
 
             const starttls_was_pending = session.stream.state == .starttls_pending;
-            processXmlEvent(self,session, event.?, changes);
+            processXmlEvent(self, session, event.?, changes);
 
             if (self.sessions[id] == null) return;
 
@@ -770,7 +769,7 @@ pub fn handleReadable(self: *Server, id: usize, changes: *ChangeList) void {
             // closes the stanza cannot hold the session open.
             if (session.stanza_overflow) {
                 log.warn("connection {d} stanza exceeds {d} bytes: policy-violation", .{ id, session.stanza_buf.len });
-                sendStreamError(self,session, .policy_violation);
+                sendStreamError(self, session, .policy_violation);
                 session.conn.flushSync();
                 session_lifecycle.forceCloseSession(self, id, changes);
                 return;
@@ -783,7 +782,7 @@ pub fn handleReadable(self: *Server, id: usize, changes: *ChangeList) void {
                 pos < data.len)
             {
                 log.info("connection {d} plaintext read-ahead past <starttls/> — policy-violation", .{id});
-                sendStreamError(self,session, .policy_violation);
+                sendStreamError(self, session, .policy_violation);
                 session.conn.flushSync();
                 session_lifecycle.forceCloseSession(self, id, changes);
                 return;
@@ -817,11 +816,11 @@ pub fn processXmlEvent(self: *Server, session: *Session, event: xml.Event, chang
             // Expected at stream start, no action needed
         },
         .stream_open => |elem| {
-            handleStreamOpen(self,session, elem, changes);
+            handleStreamOpen(self, session, elem, changes);
         },
         .stream_close => {
             _ = session.stream.handleClose();
-            sendRaw(self,session, "</stream:stream>");
+            sendRaw(self, session, "</stream:stream>");
             // Flush the closing tag before teardown so the peer receives it.
             if (session.conn.hasPendingWrite()) {
                 session.conn.flushSync();
@@ -830,13 +829,13 @@ pub fn processXmlEvent(self: *Server, session: *Session, event: xml.Event, chang
         },
         .element_start => |elem| {
             var e = elem;
-            handleElementStart(self,session, &e, changes);
+            handleElementStart(self, session, &e, changes);
         },
         .element_end => |name| {
-            handleElementEnd(self,session, name, changes);
+            handleElementEnd(self, session, name, changes);
         },
         .text => |text| {
-            handleText(self,session, text);
+            handleText(self, session, text);
         },
     }
 }
@@ -852,7 +851,7 @@ pub fn handleStreamOpen(self: *Server, session: *Session, elem: xml.Element, cha
     }
 
     const action = session.stream.handleStreamOpen(to, "1.0");
-    executeAction(self,session, action, changes);
+    executeAction(self, session, action, changes);
 }
 
 /// Verdict of enforcePreBindStanzaPolicy (T182).
@@ -917,7 +916,7 @@ pub fn enforcePreBindStanzaPolicy(self: *Server, session: *Session, elem: xml.El
 
     log.info("connection {d} {s} to a third party before resource binding — closing stream (not-authorized)", .{ session.conn.id, elem.local_name });
     // writeStreamError includes the closing </stream:stream> tag.
-    sendStreamError(self,session, .not_authorized);
+    sendStreamError(self, session, .not_authorized);
     // Flush the error and closing tag before teardown so the client sees them.
     session.conn.flushSync();
     session_lifecycle.forceCloseSession(self, session.conn.id, changes);
@@ -1010,9 +1009,9 @@ pub fn prepareStanzaAddresses(self: *Server, session: *Session, elem: *xml.Eleme
                     // attributes; third party closes the stream with
                     // not-authorized, server/account-addressed gets the
                     // stanza error, presence stays silently ignored.
-                    switch (enforcePreBindStanzaPolicy(self,session, elem.*, changes)) {
+                    switch (enforcePreBindStanzaPolicy(self, session, elem.*, changes)) {
                         .third_party_closed, .not_stanza => {},
-                        .server_addressed => sendPreBindStanzaError(self,session, elem.*, changes),
+                        .server_addressed => sendPreBindStanzaError(self, session, elem.*, changes),
                     }
                 } else if (!is_error_stanza) {
                     self.sendIngressJidMalformed(session, elem, changes);
@@ -1061,7 +1060,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
             session.pres_priority_collecting = true;
             session.pres_priority_len = 0;
         }
-        accumulateStanzaElement(self,session, elem.*);
+        accumulateStanzaElement(self, session, elem.*);
         return;
     }
 
@@ -1078,7 +1077,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
             std.mem.eql(u8, elem.local_name, "presence") or
             std.mem.eql(u8, elem.local_name, "iq")))
     {
-        if (!prepareStanzaAddresses(self,session, elem, changes)) return;
+        if (!prepareStanzaAddresses(self, session, elem, changes)) return;
     }
 
     const ns = elem.namespace_uri;
@@ -1088,7 +1087,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
         if (std.mem.eql(u8, elem.local_name, "starttls")) {
             if (elem.self_closing) {
                 const action = session.stream.handleStarttls();
-                executeAction(self,session, action, changes);
+                executeAction(self, session, action, changes);
             } else {
                 // <starttls></starttls> form: trigger on the close tag so
                 // the read-ahead check (T215) sees a complete element.
@@ -1101,7 +1100,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
     // SASL namespace
     if (std.mem.eql(u8, ns, xml.ns.sasl)) {
         if (std.mem.eql(u8, elem.local_name, "auth")) {
-            handleSaslAuth(self,session, elem.*, changes);
+            handleSaslAuth(self, session, elem.*, changes);
         } else if (std.mem.eql(u8, elem.local_name, "response")) {
             // Start collecting SCRAM response text
             session.sasl_collecting = .response;
@@ -1115,7 +1114,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
         if (std.mem.eql(u8, elem.local_name, "iq") and std.mem.eql(u8, ns, xml.ns.client)) {
             // RFC 6120 §7.1 (T182): a pre-auth stanza addressed to a third
             // party is not processed — the stream is closed instead.
-            if (enforcePreBindStanzaPolicy(self,session, elem.*, changes) == .third_party_closed) return;
+            if (enforcePreBindStanzaPolicy(self, session, elem.*, changes) == .third_party_closed) return;
             // Start IQ accumulation for registration
             iq_handler.handleIq(session, elem.*, self.server_host);
             return;
@@ -1123,7 +1122,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
         // IQ child elements during pre-auth registration
         if (session.iq_active) {
             if (session.vcard_collecting) {
-                accumulateVcardElement(self,session, elem.*);
+                accumulateVcardElement(self, session, elem.*);
                 return;
             }
             self.handleIqChild(session, elem.*);
@@ -1147,7 +1146,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
     // XEP-0198: SM resume at features_bind — client sends <resume/> instead of <bind/>
     if (session.stream.state == .features_bind and std.mem.eql(u8, ns, xml.ns.sm)) {
         if (std.mem.eql(u8, elem.local_name, "resume")) {
-            c2s_sm.handleSmResume(self,session, elem.*, changes);
+            c2s_sm.handleSmResume(self, session, elem.*, changes);
         }
         return;
     }
@@ -1158,7 +1157,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
         // before resource binding is not processed — the stream closes
         // with a not-authorized stream error. The bind wrapper IQ itself
         // is server-addressed and continues below.
-        switch (enforcePreBindStanzaPolicy(self,session, elem.*, changes)) {
+        switch (enforcePreBindStanzaPolicy(self, session, elem.*, changes)) {
             .third_party_closed => return,
             .not_stanza => return, // presence pre-bind: silently ignored
             .server_addressed => {},
@@ -1171,7 +1170,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
                     // id than it sent (S11).
                     if (attr.value.len > session.bind_iq_id_buf.len) {
                         log.warn("connection {d} bind id exceeds {d} bytes, policy-violation", .{ session.conn.id, session.bind_iq_id_buf.len });
-                        sendStreamError(self,session, .policy_violation);
+                        sendStreamError(self, session, .policy_violation);
                         session.conn.flushSync();
                         session_lifecycle.forceCloseSession(self, session.conn.id, changes);
                         return;
@@ -1189,7 +1188,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
         } else if (std.mem.eql(u8, elem.local_name, "message")) {
             // Server/account-addressed message pre-bind — not processed,
             // but answered with a not-authorized stanza error.
-            sendPreBindStanzaError(self,session, elem.*, changes);
+            sendPreBindStanzaError(self, session, elem.*, changes);
         }
         return;
     }
@@ -1208,13 +1207,13 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
     if (std.mem.eql(u8, ns, xml.ns.sm)) {
         if (std.mem.eql(u8, elem.local_name, "enable")) {
             if (session.stream.isActive()) {
-                c2s_sm.handleSmEnable(self,session, elem.*, changes);
+                c2s_sm.handleSmEnable(self, session, elem.*, changes);
             } else {
                 // XEP-0198 §3.1: SM enable before resource bind — reject
-                c2s_sm.sendSmFailed(self,session, "unexpected-request", changes);
+                c2s_sm.sendSmFailed(self, session, "unexpected-request", changes);
             }
         } else if (std.mem.eql(u8, elem.local_name, "r") and session.sm_enabled) {
-            c2s_sm.handleSmRequest(self,session, changes);
+            c2s_sm.handleSmRequest(self, session, changes);
         } else if (std.mem.eql(u8, elem.local_name, "a") and session.sm_enabled) {
             // Client acknowledges our stanzas
             session.sm_r_outstanding = false;
@@ -1225,7 +1224,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
                         // parsing it as 0 would silently desync the ack
                         // window (S24). It cannot be echoed back, so no h
                         // is reported on the error.
-                        c2s_sm.sendSmHandledCountError(self,session, null, changes);
+                        c2s_sm.sendSmHandledCountError(self, session, null, changes);
                         return;
                     };
                     // S24: validate the report before recording it. With a
@@ -1243,7 +1242,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
                         // XEP-0198 Example 17: h above the number of
                         // stanzas sent fails the stream.
                         .too_high => {
-                            c2s_sm.sendSmHandledCountError(self,session, client_h, changes);
+                            c2s_sm.sendSmHandledCountError(self, session, client_h, changes);
                             return;
                         },
                         // A duplicate or out-of-order report discards
@@ -1254,7 +1253,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
                 }
             }
         } else if (std.mem.eql(u8, elem.local_name, "resume") and session.stream.state == .features_bind) {
-            c2s_sm.handleSmResume(self,session, elem.*, changes);
+            c2s_sm.handleSmResume(self, session, elem.*, changes);
         }
         return;
     }
@@ -1265,13 +1264,13 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
     // stanza error instead (IQs are answered via dispatchIq's pre-bind
     // gate); presence stays silently ignored.
     if (!session.stream.isActive()) {
-        switch (enforcePreBindStanzaPolicy(self,session, elem.*, changes)) {
+        switch (enforcePreBindStanzaPolicy(self, session, elem.*, changes)) {
             .third_party_closed, .not_stanza => return,
             .server_addressed => {
                 // Client-namespace IQs were handled above (registration /
                 // dispatchIq). A server-addressed message is bounced.
                 if (std.mem.eql(u8, elem.local_name, "message")) {
-                    sendPreBindStanzaError(self,session, elem.*, changes);
+                    sendPreBindStanzaError(self, session, elem.*, changes);
                 }
                 return;
             },
@@ -1283,7 +1282,7 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
         // If we're inside an IQ stanza, handle child elements
         if (session.iq_active) {
             if (session.vcard_collecting) {
-                accumulateVcardElement(self,session, elem.*);
+                accumulateVcardElement(self, session, elem.*);
                 return;
             }
             self.handleIqChild(session, elem.*);
@@ -1292,10 +1291,10 @@ pub fn handleElementStart(self: *Server, session: *Session, elem: *xml.Element, 
 
         if (std.mem.eql(u8, elem.local_name, "message")) {
             if (session.sm_enabled) session.sm_in_h +%= 1;
-            handleMessage(self,session, elem.*, changes);
+            handleMessage(self, session, elem.*, changes);
         } else if (std.mem.eql(u8, elem.local_name, "presence")) {
             if (session.sm_enabled) session.sm_in_h +%= 1;
-            handlePresence(self,session, elem.*, changes);
+            handlePresence(self, session, elem.*, changes);
         } else if (std.mem.eql(u8, elem.local_name, "iq")) {
             if (session.sm_enabled) session.sm_in_h +%= 1;
             self.handleIq(session, elem.*, changes);
@@ -1315,7 +1314,7 @@ pub fn handleText(self: *Server, session: *Session, text: []const u8) void {
                 session.pres_priority_len += to_copy;
             }
         }
-        accumulateStanzaText(self,session, text);
+        accumulateStanzaText(self, session, text);
         return;
     }
 
@@ -1332,7 +1331,7 @@ pub fn handleText(self: *Server, session: *Session, text: []const u8) void {
 
     // vCard XML text accumulation (for vcard-temp SET)
     if (session.vcard_collecting) {
-        accumulateVcardText(self,session, text);
+        accumulateVcardText(self, session, text);
         return;
     }
 
@@ -1405,7 +1404,7 @@ pub fn handleElementEnd(self: *Server, session: *Session, name: []const u8, chan
         const local = if (std.mem.lastIndexOfScalar(u8, name, ':')) |c| name[c + 1 ..] else name;
         if (std.mem.eql(u8, local, "starttls")) {
             const action = session.stream.handleStarttls();
-            executeAction(self,session, action, changes);
+            executeAction(self, session, action, changes);
             return;
         }
     }
@@ -1413,7 +1412,7 @@ pub fn handleElementEnd(self: *Server, session: *Session, name: []const u8, chan
     if (session.stanza_kind != .none) {
         if (session.reader.depth > 1) {
             // Still inside the stanza — accumulate the child close tag
-            accumulateStanzaClose(self,session, name);
+            accumulateStanzaClose(self, session, name);
             // Stop collecting <priority> text on </priority>
             if (session.pres_priority_collecting and std.mem.eql(u8, name, "priority")) {
                 session.pres_priority_collecting = false;
@@ -1425,7 +1424,7 @@ pub fn handleElementEnd(self: *Server, session: *Session, name: []const u8, chan
             // this whole-stanza limit.
             if (session.stanza_overflow) {
                 log.warn("connection {d} stanza exceeds {d} bytes: policy-violation", .{ session.conn.id, session.stanza_buf.len });
-                sendStreamError(self,session, .policy_violation);
+                sendStreamError(self, session, .policy_violation);
                 session.conn.flushSync();
                 session_lifecycle.forceCloseSession(self, session.conn.id, changes);
                 return;
@@ -1440,7 +1439,7 @@ pub fn handleElementEnd(self: *Server, session: *Session, name: []const u8, chan
                     const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
                     presence_handler.dispatchSubscription(self, session, ptype, inner_xml, changes);
                 } else {
-                    dispatchStanza(self,session, changes);
+                    dispatchStanza(self, session, changes);
                 }
             }
         }
@@ -1491,11 +1490,11 @@ pub fn handleElementEnd(self: *Server, session: *Session, name: []const u8, chan
     // SASL text accumulation
     switch (session.sasl_collecting) {
         .auth => {
-            processSaslAuthComplete(self,session, changes);
+            processSaslAuthComplete(self, session, changes);
             return;
         },
         .response => {
-            processSaslResponseComplete(self,session, changes);
+            processSaslResponseComplete(self, session, changes);
             return;
         },
         .none => {},
@@ -1504,13 +1503,13 @@ pub fn handleElementEnd(self: *Server, session: *Session, name: []const u8, chan
     // vCard/PEP XML close tag accumulation
     if (session.iq_active and session.vcard_collecting) {
         if (session.reader.depth > session.vcard_collect_depth) {
-            accumulateVcardClose(self,session, name);
+            accumulateVcardClose(self, session, name);
         } else {
             // Reached the depth where collecting started — stop.
             // For vCard (depth=2), include the closing tag (stores full <vCard>...</vCard>).
             // For PEP items (depth>2), skip the closing </item> tag (stores inner payload only).
             if (session.vcard_collect_depth <= 2) {
-                accumulateVcardClose(self,session, name);
+                accumulateVcardClose(self, session, name);
             }
             session.vcard_collecting = false;
         }
@@ -1592,7 +1591,7 @@ pub fn handleSaslAuth(self: *Server, session: *Session, elem: xml.Element, chang
             session.sasl_buf_len = 0;
             session.sasl_mechanism = mechanism;
         },
-        else => executeAction(self,session, action, changes),
+        else => executeAction(self, session, action, changes),
     }
 }
 
@@ -1604,7 +1603,7 @@ pub fn processSaslAuthComplete(self: *Server, session: *Session, changes: *Chang
         log.warn("connection {d} auth request but no auth daemon", .{session.conn.id});
         // Retryable: the reconnect timer re-links the auth daemon.
         const fail_action = session.stream.saslFailure("temporary-auth-failure");
-        executeAction(self,session, fail_action, changes);
+        executeAction(self, session, fail_action, changes);
         return;
     }
 
@@ -1614,14 +1613,14 @@ pub fn processSaslAuthComplete(self: *Server, session: *Session, changes: *Chang
     const decoded = stanza_writer.b64Decode(b64_data, &decoded_buf) orelse {
         log.warn("connection {d} invalid base64 in SASL auth", .{session.conn.id});
         const fail_action = session.stream.saslFailure("not-authorized");
-        executeAction(self,session, fail_action, changes);
+        executeAction(self, session, fail_action, changes);
         return;
     };
 
     // Determine mechanism ID
     const mech_id = ipc_protocol.MechanismId.fromName(session.sasl_mechanism) orelse {
         const fail_action = session.stream.saslFailure("not-authorized");
-        executeAction(self,session, fail_action, changes);
+        executeAction(self, session, fail_action, changes);
         return;
     };
 
@@ -1645,7 +1644,7 @@ pub fn processSaslAuthComplete(self: *Server, session: *Session, changes: *Chang
     }) catch {
         log.err("connection {d} failed to send auth request via IPC", .{session.conn.id});
         const fail_action = session.stream.saslFailure("temporary-auth-failure");
-        executeAction(self,session, fail_action, changes);
+        executeAction(self, session, fail_action, changes);
         return;
     };
 
@@ -1660,7 +1659,7 @@ pub fn processSaslResponseComplete(self: *Server, session: *Session, changes: *C
 
     if (!self.ipc.connected) {
         const fail_action = session.stream.saslFailure("temporary-auth-failure");
-        executeAction(self,session, fail_action, changes);
+        executeAction(self, session, fail_action, changes);
         return;
     }
 
@@ -1670,7 +1669,7 @@ pub fn processSaslResponseComplete(self: *Server, session: *Session, changes: *C
     const decoded = stanza_writer.b64Decode(b64_data, &decoded_buf) orelse {
         log.warn("connection {d} invalid base64 in SASL response", .{session.conn.id});
         const fail_action = session.stream.saslFailure("not-authorized");
-        executeAction(self,session, fail_action, changes);
+        executeAction(self, session, fail_action, changes);
         return;
     };
 
@@ -1681,7 +1680,7 @@ pub fn processSaslResponseComplete(self: *Server, session: *Session, changes: *C
     } }) catch {
         log.err("connection {d} failed to send SASL response via IPC", .{session.conn.id});
         const fail_action = session.stream.saslFailure("temporary-auth-failure");
-        executeAction(self,session, fail_action, changes);
+        executeAction(self, session, fail_action, changes);
         return;
     };
 
@@ -1714,7 +1713,7 @@ pub fn handleMessage(self: *Server, session: *Session, elem: xml.Element, change
 
     // Self-closing message (no children) — dispatch immediately
     if (elem.self_closing) {
-        dispatchStanza(self,session, changes);
+        dispatchStanza(self, session, changes);
     }
 }
 
@@ -1796,7 +1795,7 @@ pub fn writeVcardElement(session: *Session, elem: xml.Element) !usize {
 
 pub fn accumulateVcardElement(self: *Server, session: *Session, elem: xml.Element) void {
     if (session.pep_collecting) {
-        accumulatePepElement(self,session, elem);
+        accumulatePepElement(self, session, elem);
         return;
     }
     if (session.vcard_overflow) return;
@@ -1809,7 +1808,7 @@ pub fn accumulateVcardElement(self: *Server, session: *Session, elem: xml.Elemen
 
 pub fn accumulateVcardText(self: *Server, session: *Session, text: []const u8) void {
     if (session.pep_collecting) {
-        accumulatePepText(self,session, text);
+        accumulatePepText(self, session, text);
         return;
     }
     if (session.vcard_overflow) return;
@@ -1823,7 +1822,7 @@ pub fn accumulateVcardText(self: *Server, session: *Session, text: []const u8) v
 
 pub fn accumulateVcardClose(self: *Server, session: *Session, name: []const u8) void {
     if (session.pep_collecting) {
-        accumulatePepClose(self,session, name);
+        accumulatePepClose(self, session, name);
         return;
     }
     if (session.vcard_overflow) return;
@@ -1936,7 +1935,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
             // Nothing in this branch touches the session afterwards, and
             // every caller returns on reaching it, so a failed upgrade
             // that frees the session is not read here.
-            _ = startTlsUpgrade(self,session, changes);
+            _ = startTlsUpgrade(self, session, changes);
         },
         .send_sasl_success => |server_final| {
             writer.writeAll("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch return;
@@ -1976,7 +1975,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
             session.queueSendStanza(fbs.getWritten()) catch return;
         },
         .send_error => |err| {
-            sendStreamError(self,session, err);
+            sendStreamError(self, session, err);
         },
         .session_established => {
             // Nothing to send — session is now active
@@ -2017,7 +2016,7 @@ pub fn handleWritable(self: *Server, id: usize, changes: *ChangeList) void {
         // that <proceed/> is fully on the wire. A failed upgrade frees
         // the session, so nothing below may touch it.
         if (session.stream.state == .starttls_pending and !session.conn.isTlsHandshaking()) {
-            if (!startTlsUpgrade(self,session, changes)) return;
+            if (!startTlsUpgrade(self, session, changes)) return;
         }
     }
 
@@ -2029,7 +2028,7 @@ pub fn handleWritable(self: *Server, id: usize, changes: *ChangeList) void {
         session_lifecycle.drainOfflinePending(self, session, changes);
     }
 
-    applyReadBackpressure(self,session, changes);
+    applyReadBackpressure(self, session, changes);
 }
 
 /// Begin the TLS handshake once the plaintext <proceed/> is fully
@@ -2146,7 +2145,7 @@ test "Server: read backpressure toggles EVFILT_READ across write-buffer threshol
     try std.testing.expectEqual(connection_mod.WRITE_SUPPRESS_HIGH + 128, session.conn.pendingWriteBytes());
     try std.testing.expect(!session.conn.read_suppressed);
 
-    applyReadBackpressure(&server,session, &changes);
+    applyReadBackpressure(&server, session, &changes);
     try std.testing.expect(session.conn.read_suppressed);
     // Expect an EV.DISABLE change for the READ filter on this fd
     var saw_disable = false;
@@ -2158,14 +2157,14 @@ test "Server: read backpressure toggles EVFILT_READ across write-buffer threshol
     // Suppression is sticky in the hysteresis band (between LOW and HIGH)
     changes.reset();
     session.conn.write_end = connection_mod.WRITE_SUPPRESS_HIGH - 16;
-    applyReadBackpressure(&server,session, &changes);
+    applyReadBackpressure(&server, session, &changes);
     try std.testing.expect(session.conn.read_suppressed);
     try std.testing.expectEqual(@as(usize, 0), changes.count());
 
     // Drained at/below low-water: read watch re-enabled
     changes.reset();
     session.conn.write_end = connection_mod.WRITE_SUPPRESS_LOW;
-    applyReadBackpressure(&server,session, &changes);
+    applyReadBackpressure(&server, session, &changes);
     try std.testing.expect(!session.conn.read_suppressed);
     var saw_enable = false;
     for (changes.slice()) |ev| {
@@ -2210,7 +2209,7 @@ test "H6: an oversized pre-auth element is a policy violation, not a silent drop
     var changes = ChangeList.init(&change_buf);
     const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
 
     // One element larger than the pre-auth cap. It is never authenticated, so
@@ -2223,7 +2222,7 @@ test "H6: an oversized pre-auth element is a policy violation, not a silent drop
     var fed: usize = 0;
     while (fed <= xml.max_item_bytes_pre_auth and server.sessions[1] != null) : (fed += big.len) {
         _ = try posix.write(fds[1], &big);
-        handleReadable(&server,1, &changes);
+        handleReadable(&server, 1, &changes);
     }
 
     try std.testing.expect(server.sessions[1] == null);
@@ -2249,7 +2248,7 @@ test "H6: a stanza the accumulator can deliver is accepted after auth" {
     var changes = ChangeList.init(&change_buf);
     const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
 
     // A body that fills most of the 16 KiB stanza accumulator: legal today, so
@@ -2264,7 +2263,7 @@ test "H6: a stanza the accumulator can deliver is accepted after auth" {
     fbs.pos += body_len;
     try w.writeAll("</body></message>");
     _ = try posix.write(fds[1], fbs.getWritten());
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     try std.testing.expect(server.sessions[1] != null);
     var buf: [4096]u8 = undefined;
@@ -2301,7 +2300,7 @@ test "H6: a broken stanza closes the stream before its close tag arrives" {
     var changes = ChangeList.init(&change_buf);
     const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
 
     // A stanza whose children pass the 16 KiB accumulator with no
@@ -2320,7 +2319,7 @@ test "H6: a broken stanza closes the stream before its close tag arrives" {
     const limit = 64 * 1024;
     while (fed < limit and server.sessions[1] != null) : (fed += fbs.pos) {
         _ = try posix.write(fds[1], fbs.getWritten());
-        handleReadable(&server,1, &changes);
+        handleReadable(&server, 1, &changes);
     }
 
     // Closed on the accumulator overflow, well before the children ran out and
@@ -2357,7 +2356,7 @@ test "Server: stream open produces response" {
     // Process the readable event
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     // Server should have queued (and, since handleReadable flushes eagerly,
     // likely already sent) a response — flush covers both cases.
@@ -2388,7 +2387,7 @@ test "Server: stream open with mixed-case 'to' produces response" {
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     _ = try session.conn.flushSend();
     var buf: [2048]u8 = undefined;
@@ -2424,7 +2423,7 @@ test "Server: pre-bind stanza to the domain in another case is server-addressed"
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
 
-    try std.testing.expectEqual(PreBindVerdict.server_addressed, enforcePreBindStanzaPolicy(&server,session, elem, &changes));
+    try std.testing.expectEqual(PreBindVerdict.server_addressed, enforcePreBindStanzaPolicy(&server, session, elem, &changes));
 }
 
 test "F6: ingress preparation folds the local 'to' before routing" {
@@ -2479,7 +2478,7 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     };
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    handleElementStart(&server,alice, &elem, &changes);
+    handleElementStart(&server, alice, &elem, &changes);
 
     // Routed to the folded account and serialized with the prepared spelling.
     _ = target.conn.flushSend() catch {};
@@ -2515,7 +2514,7 @@ test "F6: pre-bind stanza to the folded account is server-addressed" {
     };
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    handleElementStart(&server,session, &elem, &changes);
+    handleElementStart(&server, session, &elem, &changes);
 
     // Own-account: answered with a stanza error, the stream stays open.
     try std.testing.expect(server.sessions[1] != null);
@@ -2557,7 +2556,7 @@ test "F6: a 320-octet localpart survives the pre-bind account compare" {
     };
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    handleElementStart(&server,session, &elem, &changes);
+    handleElementStart(&server, session, &elem, &changes);
 
     try std.testing.expect(server.sessions[1] != null);
     _ = try session.conn.flushSend();
@@ -2601,7 +2600,7 @@ test "F6: a maximum-length prepared username is not judged third party" {
     };
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    handleElementStart(&server,session, &elem, &changes);
+    handleElementStart(&server, session, &elem, &changes);
 
     // Own-account: stanza error, the stream stays open.
     try std.testing.expect(server.sessions[1] != null);
@@ -2644,7 +2643,7 @@ test "F6: malformed local 'to' gets jid-malformed for message and iq" {
         .attributes = &msg_attrs,
         .self_closing = true,
     };
-    handleElementStart(&server,session, &msg_elem, &changes);
+    handleElementStart(&server, session, &msg_elem, &changes);
     _ = try session.conn.flushSend();
     var n = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "jid-malformed") != null);
@@ -2663,7 +2662,7 @@ test "F6: malformed local 'to' gets jid-malformed for message and iq" {
         .attributes = &iq_attrs,
         .self_closing = true,
     };
-    handleElementStart(&server,session, &iq_elem, &changes);
+    handleElementStart(&server, session, &iq_elem, &changes);
     _ = try session.conn.flushSend();
     n = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "jid-malformed") != null);
@@ -3075,7 +3074,7 @@ test "Server: registration submits are PRECIS-prepared and invalid names get not
     // features_sasl state.
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     _ = try session.conn.flushSend();
     var buf: [4096]u8 = undefined;
     const n0 = posix.read(fds[1], &buf) catch 0;
@@ -3090,7 +3089,7 @@ test "Server: registration submits are PRECIS-prepared and invalid names get not
     // not-acceptable and never reaches the auth daemon.
     const bad_reg = "<iq type='set' id='r1'><query xmlns='jabber:iq:register'><username>a b</username><password>pw</password></query></iq>";
     _ = try posix.write(fds[1], bad_reg);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     _ = try session.conn.flushSend();
     const n1 = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n1], "<not-acceptable") != null);
@@ -3101,7 +3100,7 @@ test "Server: registration submits are PRECIS-prepared and invalid names get not
     // IdentifierClass permits it.
     const excluded_reg = "<iq type='set' id='r1x'><query xmlns='jabber:iq:register'><username>a@b</username><password>pw</password></query></iq>";
     _ = try posix.write(fds[1], excluded_reg);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     _ = try session.conn.flushSend();
     const n1x = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n1x], "<not-acceptable") != null);
@@ -3112,7 +3111,7 @@ test "Server: registration submits are PRECIS-prepared and invalid names get not
     // to U+03C3 unconditionally; no final-sigma rule).
     const good_reg = "<iq type='set' id='r2'><query xmlns='jabber:iq:register'><username>\u{039F}\u{0394}\u{039F}\u{03A3}</username><password>pw</password></query></iq>";
     _ = try posix.write(fds[1], good_reg);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     _ = try session.conn.flushSend();
 
     // One length-prefixed frame lands on the IPC socket: a register_request
@@ -3143,7 +3142,7 @@ test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    handleReadable(&server,3, &changes);
+    handleReadable(&server, 3, &changes);
 
     // Session must be closed immediately, without feeding bytes to the XML parser
     try std.testing.expect(server.sessions[3] == null);
@@ -3179,7 +3178,7 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     // Drive the stream open so the FSM reaches features_tls.
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     // Drain the peer side, then fill the kernel send path (unix pairs
     // buffer 64 KiB and ignore SO_SNDBUF): with the socket full the
@@ -3189,7 +3188,7 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     try std.testing.expect(fillWriteBuffer(session));
 
     _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     // Upgrade deferred: FSM is pending but TLS has NOT started.
     try std.testing.expect(session.stream.state == .starttls_pending);
@@ -3200,7 +3199,7 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     while (posix.read(fds[1], &drain_buf)) |n| {
         if (n == 0) break;
     } else |_| {}
-    handleWritable(&server,1, &changes);
+    handleWritable(&server, 1, &changes);
     try std.testing.expect(!session.conn.hasPendingWrite());
 
     // Buffer drained: the deferred upgrade has started the handshake.
@@ -3232,7 +3231,7 @@ test "Server: T215 failed deferred upgrade does not touch the freed session" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     // Park the FSM in starttls_pending with <proceed/> still unflushed, so
     // the upgrade is deferred to handleWritable.
@@ -3241,7 +3240,7 @@ test "Server: T215 failed deferred upgrade does not touch the freed session" {
     try std.testing.expect(fillWriteBuffer(session));
 
     _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     try std.testing.expect(session.stream.state == .starttls_pending);
 
     // The upgrade will fail, and a failure closes the session and frees it.
@@ -3250,7 +3249,7 @@ test "Server: T215 failed deferred upgrade does not touch the freed session" {
     while (posix.read(fds[1], &drain_buf)) |n| {
         if (n == 0) break;
     } else |_| {}
-    handleWritable(&server,1, &changes);
+    handleWritable(&server, 1, &changes);
 
     // handleWritable must stop at the failed upgrade. Continuing into the
     // offline-pending drain and read-backpressure re-arm would access freed
@@ -3275,20 +3274,20 @@ test "Server: T215 plaintext in a later segment while STARTTLS pending is a poli
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
     // <starttls/> alone: the FSM parks in starttls_pending.
     _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     try std.testing.expect(session.stream.state == .starttls_pending);
     try std.testing.expect(server.sessions[1] != null);
 
     // Plaintext in a LATER segment: the peer must send nothing until the
     // upgrade. Reject and close (RFC 6120 5.4.3.2).
     _ = try posix.write(fds[1], "<message to='a@b'><body>x</body></message>");
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     try std.testing.expect(server.sessions[1] == null);
     var buf: [4096]u8 = undefined;
@@ -3316,13 +3315,13 @@ test "Server: T215 plaintext read-ahead past <starttls/> is a policy-violation" 
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
     // <starttls/> followed by more plaintext in the same flight.
     _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/><message to='a@b'><body>x</body></message>");
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     // Protocol violation: the session is closed with a stream error.
     try std.testing.expect(server.sessions[1] == null);
@@ -3346,13 +3345,13 @@ test "Server: S27 nested stream:stream closes with not-well-formed" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
 
     // A second stream header inside the open stream: protocol violation.
     const nested = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], nested);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     try std.testing.expect(server.sessions[1] == null);
     var buf: [4096]u8 = undefined;
@@ -3383,7 +3382,7 @@ pub fn expectBadRootBounded(root: []const u8) !void {
     var drain_buf: [8192]u8 = undefined;
 
     _ = try posix.write(fds[1], root);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     var err_buf: [4096]u8 = undefined;
     var err_total: usize = 0;
     while (posix.read(fds[1], err_buf[err_total..])) |n| {
@@ -3414,7 +3413,7 @@ pub fn expectBadRootBounded(root: []const u8) !void {
             if (n == 0) break;
             off += n;
         }
-        handleReadable(&server,1, &changes);
+        handleReadable(&server, 1, &changes);
         while (posix.read(fds[1], &drain_buf)) |n| {
             if (n == 0) break;
         } else |_| break;
@@ -3457,7 +3456,7 @@ test "Server: direct TLS skips STARTTLS features" {
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    handleReadable(&server,2, &changes);
+    handleReadable(&server, 2, &changes);
 
     _ = try session.conn.flushSend();
     var buf: [2048]u8 = undefined;
@@ -3497,9 +3496,9 @@ test "S1: PEP accumulator escapes attributes, namespaces and text" {
         .attributes = &attrs,
         .self_closing = false,
     };
-    accumulatePepElement(&server,session, elem);
-    accumulatePepText(&server,session, "10</lat><evil/>");
-    accumulatePepClose(&server,session, "geoloc");
+    accumulatePepElement(&server, session, elem);
+    accumulatePepText(&server, session, "10</lat><evil/>");
+    accumulatePepClose(&server, session, "geoloc");
 
     const payload = session.pep_payload.items;
     try std.testing.expect(std.mem.indexOf(u8, payload, "<message") == null);
@@ -3654,14 +3653,14 @@ test "Server: S11 stray close tag closes the stream not-well-formed" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
     // A close tag with no matching open: depth must not desync.
     _ = try posix.write(fds[1], "</junk>");
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     try std.testing.expect(server.sessions[1] == null);
     var buf: [4096]u8 = undefined;
@@ -3689,7 +3688,7 @@ test "Server: S11 overlong bind id is rejected, not truncated" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
@@ -3698,7 +3697,7 @@ test "Server: S11 overlong bind id is rejected, not truncated" {
     const long_id = "i" ** 300;
     const iq = "<iq type='set' id='" ++ long_id ++ "'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></iq>";
     _ = try posix.write(fds[1], iq);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     try std.testing.expect(server.sessions[1] == null);
     var buf: [4096]u8 = undefined;
@@ -3726,7 +3725,7 @@ test "Server: S11 register flow iq ids survive the reader-arena reset" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     var drain_buf: [8192]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
@@ -3735,14 +3734,14 @@ test "Server: S11 register flow iq ids survive the reader-arena reset" {
     session.stream.state = .features_sasl;
 
     _ = try posix.write(fds[1], "<iq type='get' id='reg1'><query xmlns='jabber:iq:register'/></iq>");
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     const n1 = posix.read(fds[1], &drain_buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, drain_buf[0..n1], "id='reg1'") != null);
 
     // The next stanza resets the reader arena the id slice came from; the
     // mirrored id in the reply must still be the client's.
     _ = try posix.write(fds[1], "<iq type='get' id='reg2-longer-id'><query xmlns='jabber:iq:register'/></iq>");
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     const n2 = posix.read(fds[1], &drain_buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, drain_buf[0..n2], "id='reg2-longer-id'") != null);
     try std.testing.expect(server.sessions[1] != null);
@@ -3816,16 +3815,16 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
         .attributes = &[_]xml.Attribute{},
         .self_closing = false,
     };
-    accumulateStanzaElement(&server,alice, body_elem);
+    accumulateStanzaElement(&server, alice, body_elem);
     var big: [20000]u8 = undefined;
     @memset(&big, 'A');
-    accumulateStanzaText(&server,alice, &big);
-    accumulateStanzaClose(&server,alice, "body");
+    accumulateStanzaText(&server, alice, &big);
+    accumulateStanzaClose(&server, alice, "body");
     try std.testing.expect(alice.stanza_overflow);
 
     // The stanza completes: the partial is not routed, the stream is failed
     // closed, and the session is torn down.
-    handleElementEnd(&server,alice, "message", &changes);
+    handleElementEnd(&server, alice, "message", &changes);
 
     // Nothing reached bob.
     _ = bob.conn.flushSend() catch {};
@@ -3868,7 +3867,7 @@ test "Server: G4 an oversized vCard is rejected without replacing the stored val
 
     const stream_open = "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     try std.testing.expectEqual(stream_open.len, try posix.write(fds[1], stream_open));
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
     session.stream.state = .active;
     session.stream.authenticated = true;
@@ -3883,7 +3882,7 @@ test "Server: G4 an oversized vCard is rejected without replacing the stored val
     @memset(payload[prefix.len..][0 .. payload.len - prefix.len - suffix.len], 'N');
     @memcpy(payload[payload.len - suffix.len ..], suffix);
     try std.testing.expectEqual(payload.len, try posix.write(fds[1], payload));
-    for (0..2) |_| handleReadable(&server,1, &changes);
+    for (0..2) |_| handleReadable(&server, 1, &changes);
 
     _ = session.conn.flushSend() catch {};
     var response: [8192]u8 = undefined;
@@ -3913,7 +3912,7 @@ test "Server: E6 non-whitespace between stanzas closes the stream" {
     // terminated by the stream close so the scanner emits it as a token.
     const payload = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>GARBAGE</stream:stream>";
     _ = try posix.write(fds[1], payload);
-    handleReadable(&server,1, &changes);
+    handleReadable(&server, 1, &changes);
 
     // The stream is failed closed with a not-well-formed stream error and the
     // session is gone.
@@ -3955,7 +3954,7 @@ test "Server: E6 an over-long token is a policy-violation" {
         const n = posix.write(fds[1], data[written..][0..chunk]) catch break;
         if (n == 0) break;
         written += n;
-        handleReadable(&server,1, &changes);
+        handleReadable(&server, 1, &changes);
     }
 
     // A policy-violation (not not-well-formed) closed the stream.

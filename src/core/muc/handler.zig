@@ -27,10 +27,10 @@ const Role = room_store.Role;
 const Affiliation = room_store.Affiliation;
 
 const connection_mod = @import("../connection.zig");
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 const fanout = @import("fanout.zig");
 const FanoutQueue = fanout.FanoutQueue;
 const router = @import("../routing/router.zig");

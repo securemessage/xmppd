@@ -4,7 +4,7 @@
 //! cache is per-worker memory, so a roster or subscription change drops the
 //! entry locally and on every other worker through the room-actor mailbox.
 
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const sub_cache_mod = server_mod.sub_cache_mod;
 const muc_actor = @import("../muc/actor.zig");

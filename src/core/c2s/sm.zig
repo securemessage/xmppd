@@ -10,12 +10,12 @@ const xml = @import("xml");
 const xmpp = @import("xmpp");
 const sasl = @import("sasl");
 const precis = @import("precis_username");
-const EventLoop = @import("../event_loop.zig").EventLoop;
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const EventLoop = @import("../worker/loop.zig").EventLoop;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 const Connection = @import("../connection.zig").Connection;
 pub const connection_mod = @import("../connection.zig");
 const Listener = @import("../listener.zig").Listener;
-const Event = @import("../event_loop.zig").Event;
+const Event = @import("../worker/loop.zig").Event;
 
 const ssl = @import("ssl");
 const IpcClient = @import("ipc_client").IpcClient;
@@ -62,12 +62,12 @@ const actor_message = @import("../xworker/envelope.zig");
 pub const sm_state = @import("sm_state.zig");
 const sm_handoff = @import("sm_handoff.zig");
 const block_store_mod = @import("block_store");
-const metrics = @import("../metrics.zig");
+const metrics = @import("../worker/metrics.zig");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const pep_store_mod = @import("pep_store");
 const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
 
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const c2s_session = @import("session.zig");
 const Session = c2s_session.Session;
@@ -91,7 +91,6 @@ const MAX_SM_REDIRECTS: usize = 256;
 const MAX_SM_REDIRECT_HOPS: u8 = 8;
 
 /// FNV-1a hash of an SM-ID for map indexing (T127).
-
 /// Handle <enable xmlns='urn:xmpp:sm:3'/> — activate SM for this session.
 /// If the client includes resume='true', session resumption is enabled and
 /// an SM-ID is generated for future reconnection.
@@ -171,7 +170,7 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
                 // Malformed h must not silently become 0: that would
                 // look like a backwards report and desync the replay
                 // (S24).
-                sendSmFailed(self,session, "bad-request", changes);
+                sendSmFailed(self, session, "bad-request", changes);
                 return;
             };
             h_found = true;
@@ -179,7 +178,7 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     }
 
     if (previd.len == 0 or !h_found) {
-        sendSmFailed(self,session, "unexpected-request", changes);
+        sendSmFailed(self, session, "unexpected-request", changes);
         return;
     }
 
@@ -189,30 +188,30 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     if (muc_actor.getWorkerCount(self) > 1) {
         if (sm_state.workerIdFromSmId(previd)) |owner| {
             if (owner != self.worker_id and owner < muc_actor.getWorkerCount(self)) {
-                startCrossWorkerResume(self,session, previd, h_value, owner, changes);
+                startCrossWorkerResume(self, session, previd, h_value, owner, changes);
                 return;
             }
         }
     }
 
     // Find the detached session with matching SM-ID
-    const detached_id = findDetachedSession(self,previd) orelse {
+    const detached_id = findDetachedSession(self, previd) orelse {
         // T177: prefix routed here but the session was handed off —
         // follow the redirect breadcrumb instead of failing.
         if (muc_actor.getWorkerCount(self) > 1) {
-            if (smRedirectLookup(self,previd)) |target| {
+            if (smRedirectLookup(self, previd)) |target| {
                 if (target != self.worker_id and target < muc_actor.getWorkerCount(self)) {
-                    startCrossWorkerResume(self,session, previd, h_value, target, changes);
+                    startCrossWorkerResume(self, session, previd, h_value, target, changes);
                     return;
                 }
             }
         }
-        sendSmFailed(self,session, "item-not-found", changes);
+        sendSmFailed(self, session, "item-not-found", changes);
         return;
     };
 
     const detached = self.sessions[detached_id] orelse {
-        sendSmFailed(self,session, "item-not-found", changes);
+        sendSmFailed(self, session, "item-not-found", changes);
         return;
     };
 
@@ -220,24 +219,24 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     // batch — its replay queue is corrupt. Fail the resume as if the
     // session were already gone; reapOutboundOverflow destroys it at batch end.
     if (detached.sm_overflow) {
-        sendSmFailed(self,session, "item-not-found", changes);
+        sendSmFailed(self, session, "item-not-found", changes);
         return;
     }
 
     // Verify the authenticated user matches the detached session's user
     const auth_jid = session.stream.authenticated_jid orelse {
-        sendSmFailed(self,session, "not-authorized", changes);
+        sendSmFailed(self, session, "not-authorized", changes);
         return;
     };
     const detached_jid = detached.stream.bound_jid orelse {
-        sendSmFailed(self,session, "item-not-found", changes);
+        sendSmFailed(self, session, "item-not-found", changes);
         return;
     };
 
     if (!std.mem.eql(u8, auth_jid.local, detached_jid.local) or
         !std.mem.eql(u8, auth_jid.domain, detached_jid.domain))
     {
-        sendSmFailed(self,session, "not-authorized", changes);
+        sendSmFailed(self, session, "not-authorized", changes);
         return;
     }
 
@@ -247,14 +246,14 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
             .ok => {},
             // XEP-0198 §4: h above the number sent fails the resume.
             .too_high => {
-                sendSmFailed(self,session, "handled-count-too-high", changes);
+                sendSmFailed(self, session, "handled-count-too-high", changes);
                 return;
             },
             // A backwards report means the client lost track of what it
             // already acked; replaying would redeliver stanzas it
             // processed (S24).
             .backwards => {
-                sendSmFailed(self,session, "unexpected-request", changes);
+                sendSmFailed(self, session, "unexpected-request", changes);
                 return;
             },
         }
@@ -342,8 +341,8 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
 
     // Clean up detached session bookkeeping before destroying
     if (self.detached_count > 0) self.detached_count -= 1;
-    smIdMapRemove(self,detached.sm_id[0..detached.sm_id_len]);
-    smRedirectDrop(self,previd); // session lives here again
+    smIdMapRemove(self, detached.sm_id[0..detached.sm_id_len]);
+    smRedirectDrop(self, previd); // session lives here again
 
     // Destroy the detached session (slot freed for reuse)
     detached.sm_resume_enabled = false; // Prevent re-detach
@@ -365,7 +364,7 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     // (possibly remote); roomOwner == self applies synchronously.
     if (move_room_count > 0) {
         if (bound_generation) |gen| {
-            replayOccupantMoves(self,session, move_rooms_buf[0..move_room_count], gen, self.worker_id);
+            replayOccupantMoves(self, session, move_rooms_buf[0..move_room_count], gen, self.worker_id);
         } else {
             log.warn("connection {d} resumed with {d} MUC rooms but no session-map generation — occupant moves skipped", .{
                 session.conn.id, move_room_count,
@@ -417,11 +416,11 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
 /// session's state. Nothing is sent to the client until the reply arrives.
 pub fn startCrossWorkerResume(self: *Server, session: *Session, previd: []const u8, h_value: u32, owner: u16, changes: *ChangeList) void {
     const auth_jid = session.stream.authenticated_jid orelse {
-        sendSmFailed(self,session, "not-authorized", changes);
+        sendSmFailed(self, session, "not-authorized", changes);
         return;
     };
     if (session.sm_resume_pending) {
-        sendSmFailed(self,session, "unexpected-request", changes);
+        sendSmFailed(self, session, "unexpected-request", changes);
         return;
     }
 
@@ -433,7 +432,7 @@ pub fn startCrossWorkerResume(self: *Server, session: *Session, previd: []const 
         session.conn.id, previd, owner,
     });
 
-    enqueueSmActor(self,owner, .{ .sm_resume_request = .{
+    enqueueSmActor(self, owner, .{ .sm_resume_request = .{
         .previd = previd,
         .h = h_value,
         .req_worker = self.worker_id,
@@ -444,7 +443,7 @@ pub fn startCrossWorkerResume(self: *Server, session: *Session, previd: []const 
     } }) catch |err| {
         log.warn("cross-worker SM resume: enqueue to worker {d} failed: {}", .{ owner, err });
         session.sm_resume_pending = false;
-        sendSmFailed(self,session, "item-not-found", changes);
+        sendSmFailed(self, session, "item-not-found", changes);
     };
 }
 
@@ -459,7 +458,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
     const fail = struct {
         fn send(server: *Server, r: actor_message.SmResumeRequest, status: []const u8, why: []const u8) void {
             log.info("cross-worker SM resume handoff for {s} rejected: {s}", .{ r.previd, why });
-            enqueueSmActor(server,r.req_worker, .{ .sm_resume_reply = .{
+            enqueueSmActor(server, r.req_worker, .{ .sm_resume_reply = .{
                 .previd = r.previd,
                 .req_session = r.req_session,
                 .req_epoch = r.req_epoch,
@@ -468,18 +467,18 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
         }
     }.send;
 
-    const detached_id = findDetachedSession(self,req.previd) orelse {
+    const detached_id = findDetachedSession(self, req.previd) orelse {
         // T177: this worker handed the session off earlier — follow the
         // breadcrumb, preserving the original requester addressing.
         if (req.hops < MAX_SM_REDIRECT_HOPS) {
-            if (smRedirectLookup(self,req.previd)) |target| {
+            if (smRedirectLookup(self, req.previd)) |target| {
                 if (target != self.worker_id and target < muc_actor.getWorkerCount(self)) {
                     log.info("cross-worker SM resume: {s} relocated to worker {d}, forwarding (hop {d})", .{
                         req.previd, target, req.hops + 1,
                     });
                     var fwd = req;
                     fwd.hops += 1;
-                    enqueueSmActor(self,target, .{ .sm_resume_request = fwd }) catch
+                    enqueueSmActor(self, target, .{ .sm_resume_request = fwd }) catch
                         return fail(self, req, "item-not-found", "redirect forward failed");
                     return;
                 }
@@ -568,7 +567,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
     // Snapshot the detached session's MUC occupancies into the bundle.
     // Over the cap: refuse the handoff (full re-bind + rejoin fallback,
     // the pre-migration behavior).
-    if (!gatherSessionRooms(self,self.worker_id, detached_id, bundle)) {
+    if (!gatherSessionRooms(self, self.worker_id, detached_id, bundle)) {
         bundle.deinit();
         sm_handoff.allocator.destroy(bundle);
         return fail(self, req, "item-not-found", "occupancy exceeds migration cap");
@@ -577,7 +576,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
     sm_handoff.put(req.previd, bundle) catch {
         bundle.deinit();
         sm_handoff.allocator.destroy(bundle);
-        enqueueSmActor(self,req.req_worker, .{ .sm_resume_reply = .{
+        enqueueSmActor(self, req.req_worker, .{ .sm_resume_reply = .{
             .previd = req.previd,
             .req_session = req.req_session,
             .req_epoch = req.req_epoch,
@@ -596,7 +595,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
         _ = sm.unbind(dj.local, dj.domain, dj.resource);
     }
     if (self.detached_count > 0) self.detached_count -= 1;
-    smIdMapRemove(self,detached.sm_id[0..detached.sm_id_len]);
+    smIdMapRemove(self, detached.sm_id[0..detached.sm_id_len]);
     detached.sm_resume_enabled = false; // Prevent re-detach
     detached.deinit();
     self.allocator.destroy(detached);
@@ -608,13 +607,13 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
 
     // Breadcrumb: the SM-ID prefix still names THIS worker; a repeat
     // resume of the relocated session must find worker req.req_worker.
-    smRedirectNote(self,req.previd, req.req_worker);
+    smRedirectNote(self, req.previd, req.req_worker);
 
     log.info("cross-worker SM resume: handed off {s} to worker {d} ({d} stanzas, {d} rooms)", .{
         req.previd, req.req_worker, bundle.stanzas.items.len, bundle.rooms.items.len,
     });
 
-    enqueueSmActor(self,req.req_worker, .{ .sm_resume_reply = .{
+    enqueueSmActor(self, req.req_worker, .{ .sm_resume_reply = .{
         .previd = req.previd,
         .req_session = req.req_session,
         .req_epoch = req.req_epoch,
@@ -648,20 +647,20 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
 
     if (!std.mem.eql(u8, rep.status, "ok")) {
         log.info("connection {d} cross-worker SM resume failed: {s}", .{ session.conn.id, rep.status });
-        sendSmFailed(self,session, rep.status, changes);
+        sendSmFailed(self, session, rep.status, changes);
         return;
     }
 
     const bundle = sm_handoff.take(rep.previd) orelse {
-        sendSmFailed(self,session, "item-not-found", changes);
+        sendSmFailed(self, session, "item-not-found", changes);
         return;
     };
     defer sm_handoff.release(bundle);
-    smRedirectDrop(self,rep.previd); // session lives here again
+    smRedirectDrop(self, rep.previd); // session lives here again
 
     // Rebuild the unacked queue on this worker's allocator.
     const queue = self.allocator.create(sm_state.SmUnackedQueue) catch {
-        sendSmFailed(self,session, "item-not-found", changes);
+        sendSmFailed(self, session, "item-not-found", changes);
         return;
     };
     queue.* = sm_state.SmUnackedQueue.init(self.allocator);
@@ -677,7 +676,7 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
                 log.err("cross-worker SM resume: rebuilt queue overflow", .{});
                 queue.deinit();
                 self.allocator.destroy(queue);
-                sendSmFailed(self,session, "item-not-found", changes);
+                sendSmFailed(self, session, "item-not-found", changes);
                 return;
             },
         }
@@ -734,7 +733,7 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
     if (bundle.rooms.items.len > 0) {
         if (bound_generation) |gen| {
             const old_worker = sm_state.workerIdFromSmId(&bundle.previd) orelse self.worker_id;
-            replayOccupantMoves(self,session, bundle.rooms.items, gen, old_worker);
+            replayOccupantMoves(self, session, bundle.rooms.items, gen, old_worker);
         } else {
             log.warn("connection {d} resumed with {d} MUC rooms but no session-map generation — occupant moves skipped (client should MAM/rejoin)", .{
                 session.conn.id, bundle.rooms.items.len,
@@ -787,10 +786,10 @@ pub fn handleSmActorMessage(self: *Server, payload: []const u8, changes: *Change
         return;
     };
     switch (msg) {
-        .sm_resume_request => |ev| handleSmResumeRequest(self,ev),
-        .sm_resume_reply => |ev| handleSmResumeReply(self,ev, changes),
-        .session_kick_request => |ev| handleSessionKickRequest(self,ev, changes),
-        .session_kick_reply => |ev| handleSessionKickReply(self,ev, changes),
+        .sm_resume_request => |ev| handleSmResumeRequest(self, ev),
+        .sm_resume_reply => |ev| handleSmResumeReply(self, ev, changes),
+        .session_kick_request => |ev| handleSessionKickRequest(self, ev, changes),
+        .session_kick_reply => |ev| handleSessionKickReply(self, ev, changes),
         else => log.warn("unexpected tag in SM actor dispatch: 0x{x:0>2}", .{msg.tag()}),
     }
 }
@@ -811,7 +810,7 @@ pub fn startSessionKick(self: *Server, session: *Session, local: []const u8, dom
     @memcpy(session.bind_kick_resource_buf[0..resource.len], resource);
     session.bind_kick_resource_len = @intCast(resource.len);
 
-    enqueueSmActor(self,owner, .{ .session_kick_request = .{
+    enqueueSmActor(self, owner, .{ .session_kick_request = .{
         .local = local,
         .domain = domain,
         .resource = resource,
@@ -841,7 +840,7 @@ pub fn handleSessionKickRequest(self: *Server, req: actor_message.SessionKickReq
                     log.warn("session {d} evicted: resource {s}@{s}/{s} taken by worker {d}", .{
                         old_id, req.local, req.domain, req.resource, req.req_worker,
                     });
-                    c2s_session.sendStreamError(self,old, .conflict);
+                    c2s_session.sendStreamError(self, old, .conflict);
                     old.conn.flushSync(); // deliver the conflict before teardown closes the fd
                     session_lifecycle.forceCloseSession(self, old_id, changes);
                 } else {
@@ -852,7 +851,7 @@ pub fn handleSessionKickRequest(self: *Server, req: actor_message.SessionKickReq
         }
     }
 
-    enqueueSmActor(self,req.req_worker, .{ .session_kick_reply = .{
+    enqueueSmActor(self, req.req_worker, .{ .session_kick_reply = .{
         .req_session = req.req_session,
         .req_epoch = req.req_epoch,
     } }) catch |err| {
@@ -1029,7 +1028,7 @@ pub fn smRedirectNote(self: *Server, previd: []const u8, worker: u16) void {
     var key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
     @memcpy(&key, previd);
     const now = std.time.timestamp();
-    smRedirectsPurgeExpired(self,now);
+    smRedirectsPurgeExpired(self, now);
     if (self.sm_redirects.count() >= MAX_SM_REDIRECTS and !self.sm_redirects.contains(key)) {
         var oldest_key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
         var oldest_ts: i64 = std.math.maxInt(i64);
@@ -1111,7 +1110,7 @@ test "S17: SM-ID map holds more than 64 detached sessions" {
     while (i < 200) : (i += 1) {
         var id: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
         _ = std.fmt.bufPrint(&id, "{x:0>32}", .{i}) catch unreachable;
-        smIdMapInsert(&server,&id, i);
+        smIdMapInsert(&server, &id, i);
     }
     try std.testing.expectEqual(@as(u32, 200), server.sm_id_map.count());
 
@@ -1119,7 +1118,7 @@ test "S17: SM-ID map holds more than 64 detached sessions" {
     while (i < 200) : (i += 1) {
         var id: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
         _ = std.fmt.bufPrint(&id, "{x:0>32}", .{i}) catch unreachable;
-        try std.testing.expectEqual(@as(?usize, i), findDetachedSession(&server,&id));
+        try std.testing.expectEqual(@as(?usize, i), findDetachedSession(&server, &id));
     }
 }
 
@@ -1135,22 +1134,22 @@ test "S17: SM-ID map remove does not break later lookups" {
     while (i < 100) : (i += 1) {
         var id: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
         _ = std.fmt.bufPrint(&id, "{x:0>32}", .{i}) catch unreachable;
-        smIdMapInsert(&server,&id, i + 1000);
+        smIdMapInsert(&server, &id, i + 1000);
     }
     i = 0;
     while (i < 100) : (i += 3) {
         var id: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
         _ = std.fmt.bufPrint(&id, "{x:0>32}", .{i}) catch unreachable;
-        smIdMapRemove(&server,&id);
+        smIdMapRemove(&server, &id);
     }
     i = 0;
     while (i < 100) : (i += 1) {
         var id: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
         _ = std.fmt.bufPrint(&id, "{x:0>32}", .{i}) catch unreachable;
         if (i % 3 == 0) {
-            try std.testing.expectEqual(@as(?usize, null), findDetachedSession(&server,&id));
+            try std.testing.expectEqual(@as(?usize, null), findDetachedSession(&server, &id));
         } else {
-            try std.testing.expectEqual(@as(?usize, i + 1000), findDetachedSession(&server,&id));
+            try std.testing.expectEqual(@as(?usize, i + 1000), findDetachedSession(&server, &id));
         }
     }
 }
@@ -1235,7 +1234,7 @@ test "Server: S24 a h above the sent count fails the stream" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
@@ -1249,7 +1248,7 @@ test "Server: S24 a h above the sent count fails the stream" {
 
     // 2 stanzas outstanding, client claims 5 handled.
     _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='5'/>");
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
 
     try std.testing.expect(server.sessions[1] == null);
     var buf: [4096]u8 = undefined;
@@ -1278,7 +1277,7 @@ test "Server: S24 malformed a h fails the stream" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
@@ -1286,7 +1285,7 @@ test "Server: S24 malformed a h fails the stream" {
     session.sm_enabled = true;
 
     _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='five'/>");
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
 
     try std.testing.expect(server.sessions[1] == null);
     var buf: [4096]u8 = undefined;
@@ -1314,7 +1313,7 @@ test "Server: S24 SM without resume rejects h above the sent count" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
@@ -1326,7 +1325,7 @@ test "Server: S24 SM without resume rejects h above the sent count" {
     session.sm_unacked = null;
 
     _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='10'/>");
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
 
     try std.testing.expect(server.sessions[1] == null);
     var buf: [4096]u8 = undefined;
@@ -1357,7 +1356,7 @@ test "Server: S24 a backwards or duplicate a h does not corrupt the accepted cou
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
@@ -1369,19 +1368,19 @@ test "Server: S24 a backwards or duplicate a h does not corrupt the accepted cou
 
     // A backwards report (h=2 below the accepted 3) must not move sm_out_h.
     _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='2'/>");
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
     try std.testing.expectEqual(@as(u32, 3), session.sm_out_h);
 
     // A duplicate of the accepted count is a no-op as well.
     _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='3'/>");
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
     try std.testing.expectEqual(@as(u32, 3), session.sm_out_h);
 
     // A forward report within the sent count is accepted and advances sm_out_h.
     _ = try posix.write(fds[1], "<a xmlns='urn:xmpp:sm:3' h='4'/>");
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
     try std.testing.expectEqual(@as(u32, 4), session.sm_out_h);
 }
@@ -1413,7 +1412,7 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
 
     var previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
     sm_state.generateSmId(server.worker_id, &previd);
-    smIdMapInsert(&server,&previd, 2);
+    smIdMapInsert(&server, &previd, 2);
 
     // Fresh connection resuming the detached session.
     const fds = try makeSocketPair();
@@ -1424,7 +1423,7 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
@@ -1434,7 +1433,7 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
     var resume_buf: [128]u8 = undefined;
     const backwards = std.fmt.bufPrint(&resume_buf, "<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='3'/>", .{previd}) catch unreachable;
     _ = try posix.write(fds[1], backwards);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
 
     var buf: [4096]u8 = undefined;
     const n1 = posix.read(fds[1], &buf) catch 0;
@@ -1447,7 +1446,7 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
 
     const too_high = std.fmt.bufPrint(&resume_buf, "<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='100'/>", .{previd}) catch unreachable;
     _ = try posix.write(fds[1], too_high);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
 
     const n2 = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n2], "<failed") != null);
@@ -1458,7 +1457,7 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
     // Malformed h fails instead of parsing as 0.
     const malformed = std.fmt.bufPrint(&resume_buf, "<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='x'/>", .{previd}) catch unreachable;
     _ = try posix.write(fds[1], malformed);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
 
     const n3 = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n3], "<failed") != null);
@@ -1508,7 +1507,7 @@ test "Server: S24 cross-worker handoff carries last_h" {
     bundle.stanzas.append(sm_handoff.allocator, sm_handoff.allocator.dupe(u8, "<message/>") catch unreachable) catch unreachable;
     try sm_handoff.put(&previd, bundle);
 
-    handleSmResumeReply(&server,.{
+    handleSmResumeReply(&server, .{
         .previd = &previd,
         .req_session = 1,
         .req_epoch = 7,
@@ -1608,7 +1607,7 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
     var status = CapturedResumeStatus{};
 
     // A backwards h must fail the handoff and leave the queue untouched.
-    handleSmResumeRequest(&server,.{
+    handleSmResumeRequest(&server, .{
         .previd = previd,
         .h = 3,
         .req_worker = 1,
@@ -1628,7 +1627,7 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
     // An h above the sent count must fail the same way. Only the wrap-aware
     // subtraction catches a report that has passed 2^32 (see the sm_state
     // wrap tests); here the plain overshoot is rejected.
-    handleSmResumeRequest(&server,.{
+    handleSmResumeRequest(&server, .{
         .previd = previd,
         .h = 100,
         .req_worker = 1,
@@ -1646,7 +1645,7 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
 
     // A valid forward h is the only one that parks a bundle and tears the
     // detached slot down; its last_h carries into the bundle.
-    handleSmResumeRequest(&server,.{
+    handleSmResumeRequest(&server, .{
         .previd = previd,
         .h = 5,
         .req_worker = 1,
@@ -1683,7 +1682,7 @@ test "Re-review 7.4: the resume request carries the drain sequence into the bund
     detached.offline_last_sent_sequence = 41;
 
     var status = CapturedResumeStatus{};
-    handleSmResumeRequest(&server,.{
+    handleSmResumeRequest(&server, .{
         .previd = previd,
         .h = 5,
         .req_worker = 1,
@@ -1722,7 +1721,7 @@ test "Server: S24 cross-worker resume rejects a wrapped h above the sent count" 
     _ = try makeDetachedForResume(&server, 2, previd, 2, 0xFFFF_FFFE, 1, det_fds[0]);
 
     var status = CapturedResumeStatus{};
-    handleSmResumeRequest(&server,.{
+    handleSmResumeRequest(&server, .{
         .previd = previd,
         .h = 3,
         .req_worker = 1,

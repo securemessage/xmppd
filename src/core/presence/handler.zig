@@ -17,11 +17,11 @@ const std = @import("std");
 const xml = @import("xml");
 const xmpp = @import("xmpp");
 
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const caps_mod = server_mod.caps_mod;
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 
 const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;

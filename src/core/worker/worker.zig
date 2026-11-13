@@ -36,12 +36,12 @@ const xml = @import("xml");
 const xmpp = @import("xmpp");
 const sasl = @import("sasl");
 const precis = @import("precis_username");
-const EventLoop = @import("event_loop.zig").EventLoop;
-const ChangeList = @import("event_loop.zig").ChangeList;
-const Connection = @import("connection.zig").Connection;
-pub const connection_mod = @import("connection.zig");
-const Listener = @import("listener.zig").Listener;
-const Event = @import("event_loop.zig").Event;
+const EventLoop = @import("loop.zig").EventLoop;
+const ChangeList = @import("loop.zig").ChangeList;
+const Connection = @import("../connection.zig").Connection;
+pub const connection_mod = @import("../connection.zig");
+const Listener = @import("../listener.zig").Listener;
+const Event = @import("loop.zig").Event;
 
 const ssl = @import("ssl");
 const IpcClient = @import("ipc_client").IpcClient;
@@ -72,30 +72,30 @@ const ArchiveBackendType = ArchiveBackendMod.Backend;
 const archive_queue_mod = @import("archive_queue");
 const vcard_store_mod = @import("vcard_store");
 const GenericVCardStore = vcard_store_mod.VCardStore(OpBackendType);
-const iq_handler = @import("iq/dispatch.zig");
-const muc_handler = @import("muc/handler.zig");
-const presence_handler = @import("presence/handler.zig");
-const presence_sub = @import("presence/subscription.zig");
-const muc_actor = @import("muc/actor.zig");
-pub const sub_cache_mod = @import("subscription_cache.zig");
-pub const caps_mod = @import("caps.zig");
-const router = @import("routing/router.zig");
-const session_lifecycle = @import("c2s/lifecycle.zig");
-const stanza_writer = @import("stanza/writer.zig");
-const stanza_facts = @import("stanza/facts.zig");
+const iq_handler = @import("../iq/dispatch.zig");
+const muc_handler = @import("../muc/handler.zig");
+const presence_handler = @import("../presence/handler.zig");
+const presence_sub = @import("../presence/subscription.zig");
+const muc_actor = @import("../muc/actor.zig");
+pub const sub_cache_mod = @import("../subscription_cache.zig");
+pub const caps_mod = @import("../caps.zig");
+const router = @import("../routing/router.zig");
+const session_lifecycle = @import("../c2s/lifecycle.zig");
+const stanza_writer = @import("../stanza/writer.zig");
+const stanza_facts = @import("../stanza/facts.zig");
 const room_registry_mod = @import("room_registry");
 const room_mailbox_mod = @import("room_mailbox");
 const RoomRegistry = room_registry_mod.RoomRegistry;
 const room_store_mod = @import("room_store");
 const GenericRoomStore = room_store_mod.RoomStore(OpBackendType);
-const fanout_mod = @import("muc/fanout.zig");
+const fanout_mod = @import("../muc/fanout.zig");
 const FanoutQueue = fanout_mod.FanoutQueue;
-const actor_message = @import("xworker/envelope.zig");
-pub const sm_state = @import("c2s/sm_state.zig");
-const sm_handoff = @import("c2s/sm_handoff.zig");
-const c2s_session = @import("c2s/session.zig");
-const c2s_sm = @import("c2s/sm.zig");
-const routing_deliver = @import("routing/deliver.zig");
+const actor_message = @import("../xworker/envelope.zig");
+pub const sm_state = @import("../c2s/sm_state.zig");
+const sm_handoff = @import("../c2s/sm_handoff.zig");
+const c2s_session = @import("../c2s/session.zig");
+const c2s_sm = @import("../c2s/sm.zig");
+const routing_deliver = @import("../routing/deliver.zig");
 const block_store_mod = @import("block_store");
 const metrics = @import("metrics.zig");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
@@ -562,7 +562,7 @@ pub const Server = struct {
             if (session.auth_state == .none) continue;
             session.auth_state = .none;
             session.sasl_collecting = .none;
-            c2s_session.executeAction(self,session, session.stream.saslFailure("temporary-auth-failure"), changes);
+            c2s_session.executeAction(self, session, session.stream.saslFailure("temporary-auth-failure"), changes);
             if (session.conn.hasPendingWrite()) {
                 changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }
@@ -699,7 +699,6 @@ pub const Server = struct {
             };
         }
     }
-
 
     /// Configure the vCard store (XEP-0054).
     pub fn configureVcard(self: *Server, vcard_store: *GenericVCardStore) void {
@@ -1098,19 +1097,19 @@ pub const Server = struct {
     fn handleReadableOrHandshake(self: *Server, id: usize, changes: *ChangeList) void {
         const session = self.sessions[id] orelse return;
         if (session.conn.isTlsHandshaking()) {
-            c2s_session.continueTlsHandshake(self,id, session, changes);
+            c2s_session.continueTlsHandshake(self, id, session, changes);
             return;
         }
-        c2s_session.handleReadable(self,id, changes);
+        c2s_session.handleReadable(self, id, changes);
     }
 
     fn handleWritableOrHandshake(self: *Server, id: usize, changes: *ChangeList) void {
         const session = self.sessions[id] orelse return;
         if (session.conn.isTlsHandshaking()) {
-            c2s_session.continueTlsHandshake(self,id, session, changes);
+            c2s_session.continueTlsHandshake(self, id, session, changes);
             return;
         }
-        c2s_session.handleWritable(self,id, changes);
+        c2s_session.handleWritable(self, id, changes);
     }
 
     /// Route one batch of kqueue events to their handlers. The wake pipe is
@@ -1518,7 +1517,7 @@ pub const Server = struct {
                 }
 
                 const success_action = session.stream.saslSuccess(stable_username, server_final_b64);
-                c2s_session.executeAction(self,session, success_action, changes);
+                c2s_session.executeAction(self, session, success_action, changes);
                 session.resetSasl();
                 if (session.conn.hasPendingWrite()) {
                     // Flush immediately rather than deferring to kqueue
@@ -1534,14 +1533,14 @@ pub const Server = struct {
                 // as post-TLS and the S2S post-SASL fix.
                 if (session.conn.tls_conn) |*tls| {
                     if (tls.pending() > 0) {
-                        c2s_session.handleReadable(self,conn_id, changes);
+                        c2s_session.handleReadable(self, conn_id, changes);
                     }
                 }
             },
             .auth_failure => |m| {
                 log.info("connection {d} auth failed: {s}", .{ conn_id, m.reason });
                 const fail_action = session.stream.saslFailure(m.reason);
-                c2s_session.executeAction(self,session, fail_action, changes);
+                c2s_session.executeAction(self, session, fail_action, changes);
                 session.resetSasl();
 
                 if (session.conn.hasPendingWrite()) {
@@ -2236,7 +2235,7 @@ test "Server: S28 stale writable event does not destroy a detached session" {
     const sm_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
     @memcpy(&session.sm_id, sm_id);
     server.detached_count = 1;
-    c2s_sm.smIdMapInsert(&server,&session.sm_id, 1);
+    c2s_sm.smIdMapInsert(&server, &session.sm_id, 1);
     session.conn.close();
     try std.testing.expectEqual(@as(posix.fd_t, -1), session.conn.fd);
 
@@ -2245,7 +2244,7 @@ test "Server: S28 stale writable event does not destroy a detached session" {
 
     // The stale event kevent already returned this batch, for the fd that no
     // longer exists.
-    c2s_session.handleWritable(&server,1, &changes);
+    c2s_session.handleWritable(&server, 1, &changes);
 
     // The resumable session survives, and the skip was counted rather than
     // silently swallowed.
@@ -2255,7 +2254,7 @@ test "Server: S28 stale writable event does not destroy a detached session" {
     try std.testing.expectEqual(@as(u16, 1), server.detached_count);
 
     // Same for a stale readable event and a stale error event.
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
     try std.testing.expectEqual(@as(u64, 2), server.stale_event_skips);
 
@@ -2309,7 +2308,7 @@ test "Server: S28 a same-batch kqueue race keeps a detached session resumable" {
     const sm_id = "b2c3d4e5f60718293a4b5c6d7e8f9001";
     @memcpy(&session.sm_id, sm_id);
     server.detached_count = 1;
-    c2s_sm.smIdMapInsert(&server,&session.sm_id, 1);
+    c2s_sm.smIdMapInsert(&server, &session.sm_id, 1);
     changes.purgeFd(session.conn.fd);
     session.conn.close();
 
@@ -2322,7 +2321,7 @@ test "Server: S28 a same-batch kqueue race keeps a detached session resumable" {
     try std.testing.expect(server.detached_count == 1);
     try std.testing.expect(server.stale_event_skips > 0);
     // A resume can still find it by SM-ID: the stale events left the map alone.
-    try std.testing.expectEqual(@as(?usize, 1), c2s_sm.findDetachedSession(&server,&session.sm_id));
+    try std.testing.expectEqual(@as(?usize, 1), c2s_sm.findDetachedSession(&server, &session.sm_id));
 }
 
 test "Server: S28 a stale writable event on a closed live session is skipped" {
@@ -2349,7 +2348,7 @@ test "Server: S28 a stale writable event on a closed live session is skipped" {
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    c2s_session.handleWritable(&server,1, &changes);
+    c2s_session.handleWritable(&server, 1, &changes);
 
     try std.testing.expect(server.sessions[1] != null);
     try std.testing.expectEqual(@as(u64, 1), server.stale_event_skips);
@@ -2377,7 +2376,7 @@ test "Server: M1 counters track client traffic through the read path" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     try std.testing.expect(server.sessions[1] != null);
 
     // Client bytes were counted on recv; the features reply was counted
@@ -2409,9 +2408,6 @@ test "Server: M1 SIGUSR1 dump runs against a live worker block" {
     try std.testing.expectEqual(@as(u64, 3), c.stanzas_message.load(.monotonic));
 }
 
-
-
-
 // The live delivery path enqueues with queueSendWithFlush. Counting the call
 // is not enough: the stanza still has to be tracked for XEP-0198, or the ack
 // window shifts under the client.
@@ -2428,42 +2424,42 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         "conn.queue" ++ "SendWithFlush(",
     };
     const cases = .{
-        .{ "connection.zig", @embedFile("connection.zig"), 17 }, // Connection layer self-tests incl. the M1 counter test; no Session.
-        .{ "muc/fanout.zig", @embedFile("muc/fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
-        .{ "presence/handler.zig", @embedFile("presence/handler.zig"), 0 },
-        .{ "presence/subscription.zig", @embedFile("presence/subscription.zig"), 0 },
-        .{ "presence/broadcast.zig", @embedFile("presence/broadcast.zig"), 0 },
-        .{ "routing/router.zig", @embedFile("routing/router.zig"), 2 }, // one comment; queueSendWithFlush is tracked.
-        .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig"), 0 },
-        .{ "server.zig", @embedFile("server.zig"), 4 }, // stream/SASL/SM nonzas + M1 counter self-test.
-        .{ "routing/deliver.zig", @embedFile("routing/deliver.zig"), 1 }, // cross-worker drain queues the stanza raw.
-        .{ "c2s/session.zig", @embedFile("c2s/session.zig"), 13 }, // queueSendStanza itself + stream/SASL nonzas.
-        .{ "c2s/sm.zig", @embedFile("c2s/sm.zig"), 9 }, // SM enable/resume/failed nonzas.
-        .{ "iq/dispatch.zig", @embedFile("iq/dispatch.zig"), 0 },
-        .{ "iq/carbons.zig", @embedFile("iq/carbons.zig"), 0 },
-        .{ "muc/handler.zig", @embedFile("muc/handler.zig"), 0 },
-        .{ "muc/actor.zig", @embedFile("muc/actor.zig"), 0 },
-        .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig"), 0 },
-        .{ "caps.zig", @embedFile("caps.zig"), 0 },
+        .{ "connection.zig", @embedFile("../connection.zig"), 17 }, // Connection layer self-tests incl. the M1 counter test; no Session.
+        .{ "muc/fanout.zig", @embedFile("../muc/fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
+        .{ "presence/handler.zig", @embedFile("../presence/handler.zig"), 0 },
+        .{ "presence/subscription.zig", @embedFile("../presence/subscription.zig"), 0 },
+        .{ "presence/broadcast.zig", @embedFile("../presence/broadcast.zig"), 0 },
+        .{ "routing/router.zig", @embedFile("../routing/router.zig"), 2 }, // one comment; queueSendWithFlush is tracked.
+        .{ "c2s/lifecycle.zig", @embedFile("../c2s/lifecycle.zig"), 0 },
+        .{ "worker/worker.zig", @embedFile("worker.zig"), 4 }, // stream/SASL/SM nonzas + M1 counter self-test.
+        .{ "routing/deliver.zig", @embedFile("../routing/deliver.zig"), 1 }, // cross-worker drain queues the stanza raw.
+        .{ "c2s/session.zig", @embedFile("../c2s/session.zig"), 13 }, // queueSendStanza itself + stream/SASL nonzas.
+        .{ "c2s/sm.zig", @embedFile("../c2s/sm.zig"), 9 }, // SM enable/resume/failed nonzas.
+        .{ "iq/dispatch.zig", @embedFile("../iq/dispatch.zig"), 0 },
+        .{ "iq/carbons.zig", @embedFile("../iq/carbons.zig"), 0 },
+        .{ "muc/handler.zig", @embedFile("../muc/handler.zig"), 0 },
+        .{ "muc/actor.zig", @embedFile("../muc/actor.zig"), 0 },
+        .{ "xworker/envelope.zig", @embedFile("../xworker/envelope.zig"), 0 },
+        .{ "caps.zig", @embedFile("../caps.zig"), 0 },
         // Remaining core files (S15): a raw send added here must be caught
         // like any other, not smuggled in outside the allowlist.
-        .{ "archive_queue.zig", @embedFile("archive_queue.zig"), 0 },
-        .{ "xworker/ring.zig", @embedFile("xworker/ring.zig"), 0 },
-        .{ "event_loop.zig", @embedFile("event_loop.zig"), 0 },
-        .{ "routing/address.zig", @embedFile("routing/address.zig"), 0 },
-        .{ "listener.zig", @embedFile("listener.zig"), 0 },
-        .{ "main.zig", @embedFile("main.zig"), 0 },
-        .{ "metrics.zig", @embedFile("metrics.zig"), 0 },
-        .{ "offline_store.zig", @embedFile("offline_store.zig"), 0 },
-        .{ "muc/mailbox.zig", @embedFile("muc/mailbox.zig"), 0 },
-        .{ "muc/registry.zig", @embedFile("muc/registry.zig"), 0 },
-        .{ "roster_store.zig", @embedFile("roster_store.zig"), 0 },
-        .{ "session_map.zig", @embedFile("session_map.zig"), 0 },
-        .{ "c2s/sm_handoff.zig", @embedFile("c2s/sm_handoff.zig"), 0 },
-        .{ "c2s/sm_state.zig", @embedFile("c2s/sm_state.zig"), 0 },
-        .{ "subscription_cache.zig", @embedFile("subscription_cache.zig"), 0 },
-        .{ "stanza/facts.zig", @embedFile("stanza/facts.zig"), 0 },
-        .{ "stanza/writer.zig", @embedFile("stanza/writer.zig"), 0 },
+        .{ "archive_queue.zig", @embedFile("../archive_queue.zig"), 0 },
+        .{ "xworker/ring.zig", @embedFile("../xworker/ring.zig"), 0 },
+        .{ "worker/loop.zig", @embedFile("loop.zig"), 0 },
+        .{ "routing/address.zig", @embedFile("../routing/address.zig"), 0 },
+        .{ "listener.zig", @embedFile("../listener.zig"), 0 },
+        .{ "main.zig", @embedFile("../main.zig"), 0 },
+        .{ "worker/metrics.zig", @embedFile("metrics.zig"), 0 },
+        .{ "offline_store.zig", @embedFile("../offline_store.zig"), 0 },
+        .{ "muc/mailbox.zig", @embedFile("../muc/mailbox.zig"), 0 },
+        .{ "muc/registry.zig", @embedFile("../muc/registry.zig"), 0 },
+        .{ "roster_store.zig", @embedFile("../roster_store.zig"), 0 },
+        .{ "session_map.zig", @embedFile("../session_map.zig"), 0 },
+        .{ "c2s/sm_handoff.zig", @embedFile("../c2s/sm_handoff.zig"), 0 },
+        .{ "c2s/sm_state.zig", @embedFile("../c2s/sm_state.zig"), 0 },
+        .{ "subscription_cache.zig", @embedFile("../subscription_cache.zig"), 0 },
+        .{ "stanza/facts.zig", @embedFile("../stanza/facts.zig"), 0 },
+        .{ "stanza/writer.zig", @embedFile("../stanza/writer.zig"), 0 },
     };
     if (cases.len != 34) {
         log.err("S15 ratchet: covers {d} core files, expected 34", .{cases.len});
@@ -2487,7 +2483,6 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         }
     }
 }
-
 
 // The MUC fan-out tears down a session whose buffer is genuinely full rather
 // than leaving it wedged. c2s delivery now answers the same condition the same
@@ -2675,7 +2670,6 @@ test "Server: a non-archivable message stores offline with no archive" {
     }
 }
 
-
 // The tail is per bare JID but the drain flag is per session, so one resource
 // draining the tail leaves every other resource of that JID marked pending.
 // The empty-tail branch clears the flag, or that session parks every later
@@ -2796,8 +2790,6 @@ test "Re-review 6.8: an empty tail cancels the retry timer" {
     try std.testing.expectEqual(@as(usize, 1), timers);
 }
 
-
-
 // After the retry's delete lands, no row is outstanding for this session, so
 // the recorded sequence must be cleared: it travels in the resume bundle, and
 // a stale value would make a resumed drain delete a row without sending it.
@@ -2842,7 +2834,6 @@ test "Re-review 6.8: a successful retry delete clears the recorded sequence" {
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
     try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
 }
-
 
 // A delivery form between the write buffer and the scratch bank fits the
 // serializer but never the socket buffer. That is not a slow reader: the form
@@ -3012,10 +3003,6 @@ test "Re-review 6.2: a real delete failure records the sequence, the retry does 
     try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
     try std.testing.expect(!session.offline_pending);
 }
-
-
-
-
 
 test "Server: H4 an inbound S2S message lands behind an existing offline tail" {
     const allocator = std.testing.allocator;
@@ -3344,9 +3331,6 @@ test "Server: E2d an oversized archive form is not stored offline" {
     try std.testing.expectEqual(not_stored_before + 1, delivery_queue_mod.offline_not_stored.load(.monotonic));
 }
 
-
-
-
 test "Server: H3 a resume carries the stalled offline tail" {
     const allocator = std.testing.allocator;
 
@@ -3417,7 +3401,7 @@ test "Server: H3 a resume carries the stalled offline tail" {
     @memcpy(&bundle.previd, previd);
     try sm_handoff.put(previd, bundle);
 
-    c2s_sm.handleSmResumeReply(&server,.{
+    c2s_sm.handleSmResumeReply(&server, .{
         .previd = previd,
         .req_session = 1,
         .req_epoch = 7,
@@ -3562,7 +3546,7 @@ test "Re-review 6.3: a cross-worker resume carries the recorded sequence" {
     @memcpy(&bundle.previd, previd);
     try sm_handoff.put(previd, bundle);
 
-    c2s_sm.handleSmResumeReply(&server,.{
+    c2s_sm.handleSmResumeReply(&server, .{
         .previd = previd,
         .req_session = 1,
         .req_epoch = 3,
@@ -3632,7 +3616,7 @@ test "Re-review 6.3: a local resume carries the recorded sequence" {
 
     var previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
     sm_state.generateSmId(server.worker_id, &previd);
-    c2s_sm.smIdMapInsert(&server,&previd, 2);
+    c2s_sm.smIdMapInsert(&server, &previd, 2);
     server.detached_count = 1;
 
     const fds = try makeSocketPair();
@@ -3643,7 +3627,7 @@ test "Re-review 6.3: a local resume carries the recorded sequence" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
@@ -3660,7 +3644,7 @@ test "Re-review 6.3: a local resume carries the recorded sequence" {
     var resume_buf: [128]u8 = undefined;
     const resume_xml = std.fmt.bufPrint(&resume_buf, "<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='0'/>", .{previd}) catch unreachable;
     _ = try posix.write(fds[1], resume_xml);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
 
     // The retry deletes the row instead of resending it.
     try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
@@ -3718,7 +3702,7 @@ test "Server: H3 a local resume carries the stalled offline tail" {
 
     var previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
     sm_state.generateSmId(server.worker_id, &previd);
-    c2s_sm.smIdMapInsert(&server,&previd, 2);
+    c2s_sm.smIdMapInsert(&server, &previd, 2);
     server.detached_count = 1;
 
     _ = try offline_store.storeHeldPointer(
@@ -3737,7 +3721,7 @@ test "Server: H3 a local resume carries the stalled offline tail" {
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     _ = try posix.write(fds[1], stream_open);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
     var drain_buf: [4096]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
 
@@ -3755,7 +3739,7 @@ test "Server: H3 a local resume carries the stalled offline tail" {
     var resume_buf: [128]u8 = undefined;
     const resume_xml = std.fmt.bufPrint(&resume_buf, "<resume xmlns='urn:xmpp:sm:3' previd='{s}' h='0'/>", .{previd}) catch unreachable;
     _ = try posix.write(fds[1], resume_xml);
-    c2s_session.handleReadable(&server,1, &changes);
+    c2s_session.handleReadable(&server, 1, &changes);
 
     try std.testing.expect(!session.offline_pending);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
@@ -3764,13 +3748,6 @@ test "Server: H3 a local resume carries the stalled offline tail" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<resumed") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "tail-2") != null);
 }
-
-
-
-
-
-
-
 
 // E2c: the stanza ID is the key tiebreaker within a timestamp
 // (owner\x00timestamp_be\x00stanza_id), so its lexicographic order has to match
@@ -4046,7 +4023,7 @@ test "Server: S13 writable handler resumes the stalled offline drain" {
     var rounds: usize = 0;
     while (rounds < 64) : (rounds += 1) {
         changes.reset();
-        c2s_session.handleWritable(&server,1, &changes);
+        c2s_session.handleWritable(&server, 1, &changes);
         while (true) {
             const n = posix.read(fds[1], &buf) catch break;
             if (n == 0) break;
@@ -4065,7 +4042,6 @@ test "Server: S13 writable handler resumes the stalled offline drain" {
     try std.testing.expect(tail_at != null);
     try std.testing.expect(filler_at.? < tail_at.?);
 }
-
 
 test "Server: R5 S2S cross-worker delivery drops are counted" {
     const allocator = std.testing.allocator;
@@ -4102,10 +4078,6 @@ test "Server: R5 S2S cross-worker delivery drops are counted" {
     } }, &changes);
     try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.cross_worker_drops.load(.monotonic));
 }
-
-
-
-
 
 // E6 (S11): only whitespace is allowed at the stream level between stanzas.
 // Non-whitespace there is a stream error (RFC 6120 4.6.1).
@@ -4173,18 +4145,18 @@ test "S10: IPC write interest lives only in server.zig" {
     const auth_needle = "IPC_AUTH_" ++ "UDATA";
     const s2s_needle = "IPC_S2S_" ++ "UDATA";
     const cases = .{
-        .{ "iq/dispatch.zig", @embedFile("iq/dispatch.zig") },
-        .{ "iq/carbons.zig", @embedFile("iq/carbons.zig") },
-        .{ "routing/router.zig", @embedFile("routing/router.zig") },
-        .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig") },
-        .{ "presence/handler.zig", @embedFile("presence/handler.zig") },
-        .{ "presence/subscription.zig", @embedFile("presence/subscription.zig") },
-        .{ "presence/broadcast.zig", @embedFile("presence/broadcast.zig") },
-        .{ "muc/handler.zig", @embedFile("muc/handler.zig") },
-        .{ "muc/actor.zig", @embedFile("muc/actor.zig") },
-        .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig") },
-        .{ "muc/fanout.zig", @embedFile("muc/fanout.zig") },
-        .{ "caps.zig", @embedFile("caps.zig") },
+        .{ "iq/dispatch.zig", @embedFile("../iq/dispatch.zig") },
+        .{ "iq/carbons.zig", @embedFile("../iq/carbons.zig") },
+        .{ "routing/router.zig", @embedFile("../routing/router.zig") },
+        .{ "c2s/lifecycle.zig", @embedFile("../c2s/lifecycle.zig") },
+        .{ "presence/handler.zig", @embedFile("../presence/handler.zig") },
+        .{ "presence/subscription.zig", @embedFile("../presence/subscription.zig") },
+        .{ "presence/broadcast.zig", @embedFile("../presence/broadcast.zig") },
+        .{ "muc/handler.zig", @embedFile("../muc/handler.zig") },
+        .{ "muc/actor.zig", @embedFile("../muc/actor.zig") },
+        .{ "xworker/envelope.zig", @embedFile("../xworker/envelope.zig") },
+        .{ "muc/fanout.zig", @embedFile("../muc/fanout.zig") },
+        .{ "caps.zig", @embedFile("../caps.zig") },
     };
     inline for (cases) |case| {
         const name = case[0];
@@ -4217,7 +4189,7 @@ test "S10: server.zig arms IPC write interest in exactly one place" {
     // it and the filter fires writable every kevent. Counting the exact arm
     // expressions confines both write arms to the reconciler.
     // The patterns are split so this test does not match itself.
-    const src = @embedFile("server.zig");
+    const src = @embedFile("worker.zig");
     const cases = .{
         .{ "addWrite(self.ipc.fd, IPC_AUTH_" ++ "UDATA)", @as(usize, 1) },
         .{ "addWrite(self.s2s_ipc.fd, IPC_S2S_" ++ "UDATA)", @as(usize, 1) },
@@ -4248,21 +4220,21 @@ test "S10: the IPC reconnect timers are armed in exactly one place" {
     const auth_needle = "addTimer(AUTH_RECONNECT_" ++ "TIMER_IDENT";
     const s2s_needle = "addTimer(S2S_RECONNECT_" ++ "TIMER_IDENT";
     const cases = .{
-        .{ "server.zig", @embedFile("server.zig"), @as(usize, 1), @as(usize, 1) },
-        .{ "connection.zig", @embedFile("connection.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "iq/dispatch.zig", @embedFile("iq/dispatch.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "iq/carbons.zig", @embedFile("iq/carbons.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "routing/router.zig", @embedFile("routing/router.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "c2s/lifecycle.zig", @embedFile("c2s/lifecycle.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "presence/handler.zig", @embedFile("presence/handler.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "presence/subscription.zig", @embedFile("presence/subscription.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "presence/broadcast.zig", @embedFile("presence/broadcast.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "muc/handler.zig", @embedFile("muc/handler.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "muc/actor.zig", @embedFile("muc/actor.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "xworker/envelope.zig", @embedFile("xworker/envelope.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "muc/fanout.zig", @embedFile("muc/fanout.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "caps.zig", @embedFile("caps.zig"), @as(usize, 0), @as(usize, 0) },
-        .{ "event_loop.zig", @embedFile("event_loop.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "worker/worker.zig", @embedFile("worker.zig"), @as(usize, 1), @as(usize, 1) },
+        .{ "connection.zig", @embedFile("../connection.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "iq/dispatch.zig", @embedFile("../iq/dispatch.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "iq/carbons.zig", @embedFile("../iq/carbons.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "routing/router.zig", @embedFile("../routing/router.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "c2s/lifecycle.zig", @embedFile("../c2s/lifecycle.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "presence/handler.zig", @embedFile("../presence/handler.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "presence/subscription.zig", @embedFile("../presence/subscription.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "presence/broadcast.zig", @embedFile("../presence/broadcast.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "muc/handler.zig", @embedFile("../muc/handler.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "muc/actor.zig", @embedFile("../muc/actor.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "xworker/envelope.zig", @embedFile("../xworker/envelope.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "muc/fanout.zig", @embedFile("../muc/fanout.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "caps.zig", @embedFile("../caps.zig"), @as(usize, 0), @as(usize, 0) },
+        .{ "worker/loop.zig", @embedFile("loop.zig"), @as(usize, 0), @as(usize, 0) },
     };
     inline for (cases) |case| {
         const name = case[0];
@@ -4293,7 +4265,7 @@ test "S10: the IPC reconnect timers are armed in exactly one place" {
     // alias never spells the call form. Count the bare name instead. Split the
     // needle so this test does not count itself.
     const any_timer_needle = "add" ++ "Timer";
-    const src = @embedFile("server.zig");
+    const src = @embedFile("worker.zig");
     var total: usize = 0;
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, src, pos, any_timer_needle)) |hit| {
@@ -4803,7 +4775,7 @@ test "Server: S10 handshake write interest is one-shot" {
     var change_buf: [8]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
 
-    c2s_session.continueTlsHandshake(&server,1, session, &changes);
+    c2s_session.continueTlsHandshake(&server, 1, session, &changes);
     try std.testing.expectEqual(connection_mod.TlsState.handshake_want_write, session.conn.tls_state.?);
 
     // The staged re-arm must be EV_ONESHOT; a persistent filter fires on
@@ -4820,8 +4792,8 @@ test "Server: S10 handshake write interest is one-shot" {
 
 test "S13: offline archive failure injection stays out of production" {
     const hook_name = "fail_next_offline" ++ "_archive_read";
-    try std.testing.expect(std.mem.indexOf(u8, @embedFile("server.zig"), hook_name) == null);
-    try std.testing.expect(std.mem.indexOf(u8, @embedFile("c2s/lifecycle.zig"), hook_name) == null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("worker.zig"), hook_name) == null);
+    try std.testing.expect(std.mem.indexOf(u8, @embedFile("../c2s/lifecycle.zig"), hook_name) == null);
 }
 
 // Force analysis of sibling files whose tests otherwise never run.
@@ -4831,7 +4803,7 @@ test {
     _ = muc_handler;
     _ = presence_handler;
     _ = session_lifecycle;
-    _ = @import("iq/carbons.zig");
+    _ = @import("../iq/carbons.zig");
 }
 
 test "Server: inline archiveStore failure increments archive_store_failed (S31)" {
@@ -5023,9 +4995,6 @@ test "every store namespace constant is registered and every registry entry is o
         try std.testing.expect(seen);
     }
 }
-
-
-
 
 // A worker that restarts within the same wall second starts its stanza id
 // counter from zero again, so without per-process entropy both incarnations

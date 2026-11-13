@@ -31,7 +31,7 @@
 const std = @import("std");
 const posix = std.posix;
 const ssl = @import("ssl");
-const metrics = @import("metrics.zig");
+const metrics = @import("worker/metrics.zig");
 
 /// Create a non-blocking Unix socketpair. Used in tests.
 fn makeSocketPair() ![2]posix.fd_t {

@@ -15,13 +15,13 @@ const std = @import("std");
 const xml = @import("xml");
 const xmpp = @import("xmpp");
 
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const c2s_session = @import("session.zig");
 const c2s_sm = @import("sm.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const sm_state = server_mod.sm_state;
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 const muc_handler = @import("../muc/handler.zig");
 const presence_handler = @import("../presence/handler.zig");
 const lastact_store = @import("last_activity_store");
@@ -1048,7 +1048,7 @@ fn releaseId(server: *Server, id: usize) void {
 // ============================================================================
 
 const posix = std.posix;
-const ChangeListT = @import("../event_loop.zig").ChangeList;
+const ChangeListT = @import("../worker/loop.zig").ChangeList;
 const SessionMap = @import("session_map").SessionMap;
 const xmpp_lib = @import("xmpp");
 const op_backend = @import("op_backend");

@@ -499,7 +499,7 @@ pub fn build(b: *std.Build) void {
     // --- Core daemon tests ---
 
     const event_loop_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
+        .root_source_file = b.path("src/core/worker/loop.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -603,7 +603,7 @@ pub fn build(b: *std.Build) void {
     // --- Server tests (depends on IPC modules) ---
 
     const server_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/server.zig"),
+        .root_source_file = b.path("src/core/worker_tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1107,7 +1107,7 @@ pub fn build(b: *std.Build) void {
     // --- S2S main (daemon) tests ---
 
     const s2s_event_loop_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
+        .root_source_file = b.path("src/core/worker/loop.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1740,7 +1740,7 @@ pub fn build(b: *std.Build) void {
     auth_handler_mod.addImport("invite_store", auth_invite_store_mod);
 
     const auth_event_loop_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
+        .root_source_file = b.path("src/core/worker/loop.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1854,7 +1854,7 @@ pub fn build(b: *std.Build) void {
     oidc_handler_mod.addImport("policy", oidc_policy_mod);
 
     const oidc_event_loop_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
+        .root_source_file = b.path("src/core/worker/loop.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1922,7 +1922,7 @@ pub fn build(b: *std.Build) void {
     s2s_ipc_server_mod.addImport("ipc_protocol", s2s_ipc_protocol_mod);
 
     const s2s_event_loop_exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
+        .root_source_file = b.path("src/core/worker/loop.zig"),
         .target = target,
         .optimize = optimize,
     });

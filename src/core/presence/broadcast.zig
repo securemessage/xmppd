@@ -5,10 +5,10 @@
 //! handler.zig; these two functions only wrap the s2s IPC send.
 
 const std = @import("std");
-const server_mod = @import("../server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
-const ChangeList = @import("../event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 
 const log = std.log.scoped(.xmppd);
 
