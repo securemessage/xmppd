@@ -112,12 +112,55 @@ pub fn procIsOrphanMatch(pid: posix.pid_t, expected_basename: []const u8, expect
     return kp.ki_ppid == 1;
 }
 
+/// Bounded wait for a process's NOTE_EXIT on a private kqueue: orphan
+/// grace deadlines ride EVFILT_PROC and a one-shot EVFILT_TIMER instead
+/// of sleeps (T336). True when the exit arrived before the deadline.
+fn waitExit(pid: posix.pid_t, ms: i64) bool {
+    if (std.c.kill(pid, 0) != 0) return true;
+    const kq = std.c.kqueue();
+    if (kq < 0) return false;
+    defer _ = std.c.close(kq);
+    var changes = [_]std.c.Kevent{
+        .{
+            .ident = @intCast(pid),
+            .filter = std.c.EVFILT.PROC,
+            .flags = std.c.EV.ADD,
+            .fflags = std.c.NOTE.EXIT,
+            .data = 0,
+            .udata = 0,
+        },
+        .{
+            .ident = 1,
+            .filter = std.c.EVFILT.TIMER,
+            .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+            .fflags = 0,
+            .data = ms,
+            .udata = 0,
+        },
+    };
+    if (std.c.kevent(kq, &changes, changes.len, &changes, 0, null) < 0) return false;
+    // Close the arm window: a death between the first check and the
+    // registration is caught here instead of costing the deadline.
+    if (std.c.kill(pid, 0) != 0) return true;
+    var out: [2]std.c.Kevent = undefined;
+    const n = std.c.kevent(kq, &[_]std.c.Kevent{}, 0, &out, out.len, null);
+    if (n <= 0) return false;
+    for (out[0..@intCast(n)]) |ev| {
+        if (ev.filter == std.c.EVFILT.PROC) return true;
+    }
+    return false;
+}
+
 /// Check for an orphaned child process from a previous master instance.
 /// PID files now live under run_dir and hold "PID START_SEC BASE". Kill
 /// only when the live process still matches comm + start time + ppid==1,
 /// so a recycled pid or a pkg-upgraded binary can never take a stray
 /// SIGKILL (T259). identity is re-verified before SIGKILL too.
 pub fn cleanupOrphan(path: []const u8, expected_basename: []const u8) void {
+    cleanupOrphanTimed(path, expected_basename, 2_000, 100);
+}
+
+fn cleanupOrphanTimed(path: []const u8, expected_basename: []const u8, term_ms: i64, kill_ms: i64) void {
     const file = std.fs.cwd().openFile(path, .{}) catch return;
     defer file.close();
 
@@ -153,14 +196,14 @@ pub fn cleanupOrphan(path: []const u8, expected_basename: []const u8) void {
 
     log.warn("killing orphaned child pid={d} from {s}", .{ pid, path });
     _ = std.c.kill(pid, posix.SIG.TERM);
-    std.Thread.sleep(2 * std.time.ns_per_s);
-
-    // Re-verify before the kill escalation: a fresh process on the same
-    // pid number between SIGTERM and SIGKILL must not eat it.
-    if (std.c.kill(pid, 0) == 0 and procIsOrphanMatch(pid, expected_basename, pid_start)) {
-        log.warn("orphan pid={d} did not exit, sending SIGKILL", .{pid});
-        _ = std.c.kill(pid, posix.SIG.KILL);
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+    if (!waitExit(pid, term_ms)) {
+        // Re-verify before the kill escalation: a fresh process on the
+        // same pid number between SIGTERM and SIGKILL must not eat it.
+        if (std.c.kill(pid, 0) == 0 and procIsOrphanMatch(pid, expected_basename, pid_start)) {
+            log.warn("orphan pid={d} did not exit, sending SIGKILL", .{pid});
+            _ = std.c.kill(pid, posix.SIG.KILL);
+            _ = waitExit(pid, kill_ms);
+        }
     }
 
     std.fs.cwd().deleteFile(path) catch {};
@@ -201,4 +244,166 @@ test "pidFilePath builds run_dir-relative path" {
     var buf: [4096]u8 = undefined;
     const p = try pidFilePath(&buf, "/var/run/xmppd", "auth.pid");
     try std.testing.expectEqualStrings("/var/run/xmppd/auth.pid", p);
+}
+
+extern "c" fn sigsuspend(mask: *const posix.sigset_t) c_int;
+
+fn pauseForever() noreturn {
+    const mask = posix.sigemptyset();
+    while (true) _ = sigsuspend(&mask);
+}
+
+/// Fork a grandchild through an intermediate that exits at once: the
+/// survivor reparents to init, the ppid==1 shape the orphan check needs.
+/// Its pid comes back over the pipe; mid's reap is complete before the
+/// grandchild's reparenting becomes visible to kinfo.
+fn spawnTestOrphan(ignore_term: bool) !posix.pid_t {
+    const pipe_fds = try posix.pipe();
+    const mid = try posix.fork();
+    if (mid == 0) {
+        const g = try posix.fork();
+        if (g == 0) {
+            if (ignore_term) {
+                const ign: posix.Sigaction = .{
+                    .handler = .{ .handler = posix.SIG.IGN },
+                    .flags = 0,
+                    .mask = posix.sigemptyset(),
+                };
+                posix.sigaction(posix.SIG.TERM, &ign, null);
+            }
+            pauseForever();
+        }
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(i32, &b, @intCast(g), .little);
+        _ = posix.write(pipe_fds[1], &b) catch {};
+        std.c._exit(0);
+    }
+    posix.close(pipe_fds[1]);
+    defer posix.close(pipe_fds[0]);
+    var b: [4]u8 = undefined;
+    const n = try posix.read(pipe_fds[0], &b);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    var st: c_int = 0;
+    _ = std.c.waitpid(mid, &st, 0);
+    return std.mem.readInt(i32, &b, .little);
+}
+
+/// NOTE_EXIT watch plus a bound on the test's own kqueue: assertions
+/// ride the same event the production wait consumes.
+const ExitWatch = struct {
+    kq: posix.fd_t,
+
+    fn init(pid: posix.pid_t, bound_ms: i64) !ExitWatch {
+        const kq = std.c.kqueue();
+        try std.testing.expect(kq >= 0);
+        var changes = [_]std.c.Kevent{
+            .{
+                .ident = @intCast(pid),
+                .filter = std.c.EVFILT.PROC,
+                .flags = std.c.EV.ADD,
+                .fflags = std.c.NOTE.EXIT,
+                .data = 0,
+                .udata = 0,
+            },
+            .{
+                .ident = 1,
+                .filter = std.c.EVFILT.TIMER,
+                .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+                .fflags = 0,
+                .data = bound_ms,
+                .udata = 0,
+            },
+        };
+        try std.testing.expect(std.c.kevent(kq, &changes, changes.len, &changes, 0, null) == 0);
+        return .{ .kq = kq };
+    }
+
+    fn deinit(self: *ExitWatch) void {
+        _ = std.c.close(self.kq);
+    }
+
+    /// True when the watched pid's NOTE_EXIT arrived before the bound.
+    fn sawExit(self: *ExitWatch) bool {
+        var out: [2]std.c.Kevent = undefined;
+        const n = std.c.kevent(self.kq, &[_]std.c.Kevent{}, 0, &out, out.len, null);
+        if (n <= 0) return false;
+        for (out[0..@intCast(n)]) |ev| {
+            if (ev.filter == std.c.EVFILT.PROC) return true;
+        }
+        return false;
+    }
+};
+
+fn fileExists(path: []const u8) bool {
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+test "cleanupOrphan: an identity-matching orphan exits on TERM inside the grace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const run_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(run_dir);
+    var pb: [4096]u8 = undefined;
+    const path = try pidFilePath(&pb, run_dir, "stub.pid");
+
+    const g = try spawnTestOrphan(false);
+    defer _ = std.c.kill(g, posix.SIG.KILL);
+    var kp: KinfoProc = undefined;
+    try std.testing.expect(lookupKinfoProc(g, &kp));
+    try std.testing.expectEqual(@as(c_int, 1), kp.ki_ppid);
+    writeChildPid(path, g, "master-tests");
+
+    var ew = try ExitWatch.init(g, 4_000);
+    defer ew.deinit();
+    cleanupOrphanTimed(path, "master-tests", 2_000, 200);
+    try std.testing.expect(ew.sawExit());
+    try std.testing.expect(!fileExists(path));
+}
+
+test "cleanupOrphan: a TERM-ignoring orphan is SIGKILLed at the grace deadline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const run_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(run_dir);
+    var pb: [4096]u8 = undefined;
+    const path = try pidFilePath(&pb, run_dir, "stub.pid");
+
+    // Only SIGKILL can take this one down, so its exit proves escalation.
+    const g = try spawnTestOrphan(true);
+    defer _ = std.c.kill(g, posix.SIG.KILL);
+    var kp: KinfoProc = undefined;
+    try std.testing.expect(lookupKinfoProc(g, &kp));
+    try std.testing.expectEqual(@as(c_int, 1), kp.ki_ppid);
+    writeChildPid(path, g, "master-tests");
+
+    var ew = try ExitWatch.init(g, 4_000);
+    defer ew.deinit();
+    cleanupOrphanTimed(path, "master-tests", 200, 1_000);
+    try std.testing.expect(ew.sawExit());
+    try std.testing.expect(!fileExists(path));
+}
+
+test "cleanupOrphan: a pid file naming a mismatched live process spares it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const run_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(run_dir);
+    var pb: [4096]u8 = undefined;
+    const path = try pidFilePath(&pb, run_dir, "stub.pid");
+
+    const g = try spawnTestOrphan(false);
+    defer {
+        _ = std.c.kill(g, posix.SIG.KILL);
+    }
+    var kp: KinfoProc = undefined;
+    try std.testing.expect(lookupKinfoProc(g, &kp));
+    try std.testing.expectEqual(@as(c_int, 1), kp.ki_ppid);
+    writeChildPid(path, g, "master-tests");
+
+    // ppid and start match; only the expected comm differs, so the
+    // identity gate is what spares it.
+    cleanupOrphanTimed(path, "xmppd-auth", 200, 200);
+    try std.testing.expect(std.c.kill(g, 0) == 0);
+    try std.testing.expect(!fileExists(path));
 }
