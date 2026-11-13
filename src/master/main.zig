@@ -531,44 +531,30 @@ pub fn main() !void {
     });
 
     // Spawn order is the child table order; shutdown signals dependents
-    // first (reverse). s2s sits between auth and core when enabled.
+    // first (reverse). s2s sits between auth and core when enabled. auth
+    // and s2s gate the sequence on their IPC socket: core must not spawn
+    // until each accepts connects.
     var children_buf: [3]ChildCtl = undefined;
     var child_count: usize = 0;
-    children_buf[child_count] = .{ .name = "auth", .pid_file = "auth.pid", .exe_base = "xmppd-auth", .sup = &auth_sup };
+    children_buf[child_count] = .{ .name = "auth", .pid_file = "auth.pid", .exe_base = "xmppd-auth", .ready_socket = auth_socket, .sup = &auth_sup };
     child_count += 1;
     if (s2s_enabled) {
-        children_buf[child_count] = .{ .name = "s2s", .pid_file = "s2s.pid", .exe_base = "xmppd-s2s", .sup = &s2s_sup };
+        children_buf[child_count] = .{ .name = "s2s", .pid_file = "s2s.pid", .exe_base = "xmppd-s2s", .ready_socket = s2s_socket, .sup = &s2s_sup };
         child_count += 1;
     }
-    const core_idx = child_count;
     children_buf[child_count] = .{ .name = "core", .pid_file = "core.pid", .exe_base = "xmppd-core", .sup = &core_sup };
     child_count += 1;
 
     var rt = try Runtime.init(allocator, children_buf[0..child_count], run_dir, .{});
     defer rt.deinit();
 
-    // Spawn xmppd-auth first (must be ready before core connects)
-    _ = try rt.spawnChild(0);
-    log.info("auth daemon started, waiting for socket", .{});
-
-    // Brief delay for auth daemon to bind its socket
-    std.Thread.sleep(100 * std.time.ns_per_ms);
-
-    // Spawn xmppd-s2s (must be ready before core connects to it)
-    if (s2s_enabled) {
-        _ = try rt.spawnChild(1);
-        log.info("s2s daemon started, waiting for socket", .{});
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
-
-    // Spawn xmppd-core
-    _ = try rt.spawnChild(core_idx);
-
+    try rt.start();
     rt.run();
 
     // Clean up child PID files on graceful shutdown
     for (rt.children) |*ctl| rt.removePidFile(ctl);
 
+    if (rt.start_failed) return error.StartupFailed;
     log.info("xmppd master shutdown complete", .{});
 }
 
