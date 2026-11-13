@@ -1635,18 +1635,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(core_exe);
 
     // xmppd: the master supervisor
-    const master_event_loop_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     const master_mod = b.createModule(.{
         .root_source_file = b.path("src/master/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    master_mod.addImport("event_loop", master_event_loop_mod);
+    master_mod.addImport("net", net_mod);
     master_mod.addImport("config", config_mod);
     master_mod.addImport("xmppd_log", xmppd_log_mod);
     master_mod.addImport("build_options", build_options_mod);

@@ -28,16 +28,12 @@ pub const std_options = xmppd_log.std_options;
 const posix = std.posix;
 const Supervisor = @import("supervisor.zig").Supervisor;
 const procinfo = @import("procinfo.zig");
-const event_loop_mod = @import("event_loop");
-const EventLoop = event_loop_mod.EventLoop;
-const ChangeList = event_loop_mod.ChangeList;
-const Event = event_loop_mod.Event;
+const runtime_mod = @import("runtime.zig");
+const Runtime = runtime_mod.Runtime;
+const ChildCtl = runtime_mod.ChildCtl;
 const config_mod = @import("config");
 
 const log = std.log.scoped(.xmppd);
-
-/// Timer ident for restart backoff.
-const RESTART_TIMER_IDENT: usize = 0xBACCF;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -526,20 +522,25 @@ pub fn main() !void {
         key_path orelse "(none)",
     });
 
-    // Initialize event loop
-    var loop = try EventLoop.init(allocator, 8);
-    defer loop.deinit();
+    // Spawn order is the child table order; shutdown signals dependents
+    // first (reverse). s2s sits between auth and core when enabled.
+    var children_buf: [3]ChildCtl = undefined;
+    var child_count: usize = 0;
+    children_buf[child_count] = .{ .name = "auth", .pid_file = "auth.pid", .exe_base = "xmppd-auth", .sup = &auth_sup };
+    child_count += 1;
+    if (s2s_enabled) {
+        children_buf[child_count] = .{ .name = "s2s", .pid_file = "s2s.pid", .exe_base = "xmppd-s2s", .sup = &s2s_sup };
+        child_count += 1;
+    }
+    const core_idx = child_count;
+    children_buf[child_count] = .{ .name = "core", .pid_file = "core.pid", .exe_base = "xmppd-core", .sup = &core_sup };
+    child_count += 1;
 
-    // Register signals (automatic masking)
-    try loop.addSignal(posix.SIG.TERM);
-    try loop.addSignal(posix.SIG.INT);
-    try loop.addSignal(posix.SIG.HUP);
+    var rt = try Runtime.init(allocator, children_buf[0..child_count], run_dir);
+    defer rt.deinit();
 
     // Spawn xmppd-auth first (must be ready before core connects)
-    var pid_path_buf: [4096]u8 = undefined;
-    const auth_pid = try auth_sup.spawnChild();
-    try loop.addProcess(auth_pid);
-    procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "auth.pid"), auth_pid, "xmppd-auth");
+    _ = try rt.spawnChild(0);
     log.info("auth daemon started, waiting for socket", .{});
 
     // Brief delay for auth daemon to bind its socket
@@ -547,119 +548,18 @@ pub fn main() !void {
 
     // Spawn xmppd-s2s (must be ready before core connects to it)
     if (s2s_enabled) {
-        const s2s_pid = try s2s_sup.spawnChild();
-        try loop.addProcess(s2s_pid);
-        procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "s2s.pid"), s2s_pid, "xmppd-s2s");
+        _ = try rt.spawnChild(1);
         log.info("s2s daemon started, waiting for socket", .{});
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 
     // Spawn xmppd-core
-    const core_pid = try core_sup.spawnChild();
-    try loop.addProcess(core_pid);
-    procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "core.pid"), core_pid, "xmppd-core");
+    _ = try rt.spawnChild(core_idx);
 
-    // Timer idents for restart backoff
-    const AUTH_UDATA: usize = 1;
-    const CORE_UDATA: usize = 2;
-    const S2S_UDATA: usize = 3;
-
-    // Supervisor event loop
-    var running = true;
-    while (running) {
-        const events = loop.poll(null) catch |err| {
-            log.err("event loop poll failed: {}", .{err});
-            break;
-        };
-
-        for (events) |ev| {
-            switch (ev) {
-                .process_exit => |p| {
-                    if (auth_sup.child_pid != null and p.pid == auth_sup.child_pid.?) {
-                        _ = auth_sup.waitChild() catch {};
-                        switch (auth_sup.handleChildExit(p.status)) {
-                            .restart => {
-                                log.info("restarting auth daemon in {d}ms", .{auth_sup.backoffMs()});
-                                loop.addTimer(AUTH_UDATA, auth_sup.backoffMs(), true) catch {};
-                            },
-                            .shutdown => running = false,
-                            .ignore => {},
-                        }
-                    } else if (core_sup.child_pid != null and p.pid == core_sup.child_pid.?) {
-                        _ = core_sup.waitChild() catch {};
-                        switch (core_sup.handleChildExit(p.status)) {
-                            .restart => {
-                                log.info("restarting core in {d}ms", .{core_sup.backoffMs()});
-                                loop.addTimer(CORE_UDATA, core_sup.backoffMs(), true) catch {};
-                            },
-                            .shutdown => running = false,
-                            .ignore => {},
-                        }
-                    } else if (s2s_enabled and s2s_sup.child_pid != null and p.pid == s2s_sup.child_pid.?) {
-                        _ = s2s_sup.waitChild() catch {};
-                        switch (s2s_sup.handleChildExit(p.status)) {
-                            .restart => {
-                                log.info("restarting s2s in {d}ms", .{s2s_sup.backoffMs()});
-                                loop.addTimer(S2S_UDATA, s2s_sup.backoffMs(), true) catch {};
-                            },
-                            .shutdown => running = false,
-                            .ignore => {},
-                        }
-                    }
-                },
-                .timer => |t| {
-                    if (t.ident == AUTH_UDATA) {
-                        const new_pid = auth_sup.spawnChild() catch |err| {
-                            log.err("failed to respawn auth daemon: {}", .{err});
-                            running = false;
-                            continue;
-                        };
-                        loop.addProcess(new_pid) catch {};
-                        procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "auth.pid"), new_pid, "xmppd-auth");
-                    } else if (t.ident == CORE_UDATA) {
-                        const new_pid = core_sup.spawnChild() catch |err| {
-                            log.err("failed to respawn core: {}", .{err});
-                            running = false;
-                            continue;
-                        };
-                        loop.addProcess(new_pid) catch {};
-                        procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "core.pid"), new_pid, "xmppd-core");
-                    } else if (t.ident == S2S_UDATA) {
-                        const new_pid = s2s_sup.spawnChild() catch |err| {
-                            log.err("failed to respawn s2s: {}", .{err});
-                            running = false;
-                            continue;
-                        };
-                        loop.addProcess(new_pid) catch {};
-                        procinfo.writeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "s2s.pid"), new_pid, "xmppd-s2s");
-                    }
-                },
-                .signal => |s| {
-                    if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
-                        log.info("received signal {d}, shutting down", .{s.signo});
-                        core_sup.shutdown();
-                        _ = core_sup.waitChild() catch {};
-                        if (s2s_enabled) {
-                            s2s_sup.shutdown();
-                            _ = s2s_sup.waitChild() catch {};
-                        }
-                        auth_sup.shutdown();
-                        _ = auth_sup.waitChild() catch {};
-                        running = false;
-                    } else if (s.signo == posix.SIG.HUP) {
-                        log.info("received SIGHUP, forwarding to auth daemon", .{});
-                        auth_sup.forwardSignal(@intCast(s.signo));
-                    }
-                },
-                else => {},
-            }
-        }
-    }
+    rt.run();
 
     // Clean up child PID files on graceful shutdown
-    procinfo.removeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "auth.pid"));
-    procinfo.removeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "s2s.pid"));
-    procinfo.removeChildPid(try procinfo.pidFilePath(&pid_path_buf, run_dir, "core.pid"));
+    for (rt.children) |*ctl| rt.removePidFile(ctl);
 
     log.info("xmppd master shutdown complete", .{});
 }
