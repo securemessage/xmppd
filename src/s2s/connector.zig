@@ -148,6 +148,18 @@ pub const OutboundConnection = struct {
     /// answers it. A verdict can only authenticate this connection while
     /// that exchange is outstanding.
     db_assertion_pending: bool = false,
+    /// The peer answered our dialback key with type='error' (XEP-0220 2.5):
+    /// this domain pair is dead but the stream stays up for any other
+    /// exchanges it still carries. New stanzas for the pair bounce at once.
+    db_assertion_errored: bool = false,
+    /// Parse depth while reading a peer's type='error' verdict: 0 outside
+    /// one, 1 inside the db:result/db:verify element, 2 inside its <error/>
+    /// child, deeper content swallowed until the verdict closes.
+    db_error_depth: u8 = 0,
+    /// Stanza error condition captured from the verdict's <error/> child
+    /// (informational; logged when the verdict closes).
+    db_error_cond_buf: [64]u8 = undefined,
+    db_error_cond_len: usize = 0,
     /// A SASL <auth/> element was written on this connection. A SASL
     /// outcome is only meaningful after the peer has seen our auth request.
     sasl_auth_sent: bool = false,
@@ -188,9 +200,21 @@ pub const OutboundConnection = struct {
     dns_key: usize = 0,
     /// Ident of the armed per-target connect deadline; 0 when none.
     deadline_ident: usize = 0,
+    /// Ident of the armed retry backoff deadline; 0 when none. Nonzero
+    /// means the conn is in backoff after a temporary failure (ADR-13):
+    /// no attempt is running and new stanzas only join the queue.
+    retry_ident: usize = 0,
+    /// Count of temporary failures so far; indexes the backoff schedule.
+    retry_attempt: u8 = 0,
+    /// When the first queued stanza arrived (ms); 0 while the queue is
+    /// empty or unstamped. The queue bounces once its lifetime ends.
+    queue_started_ms: i64 = 0,
 
     const READ_BUF_SIZE = 8192;
     const WRITE_BUF_SIZE = 16384;
+    /// Bound on queued stanzas per domain (X1, ADR-13): overflow is
+    /// bounced and counted by the daemon.
+    pub const MAX_PENDING_STANZAS = 256;
     const PendingQueue = std.ArrayList(PendingStanza);
 
     pub fn init(
@@ -445,6 +469,7 @@ pub const OutboundConnection = struct {
     /// from/to/xml are all copied: the caller's slices borrow the IPC recv
     /// buffer whose next frame rewrites them (T275).
     pub fn queueStanza(self: *OutboundConnection, allocator: std.mem.Allocator, from: []const u8, to: []const u8, xml: []const u8) !void {
+        if (self.pending_stanzas.items.len >= MAX_PENDING_STANZAS) return error.QueueFull;
         const from_copy = try allocator.dupe(u8, from);
         errdefer allocator.free(from_copy);
         const to_copy = try allocator.dupe(u8, to);
@@ -669,6 +694,20 @@ pub const OutboundConnection = struct {
         if (to.len > 0 and !std.ascii.eqlIgnoreCase(to, self.local_domain)) return false;
         self.db_assertion_pending = false;
         return true;
+    }
+
+    /// The stanza error condition captured from the last type='error'
+    /// verdict; empty when none arrived.
+    pub fn dbErrorCond(self: *const OutboundConnection) []const u8 {
+        return self.db_error_cond_buf[0..self.db_error_cond_len];
+    }
+
+    /// Begin capturing a peer's type='error' verdict: element events are
+    /// swallowed until the verdict closes, and the stanza error condition
+    /// inside its <error/> child is recorded for the log (XEP-0220 2.5).
+    pub fn armDbErrorCapture(self: *OutboundConnection) void {
+        self.db_error_depth = 1;
+        self.db_error_cond_len = 0;
     }
 
     /// Any registered callback (sent or not).
@@ -1087,6 +1126,19 @@ test "OutboundConnection: buildStreamOpen" {
     try std.testing.expect(std.mem.indexOf(u8, xml, "from='a.example'") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "to='b.example'") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "version='1.0'") != null);
+}
+
+test "OutboundConnection: buildStreamOpen declares the dialback namespace" {
+    // XEP-0220: db:result/db:verify elements are only legal while the
+    // stream header declares xmlns:db; dropping it would silently break
+    // every dialback exchange including error verdicts.
+    const alloc = std.testing.allocator;
+    var conn = try OutboundConnection.init(alloc, "a.example", "b.example");
+    defer conn.deinit(alloc);
+
+    var buf: [1024]u8 = undefined;
+    const xml = try conn.buildStreamOpen(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "xmlns:db='jabber:server:dialback'") != null);
 }
 
 test "OutboundConnection: buildSaslExternal" {
