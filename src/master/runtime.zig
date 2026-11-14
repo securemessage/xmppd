@@ -18,7 +18,10 @@
 //! (a respawn that cannot spawn, a deadline that cannot be armed) enters
 //! the same path, so the master never exits with a live child it has not
 //! signalled; a child still alive at give-up keeps its pid file for the
-//! next master's orphan cleanup.
+//! next master's orphan cleanup. TERM also ends a gated startup: the
+//! active readiness gate is torn down, so a late byte, deadline or child
+//! exit neither spawns the pending children nor marks the stop a failed
+//! start.
 //!
 //! ## Startup readiness
 //!
@@ -307,7 +310,10 @@ pub const Runtime = struct {
     }
 
     /// Spawn until a gate pauses the sequence or the table is done.
+    /// Once shutdown begins the sequence is over: a late readiness byte
+    /// must never spawn a child the shutdown already passed.
     fn advanceStartup(self: *Runtime) !void {
+        if (self.phase != .starting) return;
         while (self.pending < self.children.len) {
             const idx = self.pending;
             self.pending += 1;
@@ -317,10 +323,8 @@ pub const Runtime = struct {
                 return;
             }
         }
-        if (self.phase == .starting) {
-            self.phase = .running;
-            log.info("all children spawned and ready", .{});
-        }
+        self.phase = .running;
+        log.info("all children spawned and ready", .{});
     }
 
     /// A failed spawn or gate arm still shuts the started children down.
@@ -498,10 +502,11 @@ pub const Runtime = struct {
 
     /// The readiness byte, or EOF when the source vanished without one.
     /// A readable with nothing to read yet (WouldBlock) keeps waiting.
+    /// A byte outside startup is stale and spawns nothing.
     fn onReadyByte(self: *Runtime, io: net.loop.Io) void {
         const idx: usize = io.ctx.index;
         if (idx >= self.children.len) return;
-        if (self.waiting_ready != idx) {
+        if (self.phase != .starting or self.waiting_ready != idx) {
             _ = self.loop.close(io.handle) catch {};
             return;
         }
@@ -581,12 +586,19 @@ pub const Runtime = struct {
         return false;
     }
 
-    /// SIGTERM every live child, drop pending respawns, and arm the
-    /// escalation deadline. Idempotent once shutdown has begun.
+    /// SIGTERM every live child, drop pending respawns and the active
+    /// readiness gate, and arm the escalation deadline. The gate teardown
+    /// ends a gated startup: no child spawns after this and nothing is
+    /// recorded as a startup failure. Idempotent once shutdown has begun.
     fn beginShutdown(self: *Runtime) void {
         if (self.phase == .stopping or self.phase == .killing) return;
         self.phase = .stopping;
         for (self.restart_timers) |*slot| self.cancelSlot(slot);
+        for (self.gates, 0..) |*g, i| {
+            if (g.active) self.closeGate(i);
+        }
+        self.waiting_ready = null;
+        self.hup_deferred = false;
         for (self.children) |*ctl| ctl.sup.shutdown();
         if (!self.anyAlive()) {
             self.running = false;
@@ -641,8 +653,10 @@ pub const Runtime = struct {
         // report must not make a live child untracked.
         if (action != .ignore) ctl.sup.child_pid = null;
         // A gated child dying before its byte can never become ready;
-        // failStart moves the runtime to .stopping, handled below.
-        if (self.waiting_ready == idx) {
+        // failStart moves the runtime to .stopping, handled below. That
+        // only matters while the start is live: after TERM the exit is
+        // the requested stop, not a startup failure.
+        if (self.phase == .starting and self.waiting_ready == idx) {
             self.failStart(idx, "exited before signaling readiness");
         }
         switch (self.phase) {
@@ -693,6 +707,7 @@ pub const Runtime = struct {
             },
             ready_deadline_kind => {
                 if (idx >= self.children.len) return;
+                if (self.phase != .starting) return;
                 if (!takeTimer(&self.gates[idx].deadline_timer, d.timer)) return;
                 if (self.waiting_ready == idx) self.failStart(idx, "readiness deadline expired");
             },
@@ -1713,4 +1728,155 @@ test "Runtime: SIGHUP during startup reaches ready children now and the gated ch
     try testing.expect(!rt.start_failed);
     try testing.expect(!rt.hup_deferred);
     try testing.expect(try readableWithin(hup_b[0], 2_000));
+}
+
+test "Runtime: a readiness byte after TERM spawns nothing and drops the gate" {
+    var sup_a = try Supervisor.init("/nonexistent", &.{}, 1);
+    var sup_b = try Supervisor.init("/nonexistent", &.{}, 1);
+    var children = [_]ChildCtl{
+        .{ .name = "a", .pid_file = "a.pid", .exe_base = "stub", .sup = &sup_a },
+        .{ .name = "b", .pid_file = "b.pid", .exe_base = "stub", .sup = &sup_b },
+    };
+    // Fork before init: watchSignal turns TERM into SIG_IGN process-wide
+    // and the stub must keep the default disposition to die on TERM.
+    const pid_a = try forkStub(-1, false);
+    var rt = try Runtime.init(testing.allocator, children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, pid_a);
+    defer killStub(&sup_a);
+    defer killStub(&sup_b);
+
+    // a is up and gating; b is never spawned. The gate owns gate_r[0];
+    // the dup keeps the pipe's read side open so the byte below cannot
+    // SIGPIPE once shutdown closes the runtime's end.
+    const gate_r = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer posix.close(gate_r[1]);
+    const gate_hold = try posix.dup(gate_r[0]);
+    defer posix.close(gate_hold);
+    rt.phase = .starting;
+    rt.pending = 1;
+    try rt.armGatePipe(0, gate_r[0]);
+    rt.hup_deferred = true;
+
+    rt.onSignal(.{ .signo = posix.SIG.TERM, .count = 1 });
+    try testing.expectEqual(Phase.stopping, rt.phase);
+    try testing.expect(rt.waiting_ready == null);
+    try testing.expect(!rt.hup_deferred);
+    try testing.expect(!rt.gates[0].active);
+    // Only the shutdown grace deadline is armed now.
+    try testing.expectEqual(@as(u32, 1), armedTimers(&rt));
+
+    // The late byte lands in a pipe the runtime no longer reads, and the
+    // gated child exits on its TERM.
+    _ = try posix.write(gate_r[1], "R");
+    while (rt.running) try rt.step();
+    try testing.expectEqual(@as(usize, 1), rt.pending);
+    try testing.expectEqual(@as(i128, 0), sup_b.last_start);
+    try testing.expectEqual(@as(usize, 0), rt.ready_count);
+    try testing.expect(!rt.start_failed);
+
+    // Last line of defense: the spawn sequence itself refuses outside
+    // .starting.
+    rt.advanceStartupInternal();
+    try testing.expectEqual(@as(usize, 1), rt.pending);
+    try testing.expectEqual(@as(i128, 0), sup_b.last_start);
+}
+
+test "Runtime: the gated child exiting on TERM is a stop, not a failed start" {
+    var sup = try Supervisor.init("/nonexistent", &.{}, 1);
+    var children = [_]ChildCtl{
+        .{ .name = "stub", .pid_file = "stub.pid", .exe_base = "stub", .sup = &sup },
+    };
+    const pid = try forkStub(-1, false);
+    var rt = try Runtime.init(testing.allocator, children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, pid);
+    defer killStub(&sup);
+    const p = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer posix.close(p[1]);
+    rt.phase = .starting;
+    rt.pending = children.len;
+    try rt.armGatePipe(0, p[0]);
+
+    rt.onSignal(.{ .signo = posix.SIG.TERM, .count = 1 });
+    try testing.expectEqual(@as(u32, 1), armedTimers(&rt));
+    // The stub dies on TERM; its exit is the requested stop and ends the
+    // run, so main exits like any other shutdown.
+    rt.run();
+    try testing.expectEqual(Phase.stopping, rt.phase);
+    try testing.expect(!rt.start_failed);
+    try testing.expectEqualStrings("", rt.fail_why);
+    try testing.expect(sup.child_pid == null);
+}
+
+test "Runtime: TERM while gated cancels the readiness deadline" {
+    var sup = try Supervisor.init("/nonexistent", &.{}, 1);
+    var children = [_]ChildCtl{
+        .{ .name = "stub", .pid_file = "stub.pid", .exe_base = "stub", .sup = &sup },
+    };
+    const pid = try forkStub(-1, false);
+    var rt = try Runtime.init(testing.allocator, children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, pid);
+    defer killStub(&sup);
+    const p = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer posix.close(p[1]);
+    rt.phase = .starting;
+    rt.pending = children.len;
+    try rt.armGatePipe(0, p[0]);
+    // The readiness deadline is the only timer before the signal.
+    try testing.expectEqual(@as(u32, 1), armedTimers(&rt));
+
+    rt.onSignal(.{ .signo = posix.SIG.TERM, .count = 1 });
+    // The deadline is gone with the gate: only the shutdown grace
+    // deadline remains, and nothing can mark this stop a failed start.
+    try testing.expectEqual(@as(u32, 1), armedTimers(&rt));
+    try testing.expect(rt.gates[0].deadline_timer == null);
+    rt.run();
+    try testing.expect(!rt.start_failed);
+}
+
+test "Runtime: a gated wait that outlives .starting cannot fail or advance the start" {
+    // beginShutdown tears the active gate down; the per-path guards are
+    // the last line of defense if gated startup state ever outlives the
+    // phase. Force that state directly: gate armed, phase .stopping.
+    var sup_a = try Supervisor.init("/nonexistent", &.{}, 1);
+    var sup_b = try Supervisor.init("/nonexistent", &.{}, 1);
+    var children = [_]ChildCtl{
+        .{ .name = "a", .pid_file = "a.pid", .exe_base = "stub", .sup = &sup_a },
+        .{ .name = "b", .pid_file = "b.pid", .exe_base = "stub", .sup = &sup_b },
+    };
+    const pid_a = try forkStub(-1, false);
+    var rt = try Runtime.init(testing.allocator, children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, pid_a);
+    defer killStub(&sup_a);
+    defer killStub(&sup_b);
+    const p = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer posix.close(p[1]);
+    rt.phase = .starting;
+    rt.pending = 1;
+    try rt.armGatePipe(0, p[0]);
+    rt.phase = .stopping;
+
+    // A readiness byte in .stopping is stale: dropped, never consumed.
+    _ = try posix.write(p[1], "R");
+    try rt.step();
+    try testing.expectEqual(@as(usize, 0), rt.ready_count);
+    try testing.expectEqual(@as(usize, 1), rt.pending);
+
+    // The spawn sequence itself refuses outside .starting.
+    rt.advanceStartupInternal();
+    try testing.expectEqual(@as(usize, 1), rt.pending);
+    try testing.expectEqual(@as(i128, 0), sup_b.last_start);
+
+    // The armed readiness deadline fires and is dropped.
+    while (armedTimers(&rt) != 0 and !rt.start_failed) try rt.step();
+    try testing.expect(!rt.start_failed);
+
+    // The gated child's exit is just an exit, never a failed start.
+    _ = std.c.kill(sup_a.child_pid.?, posix.SIG.TERM);
+    while (rt.running) try rt.step();
+    try testing.expect(!rt.start_failed);
+    try testing.expect(sup_a.child_pid == null);
 }
