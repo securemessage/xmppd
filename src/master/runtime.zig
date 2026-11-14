@@ -5,6 +5,8 @@
 //! waitpid, including the #60 deferred-reap race fix), restarts and
 //! shutdown escalations ride one-shot deadline timers, and TERM/INT/HUP
 //! arrive as EVFILT_SIGNAL. Nothing in this file sleeps or waitpid-blocks.
+//! HUP is forwarded only to children that declare `forward_hup`: core and
+//! s2s install no HUP handler, and the default action would kill them.
 //!
 //! ## Shutdown
 //!
@@ -12,7 +14,11 @@
 //! Each NOTE_EXIT is reaped by the loop; when the last child is gone the
 //! master exits. A missed deadline escalates to SIGKILL for the stragglers
 //! under a second deadline, and a second missed deadline gives up so the
-//! master can never hang on an unkillable child.
+//! master can never hang on an unkillable child. Every internal failure
+//! (a respawn that cannot spawn, a deadline that cannot be armed) enters
+//! the same path, so the master never exits with a live child it has not
+//! signalled; a child still alive at give-up keeps its pid file for the
+//! next master's orphan cleanup.
 //!
 //! ## Startup readiness
 //!
@@ -26,10 +32,21 @@
 //! write end and a prober decides readiness the same way the dependents
 //! experience it: a Unix connect() against the child's IPC socket. The
 //! prober wakes on an EVFILT_VNODE watch of the socket's directory (a
-//! nested kqueue fd registered with the loop, the resolver's pattern)
-//! and retries refused connects on a short deadline for the bind-to-
-//! listen gap. A later --ready-fd child can write the same byte itself
-//! and the prober goes away; the pipe contract stays.
+//! nested kqueue fd registered with the loop, the resolver's pattern).
+//! A missing socket waits for the next directory event; only a refused
+//! connect (the bind-to-listen gap) arms a short retry deadline, one per
+//! gate, at most `probe_refused_max` times per directory event so a
+//! stale socket file left by a crashed child is never polled. Each probe
+//! is a connect-and-close the child sees as a short-lived IPC peer (s2s
+//! logs a "core connected" / "core disconnected" pair). A later
+//! --ready-fd child can write the same byte itself and the prober goes
+//! away; the pipe contract stays.
+//!
+//! ## Timers
+//!
+//! Every deadline the runtime arms is held by its TimerId and cancelled
+//! when its purpose ends; a deadline whose id no longer matches the held
+//! one is stale and ignored.
 
 const std = @import("std");
 const net = @import("net");
@@ -90,6 +107,10 @@ pub const ChildCtl = struct {
     /// child whose dependents must not spawn until it listens. null for
     /// a child nothing gates on (the last in the spawn order).
     ready_socket: ?[]const u8 = null,
+    /// The child installs a SIGHUP handler. HUP's default action
+    /// terminates the process, so the master forwards a reload only to
+    /// children that opt in.
+    forward_hup: bool = false,
     sup: *Supervisor,
 };
 
@@ -103,6 +124,9 @@ pub const Limits = struct {
     ready_ms: u64 = 10_000,
     /// Refused-connect retry while a gated child's socket is coming up.
     probe_retry_ms: u64 = 25,
+    /// Refused-connect retries per directory event before the prober
+    /// waits for the next event (a stale socket file refuses forever).
+    probe_refused_max: u8 = 4,
 };
 
 const Phase = enum { starting, running, stopping, killing };
@@ -120,13 +144,29 @@ const Gate = struct {
     kq: posix.fd_t = -1,
     kq_h: ?net.Token = null,
     dir_fd: posix.fd_t = -1,
+    /// The readiness deadline and the single pending refused-connect
+    /// retry, cancelled when the gate completes or closes.
+    deadline_timer: ?net.TimerId = null,
+    retry_timer: ?net.TimerId = null,
+    /// Refused-connect retries since the last directory event.
+    refused_retries: u8 = 0,
     active: bool = false,
 };
+
+/// Clear `slot` when `fired` is the deadline it holds. False for a stale
+/// deadline (cancelled, superseded, or never armed through this slot).
+fn takeTimer(slot: *?net.TimerId, fired: net.TimerId) bool {
+    const held = slot.* orelse return false;
+    if (!held.eql(fired)) return false;
+    slot.* = null;
+    return true;
+}
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     loop: net.Loop = undefined,
-    /// Spawn order; shutdown signals dependents first (reverse).
+    /// Spawn order (dependencies before dependents). Shutdown signals
+    /// every live child at once; no child waits on another.
     children: []ChildCtl,
     run_dir: []const u8,
     limits: Limits,
@@ -135,6 +175,15 @@ pub const Runtime = struct {
     pid_path: [4096]u8 = undefined,
     /// Readiness gates, index-aligned with children.
     gates: []Gate = &.{},
+    /// Pending restart backoff deadlines, index-aligned with children.
+    restart_timers: []?net.TimerId = &.{},
+    /// The armed TERM-grace or SIGKILL-grace deadline.
+    shutdown_timer: ?net.TimerId = null,
+    /// connect() probes issued; tests assert the prober does not poll.
+    probe_count: usize = 0,
+    /// A SIGHUP arrived while the child in waiting_ready was starting;
+    /// it is delivered when that child's readiness byte arrives.
+    hup_deferred: bool = false,
     /// Next child the startup sequence spawns.
     pending: usize = 0,
     /// Child whose readiness byte the sequence waits on, if any.
@@ -143,6 +192,9 @@ pub const Runtime = struct {
     start_failed: bool = false,
     /// The first failure reason; tests assert which path tripped.
     fail_why: []const u8 = "",
+    /// Set when supervision itself failed after startup (a respawn, or a
+    /// deadline that could not be armed); main exits nonzero.
+    runtime_failed: bool = false,
     /// Readiness bytes consumed; tests assert the gate path ran.
     ready_count: usize = 0,
 
@@ -164,6 +216,9 @@ pub const Runtime = struct {
         rt.gates = try allocator.alloc(Gate, children.len);
         errdefer allocator.free(rt.gates);
         for (rt.gates) |*g| g.* = .{};
+        rt.restart_timers = try allocator.alloc(?net.TimerId, children.len);
+        errdefer allocator.free(rt.restart_timers);
+        @memset(rt.restart_timers, null);
         try rt.loop.init(allocator, &.{ .handles_max = 32, .timers_max = 16 });
         errdefer rt.loop.deinit(allocator);
         try rt.loop.watchSignal(posix.SIG.TERM);
@@ -180,6 +235,7 @@ pub const Runtime = struct {
             if (g.dir_fd >= 0) posix.close(g.dir_fd);
         }
         self.allocator.free(self.gates);
+        self.allocator.free(self.restart_timers);
         self.loop.deinit(self.allocator);
     }
 
@@ -214,6 +270,25 @@ pub const Runtime = struct {
     pub fn removePidFile(self: *Runtime, ctl: *const ChildCtl) void {
         const path = procinfo.pidFilePath(&self.pid_path, self.run_dir, ctl.pid_file) catch return;
         procinfo.removeChildPid(path);
+    }
+
+    /// After run(): remove the pid file of every reaped child. A child
+    /// still alive (the SIGKILL grace gave up on it) keeps its file so
+    /// the next master's identity-checked orphan cleanup can find it.
+    pub fn removeReapedPidFiles(self: *Runtime) void {
+        for (self.children) |*ctl| {
+            if (ctl.sup.child_pid) |pid| {
+                log.warn("child {s} pid={d} is still alive at master exit; keeping {s}", .{ ctl.name, pid, ctl.pid_file });
+                continue;
+            }
+            self.removePidFile(ctl);
+        }
+    }
+
+    /// Cancel the deadline `slot` holds, if any.
+    fn cancelSlot(self: *Runtime, slot: *?net.TimerId) void {
+        if (slot.*) |id| _ = self.loop.cancelTimer(id);
+        slot.* = null;
     }
 
     /// Begin the gated spawn sequence. Children spawn in table order; a
@@ -279,7 +354,7 @@ pub const Runtime = struct {
         const gate = &self.gates[idx];
         const h = self.loop.attach(pipe_r, readyPipeCtx(idx), .{ .read = true }) catch return error.HandleTableFull;
         errdefer self.loop.close(h) catch {};
-        _ = self.loop.scheduleIn(self.limits.ready_ms, readyDeadlineCtx(idx)) catch return error.TimerTableFull;
+        gate.deadline_timer = self.loop.scheduleIn(self.limits.ready_ms, readyDeadlineCtx(idx)) catch return error.TimerTableFull;
         gate.pipe_rh = h;
         gate.pipe_r = pipe_r;
         gate.active = true;
@@ -315,6 +390,7 @@ pub const Runtime = struct {
 
     fn stopProbe(self: *Runtime, idx: usize) void {
         const gate = &self.gates[idx];
+        self.cancelSlot(&gate.retry_timer);
         if (gate.kq_h) |h| {
             self.loop.close(h) catch {};
             gate.kq_h = null;
@@ -327,7 +403,9 @@ pub const Runtime = struct {
     }
 
     /// One connect against the child's IPC socket: success writes the
-    /// readiness byte; anything else rides a bounded retry deadline.
+    /// readiness byte. A refused connect (socket bound, not yet
+    /// listening) arms the gate's retry deadline; any other failure,
+    /// a missing socket included, waits for the next directory event.
     fn probeConnect(self: *Runtime, idx: usize) void {
         const gate = &self.gates[idx];
         if (!gate.active or self.waiting_ready != idx) return;
@@ -338,11 +416,29 @@ pub const Runtime = struct {
         addr.family = posix.AF.UNIX;
         if (sock_path.len >= addr.path.len) return;
         @memcpy(addr.path[0..sock_path.len], sock_path);
-        posix.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) catch {
-            _ = self.loop.scheduleIn(self.limits.probe_retry_ms, probeRetryCtx(idx)) catch {};
+        self.probe_count += 1;
+        posix.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) catch |err| {
+            switch (err) {
+                error.ConnectionRefused, error.WouldBlock => self.armProbeRetry(idx),
+                else => {},
+            }
             return;
         };
         self.signalReady(idx);
+    }
+
+    /// At most one pending retry per gate, and at most probe_refused_max
+    /// per directory event: a stale socket file refuses forever and must
+    /// not turn the retry into a poll.
+    fn armProbeRetry(self: *Runtime, idx: usize) void {
+        const gate = &self.gates[idx];
+        if (gate.retry_timer != null) return;
+        if (gate.refused_retries >= self.limits.probe_refused_max) return;
+        gate.refused_retries += 1;
+        gate.retry_timer = self.loop.scheduleIn(self.limits.probe_retry_ms, probeRetryCtx(idx)) catch |err| blk: {
+            log.warn("{s}: cannot arm readiness probe retry: {}", .{ self.children[idx].name, err });
+            break :blk null;
+        };
     }
 
     /// The prober's verdict, delivered through the same byte any
@@ -360,6 +456,7 @@ pub const Runtime = struct {
     /// Tear down one gate's resources; callers own waiting_ready.
     fn closeGate(self: *Runtime, idx: usize) void {
         const gate = &self.gates[idx];
+        self.cancelSlot(&gate.deadline_timer);
         if (gate.pipe_rh) |h| {
             self.loop.close(h) catch {};
             gate.pipe_rh = null;
@@ -383,7 +480,10 @@ pub const Runtime = struct {
             self.fail_why = why;
             log.warn("startup failed for {s}: {s}", .{ self.children[idx].name, why });
         }
-        if (self.waiting_ready == idx) self.waiting_ready = null;
+        if (self.waiting_ready == idx) {
+            self.waiting_ready = null;
+            self.hup_deferred = false;
+        }
         self.closeGate(idx);
         self.beginShutdown();
     }
@@ -397,6 +497,7 @@ pub const Runtime = struct {
     }
 
     /// The readiness byte, or EOF when the source vanished without one.
+    /// A readable with nothing to read yet (WouldBlock) keeps waiting.
     fn onReadyByte(self: *Runtime, io: net.loop.Io) void {
         const idx: usize = io.ctx.index;
         if (idx >= self.children.len) return;
@@ -406,23 +507,20 @@ pub const Runtime = struct {
         }
         const gate = &self.gates[idx];
         var buf: [8]u8 = undefined;
-        const n = posix.read(gate.pipe_r, &buf) catch 0;
+        const n = posix.read(gate.pipe_r, &buf) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => 0,
+        };
         if (n == 0) {
             self.failStart(idx, "readiness pipe closed without a ready byte");
             return;
         }
-        gate.active = false;
-        if (gate.pipe_rh) |h| {
-            _ = self.loop.close(h) catch {};
-            gate.pipe_rh = null;
-            gate.pipe_r = -1;
-        }
-        if (gate.pipe_w >= 0) {
-            posix.close(gate.pipe_w);
-            gate.pipe_w = -1;
-        }
-        self.stopProbe(idx);
+        self.closeGate(idx);
         self.waiting_ready = null;
+        if (self.hup_deferred) {
+            self.hup_deferred = false;
+            self.children[idx].sup.forwardSignal(posix.SIG.HUP);
+        }
         self.ready_count += 1;
         log.info("child {s} is ready", .{self.children[idx].name});
         self.advanceStartupInternal();
@@ -438,6 +536,10 @@ pub const Runtime = struct {
         var evs: [4]std.c.Kevent = undefined;
         const zero_ts: posix.timespec = .{ .sec = 0, .nsec = 0 };
         _ = std.c.kevent(gate.kq, &[_]std.c.Kevent{}, 0, &evs, evs.len, &zero_ts);
+        // New directory activity may be a fresh socket: the refused
+        // budget restarts, and a pending retry already covers this probe.
+        gate.refused_retries = 0;
+        if (gate.retry_timer != null) return;
         self.probeConnect(idx);
     }
 
@@ -445,18 +547,28 @@ pub const Runtime = struct {
     /// forward HUP to every child, and drive the shutdown escalation.
     pub fn run(self: *Runtime) void {
         while (self.running) {
-            self.loop.wait() catch |err| {
-                log.err("event loop wait failed: {}", .{err});
+            self.step() catch |err| {
+                // No deadline can be armed without the loop: TERM every
+                // live child once and exit nonzero; unreaped children keep
+                // their pid files for the next master's orphan cleanup.
+                log.err("event loop wait failed: {}; sending SIGTERM to every child", .{err});
+                self.runtime_failed = true;
+                for (self.children) |*ctl| ctl.sup.shutdown();
                 break;
             };
-            while (self.loop.next()) |ev| {
-                switch (ev) {
-                    .process_exit => |p| self.onChildExit(p),
-                    .deadline => |d| self.onDeadline(d),
-                    .signal => |s| self.onSignal(s),
-                    .readable => |io| self.onReadable(io),
-                    else => {},
-                }
+        }
+    }
+
+    /// One loop wait and dispatch of every event it collected.
+    fn step(self: *Runtime) !void {
+        try self.loop.wait();
+        while (self.loop.next()) |ev| {
+            switch (ev) {
+                .process_exit => |p| self.onChildExit(p),
+                .deadline => |d| self.onDeadline(d),
+                .signal => |s| self.onSignal(s),
+                .readable => |io| self.onReadable(io),
+                else => {},
             }
         }
     }
@@ -469,23 +581,31 @@ pub const Runtime = struct {
         return false;
     }
 
-    /// SIGTERM every live child and arm the escalation deadline.
+    /// SIGTERM every live child, drop pending respawns, and arm the
+    /// escalation deadline. Idempotent once shutdown has begun.
     fn beginShutdown(self: *Runtime) void {
+        if (self.phase == .stopping or self.phase == .killing) return;
         self.phase = .stopping;
+        for (self.restart_timers) |*slot| self.cancelSlot(slot);
         for (self.children) |*ctl| ctl.sup.shutdown();
         if (!self.anyAlive()) {
             self.running = false;
             return;
         }
-        _ = self.loop.scheduleIn(self.limits.term_grace_ms, shutdownCtx()) catch {
-            self.running = false;
+        self.shutdown_timer = self.loop.scheduleIn(self.limits.term_grace_ms, shutdownCtx()) catch |err| {
+            log.warn("cannot arm the SIGTERM grace deadline: {}; escalating now", .{err});
+            self.runtime_failed = true;
+            self.escalate();
+            return;
         };
     }
 
     /// The TERM grace expired: SIGKILL whatever is left and arm the last
-    /// deadline. A second TERM while stopping takes the same path.
+    /// deadline, replacing the TERM-grace one. A second TERM while
+    /// stopping takes the same path.
     fn escalate(self: *Runtime) void {
         self.phase = .killing;
+        self.cancelSlot(&self.shutdown_timer);
         var left: usize = 0;
         for (self.children) |*ctl| {
             if (ctl.sup.child_pid) |pid| {
@@ -498,8 +618,11 @@ pub const Runtime = struct {
             self.running = false;
             return;
         }
-        _ = self.loop.scheduleIn(self.limits.kill_grace_ms, shutdownCtx()) catch {
+        self.shutdown_timer = self.loop.scheduleIn(self.limits.kill_grace_ms, shutdownCtx()) catch |err| {
+            log.warn("cannot arm the SIGKILL grace deadline: {}; giving up", .{err});
+            self.runtime_failed = true;
             self.running = false;
+            return;
         };
     }
 
@@ -517,21 +640,23 @@ pub const Runtime = struct {
         // Only a real termination frees the pid slot: a stopped/continued
         // report must not make a live child untracked.
         if (action != .ignore) ctl.sup.child_pid = null;
-        // A gated child dying before its byte can never become ready.
+        // A gated child dying before its byte can never become ready;
+        // failStart moves the runtime to .stopping, handled below.
         if (self.waiting_ready == idx) {
             self.failStart(idx, "exited before signaling readiness");
-            return;
         }
         switch (self.phase) {
             .running, .starting => switch (action) {
                 .restart => {
                     log.info("restarting {s} in {d}ms", .{ ctl.name, ctl.sup.backoffMs() });
-                    _ = self.loop.scheduleIn(ctl.sup.backoffMs(), restartCtx(idx)) catch |err| {
-                        log.err("cannot schedule {s} restart: {}", .{ ctl.name, err });
-                        self.running = false;
+                    self.restart_timers[idx] = self.loop.scheduleIn(ctl.sup.backoffMs(), restartCtx(idx)) catch |err| {
+                        log.warn("cannot schedule {s} restart: {}; shutting down", .{ ctl.name, err });
+                        self.runtime_failed = true;
+                        self.beginShutdown();
+                        return;
                     };
                 },
-                .shutdown => self.running = false,
+                .shutdown => self.beginShutdown(),
                 .ignore => {},
             },
             .stopping, .killing => {
@@ -541,33 +666,40 @@ pub const Runtime = struct {
     }
 
     fn onDeadline(self: *Runtime, d: net.Deadline) void {
+        const idx: usize = d.ctx.index;
         switch (d.ctx.kind) {
             restart_kind => {
-                if (self.phase != .running and self.phase != .starting) return;
-                const idx: usize = d.ctx.index;
                 if (idx >= self.children.len) return;
+                if (!takeTimer(&self.restart_timers[idx], d.timer)) return;
+                if (self.phase != .running and self.phase != .starting) return;
                 const ctl = &self.children[idx];
                 _ = self.spawnChild(idx) catch |err| {
-                    log.err("failed to respawn {s}: {}", .{ ctl.name, err });
-                    self.running = false;
+                    log.warn("failed to respawn {s}: {}; shutting down", .{ ctl.name, err });
+                    self.runtime_failed = true;
+                    self.beginShutdown();
                 };
             },
-            shutdown_kind => switch (self.phase) {
-                .running, .starting => {},
-                .stopping => self.escalate(),
-                .killing => {
-                    log.err("children still alive after SIGKILL grace; giving up", .{});
-                    self.running = false;
-                },
+            shutdown_kind => {
+                if (!takeTimer(&self.shutdown_timer, d.timer)) return;
+                switch (self.phase) {
+                    .running, .starting => {},
+                    .stopping => self.escalate(),
+                    .killing => {
+                        log.warn("children still alive after SIGKILL grace; giving up", .{});
+                        self.runtime_failed = true;
+                        self.running = false;
+                    },
+                }
             },
             ready_deadline_kind => {
-                const idx: usize = d.ctx.index;
-                if (idx < self.children.len and self.waiting_ready == idx)
-                    self.failStart(idx, "readiness deadline expired");
+                if (idx >= self.children.len) return;
+                if (!takeTimer(&self.gates[idx].deadline_timer, d.timer)) return;
+                if (self.waiting_ready == idx) self.failStart(idx, "readiness deadline expired");
             },
             probe_retry_kind => {
-                const idx: usize = d.ctx.index;
-                if (idx < self.children.len) self.probeConnect(idx);
+                if (idx >= self.children.len) return;
+                if (!takeTimer(&self.gates[idx].retry_timer, d.timer)) return;
+                self.probeConnect(idx);
             },
             else => {},
         }
@@ -583,9 +715,26 @@ pub const Runtime = struct {
                 .killing => {},
             }
         } else if (s.signo == posix.SIG.HUP) {
-            if (self.phase != .running) return;
-            log.info("received SIGHUP, forwarding to all children", .{});
-            for (self.children) |*ctl| ctl.sup.forwardSignal(@intCast(s.signo));
+            switch (self.phase) {
+                .running, .starting => self.forwardHup(),
+                .stopping, .killing => log.info("received SIGHUP during shutdown; not forwarded", .{}),
+            }
+        }
+    }
+
+    /// Forward HUP to every live child that handles it (forward_hup). A
+    /// child still awaiting readiness may not have installed its handler
+    /// yet, so its copy is held and delivered when its readiness byte
+    /// arrives.
+    fn forwardHup(self: *Runtime) void {
+        log.info("received SIGHUP, forwarding to children that reload on it", .{});
+        for (self.children, 0..) |*ctl, i| {
+            if (!ctl.forward_hup) continue;
+            if (self.waiting_ready == i) {
+                self.hup_deferred = true;
+                continue;
+            }
+            ctl.sup.forwardSignal(posix.SIG.HUP);
         }
     }
 };
@@ -828,33 +977,26 @@ fn hupByte(_: c_int) callconv(.c) void {
     _ = std.c.write(hup_pipe_w, "H", 1);
 }
 
-test "Runtime: SIGHUP is forwarded to every child" {
-    var pipes: [2][2]posix.fd_t = undefined;
-    var pids: [2]posix.pid_t = undefined;
-    var sups: [2]Supervisor = undefined;
-    var children: [2]ChildCtl = undefined;
-    for (0..2) |i| {
+test "Runtime: SIGHUP is forwarded to every forward_hup child and no other" {
+    // Children 0 and 1 opt in; child 2 does not (core and s2s install no
+    // HUP handler, and the default action would kill them).
+    var pipes: [3][2]posix.fd_t = undefined;
+    var pids: [3]posix.pid_t = undefined;
+    var sups: [3]Supervisor = undefined;
+    var children: [3]ChildCtl = undefined;
+    for (0..3) |i| {
         pipes[i] = try posix.pipe();
-        pids[i] = try posix.fork();
-        if (pids[i] == 0) {
-            hup_pipe_w = pipes[i][1];
-            const hup: posix.Sigaction = .{
-                .handler = .{ .handler = hupByte },
-                .flags = 0,
-                .mask = posix.sigemptyset(),
-            };
-            posix.sigaction(posix.SIG.HUP, &hup, null);
-            pauseForever();
-        }
+        pids[i] = try forkStub(pipes[i][1], false);
         sups[i] = try Supervisor.init("/nonexistent", &.{}, 1);
         children[i] = .{
             .name = "stub",
             .pid_file = "stub.pid",
             .exe_base = "stub",
+            .forward_hup = i < 2,
             .sup = &sups[i],
         };
     }
-    defer for (0..2) |i| {
+    defer for (0..3) |i| {
         _ = std.c.kill(pids[i], posix.SIG.KILL);
         reap(pids[i]);
         posix.close(pipes[i][0]);
@@ -874,11 +1016,11 @@ test "Runtime: SIGHUP is forwarded to every child" {
     const thr = try std.Thread.spawn(.{}, RtThread.main, .{&ctx});
     try awaitReady(ready[0]);
 
-    // Both children must observe the forwarded HUP; the test waits on the
-    // two pipe read ends under one deadline.
+    // Both opted-in children must observe the forwarded HUP and child 2
+    // must not; the test waits on all three pipe read ends.
     var tw = try TestWait.init();
     defer tw.deinit();
-    for (0..2) |i| {
+    for (0..3) |i| {
         var ev = [_]std.c.Kevent{.{
             .ident = @intCast(pipes[i][0]),
             .filter = std.c.EVFILT.READ,
@@ -894,18 +1036,27 @@ test "Runtime: SIGHUP is forwarded to every child" {
     killSelf(posix.SIG.HUP);
 
     var seen: usize = 0;
-    while (seen < 2) : (seen += 1) {
+    var stray = false;
+    while (seen < 2) {
         var ev: std.c.Kevent = undefined;
         if (tw.waitOne(&ev) == null) break;
         try testing.expectEqual(std.c.EVFILT.READ, ev.filter);
         var b: [1]u8 = undefined;
         try testing.expectEqual(@as(usize, 1), try posix.read(@intCast(ev.ident), &b));
         try testing.expectEqual(@as(u8, 'H'), b[0]);
+        if (ev.udata == 3) stray = true else seen += 1;
     }
-    if (seen < 2) {
+    // Child 2 was signalled after the others if at all: give its byte a
+    // bounded window to land before declaring it absent.
+    if (!stray and seen == 2) {
+        tw.armDeadline(TestWait.wait_deadline_ident, 300);
+        var ev: std.c.Kevent = undefined;
+        if (tw.waitOne(&ev) != null) stray = ev.udata == 3;
+    }
+    if (seen < 2 or stray) {
         stopRuntime(&ctx);
         thr.join();
-        std.debug.print("only {d}/2 children saw the forwarded SIGHUP\n", .{seen});
+        std.debug.print("forward_hup children saw {d}/2 HUPs; non-opted child signalled: {}\n", .{ seen, stray });
         return error.TestUnexpectedResult;
     }
 
@@ -1210,4 +1361,356 @@ test "Runtime: a gated child exiting before its byte fails the startup" {
     try testing.expect(ctx.start_failed);
     try testing.expectEqualStrings("exited before signaling readiness", ctx.fail_why);
     try testing.expectEqual(@as(usize, 0), ctx.ready_count);
+}
+
+// The tests below drive a Runtime on the test thread itself: step() runs
+// one loop wait and its dispatch, so state is asserted between events
+// with no thread handoff and no timing guesses.
+
+/// Fork a child that suspends forever. With `hup_w` >= 0 it writes 'H'
+/// there on each SIGHUP; with `ignore_term` it survives SIGTERM. Returns
+/// once the child's dispositions are installed (it writes one byte on a
+/// private pipe), so a signal sent next cannot hit the defaults.
+fn forkStub(hup_w: posix.fd_t, ignore_term: bool) !posix.pid_t {
+    const armed = try posix.pipe();
+    defer posix.close(armed[0]);
+    const pid = posix.fork() catch |err| {
+        posix.close(armed[1]);
+        return err;
+    };
+    if (pid == 0) {
+        posix.close(armed[0]);
+        if (hup_w >= 0) {
+            hup_pipe_w = hup_w;
+            const hup: posix.Sigaction = .{
+                .handler = .{ .handler = hupByte },
+                .flags = 0,
+                .mask = posix.sigemptyset(),
+            };
+            posix.sigaction(posix.SIG.HUP, &hup, null);
+        }
+        if (ignore_term) {
+            const ign: posix.Sigaction = .{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .flags = 0,
+                .mask = posix.sigemptyset(),
+            };
+            posix.sigaction(posix.SIG.TERM, &ign, null);
+        }
+        _ = posix.write(armed[1], "A") catch {};
+        posix.close(armed[1]);
+        pauseForever();
+    }
+    posix.close(armed[1]);
+    var b: [1]u8 = undefined;
+    if (try posix.read(armed[0], &b) != 1) return error.StubNotArmed;
+    return pid;
+}
+
+/// Kill and reap a stub the runtime has not reaped. A reaped pid may be
+/// recycled, so callers pass only pids still tracked as live.
+fn killStub(sup: *const Supervisor) void {
+    const pid = sup.child_pid orelse return;
+    _ = std.c.kill(pid, posix.SIG.KILL);
+    reap(pid);
+}
+
+fn armedTimers(rt: *Runtime) u32 {
+    return rt.loop.wheel.entries.count();
+}
+
+/// Wait up to `ms` for `fd` to turn readable on a private kqueue.
+fn readableWithin(fd: posix.fd_t, ms: i64) !bool {
+    var tw = try TestWait.init();
+    defer tw.deinit();
+    var ev = [_]std.c.Kevent{.{
+        .ident = @intCast(fd),
+        .filter = std.c.EVFILT.READ,
+        .flags = std.c.EV.ADD,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    try testing.expectEqual(0, std.c.kevent(tw.kq, &ev, 1, &ev, 0, null));
+    tw.armDeadline(TestWait.wait_deadline_ident, ms);
+    var out: std.c.Kevent = undefined;
+    return tw.waitOne(&out) != null;
+}
+
+test "Runtime: a missing ready socket is not polled; its directory event probes it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const run_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(run_dir);
+    const sock_path = try std.fmt.allocPrint(testing.allocator, "{s}/late.sock", .{run_dir});
+    defer testing.allocator.free(sock_path);
+
+    var sup = try Supervisor.init("/nonexistent", &.{}, 1);
+    var children = [_]ChildCtl{
+        .{ .name = "stub", .pid_file = "stub.pid", .exe_base = "stub", .ready_socket = sock_path, .sup = &sup },
+    };
+    var limits = test_limits;
+    limits.ready_ms = 5_000;
+    var rt = try Runtime.init(testing.allocator, children[0..], run_dir, limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, try forkStub(-1, false));
+    defer killStub(&sup);
+    rt.phase = .starting;
+    rt.pending = children.len;
+    try rt.armGate(0);
+
+    // One probe found no socket. Only the readiness deadline is armed:
+    // no retry timer stands in for the directory watch.
+    try testing.expectEqual(@as(usize, 1), rt.probe_count);
+    try testing.expect(rt.gates[0].retry_timer == null);
+    try testing.expectEqual(@as(u32, 1), armedTimers(&rt));
+
+    const listener = try listenUnix(sock_path);
+    defer posix.close(listener);
+    while (rt.ready_count == 0 and !rt.start_failed) try rt.step();
+    try testing.expect(!rt.start_failed);
+    try testing.expectEqual(@as(usize, 1), rt.ready_count);
+    // Directory events alone drove the probes.
+    try testing.expect(rt.probe_count <= 3);
+    // The readiness deadline was cancelled with the gate.
+    try testing.expectEqual(@as(u32, 0), armedTimers(&rt));
+}
+
+test "Runtime: a stale socket file is retried a bounded number of times, not polled" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const run_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(run_dir);
+    const sock_path = try std.fmt.allocPrint(testing.allocator, "{s}/stale.sock", .{run_dir});
+    defer testing.allocator.free(sock_path);
+    // A crashed child's socket: the file stays, connects are refused.
+    posix.close(try listenUnix(sock_path));
+
+    var sup = try Supervisor.init("/nonexistent", &.{}, 1);
+    var children = [_]ChildCtl{
+        .{ .name = "stub", .pid_file = "stub.pid", .exe_base = "stub", .ready_socket = sock_path, .sup = &sup },
+    };
+    var limits = test_limits;
+    limits.ready_ms = 5_000;
+    var rt = try Runtime.init(testing.allocator, children[0..], run_dir, limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, try forkStub(-1, false));
+    defer killStub(&sup);
+    rt.phase = .starting;
+    rt.pending = children.len;
+    try rt.armGate(0);
+
+    // The refused budget runs out and the prober goes quiet; without the
+    // cap the retry would run until the readiness deadline failed start.
+    while (rt.gates[0].retry_timer != null and !rt.start_failed) try rt.step();
+    try testing.expect(!rt.start_failed);
+    try testing.expectEqual(@as(usize, 1) + limits.probe_refused_max, rt.probe_count);
+    try testing.expectEqual(@as(u32, 1), armedTimers(&rt));
+
+    // The child replacing its socket wakes the prober through the
+    // directory watch.
+    try tmp.dir.deleteFile("stale.sock");
+    const listener = try listenUnix(sock_path);
+    defer posix.close(listener);
+    while (rt.ready_count == 0 and !rt.start_failed) try rt.step();
+    try testing.expect(!rt.start_failed);
+    try testing.expectEqual(@as(usize, 1), rt.ready_count);
+}
+
+test "Runtime: a second TERM replaces the TERM-grace deadline instead of stacking it" {
+    var sup = try Supervisor.init("/nonexistent", &.{}, 1);
+    var children = [_]ChildCtl{
+        .{ .name = "stub", .pid_file = "stub.pid", .exe_base = "stub", .sup = &sup },
+    };
+    var rt = try Runtime.init(testing.allocator, children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, try forkStub(-1, true));
+    defer killStub(&sup);
+
+    const term: net.loop.SignalEvent = .{ .signo = posix.SIG.TERM, .count = 1 };
+    rt.onSignal(term);
+    try testing.expectEqual(Phase.stopping, rt.phase);
+    try testing.expectEqual(@as(u32, 1), armedTimers(&rt));
+    // The repeat TERM escalates. A stale TERM-grace deadline left armed
+    // would fire inside the SIGKILL grace and give up early.
+    rt.onSignal(term);
+    try testing.expectEqual(Phase.killing, rt.phase);
+    try testing.expectEqual(@as(u32, 1), armedTimers(&rt));
+    try testing.expect(rt.shutdown_timer != null);
+
+    while (rt.running) try rt.step();
+    try testing.expect(sup.child_pid == null);
+}
+
+/// Child a's respawn is refused parent-side (its run uid has no passwd
+/// entry, which the supervisor logs at err); child b must then be
+/// terminated, not orphaned. Runs under runCaptured so the err log stays
+/// out of the test process. 0 on success, a distinct code per mismatch.
+fn childRespawnFailure() callconv(.c) u8 {
+    var sup_a = Supervisor.init("/nonexistent", &.{}, 1) catch return 10;
+    sup_a.uid = 0x7fff_fff0;
+    sup_a.backoff_ns = 10 * std.time.ns_per_ms;
+    var sup_b = Supervisor.init("/nonexistent", &.{}, 1) catch return 11;
+    var children = [_]ChildCtl{
+        .{ .name = "a", .pid_file = "a.pid", .exe_base = "stub", .sup = &sup_a },
+        .{ .name = "b", .pid_file = "b.pid", .exe_base = "stub", .sup = &sup_b },
+    };
+    const pid_a = forkStub(-1, false) catch return 12;
+    sup_a.child_pid = pid_a;
+    defer killStub(&sup_a);
+    const pid_b = forkStub(-1, false) catch return 13;
+    sup_b.child_pid = pid_b;
+    defer killStub(&sup_b);
+    var rt = Runtime.init(std.heap.page_allocator, children[0..], "/nonexistent", test_limits) catch return 14;
+    defer rt.deinit();
+    rt.adoptChild(0, pid_a) catch return 15;
+    rt.adoptChild(1, pid_b) catch return 16;
+
+    _ = std.c.kill(pid_a, posix.SIG.KILL);
+    while (rt.running) rt.step() catch return 17;
+    if (!rt.runtime_failed) return 2;
+    if (sup_b.child_pid != null) return 3;
+    return 0;
+}
+
+test "Runtime: a failed respawn shuts the remaining children down" {
+    const captured = try supervisor_mod.runCaptured(childRespawnFailure);
+    const stderr = captured.stderr[0..captured.len];
+    if (captured.status != 0) std.debug.print("child status {d}, stderr:\n{s}\n", .{ captured.status, stderr });
+    try testing.expectEqual(@as(u8, 0), captured.status);
+    try testing.expect(std.mem.indexOf(u8, stderr, "failed to respawn a: error.PasswdLookupFailed; shutting down") != null);
+}
+
+test "Runtime: deadlines that cannot be armed still terminate every child" {
+    // A full timer table: the restart cannot be scheduled, then neither
+    // grace deadline can. Each failure falls through to the next stage,
+    // so the sibling is still signalled before run() returns.
+    var sup_a = try Supervisor.init("/nonexistent", &.{}, 1);
+    var sup_b = try Supervisor.init("/nonexistent", &.{}, 1);
+    var children = [_]ChildCtl{
+        .{ .name = "a", .pid_file = "a.pid", .exe_base = "stub", .sup = &sup_a },
+        .{ .name = "b", .pid_file = "b.pid", .exe_base = "stub", .sup = &sup_b },
+    };
+    const pid_a = try forkStub(-1, false);
+    const pid_b = try forkStub(-1, true);
+    var tw = try TestWait.init();
+    defer tw.deinit();
+    tw.armExit(pid_b);
+    var rt = try Runtime.init(testing.allocator, children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, pid_a);
+    try rt.adoptChild(1, pid_b);
+    defer killStub(&sup_a);
+    defer killStub(&sup_b);
+
+    const filler: net.Token = .{ .index = 0, .gen = 1, .kind = 0x7f };
+    while (true) _ = rt.loop.scheduleIn(60_000, filler) catch break;
+
+    _ = std.c.kill(pid_a, posix.SIG.KILL);
+    while (rt.running) try rt.step();
+    try testing.expect(rt.runtime_failed);
+    try testing.expectEqual(Phase.killing, rt.phase);
+    // b ignores TERM: only the SIGKILL from the escalation ends it.
+    tw.armDeadline(TestWait.wait_deadline_ident, 2_000);
+    var ev: std.c.Kevent = undefined;
+    try testing.expect(tw.waitOne(&ev) != null);
+    try testing.expectEqual(std.c.EVFILT.PROC, ev.filter);
+    reap(pid_b);
+    sup_b.child_pid = null;
+}
+
+test "Runtime: only reaped children lose their pid files" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const run_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(run_dir);
+
+    var sup_a = try Supervisor.init("/nonexistent", &.{}, 1);
+    var sup_b = try Supervisor.init("/nonexistent", &.{}, 1);
+    // b survived the SIGKILL grace: still tracked as live.
+    sup_b.child_pid = std.math.maxInt(posix.pid_t);
+    var children = [_]ChildCtl{
+        .{ .name = "a", .pid_file = "a.pid", .exe_base = "stub", .sup = &sup_a },
+        .{ .name = "b", .pid_file = "b.pid", .exe_base = "stub", .sup = &sup_b },
+    };
+    try tmp.dir.writeFile(.{ .sub_path = "a.pid", .data = "1 1 stub\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.pid", .data = "2 1 stub\n" });
+
+    var rt: Runtime = .{
+        .allocator = testing.allocator,
+        .children = children[0..],
+        .run_dir = run_dir,
+        .limits = test_limits,
+    };
+    rt.removeReapedPidFiles();
+    try testing.expectError(error.FileNotFound, tmp.dir.access("a.pid", .{}));
+    try tmp.dir.access("b.pid", .{});
+}
+
+test "Runtime: a readable readiness pipe with no byte yet keeps waiting" {
+    var sup = try Supervisor.init("/nonexistent", &.{}, 1);
+    var children = [_]ChildCtl{
+        .{ .name = "stub", .pid_file = "stub.pid", .exe_base = "stub", .sup = &sup },
+    };
+    var rt = try Runtime.init(testing.allocator, children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, try forkStub(-1, false));
+    defer killStub(&sup);
+    const p = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer posix.close(p[1]);
+    rt.phase = .starting;
+    rt.pending = children.len;
+    try rt.armGatePipe(0, p[0]);
+
+    // A spurious readable: the read would block, which is not EOF.
+    rt.onReadyByte(.{ .handle = rt.gates[0].pipe_rh.?, .ctx = readyPipeCtx(0), .data = 0, .eof = false, .errno = 0 });
+    try testing.expect(!rt.start_failed);
+    try testing.expect(rt.gates[0].active);
+
+    _ = try posix.write(p[1], "R");
+    while (rt.ready_count == 0 and !rt.start_failed) try rt.step();
+    try testing.expect(!rt.start_failed);
+    try testing.expectEqual(@as(usize, 1), rt.ready_count);
+}
+
+test "Runtime: SIGHUP during startup reaches ready children now and the gated child on readiness" {
+    const hup_a = try posix.pipe();
+    defer posix.close(hup_a[0]);
+    defer posix.close(hup_a[1]);
+    const hup_b = try posix.pipe();
+    defer posix.close(hup_b[0]);
+    defer posix.close(hup_b[1]);
+
+    var sup_a = try Supervisor.init("/nonexistent", &.{}, 1);
+    var sup_b = try Supervisor.init("/nonexistent", &.{}, 1);
+    var children = [_]ChildCtl{
+        .{ .name = "a", .pid_file = "a.pid", .exe_base = "stub", .forward_hup = true, .sup = &sup_a },
+        .{ .name = "b", .pid_file = "b.pid", .exe_base = "stub", .forward_hup = true, .sup = &sup_b },
+    };
+    const pid_a = try forkStub(hup_a[1], false);
+    const pid_b = try forkStub(hup_b[1], false);
+    var rt = try Runtime.init(testing.allocator, children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, pid_a);
+    try rt.adoptChild(1, pid_b);
+    defer killStub(&sup_a);
+    defer killStub(&sup_b);
+
+    // a is ready; b holds the gated sequence.
+    const gate = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer posix.close(gate[1]);
+    rt.phase = .starting;
+    rt.pending = children.len;
+    try rt.armGatePipe(1, gate[0]);
+
+    rt.onSignal(.{ .signo = posix.SIG.HUP, .count = 1 });
+    try testing.expect(try readableWithin(hup_a[0], 2_000));
+    try testing.expect(rt.hup_deferred);
+    try testing.expect(!try readableWithin(hup_b[0], 200));
+
+    _ = try posix.write(gate[1], "R");
+    while (rt.ready_count == 0 and !rt.start_failed) try rt.step();
+    try testing.expect(!rt.start_failed);
+    try testing.expect(!rt.hup_deferred);
+    try testing.expect(try readableWithin(hup_b[0], 2_000));
 }

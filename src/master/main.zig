@@ -543,13 +543,14 @@ pub fn main() !void {
         key_path orelse "(none)",
     });
 
-    // Spawn order is the child table order; shutdown signals dependents
-    // first (reverse). s2s sits between auth and core when enabled. auth
-    // and s2s gate the sequence on their IPC socket: core must not spawn
-    // until each accepts connects.
+    // Spawn order is the child table order (dependencies first); shutdown
+    // signals every child at once. s2s sits between auth and core when
+    // enabled. auth and s2s gate the sequence on their IPC socket: core
+    // must not spawn until each accepts connects. Only auth (both
+    // backends) handles SIGHUP; core and s2s would die on a forwarded one.
     var children_buf: [3]ChildCtl = undefined;
     var child_count: usize = 0;
-    children_buf[child_count] = .{ .name = "auth", .pid_file = "auth.pid", .exe_base = "xmppd-auth", .ready_socket = auth_socket, .sup = &auth_sup };
+    children_buf[child_count] = .{ .name = "auth", .pid_file = "auth.pid", .exe_base = "xmppd-auth", .ready_socket = auth_socket, .forward_hup = true, .sup = &auth_sup };
     child_count += 1;
     if (s2s_enabled) {
         children_buf[child_count] = .{ .name = "s2s", .pid_file = "s2s.pid", .exe_base = "xmppd-s2s", .ready_socket = s2s_socket, .sup = &s2s_sup };
@@ -564,10 +565,12 @@ pub fn main() !void {
     try rt.start();
     rt.run();
 
-    // Clean up child PID files on graceful shutdown
-    for (rt.children) |*ctl| rt.removePidFile(ctl);
+    // Reaped children lose their pid files; a survivor keeps its file
+    // for the next master's orphan cleanup.
+    rt.removeReapedPidFiles();
 
     if (rt.start_failed) return error.StartupFailed;
+    if (rt.runtime_failed) return error.SupervisionFailed;
     log.info("xmppd master shutdown complete", .{});
 }
 

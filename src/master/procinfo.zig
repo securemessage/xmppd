@@ -184,7 +184,7 @@ fn cleanupOrphanTimed(path: []const u8, expected_basename: []const u8, term_ms: 
     // Old-format one-line pid files have no start time: there is no safe
     // tie-break against a recycled pid, so clean up the file and move on.
     if (pid_start == 0) {
-        log.warn("pid file {s} has no start time; orphan guessing stoppers here, NOT killing pid={d}", .{ path, pid });
+        log.warn("pid file {s} has no start time; cannot verify identity, NOT killing pid={d}", .{ path, pid });
         std.fs.cwd().deleteFile(path) catch {};
         return;
     }

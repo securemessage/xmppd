@@ -806,9 +806,9 @@ test "Supervisor: fd remap works under a low RLIMIT_NOFILE" {
 /// state match, and a distinct code naming the mismatch otherwise.
 const captured_stderr_cap = 64 * 1024;
 
-const Captured = struct { status: u8, stderr: [captured_stderr_cap]u8, len: usize };
+pub const Captured = struct { status: u8, stderr: [captured_stderr_cap]u8, len: usize };
 
-fn runCaptured(child_fn: *const fn () callconv(.c) u8) !Captured {
+pub fn runCaptured(child_fn: *const fn () callconv(.c) u8) !Captured {
     const fds = try posix.pipe();
     const pid = posix.fork() catch |err| {
         _ = posix.close(fds[0]);
