@@ -36,6 +36,11 @@ const MAX_BACKOFF_NS: u64 = 30 * std.time.ns_per_s;
 /// If the child runs for this long, reset backoff.
 const STABLE_RUN_NS: u64 = 60 * std.time.ns_per_s;
 
+/// Signals the master watches through EVFILT_SIGNAL. lib/net's watchSignal
+/// installs SIG_IGN, which fork+exec preserves, so the child path resets
+/// these to SIG_DFL: a supervised child must still die on SIGTERM.
+pub const inherited_signals = [_]u8{ posix.SIG.TERM, posix.SIG.INT, posix.SIG.HUP };
+
 /// Init failures: a root process without a run user.
 pub const InitError = error{RunUserRequired};
 
@@ -227,6 +232,18 @@ pub const Supervisor = struct {
             // Reset signal mask — children must not inherit parent's blocked signals
             var empty_mask = posix.sigemptyset();
             posix.sigprocmask(posix.SIG.SETMASK, &empty_mask, null);
+
+            // Dispositions the parent's event watches turned into SIG_IGN
+            // survive exec (POSIX), unlike caught handlers; restore defaults
+            // or the child could never be signalled (T282).
+            for (inherited_signals) |signo| {
+                const dfl: posix.Sigaction = .{
+                    .handler = .{ .handler = posix.SIG.DFL },
+                    .flags = 0,
+                    .mask = posix.sigemptyset(),
+                };
+                posix.sigaction(@intCast(signo), &dfl, null);
+            }
 
             // Drop privileges before exec if configured. setgroups always
             // runs on ANY drop (uid or gid), never gated on gid alone: a
@@ -510,6 +527,40 @@ test "Supervisor: a signal kill is a termination, a stop report is not" {
     }
 }
 
+test "Supervisor: spawned child gets SIG_DFL even when the parent ignores TERM (T282)" {
+    // lib/net's watchSignal turns SIGTERM into SIG_IGN in the master, and
+    // exec preserves an ignored disposition: without the child-side reset
+    // the spawned process could never be terminated by signal.
+    var saved: posix.Sigaction = undefined;
+    const ign: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .flags = 0,
+        .mask = posix.sigemptyset(),
+    };
+    posix.sigaction(posix.SIG.TERM, &ign, &saved);
+    defer posix.sigaction(posix.SIG.TERM, &saved, null);
+
+    // The child proves it is fully exec'd (dispositions reset, fd hygiene
+    // done) by writing a byte over its remapped fd 3 before the TERM lands;
+    // signalling earlier would race the child's own reset path.
+    var p: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &p) != 0) return error.Socketpair;
+    defer posix.close(p[0]);
+
+    var sup = try Supervisor.init("/bin/sh", &.{ "-c", "printf x >&3; exec sleep 60" }, 1);
+    sup.pass_fds = &.{p[1]};
+    const pid = try sup.spawnChild();
+    posix.close(p[1]);
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(p[0], &buf));
+
+    _ = std.c.kill(pid, posix.SIG.TERM);
+    const status = try sup.waitChild();
+    try std.testing.expect(posix.W.IFSIGNALED(status));
+    try std.testing.expectEqual(@as(u32, posix.SIG.TERM), posix.W.TERMSIG(status));
+}
+
 test "Supervisor: child fd hygiene remaps pass_fds to 3..N and closes the rest (T356)" {
     // Three socketpairs: the first two are the pass_fds (child must see them
     // remapped to 3 and 4); the third is a stray the child must NOT have
@@ -755,9 +806,9 @@ test "Supervisor: fd remap works under a low RLIMIT_NOFILE" {
 /// state match, and a distinct code naming the mismatch otherwise.
 const captured_stderr_cap = 64 * 1024;
 
-const Captured = struct { status: u8, stderr: [captured_stderr_cap]u8, len: usize };
+pub const Captured = struct { status: u8, stderr: [captured_stderr_cap]u8, len: usize };
 
-fn runCaptured(child_fn: *const fn () callconv(.c) u8) !Captured {
+pub fn runCaptured(child_fn: *const fn () callconv(.c) u8) !Captured {
     const fds = try posix.pipe();
     const pid = posix.fork() catch |err| {
         _ = posix.close(fds[0]);
