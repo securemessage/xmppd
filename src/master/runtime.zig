@@ -1,4 +1,4 @@
-//! # Runtime — the master's supervisor event machine.
+//! # Runtime: the master's supervisor event machine.
 //!
 //! Owns the lib/net Loop the supervisor runs on (ADR-8): child exits arrive
 //! as EVFILT_PROC NOTE_EXIT events the loop reaps itself (lib/net does the

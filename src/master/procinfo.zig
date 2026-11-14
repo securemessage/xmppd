@@ -1,4 +1,4 @@
-//! # Process identity and pid files — xmppd master
+//! # Process identity and pid files for the xmppd master
 //!
 //! Kernel facts for child and orphan processes (kern.proc.pid kinfo_proc),
 //! the `{run_dir}/{name}.pid` child pid files, and the identity-checked
