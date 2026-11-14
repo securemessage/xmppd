@@ -9,9 +9,13 @@
 # print as INFO; anything NEW fails the check (exit 1), which makes the
 # ratchet one-directional (frames may shrink, never grow into).
 #
-# Symbols keep Zig module naming (<file>.<scope>.<fn>); the src/core match
-# set is built from src/core/*.zig at run time so new core files are
-# covered without a script edit.
+# Symbols keep Zig module naming: files reached through the core module's
+# relative imports carry a directory-qualified stem (worker.worker.*,
+# c2s.session.*), while files that root their own named module carry a
+# bare stem (registry.*, mailbox.*, ring.*). The match set is therefore
+# every directory name and every file stem under src/core, generated from
+# the tree at run time so new files and dirs are covered without a script
+# edit.
 #
 # usage: stack_frames.sh [binary] [threshold_bytes]
 #
@@ -31,7 +35,7 @@ if [ ! -x "$BIN" ]; then
     exit 2
 fi
 
-CORE_MODS=$(ls "$SELF_DIR"/../../src/core/*.zig | xargs -n1 basename | sed 's/\.zig$//' | paste -sd '|' -)
+CORE_MODS=$(find "$SELF_DIR"/../../src/core -name '.*' -prune -o \( -type d ! -name core -o -name '*.zig' \) -print | xargs -n1 basename | sed 's/\.zig$//' | sort -u | paste -sd '|' -)
 CORE_RE="^(${CORE_MODS})\\."
 
 CURRENT=$($OBJDUMP -d --no-show-raw-insn "$BIN" | awk -v t="$THRESH" -v modre="$CORE_RE" '

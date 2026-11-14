@@ -3,10 +3,11 @@
 # v091/measure-m4 merge of master 8086a6a. Caps record the probe immediate;
 # a function fails the check when its frame exceeds its cap or has no cap
 # at all; lower caps as frames shrink.
-fanout.longestEncodedRealJid	210536
+# Symbol names re-keyed to the ADR-12 layout (C7); caps unchanged.
 main.configureServer	173672
 main.main	2710528
-muc_handler.handleMucDiscoItems	176040
-room_registry.RoomRegistry.createRoom	214104
-server.Server.dispatchEvents	77784
-server.Server.run	70600
+muc.fanout.longestEncodedRealJid	210536
+muc.handler.handleMucDiscoItems	176040
+registry.RoomRegistry.createRoom	214104
+worker.worker.Server.dispatchEvents	77784
+worker.worker.Server.run	70600

@@ -3,18 +3,19 @@
 # v091/measure-m4 merge of master 8086a6a (Zig emits __zig_probe_stack;
 # caps record the probe immediate). A function fails the check when its
 # frame exceeds its cap or has no cap at all; lower caps as frames shrink.
+# Symbol names re-keyed to the ADR-12 layout (C7); caps unchanged.
 archive_queue.ArchiveWriteQueue.init	186000
-fanout.longestEncodedRealJid	212224
+c2s.lifecycle.acceptConnections	130112
+c2s.session.Session.init	31520
 listener.Listener.accept	74704
 main.configureServer	167696
 main.main	3067136
 main.workerThread	710848
-muc_handler.handleMucDiscoItems	178448
-muc_handler.handleMucGroupchat	17024
-presence_handler.sendPresenceProbes	17040
-room_registry.RoomRegistry.createRoom	275920
-server.Server.initFromFdOpts	2132640
-server.Server.initWithMaxSessions	2488096
-server.Server.run	66608
-server.Session.init	31520
-session_lifecycle.acceptConnections	130112
+muc.fanout.longestEncodedRealJid	212224
+muc.handler.handleMucDiscoItems	178448
+muc.handler.handleMucGroupchat	17024
+presence.handler.sendPresenceProbes	17040
+registry.RoomRegistry.createRoom	275920
+worker.worker.Server.initFromFdOpts	2132640
+worker.worker.Server.initWithMaxSessions	2488096
+worker.worker.Server.run	66608
