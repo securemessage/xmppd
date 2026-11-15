@@ -2,8 +2,12 @@
     .name = .xmppd,
     .version = "0.15.2",
     .dependencies = .{
+        // git.morante.net is internal-only; its public DNS view serves an
+        // unrelated landing page, so CI and external clones cannot fetch the
+        // archive there. The same upstream tarball (byte-identical, same
+        // multihash) is mirrored as a generic package on this forge.
         .dane = .{
-            .url = "https://git.morante.net/pacyworld/dane-zig/archive/79469b549f340f164d2c44daa472d5d45b197de3.tar.gz",
+            .url = "https://pacyworld.dev/api/packages/pacyworld/generic/dane-zig/0.0.0-79469b5/dane-zig-79469b5.tar.gz",
             .hash = "dane-0.0.0-AzKYs1C7CAC8qi4EzYsp5IDnjOcQq73Lo4Ta5oi0a86B",
         },
         .lmdb = .{
