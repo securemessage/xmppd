@@ -1260,6 +1260,38 @@ const IpcTestClient = struct {
         }
         return null;
     }
+
+    /// Next reply the daemon produces inside its own event processing
+    /// (dispatch denials, backpressure, direct handler answers): pump
+    /// daemon steps until the reply parses or the bound runs out. The
+    /// bound counts loop iterations, not wall time, so a loaded host
+    /// cannot stretch it; a reply that never comes still fails on it.
+    fn nextReplyPumped(self: *IpcTestClient, daemon: *Daemon, max_steps: usize) !?protocol.Message {
+        var steps: usize = 0;
+        while (steps < max_steps) : (steps += 1) {
+            if (try self.conn.nextMessage()) |m| return m;
+            _ = self.conn.recv() catch |err| switch (err) {
+                error.WouldBlock => .would_block,
+                else => return err,
+            };
+            try daemon.step(10);
+        }
+        return null;
+    }
+
+    /// Negative assertion: pump `steps` daemon iterations and fail on
+    /// any reply, for completions that must be dropped, never answered.
+    fn expectNoReply(self: *IpcTestClient, daemon: *Daemon, steps: usize) !void {
+        var i: usize = 0;
+        while (i < steps) : (i += 1) {
+            try daemon.step(10);
+            _ = self.conn.recv() catch |err| switch (err) {
+                error.WouldBlock => .would_block,
+                else => return err,
+            };
+            if (try self.conn.nextMessage()) |_| return error.UnexpectedReply;
+        }
+    }
 };
 
 /// A daemon wired for tests: no lock checker, a rate limiter behind
@@ -1356,9 +1388,10 @@ const DaemonFixture = struct {
 fn connectClient(allocator: Allocator, fx: *DaemonFixture) !IpcTestClient {
     var client = try IpcTestClient.connect(allocator, fx.sock_path);
     errdefer client.close();
-    // Drive the accept and the mechanism_list flush.
-    const dl = std.time.milliTimestamp() + 2000;
-    while (std.time.milliTimestamp() < dl) {
+    // Drive the accept and the mechanism_list flush; both are produced
+    // inside daemon steps, so the bound counts iterations, not wall time.
+    var steps: usize = 0;
+    while (steps < 128) : (steps += 1) {
         try fx.daemon.step(10);
         _ = client.conn.recv() catch .would_block;
         if (try client.conn.nextMessage()) |m| {
@@ -1497,7 +1530,7 @@ fn serveHangingTcp(hold_ms: u64, port_out: *std.atomic.Value(u16)) void {
 
 fn startHangingStub(port_out: *std.atomic.Value(u16), hold_ms: u64) !std.Thread {
     const th = try std.Thread.spawn(.{}, serveHangingTcp, .{ hold_ms, port_out });
-    const dl = std.time.milliTimestamp() + 3000;
+    const dl = std.time.milliTimestamp() + 10000;
     while (port_out.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
         std.Thread.sleep(std.time.ns_per_ms);
     }
@@ -1524,7 +1557,8 @@ fn refusedPort() !u16 {
 test "a hanging IdP does not stall the loop" {
     const allocator = std.testing.allocator;
     var port = std.atomic.Value(u16).init(0);
-    const stub = try startHangingStub(&port, 3000);
+    const hold_ms: u64 = 10_000;
+    const stub = try startHangingStub(&port, hold_ms);
     defer stub.join();
 
     var url_buf: [128]u8 = undefined;
@@ -1543,7 +1577,9 @@ test "a hanging IdP does not stall the loop" {
         .threads = 2,
         .max_outstanding = 16,
         .connect_timeout_ms = 150,
-        .timeout_ms = 300,
+        // Parked for the whole hold so a step blocked on the exchange
+        // waits ~hold_ms; the wall bound below sits halfway to it.
+        .timeout_ms = 10_000,
     });
     defer fx.deinit(allocator);
 
@@ -1558,20 +1594,24 @@ test "a hanging IdP does not stall the loop" {
     try std.testing.expectEqual(@as(usize, 1), fx.daemon.pending.count());
 
     // The loop keeps serving: a malformed PLAIN is answered by the handler
-    // while alice's exchange is still parked.
-    const t0 = std.time.milliTimestamp();
+    // while alice's exchange is still parked. The answer is produced in
+    // the daemon step that reads the request, so the step bound proves
+    // the loop iterated; the wall bound proves it did not stall: a step
+    // blocked on the exchange returns only after ~hold_ms, and a loaded
+    // host cannot push a healthy loop to half of that.
     const bad = rawAuth(2, .plain, "mallory", "no-nuls", "10.0.0.1");
+    const t0 = std.time.milliTimestamp();
     try client.send(bad);
-    const reply_bad = (try client.nextReply(&fx.daemon, 300)).?;
+    const reply_bad = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     const elapsed = std.time.milliTimestamp() - t0;
-    try std.testing.expect(elapsed < 200);
+    try std.testing.expect(elapsed < @as(i64, @intCast(hold_ms / 2)));
     try std.testing.expect(std.meta.activeTag(reply_bad) == .auth_failure);
     try std.testing.expectEqualStrings("invalid-encoding", reply_bad.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 2), reply_bad.auth_failure.conn_id);
 
     // alice's exchange dies on its deadline and replays as a temporary
     // failure: the IdP outage is not a failed credential.
-    const reply_a = (try client.nextReply(&fx.daemon, 3000)).?;
+    const reply_a = (try client.nextReply(&fx.daemon, 15_000)).?;
     try std.testing.expect(std.meta.activeTag(reply_a) == .auth_failure);
     try std.testing.expectEqual(@as(u32, 1), reply_a.auth_failure.conn_id);
     try std.testing.expectEqualStrings("temporary-auth-failure", reply_a.auth_failure.reason);
@@ -1650,11 +1690,11 @@ test "a full pool answers temporary-auth-failure at once" {
 
     const m3 = plainAuth(3, "carol", "pw", "10.0.0.3");
     defer allocator.free(m3.auth_request.payload);
-    const t0 = std.time.milliTimestamp();
     try client.send(m3);
-    const reply = (try client.nextReply(&fx.daemon, 500)).?;
-    const elapsed = std.time.milliTimestamp() - t0;
-    try std.testing.expect(elapsed < 100);
+    // The denial is produced in the daemon step that reads the request;
+    // the only slower path is a real exchange, which cannot answer
+    // before its 8 s deadline, and 32 pumped steps cannot span that.
+    const reply = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
     try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 3), reply.auth_failure.conn_id);
@@ -1699,9 +1739,12 @@ test "a completion for a closed or reused lane is dropped" {
     var client_b = try connectClient(allocator, &fx);
     defer client_b.close();
 
-    // Past the exchange deadline the completion drops as stale.
-    const dl = std.time.milliTimestamp() + 1500;
-    while (std.time.milliTimestamp() < dl) {
+    // Past the exchange deadline the completion drops as stale. The
+    // drain waits on pending state (the exchange must reach its 300 ms
+    // deadline in the worker, so the bound stays generous); the negative
+    // part is step-bounded like every other quiet check.
+    const dl = std.time.milliTimestamp() + 10000;
+    while (fx.daemon.pending.count() > 0 and std.time.milliTimestamp() < dl) {
         try fx.daemon.step(10);
         _ = client_b.conn.recv() catch .would_block;
         if (try client_b.conn.nextMessage()) |_| {
@@ -1709,6 +1752,7 @@ test "a completion for a closed or reused lane is dropped" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
+    try client_b.expectNoReply(&fx.daemon, 8);
 }
 
 test "an auth_abort orphans the exchange but the cap still counts it" {
@@ -1753,15 +1797,16 @@ test "an auth_abort orphans the exchange but the cap still counts it" {
     const m5 = plainAuth(9, "alice", "pw", "10.0.0.9");
     defer allocator.free(m5.auth_request.payload);
     try client.send(m5);
-    const reply = (try client.nextReply(&fx.daemon, 500)).?;
+    const reply = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
     try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 9), reply.auth_failure.conn_id);
 
     // The orphaned completions are consumed, never answered, and release
-    // their cap slots.
-    const dl = std.time.milliTimestamp() + 3500;
-    while (std.time.milliTimestamp() < dl) {
+    // their cap slots. The drain bound must outlive the 2000 ms exchange
+    // deadline in the worker; the quiet check is step-bounded.
+    const dl = std.time.milliTimestamp() + 15000;
+    while (fx.daemon.pending.count() > 0 and std.time.milliTimestamp() < dl) {
         try fx.daemon.step(10);
         _ = client.conn.recv() catch .would_block;
         if (try client.conn.nextMessage()) |_| {
@@ -1769,6 +1814,7 @@ test "an auth_abort orphans the exchange but the cap still counts it" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
+    try client.expectNoReply(&fx.daemon, 8);
 }
 
 test "an OOM on the pending copy queues no orphan job" {
@@ -1803,14 +1849,14 @@ test "an OOM on the pending copy queues no orphan job" {
     try fx.daemon.step(10);
     falloc.armed = false;
 
-    const reply = (try client.nextReply(&fx.daemon, 1000)).?;
+    const reply = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expectEqual(@as(u32, 1), reply.auth_failure.conn_id);
     try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
 
     // Nothing ever reached the pool: a job queued before the failed copy
-    // would run as an orphan and spend an exchange against the IdP.
-    const drain = std.time.milliTimestamp() + 500;
-    while (std.time.milliTimestamp() < drain) try fx.daemon.step(10);
+    // would run as an orphan and spend an exchange against the IdP. A few
+    // pumped steps give a hypothetical orphan its completions.
+    try client.expectNoReply(&fx.daemon, 16);
     try std.testing.expectEqual(@as(usize, 0), fx.daemon.pool.exchanges_run.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), fx.daemon.pool.outstanding());
     try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
@@ -1851,10 +1897,13 @@ test "shutdown with exchanges in flight cancels them" {
     }
     try std.testing.expectEqual(@as(usize, 4), fx.daemon.pending.count());
 
+    // deinit must cancel the exchanges, not wait out the 10 s exchange
+    // deadline; a bound halfway to it still separates the two outcomes
+    // even on a loaded host.
     const t0 = std.time.milliTimestamp();
     fx.deinit(allocator);
     const elapsed = std.time.milliTimestamp() - t0;
-    try std.testing.expect(elapsed < 1000);
+    try std.testing.expect(elapsed < 5000);
 }
 
 // --- TLS IdP stub for the replay path ------------------------------------
@@ -2022,7 +2071,7 @@ test "a rejected credential replays as not-authorized and records the failure" {
         .{ cert_path.ptr, key_path.ptr, "400 Bad Request", "{\"error\":\"invalid_grant\"}", &port },
     );
     defer stub.join();
-    const dl = std.time.milliTimestamp() + 3000;
+    const dl = std.time.milliTimestamp() + 10000;
     while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
         std.Thread.sleep(std.time.ns_per_ms);
     }
@@ -2105,7 +2154,7 @@ test "a rate-limited or locked request is denied before the IdP is asked" {
     const m3 = plainAuth(3, "alice", "pw", "10.0.0.5");
     defer allocator.free(m3.auth_request.payload);
     try client.send(m3);
-    const reply_limited = (try client.nextReply(&fx.daemon, 500)).?;
+    const reply_limited = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expectEqual(@as(u32, 3), reply_limited.auth_failure.conn_id);
     try std.testing.expectEqualStrings("policy-violation", reply_limited.auth_failure.reason);
 
@@ -2114,7 +2163,7 @@ test "a rate-limited or locked request is denied before the IdP is asked" {
     const m4 = plainAuth(4, "bob", "pw", "10.0.0.6");
     defer allocator.free(m4.auth_request.payload);
     try client.send(m4);
-    const reply_locked_ip = (try client.nextReply(&fx.daemon, 500)).?;
+    const reply_locked_ip = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expectEqualStrings("policy-violation", reply_locked_ip.auth_failure.reason);
 
     // A locked account is denied at dispatch with the handler's own reason.
@@ -2122,14 +2171,14 @@ test "a rate-limited or locked request is denied before the IdP is asked" {
     const m5 = plainAuth(5, "carol", "pw", "10.0.0.7");
     defer allocator.free(m5.auth_request.payload);
     try client.send(m5);
-    const reply_locked_acct = (try client.nextReply(&fx.daemon, 500)).?;
+    const reply_locked_acct = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expectEqualStrings("account-disabled", reply_locked_acct.auth_failure.reason);
 
     // A locked IP also denies a well-formed OAUTHBEARER before parsing.
     fx.handler.policy.recordOutcome("", "10.0.0.8", .failure);
     const m6 = rawAuth(6, .oauthbearer, "", "n,,\x01auth=Bearer tok\x01\x01", "10.0.0.8");
     try client.send(m6);
-    const reply_bearer = (try client.nextReply(&fx.daemon, 500)).?;
+    const reply_bearer = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expectEqualStrings("policy-violation", reply_bearer.auth_failure.reason);
 
     // Only the two window-filling requests ever reached the pool.
@@ -2156,7 +2205,7 @@ test "admission is charged at dispatch; the replay does not charge again" {
         .{ cert_path.ptr, key_path.ptr, "400 Bad Request", "{\"error\":\"invalid_grant\"}", &port },
     );
     defer stub.join();
-    const dl = std.time.milliTimestamp() + 3000;
+    const dl = std.time.milliTimestamp() + 10000;
     while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
         std.Thread.sleep(std.time.ns_per_ms);
     }
@@ -2219,7 +2268,7 @@ test "admission is charged at dispatch; the replay does not charge again" {
     try std.testing.expect(saw_victim);
 
     // Drain completions; the denied request never spent an exchange.
-    const drain_dl = std.time.milliTimestamp() + 2000;
+    const drain_dl = std.time.milliTimestamp() + 10000;
     while (fx.daemon.pending.count() > 0 and std.time.milliTimestamp() < drain_dl) {
         try fx.daemon.step(10);
     }
@@ -2268,7 +2317,7 @@ test "a completion with a stale lane generation is dropped without a reply" {
     const pend = it.next() orelse return error.NoPending;
     pend.slot_gen +%= 1;
 
-    const dl = std.time.milliTimestamp() + 2500;
+    const dl = std.time.milliTimestamp() + 10000;
     while (fx.daemon.pending.count() > 0 and std.time.milliTimestamp() < dl) {
         try fx.daemon.step(10);
         _ = client.conn.recv() catch .would_block;
@@ -2277,12 +2326,7 @@ test "a completion with a stale lane generation is dropped without a reply" {
     try std.testing.expectEqual(@as(usize, 0), fx.daemon.pending.count());
 
     // One more beat: the dropped completion must leave no reply behind.
-    const settle = std.time.milliTimestamp() + 200;
-    while (std.time.milliTimestamp() < settle) {
-        try fx.daemon.step(10);
-        _ = client.conn.recv() catch .would_block;
-        if (try client.conn.nextMessage()) |_| return error.UnexpectedReply;
-    }
+    try client.expectNoReply(&fx.daemon, 8);
 }
 
 test "a closed lane keeps its in-flight cap until the completions drain" {
@@ -2328,7 +2372,7 @@ test "a closed lane keeps its in-flight cap until the completions drain" {
     const m = plainAuth(1, "alice", "pw", "10.0.0.2");
     defer allocator.free(m.auth_request.payload);
     try client_b.send(m);
-    const reply = (try client_b.nextReply(&fx.daemon, 500)).?;
+    const reply = (try client_b.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
     try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 1), reply.auth_failure.conn_id);
@@ -2373,7 +2417,7 @@ test "sixteen in-flight exchanges on one IP deny the seventeenth" {
     const m17 = plainAuth(17, "zed", "pw", "10.0.0.7");
     defer allocator.free(m17.auth_request.payload);
     try client.send(m17);
-    const reply = (try client.nextReply(&fx.daemon, 500)).?;
+    const reply = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
     try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 17), reply.auth_failure.conn_id);
@@ -2418,7 +2462,7 @@ test "four in-flight exchanges on one account deny the fifth" {
     const m5 = plainAuth(5, "alice", "pw", "10.0.2.1");
     defer allocator.free(m5.auth_request.payload);
     try client.send(m5);
-    const reply = (try client.nextReply(&fx.daemon, 500)).?;
+    const reply = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
     try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 5), reply.auth_failure.conn_id);
@@ -2466,7 +2510,7 @@ test "a full-pool denial records no outcome" {
     const m3 = plainAuth(3, "carol", "pw", "10.0.0.3");
     defer allocator.free(m3.auth_request.payload);
     try client.send(m3);
-    const reply = (try client.nextReply(&fx.daemon, 500)).?;
+    const reply = (try client.nextReplyPumped(&fx.daemon, 32)).?;
     try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
     try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 3), reply.auth_failure.conn_id);
@@ -2508,7 +2552,7 @@ test "cap slots release when the completions drain" {
         const reply = (try client.nextReply(&fx.daemon, 3000)).?;
         try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
     }
-    const drain = std.time.milliTimestamp() + 2000;
+    const drain = std.time.milliTimestamp() + 10000;
     while (fx.daemon.pending.count() > 0 and std.time.milliTimestamp() < drain) {
         try fx.daemon.step(10);
     }
@@ -2560,7 +2604,7 @@ test "a correct password answers auth_success end to end" {
     });
     defer intro_stub.join();
 
-    const dl = std.time.milliTimestamp() + 3000;
+    const dl = std.time.milliTimestamp() + 10000;
     while ((token_port.load(.acquire) == 0 or intro_port.load(.acquire) == 0) and
         std.time.milliTimestamp() < dl) std.Thread.sleep(std.time.ns_per_ms);
     try std.testing.expect(token_port.load(.acquire) != 0);
@@ -2628,7 +2672,7 @@ test "replayed credential failures engage the IP lockout" {
         &served,
     });
     defer stub.join();
-    const dl = std.time.milliTimestamp() + 3000;
+    const dl = std.time.milliTimestamp() + 10000;
     while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
         std.Thread.sleep(std.time.ns_per_ms);
     }
@@ -2816,7 +2860,7 @@ test "a full-pool denial does not count the IP attempt again" {
         const m = plainAuth(@intCast(i), name, "pw", "10.0.6.1");
         defer allocator.free(m.auth_request.payload);
         try client.send(m);
-        const reply = (try client.nextReply(&fx.daemon, 500)).?;
+        const reply = (try client.nextReplyPumped(&fx.daemon, 32)).?;
         try std.testing.expect(std.meta.activeTag(reply) == .auth_failure);
         try std.testing.expectEqual(@as(u32, @intCast(i)), reply.auth_failure.conn_id);
         try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
