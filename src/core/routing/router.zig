@@ -1310,7 +1310,7 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     try std.testing.expect(!session.sm_overflow);
     try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.oversize_queue_drops.load(.monotonic));
 
-    _ = session.conn.flushSend() catch {};
+    _ = try session.conn.flushSend();
     var wire: [4096]u8 = undefined;
     const n = posix.read(fds[1], &wire) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, wire[0..n], "type='error'") != null);
@@ -1381,7 +1381,7 @@ test "Server: an over-long sender bare JID still delivers live" {
     var changes = ChangeList.init(&change_buf);
     dispatchStanza(&server, &alice, &changes);
 
-    _ = target.conn.flushSend() catch {};
+    _ = try target.conn.flushSend();
     var buf: [2048]u8 = undefined;
     const n = posix.read(target_fds[1], &buf) catch 0;
     try std.testing.expect(n > 0);
@@ -1389,7 +1389,7 @@ test "Server: an over-long sender bare JID still delivers live" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "to='bob@localhost'") != null);
 
     // The sender got no error: the stanza was delivered.
-    _ = alice.conn.flushSend() catch {};
+    _ = try alice.conn.flushSend();
     var abuf: [512]u8 = undefined;
     const an = posix.read(alice_fds[1], &abuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), an);
@@ -1449,7 +1449,7 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
     try std.testing.expectEqual(@as(usize, 0), bob.conn.pendingWriteBytes());
 
     // The sender is told instead.
-    _ = alice.conn.flushSend() catch {};
+    _ = try alice.conn.flushSend();
     var wire: [4096]u8 = undefined;
     const n = posix.read(alice_fds[1], &wire) catch 0;
     try std.testing.expect(n > 0);
@@ -1509,7 +1509,7 @@ test "S14: failed cross-worker resource does not block local delivery" {
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<body>") != null);
 
     // The sender is not bounced: another resource took the message.
-    _ = alice.conn.flushSend() catch {};
+    _ = try alice.conn.flushSend();
     var abuf: [1024]u8 = undefined;
     const an = posix.read(alice_fds[1], &abuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), an);
@@ -1574,7 +1574,7 @@ test "S14: oversize cross-worker stanza falls back to the offline store" {
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
 
     // The sender is not bounced: the message is held, not lost.
-    _ = alice.conn.flushSend() catch {};
+    _ = try alice.conn.flushSend();
     var abuf: [1024]u8 = undefined;
     const an = posix.read(alice_fds[1], &abuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), an);
@@ -1616,7 +1616,7 @@ test "S14: oversize cross-worker stanza with no offline store bounces" {
     var changes = ChangeList.init(&change_buf);
     dispatchStanza(&server, &alice, &changes);
 
-    _ = alice.conn.flushSend() catch {};
+    _ = try alice.conn.flushSend();
     var abuf: [2048]u8 = undefined;
     const an = posix.read(alice_fds[1], &abuf) catch 0;
     try std.testing.expect(an > 0);
@@ -1666,12 +1666,12 @@ test "Server: G4 a near-limit online stanza is bounced when delivery cannot queu
     var changes = ChangeList.init(&change_buf);
     dispatchStanza(&server, alice, &changes);
 
-    _ = bob.conn.flushSend() catch {};
+    _ = try bob.conn.flushSend();
     var bob_buf: [4096]u8 = undefined;
     const bob_n = posix.read(bob_fds[1], &bob_buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), bob_n);
 
-    _ = alice.conn.flushSend() catch {};
+    _ = try alice.conn.flushSend();
     var alice_buf: [4096]u8 = undefined;
     const alice_n = posix.read(alice_fds[1], &alice_buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, alice_buf[0..alice_n], "service-unavailable") != null);
@@ -1738,7 +1738,7 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     var changes = ChangeList.init(&change_buf);
     dispatchStanza(&server, &alice, &changes);
 
-    _ = local.conn.flushSend() catch {};
+    _ = try local.conn.flushSend();
     var wire: [8192]u8 = undefined;
     const wire_len = posix.read(local_fds[1], &wire) catch 0;
     try std.testing.expect(wire_len > 0);
