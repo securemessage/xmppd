@@ -72,4 +72,4 @@ fi
 
 check_auth_binary "$1" 'handler.AuthHandler(user_store.UserStore(lmdb.LmdbBackend))'
 check_auth_binary "$2" 'handler.AuthHandler(oidc.OidcStore)'
-check_symbol "$3" 'iq_handler.handleRegisterSubmit'
+check_symbol "$3" 'iq.dispatch.handleRegisterSubmit'

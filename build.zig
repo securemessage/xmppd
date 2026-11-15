@@ -499,7 +499,7 @@ pub fn build(b: *std.Build) void {
     // --- Core daemon tests ---
 
     const event_loop_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
+        .root_source_file = b.path("src/core/worker/loop.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -603,7 +603,7 @@ pub fn build(b: *std.Build) void {
     // --- Server tests (depends on IPC modules) ---
 
     const server_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/server.zig"),
+        .root_source_file = b.path("src/core/worker_tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -631,7 +631,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const delivery_queue_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/delivery_queue.zig"),
+        .root_source_file = b.path("src/core/xworker/ring.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -700,12 +700,12 @@ pub fn build(b: *std.Build) void {
     });
     server_room_store_mod.addImport("backend", server_backend_mod);
     const server_room_registry_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/room_registry.zig"),
+        .root_source_file = b.path("src/core/muc/registry.zig"),
         .target = target,
         .optimize = optimize,
     });
     const server_room_mailbox_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/room_mailbox.zig"),
+        .root_source_file = b.path("src/core/muc/mailbox.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -973,7 +973,7 @@ pub fn build(b: *std.Build) void {
     // --- Delivery queue tests ---
 
     const delivery_queue_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/delivery_queue.zig"),
+        .root_source_file = b.path("src/core/xworker/ring.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -989,7 +989,7 @@ pub fn build(b: *std.Build) void {
     // --- SM handoff store tests ---
 
     const sm_handoff_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/sm_handoff.zig"),
+        .root_source_file = b.path("src/core/c2s/sm_handoff.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1107,7 +1107,7 @@ pub fn build(b: *std.Build) void {
     // --- S2S main (daemon) tests ---
 
     const s2s_event_loop_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
+        .root_source_file = b.path("src/core/worker/loop.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1313,7 +1313,7 @@ pub fn build(b: *std.Build) void {
     // --- Room mailbox tests ---
 
     const room_mailbox_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/room_mailbox.zig"),
+        .root_source_file = b.path("src/core/muc/mailbox.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1329,7 +1329,7 @@ pub fn build(b: *std.Build) void {
     // --- Room registry tests ---
 
     const room_registry_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/room_registry.zig"),
+        .root_source_file = b.path("src/core/muc/registry.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1346,7 +1346,7 @@ pub fn build(b: *std.Build) void {
     // --- Fan-out tests ---
 
     const fanout_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/fanout.zig"),
+        .root_source_file = b.path("src/core/fanout_tests.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1366,7 +1366,7 @@ pub fn build(b: *std.Build) void {
     // --- SM state tests ---
 
     const sm_state_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/sm_state.zig"),
+        .root_source_file = b.path("src/core/c2s/sm_state.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1381,7 +1381,7 @@ pub fn build(b: *std.Build) void {
     // --- Message (actor model) tests ---
 
     const message_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/message.zig"),
+        .root_source_file = b.path("src/core/xworker/envelope.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1740,7 +1740,7 @@ pub fn build(b: *std.Build) void {
     auth_handler_mod.addImport("invite_store", auth_invite_store_mod);
 
     const auth_event_loop_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
+        .root_source_file = b.path("src/core/worker/loop.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1854,7 +1854,7 @@ pub fn build(b: *std.Build) void {
     oidc_handler_mod.addImport("policy", oidc_policy_mod);
 
     const oidc_event_loop_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
+        .root_source_file = b.path("src/core/worker/loop.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1922,7 +1922,7 @@ pub fn build(b: *std.Build) void {
     s2s_ipc_server_mod.addImport("ipc_protocol", s2s_ipc_protocol_mod);
 
     const s2s_event_loop_exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/event_loop.zig"),
+        .root_source_file = b.path("src/core/worker/loop.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -2229,7 +2229,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     const bench_delivery_mod = b.createModule(.{
-        .root_source_file = b.path("src/core/delivery_queue.zig"),
+        .root_source_file = b.path("src/core/xworker/ring.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });

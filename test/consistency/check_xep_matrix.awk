@@ -4,7 +4,7 @@
 # set is hand-maintained in three places that must agree, with nothing enforcing
 # it. See test/consistency/README.md for rationale.
 #
-# Invoked as:  awk -f check_xep_matrix.awk caps.zig iq_handler.zig README.md
+# Invoked as:  awk -f check_xep_matrix.awk caps.zig iq/dispatch.zig README.md
 # (the wrapper check_xep_matrix.sh resolves those paths). Uses only base-system
 # awk features so it runs under FreeBSD's one-true-awk as well as gawk — no
 # python, no packages, so it works on a bare FreeBSD CI runner.
@@ -60,8 +60,8 @@ index(FILENAME, "caps.zig") {
     next
 }
 
-# ---- iq_handler.zig: the server disco#info feature block ----
-index(FILENAME, "iq_handler.zig") {
+# ---- iq/dispatch.zig: the server disco#info feature block ----
+index(FILENAME, "iq/dispatch.zig") {
     if (index($0, "<identity category='server' type='im'")) { in_disco=1 }
     # T163 single-source mode: the disco#info features are emitted by
     # iterating caps.SERVER_FEATURES via caps.writeDiscoFeatures(), so the

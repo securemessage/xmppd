@@ -18,7 +18,7 @@ for arg in "$@"; do
     esac
 done
 
-for f in src/core/caps.zig src/core/iq_handler.zig README.md; do
+for f in src/core/caps.zig src/core/iq/dispatch.zig README.md; do
     if [ ! -f "$root/$f" ]; then
         echo "error: expected file not found: $f" >&2
         exit 2
@@ -27,5 +27,5 @@ done
 
 exec awk -v strict="$strict" -f "$here/check_xep_matrix.awk" \
     "$root/src/core/caps.zig" \
-    "$root/src/core/iq_handler.zig" \
+    "$root/src/core/iq/dispatch.zig" \
     "$root/README.md"

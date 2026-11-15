@@ -17,11 +17,11 @@ const std = @import("std");
 const xml = @import("xml");
 const xmpp = @import("xmpp");
 
-const server_mod = @import("server.zig");
+const server_mod = @import("../worker/worker.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const caps_mod = server_mod.caps_mod;
-const ChangeList = @import("event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 
 const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;
@@ -29,12 +29,14 @@ const generic_roster = @import("roster_store");
 const store_keys = @import("store_keys");
 const backend_mod = @import("backend");
 const Subscription = generic_roster.Subscription;
-const muc_handler = @import("muc_handler.zig");
-const session_lifecycle = @import("session_lifecycle.zig");
-const iq_handler = @import("iq_handler.zig");
-const fanout = @import("fanout.zig");
-const router = @import("router.zig");
+const muc_handler = @import("../muc/handler.zig");
+const session_lifecycle = @import("../c2s/lifecycle.zig");
+const iq_handler = @import("../iq/dispatch.zig");
+const fanout = @import("../muc/fanout.zig");
+const router = @import("../routing/router.zig");
 const sub_cache_mod = server_mod.sub_cache_mod;
+const presence_sub = @import("subscription.zig");
+const presence_bcast = @import("broadcast.zig");
 
 const log = std.log.scoped(.presence);
 
@@ -534,7 +536,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
                     noteJidOverflow("probe stanza to '{s}' exceeds {d} bytes; skipped", .{ contact_bare, router.JID_STANZA_MAX });
                     continue;
                 };
-                server.sendPresenceViaS2s(bare_jid, contact_bare, probe_xml, changes);
+                presence_bcast.sendPresenceViaS2s(server, bare_jid, contact_bare, probe_xml, changes);
                 continue;
             }
             parts_buf[parts_len] = .{ .local = contact_local, .domain = contact_domain };
@@ -660,7 +662,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     } else {
         roster.setItem(owner_bare, to_str, "", Subscription.none, true) catch return;
     }
-    server.invalidateSubCache(owner_bare);
+    presence_sub.invalidateSubCache(server, owner_bare);
 
     // RFC 6121 §3.1.2: Push roster item to all of owner's interested resources
     iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", result_sub, true, changes);
@@ -698,7 +700,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
 
     // Remote domain? Forward via S2S.
     if (!std.mem.eql(u8, to_jid.domain, server.server_host)) {
-        server.forwardPresenceXmlToS2s(session, owner_bare, to_str, sub_pres_xml, changes);
+        presence_bcast.forwardPresenceXmlToS2s(server, session, owner_bare, to_str, sub_pres_xml, changes);
     } else {
         // RFC 6121 §3.1.3 rule 4: If the contact has no available sessions,
         // store the subscription request for deferred delivery when they come online.
@@ -752,7 +754,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     } else {
         roster.setItem(owner_bare, to_str, "", .from, false) catch return;
     }
-    server.invalidateSubCache(owner_bare);
+    presence_sub.invalidateSubCache(server, owner_bare);
 
     // RFC 6121 §3.1.5: Push updated roster to owner's interested resources
     iq_handler.pushRosterItem(server, bound.local, bound.domain, to_str, "", owner_new_sub, false, changes);
@@ -782,7 +784,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             noteDrop("contact roster insert failed for {s}: {s}", .{ to_str, @errorName(err) });
         };
     }
-    server.invalidateSubCache(to_str);
+    presence_sub.invalidateSubCache(server, to_str);
 
     // RFC 6121 §3.1.5: Push updated roster to contact's interested resources
     const to_jid_parsed = xmpp.Jid.parse(to_str) catch return;
@@ -811,7 +813,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
 
     // Remote domain? Forward via S2S.
     if (!std.mem.eql(u8, to_jid.domain, server.server_host)) {
-        server.forwardPresenceXmlToS2s(session, owner_bare, to_str, sd_pres_xml, changes);
+        presence_bcast.forwardPresenceXmlToS2s(server, session, owner_bare, to_str, sd_pres_xml, changes);
     } else {
         deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sd_pres_xml, changes);
     }
@@ -904,7 +906,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
             log.err("handleUnsubscribe: setItem owner failed: {}", .{e});
             return;
         };
-        server.invalidateSubCache(owner_bare);
+        presence_sub.invalidateSubCache(server, owner_bare);
     }
 
     // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
@@ -926,7 +928,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
                     log.err("handleUnsubscribe: setItem contact failed: {}", .{e});
                     return;
                 };
-                server.invalidateSubCache(to_str);
+                presence_sub.invalidateSubCache(server, to_str);
                 iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
             }
         }
@@ -953,7 +955,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
 
     // Remote domain? Forward via S2S.
     if (!std.mem.eql(u8, to_jid.domain, server.server_host)) {
-        server.forwardPresenceXmlToS2s(session, owner_bare, to_str, unsub_pres_xml, changes);
+        presence_bcast.forwardPresenceXmlToS2s(server, session, owner_bare, to_str, unsub_pres_xml, changes);
     } else {
         deliverPresenceToTarget(server, to_jid.local, to_jid.domain, unsub_pres_xml, changes);
     }
@@ -992,7 +994,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
             log.err("handleUnsubscribed: setItem owner failed: {}", .{e});
             return;
         };
-        server.invalidateSubCache(owner_bare);
+        presence_sub.invalidateSubCache(server, owner_bare);
     }
 
     // RFC 6121 §3.2.2: Push updated roster to owner's interested resources
@@ -1014,7 +1016,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
                     log.err("handleUnsubscribed: setItem contact failed: {}", .{e});
                     return;
                 };
-                server.invalidateSubCache(to_str);
+                presence_sub.invalidateSubCache(server, to_str);
                 iq_handler.pushRosterItem(server, to_jid_parsed.local, to_jid_parsed.domain, owner_bare, "", contact_new_sub, false, changes);
             }
         }
@@ -1072,7 +1074,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
 
     // Remote domain? Forward via S2S.
     if (!std.mem.eql(u8, to_jid.domain, server.server_host)) {
-        server.forwardPresenceXmlToS2s(session, owner_bare, to_str, unsd_pres_xml, changes);
+        presence_bcast.forwardPresenceXmlToS2s(server, session, owner_bare, to_str, unsd_pres_xml, changes);
     } else {
         deliverPresenceToTarget(server, to_jid.local, to_jid.domain, unsd_pres_xml, changes);
     }
@@ -1397,7 +1399,7 @@ fn deliverPresenceToSubscribers(
 
             // Remote domain? Forward via S2S.
             if (!std.mem.eql(u8, sub_domain, server.server_host)) {
-                server.sendPresenceViaS2s(sender_bare, sub_bare_jid, presence_xml, changes);
+                presence_bcast.sendPresenceViaS2s(server, sender_bare, sub_bare_jid, presence_xml, changes);
                 continue;
             }
             parts_buf[parts_len] = .{ .local = sub_local, .domain = sub_domain };

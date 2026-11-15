@@ -23,12 +23,12 @@ const std = @import("std");
 const xml = @import("xml");
 const room_registry = @import("room_registry");
 const delivery_queue_mod = @import("delivery_queue");
-const connection_mod = @import("connection.zig");
-const jid_bounds = @import("jid_bounds.zig");
+const connection_mod = @import("../connection.zig");
+const address = @import("../routing/address.zig");
 const Room = room_registry.Room;
 const Occupant = room_registry.Occupant;
 const RoomRegistry = room_registry.RoomRegistry;
-const ChangeList = @import("event_loop.zig").ChangeList;
+const ChangeList = @import("../worker/loop.zig").ChangeList;
 
 const log = std.log.scoped(.fanout);
 
@@ -42,7 +42,7 @@ pub const MAX_PENDING: usize = 4;
 /// "<message|presence from='" plus an occupant JID (a maximum-length room
 /// bare JID, '/', and a nick) plus "' to='", so it must hold a full JID in
 /// the worst case rather than truncate the stanza mid-attribute.
-pub const PREFIX_CAPACITY: usize = jid_bounds.FULL_JID_MAX;
+pub const PREFIX_CAPACITY: usize = address.FULL_JID_MAX;
 pub const SUFFIX_CAPACITY: usize = 16500;
 
 /// A pending fan-out operation that delivers a pre-built stanza to room
@@ -54,7 +54,7 @@ pub const PendingFanout = struct {
     next_slot: u8 = 0,
 
     /// Room JID for safe re-lookup (room may have been destroyed between ticks).
-    room_jid_buf: [jid_bounds.BARE_JID_MAX]u8 = undefined,
+    room_jid_buf: [address.BARE_JID_MAX]u8 = undefined,
     room_jid_len: u16 = 0,
 
     /// Pre-built stanza prefix: everything up to and including " to='"

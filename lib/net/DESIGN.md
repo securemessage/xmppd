@@ -521,7 +521,7 @@ change buffer is sized from `handles_max`; the wake pipe and its `wake_pending` 
 
 | Today [V] | Replaced by | Adopted in |
 |---|---|---|
-| `src/core/event_loop.zig` `EventLoop.addFd/removeFd/modifyFd/addFdOneshot` (one kevent per call) | staged `attach`/`setInterest`, committed once per `wait` | per daemon, ADR-8 order |
+| `src/core/worker/loop.zig` `EventLoop.addFd/removeFd/modifyFd/addFdOneshot` (one kevent per call) | staged `attach`/`setInterest`, committed once per `wait` | per daemon, ADR-8 order |
 | `ChangeList` (raw kevents, fixed buffer, `ChangeListFull`, `reserve`/`beginReserved`) | dirty list plus reconciliation; buffer sized `2 x handles_max`, cannot overflow | same |
 | `ChangeList.purgeFd` swap-remove (S20) and `assertNoPurgedEntries` | tombstoned dirty-list removal; raw kevents only exist inside `wait` | same |
 | `keventHardened` (drops receipts, logs, re-issues, isolates one by one) | eventlist always `>= changes`; every failure is a `change_failed` event | same |
@@ -533,7 +533,7 @@ change buffer is sized from `handles_max`; the wake pipe and its `wake_pending` 
 | Wake pipes in `delivery_queue.zig`, `archive_queue.zig`, `crypto_pool.zig`, `lib/xmppc/engine.zig` | `Wake` | C4, Q8/D2, A9, WS8 |
 | private kqueues in `archive_queue.zig`, `lib/xmppc/engine.zig` (`catch {}` at :699) | `Loop` | D2, WS8 |
 
-`src/core/event_loop.zig` is deleted when its last consumer moves (core, C2/C3).
+`src/core/worker/loop.zig` is deleted when its last consumer moves (core, C2/C3).
 
 ## 13. Scale model (event-driven-systems section 0)
 
@@ -637,7 +637,7 @@ Result: **PASS** for the library, with Q7 to settle.
   kqueue core can stay portable to macOS at small cost; Linux would be a separate
   backend.
 - **Q5 signals and processes.** Not in the F2 list, but the master mapping needs them and
-  `src/core/event_loop.zig` cannot be deleted without them. Proposal: include (item 7).
+  `src/core/worker/loop.zig` cannot be deleted without them. Proposal: include (item 7).
 - **Q6 read model.** Persistent `EV_CLEAR` read plus `requeue` for fairness budgets
   (F3 Inbox can stop after N bytes and requeue). Alternative: `EV_DISPATCH` read with
   explicit re-arm per read, which costs one change per read. Proposal: EV_CLEAR.
