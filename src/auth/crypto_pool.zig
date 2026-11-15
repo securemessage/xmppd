@@ -857,11 +857,20 @@ test "CryptoPool: no plaintext left on the worker stack" {
 
     const job_addr = test_worker_job_addr.load(.acquire);
     try std.testing.expect(job_addr != 0);
-    std.Thread.sleep(20 * std.time.ns_per_ms);
 
     // The worker samples its own copy at scope exit, before the next
     // iteration re-poisons the frame: a missed wipe leaves the marker
-    // readable then.
+    // readable then. The flag stores after finish() already published
+    // the job's completion, so no completion event orders after it; the
+    // next ordering point would be a later job's pickup, which reuses
+    // the frame this test scans. Poll the flag itself inside a deadline:
+    // a loaded host can delay the worker past any fixed pause.
+    const sample_dl = std.time.milliTimestamp() + 10000;
+    while (!test_worker_pw_zeroed.load(.acquire) and
+        std.time.milliTimestamp() < sample_dl)
+    {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
     try std.testing.expect(test_worker_pw_zeroed.load(.acquire));
 
     // Any second plaintext image the pickup left elsewhere in the frame
