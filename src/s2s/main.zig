@@ -601,7 +601,10 @@ pub const S2sDaemon = struct {
             posix.connect(sock, &t.addr.any, t.addr.getOsSockLen()) catch |err| {
                 switch (err) {
                     error.WouldBlock => {},
+                    // A synchronous connect error is this target's
+                    // failure: log it and try the next one.
                     else => {
+                        log.warn("outbound {s}: connect to {s}:{d} failed synchronously: {s}", .{ conn.remote_domain, t.host, t.addr.getPort(), @errorName(err) });
                         posix.close(sock);
                         continue;
                     },
@@ -8211,6 +8214,35 @@ test "S2sDaemon: a connect deadline advances to the next target" {
     try std.testing.expect(conn.fd >= 0);
     try std.testing.expect(conn.deadline_ident != 0 and conn.deadline_ident != ident0);
     try std.testing.expectEqual(l2.port, conn.target_port);
+}
+
+test "S2sDaemon: a synchronous connect error advances to the next target" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // 255.255.255.255 is the broadcast address: connect(2) fails it
+    // synchronously (EACCES without SO_BROADCAST). The failure belongs
+    // to that target, so the live listener behind it is tried and the
+    // conn ends up armed on it.
+    const live = try silentListener(false);
+    defer posix.close(live.fd);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{
+        .{ .addr = "255.255.255.255" },
+        .{ .addr = "127.0.0.1", .port = live.port },
+    }));
+
+    try std.testing.expectEqual(@as(usize, 1), conn.target_idx);
+    try std.testing.expect(conn.fd >= 0);
+    try std.testing.expect(conn.deadline_ident != 0);
+    try std.testing.expectEqual(live.port, conn.target_port);
+    const slot = daemon.findOutboundSlot(conn).?;
+    try std.testing.expect(daemon.outbound[slot] == conn);
 }
 
 test "S2sDaemon: targets that all failed TLSA lookup bounce temporary" {
