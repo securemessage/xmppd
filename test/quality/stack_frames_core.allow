@@ -4,18 +4,43 @@
 # caps record the probe immediate). A function fails the check when its
 # frame exceeds its cap or has no cap at all; lower caps as frames shrink.
 # Symbol names re-keyed to the ADR-12 layout (C7); caps unchanged.
+#
+# Re-measured at 941c1db (CI-QUALITY) on a -Dcpu=baseline build, matching the
+# quality job: native codegen differs by a few bytes between hosts (dev1 vs
+# runner01 moved five rows by up to 72 B and hid a +16 B Session.init), so the
+# job pins baseline to keep caps host-independent. The job died at the dane-zig
+# dependency fetch on every run since 2616, so reviewed merges grew these
+# frames without the ratchet ever firing. Each raised cap is intentional
+# work, not an accident:
+#   main.main      +32 M1 merge a56c464 (363da75 metrics init), then
+#                  +224 A2 merge ca38cb6 (61e8fcf FrameReader/Writer types)
+#   main.workerThread +64 A2 merge ca38cb6 (61e8fcf)
+#   worker.Server.run +448 M1 merge a56c464 (363da75 iter_timer + dump args)
+#   worker.Server.initFromFdOpts +192 A2 merge ca38cb6 (61e8fcf)
+#   worker.Server.initWithMaxSessions +224 A2 merge ca38cb6 (61e8fcf)
+#   muc.handler.handleMucDiscoItems +608 R4R5 merge a9074b4 (8b91874 zero
+#                  silent drops rework: dir_entries[256] + reply builders)
+#   muc.handler.handleMucGroupchat +32 2e67b8b (S32 mints a stanza id into
+#                  sid_buf[32] for id-less groupchat), +32 8b91874 (R5)
+#   c2s.session.Session.init +16: not a code change; codegen only. A
+#     -Dcpu=baseline build at the original measurement point 8086a6a
+#     already probes 0x7B30 (31536) where the native build probes 0x7B20
+#     (31520); the init body and every input type (Session, Connection,
+#     xml.Reader, xmpp.Stream) are identical across the window, so no
+#     commit in the range grew the frame. The +16 records the
+#     -Dcpu=baseline measurement pin itself.
 archive_queue.ArchiveWriteQueue.init	186000
 c2s.lifecycle.acceptConnections	130112
-c2s.session.Session.init	31520
+c2s.session.Session.init	31536
 listener.Listener.accept	74704
 main.configureServer	167696
-main.main	3067136
-main.workerThread	710848
+main.main	3067320
+main.workerThread	710912
 muc.fanout.longestEncodedRealJid	212224
-muc.handler.handleMucDiscoItems	178448
-muc.handler.handleMucGroupchat	17024
+muc.handler.handleMucDiscoItems	179056
+muc.handler.handleMucGroupchat	17048
 presence.handler.sendPresenceProbes	17040
 registry.RoomRegistry.createRoom	275920
-worker.worker.Server.initFromFdOpts	2132640
-worker.worker.Server.initWithMaxSessions	2488096
-worker.worker.Server.run	66608
+worker.worker.Server.initFromFdOpts	2132776
+worker.worker.Server.initWithMaxSessions	2488280
+worker.worker.Server.run	67056

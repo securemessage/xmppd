@@ -24,12 +24,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # archive-storage=lmdb keeps the build package-free (see multiworker).
+      # cpu=baseline pins codegen so frame sizes are identical on every host;
+      # native targets differ by a few bytes per host and make caps fragile.
       - name: Build xmppd-core
-        run: zig build -Darchive-storage=lmdb
+        run: zig build -Darchive-storage=lmdb -Dcpu=baseline
       - name: Stack-frame report Debug (no new frames over 16 KiB in src/core)
         run: sh test/quality/stack_frames.sh zig-out/bin/xmppd-core
       - name: Build xmppd-core (ReleaseSafe)
-        run: zig build -Darchive-storage=lmdb -Doptimize=ReleaseSafe
+        run: zig build -Darchive-storage=lmdb -Dcpu=baseline -Doptimize=ReleaseSafe
       - name: Stack-frame report ReleaseSafe (no new frames over 16 KiB in src/core)
         run: ALLOW=test/quality/stack_frames_core_rs.allow sh test/quality/stack_frames.sh zig-out/bin/xmppd-core
       - name: Silent-catch ratchet

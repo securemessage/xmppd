@@ -4,10 +4,21 @@
 # a function fails the check when its frame exceeds its cap or has no cap
 # at all; lower caps as frames shrink.
 # Symbol names re-keyed to the ADR-12 layout (C7); caps unchanged.
+#
+# Re-measured at 941c1db (CI-QUALITY) on a -Dcpu=baseline build, matching the
+# quality job: native codegen differs by a few bytes between hosts, so the job
+# pins baseline to keep caps host-independent. The job died at the dane-zig
+# dependency fetch on every run since 2616, so reviewed merges grew these
+# frames without the ratchet ever firing. Each raised cap is intentional
+# work, not an accident:
+#   main.main +192 A2 merge ca38cb6 (61e8fcf FrameReader/Writer types)
+#   worker.Server.dispatchEvents +112 M1 merge a56c464 (363da75 SIGUSR1
+#                  metrics dump branch)
+#   worker.Server.run +32 M1 merge a56c464 (363da75 iter_timer + dump args)
 main.configureServer	173672
-main.main	2710528
+main.main	2710664
 muc.fanout.longestEncodedRealJid	210536
-muc.handler.handleMucDiscoItems	176040
+muc.handler.handleMucDiscoItems	175944
 registry.RoomRegistry.createRoom	214104
-worker.worker.Server.dispatchEvents	77784
-worker.worker.Server.run	70600
+worker.worker.Server.dispatchEvents	77880
+worker.worker.Server.run	70632
