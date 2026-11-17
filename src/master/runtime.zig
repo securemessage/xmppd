@@ -7,6 +7,10 @@
 //! arrive as EVFILT_SIGNAL. Nothing in this file sleeps or waitpid-blocks.
 //! HUP is forwarded only to children that declare `forward_hup`: core and
 //! s2s install no HUP handler, and the default action would kill them.
+//! HUP also re-resolves each child's run identity through a short-lived
+//! worker thread whose completion byte lands on the loop (T431): no NSS
+//! call, and no blocking work at all beyond fork itself, runs on the
+//! respawn path.
 //!
 //! ## Shutdown
 //!
@@ -73,6 +77,8 @@ const probe_kq_kind: u8 = 0x84;
 const probe_retry_kind: u8 = 0x85;
 /// Timer ctx kind for the per-child readiness deadline.
 const ready_deadline_kind: u8 = 0x86;
+/// Handle ctx kind for the SIGHUP run-identity refresh completion pipe.
+const ident_pipe_kind: u8 = 0x87;
 
 fn restartCtx(idx: usize) net.Token {
     return .{ .index = @intCast(idx), .gen = 1, .kind = restart_kind };
@@ -96,6 +102,20 @@ fn probeRetryCtx(idx: usize) net.Token {
 
 fn readyDeadlineCtx(idx: usize) net.Token {
     return .{ .index = @intCast(idx), .gen = 1, .kind = ready_deadline_kind };
+}
+
+fn identPipeCtx() net.Token {
+    return .{ .index = 0, .gen = 1, .kind = ident_pipe_kind };
+}
+
+/// CLOCK.MONOTONIC in nanoseconds for the respawn-path measurements
+/// (T431); 0 when the clock read itself fails.
+fn monotonicNs() i128 {
+    const ts = posix.clock_gettime(.MONOTONIC) catch |err| {
+        log.warn("clock_gettime MONOTONIC failed: {}", .{err});
+        return 0;
+    };
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
 /// One supervised child in the runtime table.
@@ -200,8 +220,28 @@ pub const Runtime = struct {
     runtime_failed: bool = false,
     /// Readiness bytes consumed; tests assert the gate path ran.
     ready_count: usize = 0,
+    /// SIGHUP run-identity refresh (T431): getpwuid_r is a blocking NSS
+    /// call that never runs on the loop. A short-lived thread re-resolves
+    /// each child's gid into the ident_* scratch arrays, then writes a
+    /// completion byte on ident_pipe[1]; the loop's readable event applies
+    /// the results. One refresh at a time; a HUP during a refresh queues
+    /// exactly one more. Both pipe ends are nonblocking: a WouldBlock
+    /// write only means an unconsumed byte already has a readable event
+    /// pending, which applies this same result.
+    ident_pipe: [2]posix.fd_t = .{ -1, -1 },
+    ident_h: ?net.Token = null,
+    ident_thread: ?std.Thread = null,
+    /// Worker to loop handshake: set after the ident_* arrays are
+    /// written, before the completion byte is sent.
+    ident_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    ident_again: bool = false,
+    ident_gids: []posix.gid_t = &.{},
+    ident_valid: []bool = &.{},
+    /// False when any lookup failed; written by the worker before
+    /// ident_done and read by the loop after it.
+    ident_ok: bool = true,
 
-    pub const InitError = net.loop.InitError || net.Loop.WatchSignalError;
+    pub const InitError = net.loop.InitError || net.Loop.WatchSignalError || error{ PipeFailed, HandleTableFull };
 
     /// Create the loop and claim TERM/INT/HUP through EVFILT_SIGNAL.
     pub fn init(
@@ -227,10 +267,41 @@ pub const Runtime = struct {
         try rt.loop.watchSignal(posix.SIG.TERM);
         try rt.loop.watchSignal(posix.SIG.INT);
         try rt.loop.watchSignal(posix.SIG.HUP);
+        rt.ident_pipe = posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true }) catch |err| {
+            log.err("identity refresh pipe2 failed: {}", .{err});
+            return error.PipeFailed;
+        };
+        errdefer {
+            posix.close(rt.ident_pipe[0]);
+            posix.close(rt.ident_pipe[1]);
+        }
+        rt.ident_gids = try allocator.alloc(posix.gid_t, children.len);
+        errdefer allocator.free(rt.ident_gids);
+        rt.ident_valid = try allocator.alloc(bool, children.len);
+        errdefer allocator.free(rt.ident_valid);
+        @memset(rt.ident_valid, false);
+        rt.ident_h = rt.loop.attach(rt.ident_pipe[0], identPipeCtx(), .{ .read = true }) catch |err| {
+            log.err("cannot attach the identity refresh pipe: {}", .{err});
+            return error.HandleTableFull;
+        };
         return rt;
     }
 
     pub fn deinit(self: *Runtime) void {
+        // Join a refresh thread before its pipe dies: a write into a
+        // closed read end would SIGPIPE the process. NSS on local files
+        // is bounded, so the join cannot stall deinit.
+        if (self.ident_thread) |thr| thr.join();
+        if (self.ident_h) |h| {
+            self.loop.close(h) catch |err| {
+                log.warn("identity pipe close failed: {}", .{err});
+            };
+            self.ident_pipe[0] = -1;
+        }
+        if (self.ident_pipe[0] >= 0) posix.close(self.ident_pipe[0]);
+        if (self.ident_pipe[1] >= 0) posix.close(self.ident_pipe[1]);
+        self.allocator.free(self.ident_gids);
+        self.allocator.free(self.ident_valid);
         // Loop-attached fds (pipe reads, prober kqueues) die with the
         // loop; the prober-owned write end and directory fd do not.
         for (self.gates) |*g| {
@@ -265,8 +336,13 @@ pub const Runtime = struct {
     }
 
     fn writePidFile(self: *Runtime, ctl: *const ChildCtl, pid: posix.pid_t) void {
+        // A small create+write on the respawn path; the log line keeps
+        // the measured loop cost visible (T431).
+        const t0 = monotonicNs();
         const path = procinfo.pidFilePath(&self.pid_path, self.run_dir, ctl.pid_file) catch return;
         procinfo.writeChildPid(path, pid, ctl.exe_base);
+        const us: u64 = @intCast(@max(0, monotonicNs() - t0) / 1000);
+        log.info("pid file {s} written for {s} pid={d} ({d}us)", .{ ctl.pid_file, ctl.name, pid, us });
     }
 
     /// Remove a child pid file (graceful shutdown path).
@@ -294,6 +370,14 @@ pub const Runtime = struct {
         slot.* = null;
     }
 
+    /// Resolve every child's run identity once, before the loop runs
+    /// (T431): the gated sequence resumes spawns from loop callbacks,
+    /// and no NSS call may run there. SIGHUP refreshes the cache through
+    /// the identity worker.
+    fn resolveIdentities(self: *Runtime) !void {
+        for (self.children) |*ctl| try ctl.sup.resolveRunGid();
+    }
+
     /// Begin the gated spawn sequence. Children spawn in table order; a
     /// child with ready_socket holds the sequence on its readiness byte
     /// before the next spawn. After start(), run() drives the rest.
@@ -306,6 +390,7 @@ pub const Runtime = struct {
                 return error.PathTooLong;
             }
         }
+        try self.resolveIdentities();
         self.advanceStartupInternal();
     }
 
@@ -496,6 +581,7 @@ pub const Runtime = struct {
         switch (io.ctx.kind) {
             ready_pipe_kind => self.onReadyByte(io),
             probe_kq_kind => self.onProbeKq(io),
+            ident_pipe_kind => self.onIdentPipe(io),
             else => {},
         }
     }
@@ -731,7 +817,10 @@ pub const Runtime = struct {
             }
         } else if (s.signo == posix.SIG.HUP) {
             switch (self.phase) {
-                .running, .starting => self.forwardHup(),
+                .running, .starting => {
+                    self.forwardHup();
+                    self.requestIdentityRefresh();
+                },
                 .stopping, .killing => log.info("received SIGHUP during shutdown; not forwarded", .{}),
             }
         }
@@ -751,6 +840,93 @@ pub const Runtime = struct {
             }
             ctl.sup.forwardSignal(posix.SIG.HUP);
         }
+    }
+
+    /// Kick off the off-loop run-identity refresh on SIGHUP (T431). The
+    /// short-lived worker thread runs the blocking NSS lookups; its
+    /// completion byte on ident_pipe wakes the loop to apply the result.
+    /// One refresh at a time; a HUP during a refresh queues one more.
+    fn requestIdentityRefresh(self: *Runtime) void {
+        if (self.ident_thread != null) {
+            self.ident_again = true;
+            // The worker may already have finished but not yet been
+            // reaped: pick its result up instead of queueing.
+            self.finishIdentityRefresh();
+            return;
+        }
+        self.ident_done.store(false, .release);
+        self.ident_thread = std.Thread.spawn(.{}, identRefreshMain, .{self}) catch |err| {
+            log.warn("cannot spawn the identity refresh thread: {}", .{err});
+            return;
+        };
+    }
+
+    /// The refresh worker: one gid_lookup per uid-bearing child, off the
+    /// loop. It writes only the ident_* scratch arrays before setting
+    /// ident_done and never touches a live sup field; the loop adopts
+    /// the results.
+    fn identRefreshMain(rt: *Runtime) void {
+        var ok = true;
+        for (rt.children, 0..) |*ctl, i| {
+            rt.ident_valid[i] = false;
+            if (ctl.sup.uid == 0) continue;
+            rt.ident_gids[i] = ctl.sup.gid_lookup(ctl.sup.uid) catch {
+                ok = false;
+                continue;
+            };
+            rt.ident_valid[i] = true;
+        }
+        rt.ident_ok = ok;
+        rt.ident_done.store(true, .release);
+        _ = posix.write(rt.ident_pipe[1], "I") catch |err| {
+            // WouldBlock only means an unconsumed byte already has a
+            // readable event pending, which applies this same result.
+            if (err != error.WouldBlock) {
+                log.err("identity refresh completion write failed: {}", .{err});
+            }
+        };
+    }
+
+    /// The completion byte landed: join the finished worker and adopt
+    /// the gids it resolved. A refused refreshed gid keeps the previous
+    /// identity rather than dropping a child into group root.
+    fn finishIdentityRefresh(self: *Runtime) void {
+        const thr = self.ident_thread orelse return;
+        if (!self.ident_done.load(.acquire)) return;
+        thr.join();
+        self.ident_thread = null;
+        self.ident_done.store(false, .release);
+        var applied: usize = 0;
+        for (self.children, 0..) |*ctl, i| {
+            if (!self.ident_valid[i]) continue;
+            ctl.sup.adoptRunGid(self.ident_gids[i]) catch |err| {
+                log.err("{s}: refreshed run identity refused ({}); keeping the previous gid", .{ ctl.name, err });
+                continue;
+            };
+            applied += 1;
+        }
+        if (!self.ident_ok) {
+            log.warn("SIGHUP identity refresh: some NSS lookups failed; those children keep the previous gid", .{});
+        }
+        log.info("SIGHUP identity refresh applied to {d} children", .{applied});
+        if (self.ident_again) {
+            self.ident_again = false;
+            self.requestIdentityRefresh();
+        }
+    }
+
+    /// The refresh worker's completion byte: drain it and apply. The
+    /// read end is nonblocking; a spurious edge drains to WouldBlock.
+    fn onIdentPipe(self: *Runtime, io: net.loop.Io) void {
+        _ = io;
+        var buf: [8]u8 = undefined;
+        if (posix.read(self.ident_pipe[0], &buf)) |_| {} else |err| {
+            switch (err) {
+                error.WouldBlock => {},
+                else => log.warn("identity refresh pipe read failed: {}", .{err}),
+            }
+        }
+        self.finishIdentityRefresh();
     }
 };
 
@@ -1557,10 +1733,11 @@ test "Runtime: a second TERM replaces the TERM-grace deadline instead of stackin
     try testing.expect(sup.child_pid == null);
 }
 
-/// Child a's respawn is refused parent-side (its run uid has no passwd
-/// entry, which the supervisor logs at err); child b must then be
-/// terminated, not orphaned. Runs under runCaptured so the err log stays
-/// out of the test process. 0 on success, a distinct code per mismatch.
+/// Child a's respawn is refused parent-side: its run uid was never
+/// resolved (no passwd entry exists, and the spawn path no longer
+/// looks one up, T431); child b must then be terminated, not orphaned.
+/// Runs under runCaptured so the warn stays out of the test process.
+/// 0 on success, a distinct code per mismatch.
 fn childRespawnFailure() callconv(.c) u8 {
     var sup_a = Supervisor.init("/nonexistent", &.{}, 1) catch return 10;
     sup_a.uid = 0x7fff_fff0;
@@ -1593,7 +1770,7 @@ test "Runtime: a failed respawn shuts the remaining children down" {
     const stderr = captured.stderr[0..captured.len];
     if (captured.status != 0) std.debug.print("child status {d}, stderr:\n{s}\n", .{ captured.status, stderr });
     try testing.expectEqual(@as(u8, 0), captured.status);
-    try testing.expect(std.mem.indexOf(u8, stderr, "failed to respawn a: error.PasswdLookupFailed; shutting down") != null);
+    try testing.expect(std.mem.indexOf(u8, stderr, "failed to respawn a: error.RunIdentityUnresolved; shutting down") != null);
 }
 
 test "Runtime: deadlines that cannot be armed still terminate every child" {
@@ -1879,4 +2056,99 @@ test "Runtime: a gated wait that outlives .starting cannot fail or advance the s
     while (rt.running) try rt.step();
     try testing.expect(!rt.start_failed);
     try testing.expect(sup_a.child_pid == null);
+}
+
+var nss_lookup_count: usize = 0;
+var nss_lookup_gid: posix.gid_t = 65534;
+
+/// Counts invocations and returns a fixed gid so tests never touch the
+/// real NSS. Any path that must not consult NSS asserts the count flat.
+fn countingGidLookup(uid: posix.uid_t) error{PasswdLookupFailed}!posix.gid_t {
+    _ = uid;
+    nss_lookup_count += 1;
+    return nss_lookup_gid;
+}
+
+test "Runtime: start resolves each child's run identity before spawning (T431)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const run_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(run_dir);
+
+    nss_lookup_count = 0;
+    var sup = try Supervisor.init("/bin/sleep", &.{"60"}, 1);
+    sup.uid = 65534;
+    sup.gid_lookup = countingGidLookup;
+    var children = [_]ChildCtl{
+        .{ .name = "stub", .pid_file = "stub.pid", .exe_base = "sleep", .sup = &sup },
+    };
+    var rt = try Runtime.init(testing.allocator, children[0..], run_dir, test_limits);
+    defer rt.deinit();
+    defer killStub(&sup);
+
+    try rt.start();
+    // The uid-only drop resolved through the injectable lookup once, off
+    // any loop: with resolution still inside spawnChild the spawn path
+    // would also count, so a reverted fix shows up here as count > 1 or
+    // as a refused spawn.
+    try testing.expectEqual(@as(usize, 1), nss_lookup_count);
+    try testing.expectEqual(@as(posix.gid_t, 65534), sup.gid);
+    try testing.expect(!rt.start_failed);
+}
+
+test "Runtime: a respawn never calls NSS; an unresolved identity is refused (T431)" {
+    nss_lookup_count = 0;
+    var sup = try Supervisor.init("/bin/sleep", &.{"60"}, 1);
+    sup.uid = 65534;
+    sup.gid_lookup = countingGidLookup;
+    var children = [_]ChildCtl{
+        .{ .name = "stub", .pid_file = "stub.pid", .exe_base = "sleep", .sup = &sup },
+    };
+    var rt = try Runtime.init(testing.allocator, children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    defer killStub(&sup);
+
+    // The restart deadline is exactly what onChildExit arms after a
+    // child dies; firing it is the production respawn path.
+    rt.restart_timers[0] = try rt.loop.scheduleIn(60000, restartCtx(0));
+    rt.onDeadline(.{ .timer = rt.restart_timers[0].?, .ctx = restartCtx(0) });
+
+    // spawnChild refused the unresolved uid-only drop before fork and
+    // without consulting NSS; the refusal entered the shutdown path.
+    // When spawnChild still resolved inline, the lookup runs here and
+    // the count rises.
+    try testing.expectEqual(@as(usize, 0), nss_lookup_count);
+    try testing.expect(rt.runtime_failed);
+    try testing.expectEqual(Phase.stopping, rt.phase);
+}
+
+test "Runtime: SIGHUP re-resolves the run identity off the loop and applies it (T431)" {
+    nss_lookup_count = 0;
+    nss_lookup_gid = 65534;
+    var sup = try Supervisor.init("/bin/sleep", &.{"60"}, 1);
+    sup.uid = 65534;
+    sup.gid_lookup = countingGidLookup;
+    var children = [_]ChildCtl{
+        .{ .name = "stub", .pid_file = "stub.pid", .exe_base = "stub", .sup = &sup },
+    };
+    const pid = try forkStub(-1, false);
+    var rt = try Runtime.init(testing.allocator, children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    try rt.adoptChild(0, pid);
+    defer killStub(&sup);
+
+    // start() resolves before the loop; the adopted-child tests resolve
+    // the same way by hand.
+    try sup.resolveRunGid();
+    try testing.expectEqual(@as(usize, 1), nss_lookup_count);
+    try testing.expectEqual(@as(posix.gid_t, 65534), sup.gid);
+
+    // The passwd entry "moved": the HUP must pick the new gid up without
+    // a lookup on the loop. The refresh worker's completion byte is the
+    // only armed wake, so step() returns right after applying it.
+    nss_lookup_gid = 42500;
+    rt.onSignal(.{ .signo = posix.SIG.HUP, .count = 1 });
+    try rt.step();
+    try testing.expectEqual(@as(usize, 2), nss_lookup_count);
+    try testing.expectEqual(@as(posix.gid_t, 42500), sup.gid);
 }

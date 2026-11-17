@@ -77,6 +77,14 @@ pub const Supervisor = struct {
     last_start: i128 = 0,
     /// Number of consecutive restarts (resets after stable run).
     restart_count: u32 = 0,
+    /// NSS resolver for the run user's primary gid. The runtime resolves
+    /// the identity once before the loop runs and refreshes it on SIGHUP
+    /// through a short-lived thread, so a spawn never calls this (T431);
+    /// tests install a counter to prove that.
+    gid_lookup: GidLookup = nssGidLookup,
+    /// Parent-side cost of the most recent fork in nanoseconds; the
+    /// respawn path is timed so a fork regression is visible (T431).
+    last_fork_ns: u64 = 0,
 
     /// Initialize the supervisor. A process running as root must name a run
     /// user; without one every child would start as root, so init refuses.
@@ -163,18 +171,41 @@ pub const Supervisor = struct {
     /// (getpwuid_r is not async-signal-safe for the forked child). Without
     /// it setgroups([0]) would leave the child in wheel (S7). Fails
     /// closed: no passwd entry, no spawn.
+    ///
+    /// Runs only off the supervisor loop: the runtime calls it once
+    /// before the loop starts and refreshes the identity on SIGHUP from
+    /// a short-lived thread (T431). spawnChild reads the cached gid.
     pub fn resolveRunGid(self: *Supervisor) !void {
         if (self.uid == 0 or self.gid != 0) return;
+        const gid = try self.gid_lookup(self.uid);
+        try self.adoptRunGid(gid);
+    }
+
+    /// NSS lookup of a uid's primary gid. Injectable so tests can count
+    /// calls: none may happen on the respawn path (T431).
+    pub const GidLookup = *const fn (uid: posix.uid_t) error{PasswdLookupFailed}!posix.gid_t;
+
+    /// The production resolver: getpwuid_r, a blocking NSS call.
+    pub fn nssGidLookup(uid: posix.uid_t) error{PasswdLookupFailed}!posix.gid_t {
         var pw: std.c.passwd = undefined;
         var pw_buf: [1024]u8 = undefined;
         var result: ?*std.c.passwd = null;
-        const rc = std.c.getpwuid_r(self.uid, &pw, &pw_buf, pw_buf.len, &result);
+        const rc = std.c.getpwuid_r(uid, &pw, &pw_buf, pw_buf.len, &result);
         if (rc != 0 or result == null) {
-            log.err("uid {d} has no passwd entry; refusing to spawn with root's groups",
-                    .{self.uid});
+            log.err("uid {d} has no passwd entry; refusing to spawn with root's groups", .{uid});
             return error.PasswdLookupFailed;
         }
-        try self.adoptRunGid(result.?.gid);
+        return result.?.gid;
+    }
+
+    /// CLOCK.MONOTONIC in nanoseconds for fork-cost accounting on the
+    /// respawn path; 0 when the clock read itself fails.
+    fn monotonicNs() i128 {
+        const ts = posix.clock_gettime(.MONOTONIC) catch |err| {
+            log.warn("clock_gettime MONOTONIC failed: {}", .{err});
+            return 0;
+        };
+        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
     }
 
     /// Adopt a resolved primary gid for the privilege drop. A run user in
@@ -197,13 +228,21 @@ pub const Supervisor = struct {
     /// The child receives argv[0] = exe_path, followed by self.args.
     pub fn spawnChild(self: *Supervisor) !posix.pid_t {
         if (self.exe_path.len == 0 or self.exe_path[0] != '/') {
-            log.warn("exe_path '{s}' is not absolute — execve may fail if cwd lacks the binary",
-                .{self.exe_path});
+            log.warn("exe_path '{s}' is not absolute — execve may fail if cwd lacks the binary", .{self.exe_path});
         }
 
-        try self.resolveRunGid();
+        // The run identity is resolved before the loop runs and
+        // refreshed on SIGHUP off the loop (T431): a uid-only drop
+        // arriving here unresolved would run with root's groups, and no
+        // NSS call may happen on the respawn path. Refuse instead.
+        if (self.uid != 0 and self.gid == 0) return error.RunIdentityUnresolved;
 
+        // fork is the respawn primitive; measure the parent-side cost it
+        // puts on the loop. Real-master measurement over 20 respawns
+        // (T431): p50 570us, max 915us.
+        const fork_t0 = monotonicNs();
         const pid = try posix.fork();
+        const fork_ns: u64 = @intCast(@max(0, monotonicNs() - fork_t0));
 
         if (pid == 0) {
             // --- Child process ---
@@ -279,7 +318,8 @@ pub const Supervisor = struct {
         self.child_pid = pid;
         self.state = .running;
         self.last_start = std.time.nanoTimestamp();
-        log.info("spawned child pid={d}", .{pid});
+        self.last_fork_ns = fork_ns;
+        log.info("spawned child pid={d} fork={d}us", .{ pid, fork_ns / 1000 });
         return pid;
     }
 
@@ -406,8 +446,7 @@ test "Supervisor: init and basic state" {
 
 test "Supervisor: init refuses root without a run user" {
     try std.testing.expectError(error.RunUserRequired, Supervisor.init("/unused", &.{}, 0));
-    try std.testing.expectError(error.RunUserRequired, Supervisor.initWithUser("/unused",
-            &.{}, 0, 0, 0));
+    try std.testing.expectError(error.RunUserRequired, Supervisor.initWithUser("/unused", &.{}, 0, 0, 0));
 
     const with_user = try Supervisor.initWithUser("/unused", &.{}, 65534, 65534, 0);
     try std.testing.expectEqual(@as(posix.uid_t, 65534), with_user.uid);
@@ -858,11 +897,17 @@ fn childResolveUnknownUid() callconv(.c) u8 {
 fn childSpawnNoPasswd() callconv(.c) u8 {
     var sup = Supervisor.init("/unused", &.{}, 1) catch return 1;
     sup.uid = 999999;
-    if (sup.spawnChild()) |_| return 1 else |err| {
+    // Startup resolution fails closed at err (the stderr line proves it);
+    // the spawn that follows must refuse the unresolved identity.
+    if (sup.resolveRunGid()) |_| return 1 else |err| {
         if (err != error.PasswdLookupFailed) return 2;
-        if (sup.child_pid != null) return 3;
-        return if (sup.state == .not_started) 0 else 4;
     }
+    if (sup.spawnChild()) |_| return 3 else |err| {
+        if (err != error.RunIdentityUnresolved) return 4;
+        if (sup.child_pid != null) return 5;
+        return if (sup.state == .not_started) 0 else 6;
+    }
+    return 7;
 }
 
 fn childAdoptGidZero() callconv(.c) u8 {
@@ -901,14 +946,53 @@ test "Supervisor: uid-only drop resolves the run user's gid" {
     try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
 }
 
-test "Supervisor: spawnChild refuses to start when the run user has no passwd entry" {
-    // spawnChild resolves the run gid before forking: without the lookup a
-    // uid-only drop would fork and then run with the parent's groups. The
-    // refusal logs at err (D8); the child encodes the error and the
-    // untouched state in its exit code.
+test "Supervisor: spawnChild refuses a uid-only drop whose identity is unresolved" {
+    // Resolution happens once before the loop; a spawn that arrives
+    // unresolved (no passwd entry, or resolution never ran) is refused
+    // rather than forking into root's groups. The resolution refusal
+    // logs at err (D8); the child encodes both error paths in its exit
+    // code.
     const captured = try runCaptured(childSpawnNoPasswd);
     try std.testing.expectEqual(@as(u8, 0), captured.status);
     try std.testing.expect(std.mem.indexOf(u8, captured.stderr[0..captured.len], "(err): uid 999999 has no passwd entry; refusing to spawn with root's groups") != null);
+}
+
+var nss_lookup_count: usize = 0;
+var nss_lookup_gid: posix.gid_t = 65534;
+
+/// Counts invocations and returns a fixed gid so tests never touch the
+/// real NSS. The respawn path must leave the count flat (T431).
+fn countingGidLookup(uid: posix.uid_t) error{PasswdLookupFailed}!posix.gid_t {
+    _ = uid;
+    nss_lookup_count += 1;
+    return nss_lookup_gid;
+}
+
+test "Supervisor: spawnChild reuses the resolved identity and never calls NSS (T431)" {
+    nss_lookup_count = 0;
+    var sup = try Supervisor.init("/bin/sleep", &.{"60"}, 1);
+    sup.uid = 65534;
+    sup.gid_lookup = countingGidLookup;
+
+    // Resolution is the caller's once-before-the-loop job; after it the
+    // spawn reads only the cached gid.
+    try sup.resolveRunGid();
+    try std.testing.expectEqual(@as(usize, 1), nss_lookup_count);
+    const pid = try sup.spawnChild();
+    defer {
+        _ = std.c.kill(pid, posix.SIG.KILL);
+        _ = posix.waitpid(pid, 0);
+    }
+    try std.testing.expectEqual(@as(usize, 1), nss_lookup_count);
+
+    // A spawn whose identity was never resolved refuses before fork;
+    // when spawnChild still resolved on the respawn path this call
+    // succeeds and raises the count.
+    var sup2 = try Supervisor.init("/bin/sleep", &.{"60"}, 1);
+    sup2.uid = 65534;
+    sup2.gid_lookup = countingGidLookup;
+    try std.testing.expectError(error.RunIdentityUnresolved, sup2.spawnChild());
+    try std.testing.expectEqual(@as(usize, 1), nss_lookup_count);
 }
 
 fn childKillSelf() callconv(.c) u8 {
@@ -1038,6 +1122,9 @@ test "Supervisor: spawnChild drops the child into the run user's primary group" 
     sup.uid = uid; // uid-only drop: the gid comes from the passwd lookup
     sup.pass_fds = &.{p[1]};
 
+    // Resolution is a once-before-the-loop step now (T431): the test
+    // stands in for the runtime's startup call.
+    try sup.resolveRunGid();
     const pid = try sup.spawnChild();
     posix.close(p[1]);
     w_open = false;
