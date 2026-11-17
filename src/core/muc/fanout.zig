@@ -495,7 +495,7 @@ const MockSession = struct {
     sm_detached: bool = false,
     sm_overflow: bool = false,
     conn: MockConn = .{},
-    tracked: [1024]u8 = undefined,
+    tracked: [20480]u8 = undefined,
     tracked_len: usize = 0,
     track_calls: usize = 0,
 
@@ -506,14 +506,18 @@ const MockSession = struct {
     }
 
     /// Mirrors Session.stanza: detached sessions are tracked for resume,
-    /// live sessions count then append.
+    /// live sessions track unless the stanza can never fit the outbox
+    /// (the oversize drop class).
     pub fn stanza(self: *MockSession, data: []const u8) enum { queued, tracked_detached, spilled, failed_closed } {
         if (self.sm_detached) {
             self.smTrackOutbound(data);
             return .tracked_detached;
         }
+        self.conn.queueSend(data) catch {
+            if (data.len <= connection_mod.WRITE_BUF_SIZE) self.smTrackOutbound(data);
+            return .failed_closed;
+        };
         self.smTrackOutbound(data);
-        self.conn.queueSend(data) catch return .failed_closed;
         return .queued;
     }
 };

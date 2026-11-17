@@ -619,17 +619,19 @@ pub const Session = struct {
     }
 
     /// Queue a complete outbound stanza (message/presence/iq) and count it
-    /// for XEP-0198 (S15, ADR-2). SM tracking happens before the socket
-    /// append: the unacked queue is authoritative, so a stanza the socket
-    /// refuses is still counted and replayed rather than silently dropped.
-    /// A detached session has no fd; its stanzas go straight to unacked.
+    /// for XEP-0198 (S15, ADR-2). A refused stanza that could still fit
+    /// the outbox is tracked anyway: the unacked queue is authoritative,
+    /// so a slow-reader refusal lands in replay rather than vanishing.
+    /// A stanza longer than the whole outbound bound can never go out;
+    /// it stays untracked like the pre-Outbox drop (an SM entry that can
+    /// never be sent would wedge the replay queue). A detached session
+    /// has no fd; its stanzas go straight to unacked.
     pub fn stanza(self: *Session, data: []const u8) SendResult {
         if (self.sm_detached) {
             self.smTrackOutbound(data);
             return .tracked_detached;
         }
-        self.smTrackOutbound(data);
-        return sendResult(self.conn.append(data));
+        return self.finishTrack(data, sendResult(self.conn.append(data)));
     }
 
     /// stanza() with the queueSendWithFlush policy: one non-blocking
@@ -640,8 +642,18 @@ pub const Session = struct {
             self.smTrackOutbound(data);
             return .tracked_detached;
         }
-        self.smTrackOutbound(data);
-        return sendResult(self.conn.appendWithFlush(data));
+        return self.finishTrack(data, sendResult(self.conn.appendWithFlush(data)));
+    }
+
+    /// Track after the append: delivered results count like the
+    /// pre-Outbox path, and a refused stanza that could fit the bound
+    /// counts too — SM replay is where it goes next. The oversize drop
+    /// (len > spill_limit) stays untracked.
+    fn finishTrack(self: *Session, data: []const u8, r: SendResult) SendResult {
+        if (r != .failed_closed or data.len <= self.conn.outbox.spill_limit) {
+            self.smTrackOutbound(data);
+        }
+        return r;
     }
 
     /// Queue a nonza — anything that is not a message/presence/iq stanza:
