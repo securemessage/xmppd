@@ -113,7 +113,6 @@ const SaslCollecting = c2s_session.SaslCollecting;
 const noteDrop = c2s_session.noteDrop;
 const noteJidOverflow = c2s_session.noteJidOverflow;
 const queueStanzaOrDrop = c2s_session.queueStanzaOrDrop;
-const noteQueueDrop = c2s_session.noteQueueDrop;
 pub const noteQueueOverflow = c2s_session.noteQueueOverflow;
 const fillWriteBuffer = c2s_session.fillWriteBuffer;
 const makeSocketPair = c2s_session.makeSocketPair;
@@ -1455,10 +1454,10 @@ pub const Server = struct {
                     noteDrop("SASL challenge to connection {d} exceeds {d} bytes; dropped", .{ conn_id, session.write_scratch.len });
                     return;
                 };
-                session.conn.queueSend(challenge_xml) catch |err| {
-                    noteQueueDrop(session, challenge_xml, err, "SASL challenge");
+                if (session.nonza(challenge_xml) == .failed_closed) {
+                    c2s_session.noteSendDrop(session, challenge_xml, "SASL challenge");
                     return;
-                };
+                }
                 session.auth_state = .none;
 
                 if (session.conn.hasPendingWrite()) {
@@ -1573,10 +1572,10 @@ pub const Server = struct {
                     noteJidOverflow("register result to connection {d} exceeds {d} bytes; dropped", .{ conn_id, session.write_scratch.len });
                     return;
                 };
-                session.conn.queueSend(reply_xml) catch |err| {
-                    noteQueueDrop(session, reply_xml, err, "register result");
+                if (session.stanza(reply_xml) == .failed_closed) {
+                    c2s_session.noteSendDrop(session, reply_xml, "register result");
                     return;
-                };
+                }
 
                 if (session.conn.hasPendingWrite()) {
                     changes.addWrite(session.conn.fd, conn_id) catch {};
@@ -1635,7 +1634,7 @@ pub const Server = struct {
                     queueStanzaOrDrop(session, reply_xml, "account-delete result");
 
                     // Close the stream per XEP-0077 §3.2
-                    session.conn.queueSend("</stream:stream>") catch {};
+                    _ = session.nonza("</stream:stream>");
 
                     if (session.conn.hasPendingWrite()) {
                         changes.addWrite(session.conn.fd, conn_id) catch {};
@@ -2436,7 +2435,7 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "presence/broadcast.zig", @embedFile("../presence/broadcast.zig"), 0 },
         .{ "routing/router.zig", @embedFile("../routing/router.zig"), 0 }, // local delivery goes through stanzaWithFlush().
         .{ "c2s/lifecycle.zig", @embedFile("../c2s/lifecycle.zig"), 0 },
-        .{ "worker/worker.zig", @embedFile("worker.zig"), 4 }, // stream/SASL/SM nonzas + M1 counter self-test.
+        .{ "worker/worker.zig", @embedFile("worker.zig"), 1 }, // stream/SASL/SM nonzas went through nonza()/stanza(); 1 test filler remains.
         .{ "routing/deliver.zig", @embedFile("../routing/deliver.zig"), 0 }, // the cross-worker drain goes through stanza().
         .{ "c2s/session.zig", @embedFile("../c2s/session.zig"), 2 }, // stream/SASL nonzas went through nonza(); 2 test fillers remain.
         .{ "c2s/sm.zig", @embedFile("../c2s/sm.zig"), 0 }, // SM enable/resume/failed nonzas go through nonza().
