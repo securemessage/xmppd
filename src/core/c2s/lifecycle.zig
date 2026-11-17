@@ -373,6 +373,13 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
         c2s_sm.smIdMapRemove(server, session.sm_id[0..session.sm_id_len]);
     }
 
+    // A detached session that dies without a resume still owns an unacked
+    // queue; its messages go to offline storage rather than vanishing
+    // (ADR-2). Live-session overflow reaps drain in reapOutboundOverflow.
+    if (session.sm_detached) {
+        drainUnackedToOffline(server, session);
+    }
+
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
     if (session.stream.bound_jid) |bound| close_cleanup: {
         var close_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
@@ -454,7 +461,53 @@ pub fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
             c2s_session.sendStreamError(server, session, .resource_constraint);
             // Flush the stream error before teardown so the client sees it.
             session.conn.flushSync();
+            // ADR-2 fail-closed policy: the unacked queue is authoritative
+            // for what the client never acknowledged; its messages go to
+            // offline storage instead of dying with the session.
+            drainUnackedToOffline(server, session);
             forceCloseSession(server, i, changes);
+        }
+    }
+}
+
+/// ADR-2 fail-closed drain: on teardown of a session with an SM unacked
+/// queue, offer each pending `<message>` stanza to the recipient's offline
+/// store so an over-cap session loses nothing the client never
+/// acknowledged. Only `<message>` qualifies (RFC 6121): type='error' and
+/// type='groupchat' are never stored, presence and iq are skipped. Store
+/// failures count against offline_drain_drops. C11 builds the full
+/// XEP-0198 section 5 policy on this path; C2 only drains.
+fn drainUnackedToOffline(server: *Server, session: *Session) void {
+    const store = server.offline orelse return;
+    const queue = session.sm_unacked orelse return;
+    const bound = session.stream.bound_jid orelse return;
+    var recipient_buf: [router.BARE_JID_MAX]u8 = undefined;
+    const recipient = router.buildBareJid(bound.local, bound.domain, &recipient_buf) catch {
+        noteDrop("session {d} unacked drain skipped: bare JID exceeds {d} bytes", .{ session.conn.id, router.BARE_JID_MAX });
+        return;
+    };
+    const now: u64 = @intCast(@max(std.time.timestamp(), 0));
+    var iter = queue.getUnacked();
+    while (iter.next()) |stanza| {
+        const head_end = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
+        const head = stanza[0..head_end];
+        if (head.len < 8 or !std.mem.eql(u8, head[0..8], "<message")) continue;
+        if (head.len > 8 and head[8] != ' ' and head[8] != '/') continue;
+        if (c2s_session.headAttr(head, "type")) |stanza_type| {
+            if (std.mem.eql(u8, stanza_type, "error") or std.mem.eql(u8, stanza_type, "groupchat")) continue;
+        }
+        const stored = store.storeHeldPointer(
+            recipient,
+            c2s_session.headAttr(head, "from") orelse "",
+            c2s_session.headAttr(head, "id") orelse "offline",
+            now,
+            stanza,
+        ) catch {
+            _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
+            continue;
+        };
+        if (!stored) {
+            _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
         }
     }
 }
@@ -1507,6 +1560,62 @@ test "S13: stalled offline drain resumes via drainOfflinePending" {
     try std.testing.expect(!session.offline_pending);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(rounds > 1);
+}
+
+// ADR-2 fail-closed: an over-cap session's unacked <message>s reach the
+// recipient's offline store at teardown; non-messages and the types RFC
+// 6121 forbids offline (error, groupchat) are skipped.
+test "S15: an overflowed session drains unacked messages to offline storage" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // Live peer end so the stream error can flush during teardown.
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+    // Owned by session.deinit once assigned.
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    session.sm_unacked = queue;
+
+    _ = queue.push("<message from='alice@localhost' to='bob@localhost' id='m1'><body>held</body></message>");
+    _ = queue.push("<presence from='bob@localhost/res'/>");
+    _ = queue.push("<message type='error' from='alice@localhost' id='e1'/>");
+    _ = queue.push("<message type='groupchat' from='alice@localhost' id='g1'/>");
+    _ = queue.push("<iq type='result' id='i1'/>");
+
+    session.sm_overflow = true;
+    reapOutboundOverflow(&server, &changes);
+
+    // Only the plain <message> reached the offline store; the session
+    // was reaped with resource-constraint.
+    try std.testing.expect(server.sessions[1] == null);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqualStrings("m1", ptrs[0].stanza_id);
 }
 
 // S13: a pointer whose archive entry is gone must not be skipped on every
