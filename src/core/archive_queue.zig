@@ -14,9 +14,10 @@
 //!   are dropped with an error - message delivery is never delayed by
 //!   archival.
 //! - The writer wakes via a 1-byte pipe whose read end sits in the
-//!   writer thread's own kqueue. Producers write a byte only when an
-//!   enqueue takes the ring from empty to non-empty, and the writer
-//!   re-checks the count before sleeping so no wakeup can be lost.
+//!   writer thread's own kqueue. Producers write a byte only on the
+//!   `wake_pending` false->true edge (Q2); the writer clears the flag
+//!   after draining the pipe and before checking for work, so a burst
+//!   costs one byte per drain cycle and no wakeup is lost.
 //! - Job payloads live in one allocation per job; the writer commits a
 //!   storeAll batch per DRAIN_CAP chunk instead of one commit per job.
 //!   A failed chunk is retried job by job so one bad job drops only
@@ -114,6 +115,12 @@ pub const ArchiveWriteQueue = struct {
     /// retry. Only the writer thread increments it.
     retry_recovered: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    /// Q2 wake coalescing: true while a wake byte is queued for or in
+    /// flight to the writer. Producers write the pipe only on the
+    /// false->true edge; drainPipe clears it after the byte drain and
+    /// before the writer's empty check.
+    wake_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     /// Chunk of jobs popped per storeAll call inside a drain.
     drain_jobs: [DRAIN_CAP]Job = undefined,
 
@@ -181,17 +188,26 @@ pub const ArchiveWriteQueue = struct {
 
         self.slots[self.tail % MAX_JOBS] = job;
         self.tail += 1;
-        const wake = n == 0;
         self.mutex.unlock();
 
-        // Wake the writer only on the empty-to-non-empty transition; it
-        // re-checks the count before sleeping, so further bytes buy
-        // nothing. The write runs after the mutex is released so the
-        // lock is never held across a syscall.
-        if (wake) {
-            _ = posix.write(self.pipe_wr, "\x00") catch {
-                _ = self.wake_failed.fetchAdd(1, .monotonic);
-                log.err("archive write queue: wake write failed - writer may stall until next enqueue", .{});
+        // Coalesced wake (Q2): only the wake_pending false->true edge
+        // writes the pipe. The writer's clear is a read-modify-write
+        // too, so this swap and that one are totally ordered on the
+        // flag: if this swap lands first, the writer's swap reads the
+        // true it published and the job pushed here is acquired by the
+        // empty check that follows; if it lands second, this swap reads
+        // false and a byte goes out. A full pipe already reads as a
+        // pending wake, so WouldBlock is a successful signal.
+        if (!self.wake_pending.swap(true, .seq_cst)) {
+            _ = posix.write(self.pipe_wr, "\x00") catch |err| switch (err) {
+                error.WouldBlock => {},
+                else => {
+                    // Clear so the next enqueue retries the byte instead
+                    // of coalescing into a signal that never arrived.
+                    self.wake_pending.store(false, .seq_cst);
+                    _ = self.wake_failed.fetchAdd(1, .monotonic);
+                    log.err("archive write queue: wake write failed - writer may stall until next enqueue", .{});
+                },
             };
         }
     }
@@ -205,7 +221,15 @@ pub const ArchiveWriteQueue = struct {
         return self.slots[self.head % MAX_JOBS];
     }
 
-    /// Drain the wake pipe (after EVFILT_READ on pipe_rd).
+    /// Drain the wake pipe (after EVFILT_READ on pipe_rd). Clears
+    /// wake_pending after the byte drain and before the caller's empty
+    /// check. The clear is a read-modify-write, so it and the producer's
+    /// swap(true) are totally ordered on the flag: if the producer's
+    /// swap lands first, this swap reads its true and the empty check
+    /// acquires the published job; if it lands second, the producer
+    /// reads false and writes the next byte. A plain store would give
+    /// no synchronizes-with edge and could lose a wakeup on weakly
+    /// ordered hardware.
     pub fn drainPipe(self: *ArchiveWriteQueue) void {
         var buf: [64]u8 = undefined;
         while (true) {
@@ -213,6 +237,7 @@ pub const ArchiveWriteQueue = struct {
             if (n <= 0) break;
             if (n < buf.len) break;
         }
+        _ = self.wake_pending.swap(false, .seq_cst);
     }
 
     /// Writer-thread main loop: kqueue-wait on the pipe, drain up to

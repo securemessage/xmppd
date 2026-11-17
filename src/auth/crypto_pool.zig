@@ -161,9 +161,14 @@ pub const CryptoPool = struct {
     }
 
     /// Drain the wake pipe (EVFILT_READ then this). Clears the wake flag
-    /// after the byte drain and before the caller's completion drain: a
-    /// worker publishing after the clear sees the false->true edge and
-    /// writes a byte for the next wait, so no completion is missed.
+    /// after the byte drain and before the caller's completion drain.
+    /// The clear is a read-modify-write, so it and the worker's
+    /// swap(true) are totally ordered on the flag: if the worker's swap
+    /// lands first, this swap reads its true and the drain acquires the
+    /// published completion; if it lands second, the worker reads false
+    /// and writes a byte for the next wait. A plain store would give no
+    /// synchronizes-with edge and could lose a wakeup on weakly ordered
+    /// hardware.
     pub fn drainPipe(self: *CryptoPool) void {
         var buf: [64]u8 = undefined;
         while (true) {
@@ -171,7 +176,7 @@ pub const CryptoPool = struct {
             if (n <= 0) break;
             if (n < buf.len) break;
         }
-        self.wake_pending.store(false, .seq_cst);
+        _ = self.wake_pending.swap(false, .seq_cst);
     }
 
     /// Pop a completed derivation, or null when the drain is done. Popping

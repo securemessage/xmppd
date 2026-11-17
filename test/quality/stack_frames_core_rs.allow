@@ -15,8 +15,10 @@
 #   worker.Server.dispatchEvents +112 M1 merge a56c464 (363da75 SIGUSR1
 #                  metrics dump branch)
 #   worker.Server.run +32 M1 merge a56c464 (363da75 iter_timer + dump args)
+#   main.main -192 Q1 203a49b (pre-rebase fc7d7de): -Dallocator default c
+#                  lands an empty TrivialRoot where the DebugAllocator sat
 main.configureServer	173672
-main.main	2710664
+main.main	2710472
 muc.fanout.longestEncodedRealJid	210536
 muc.handler.handleMucDiscoItems	175944
 registry.RoomRegistry.createRoom	214104

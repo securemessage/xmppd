@@ -1039,7 +1039,7 @@ pub const Server = struct {
                     // don't need self-wake — they only grow from MPSC deliveries
                     // which have their own pipe-based wakeup.
                     if (ds.getQueue(self.worker_id).hasPending()) {
-                        ds.pipes[self.worker_id].wake();
+                        ds.wakeWorker(self.worker_id);
                     }
                 } else {
                     // No MPSC pending, but drain room mailboxes opportunistically

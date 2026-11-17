@@ -90,7 +90,6 @@ const MAX_SM_REDIRECTS: usize = 256;
 /// client gets item-not-found and full-rebinds.
 const MAX_SM_REDIRECT_HOPS: u8 = 8;
 
-/// FNV-1a hash of an SM-ID for map indexing (T127).
 /// Handle <enable xmlns='urn:xmpp:sm:3'/> — activate SM for this session.
 /// If the client includes resume='true', session resumption is enabled and
 /// an SM-ID is generated for future reconnection.

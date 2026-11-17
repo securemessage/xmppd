@@ -29,12 +29,15 @@
 #     xml.Reader, xmpp.Stream) are identical across the window, so no
 #     commit in the range grew the frame. The +16 records the
 #     -Dcpu=baseline measurement pin itself.
+#   main.main      +192 Q1 203a49b (pre-rebase fc7d7de): Root.init union
+#                  wraps the DebugAllocator in Debug builds (-Dallocator
+#                  default debug)
 archive_queue.ArchiveWriteQueue.init	186000
 c2s.lifecycle.acceptConnections	130112
 c2s.session.Session.init	31536
 listener.Listener.accept	74704
 main.configureServer	167696
-main.main	3067320
+main.main	3067512
 main.workerThread	710912
 muc.fanout.longestEncodedRealJid	212224
 muc.handler.handleMucDiscoItems	179056
