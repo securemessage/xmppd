@@ -124,7 +124,7 @@ pub fn handleSmEnable(self: *Server, session: *Session, elem: xml.Element, chang
             session.sm_resume_enabled = false;
             session.sm_id_len = 0;
             w.writeAll("<enabled xmlns='urn:xmpp:sm:3'/>") catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
             if (session.conn.hasPendingWrite()) {
                 changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }
@@ -147,7 +147,7 @@ pub fn handleSmEnable(self: *Server, session: *Session, elem: xml.Element, chang
         log.info("connection {d} stream management enabled", .{session.conn.id});
     }
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -379,13 +379,15 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     w.writeAll("' previd='") catch return;
     w.writeAll(session.sm_id[0..session.sm_id_len]) catch return;
     w.writeAll("'/>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
 
     // Replay unacked stanzas
     if (session.sm_unacked) |queue| {
         var iter = queue.getUnacked();
         while (iter.next()) |stanza| {
-            session.conn.queueSend(stanza) catch break;
+            // Replayed stanzas are already counted in sm_unacked: nonza
+            // appends without re-tracking, or resume would count them twice.
+            if (session.nonza(stanza) == .failed_closed) break;
         }
     }
 
@@ -747,12 +749,14 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
     w.writeAll("' previd='") catch return;
     w.writeAll(session.sm_id[0..session.sm_id_len]) catch return;
     w.writeAll("'/>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
 
     if (session.sm_unacked) |q| {
         var iter = q.getUnacked();
         while (iter.next()) |stanza| {
-            session.conn.queueSend(stanza) catch break;
+            // Replayed stanzas are already counted in sm_unacked: nonza
+            // appends without re-tracking, or resume would count them twice.
+            if (session.nonza(stanza) == .failed_closed) break;
         }
     }
 
@@ -962,7 +966,7 @@ pub fn sendSmHandledCountError(self: *Server, session: *Session, h: ?u32, change
         w.print(" h='{d}' send-count='{d}'", .{ v, session.sm_out_seq }) catch return;
     }
     w.writeAll("/></stream:error>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
     session.conn.flushSync();
     session_lifecycle.forceCloseSession(self, session.conn.id, changes);
 }
@@ -983,7 +987,7 @@ pub fn sendSmFailed(self: *Server, session: *Session, condition: []const u8, cha
     w.writeAll(" xmlns='") catch return;
     w.writeAll(ns) catch return;
     w.writeAll("'/></failed>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
     if (session.conn.hasPendingWrite()) {
         _ = session.conn.flushSend() catch {};
         if (session.conn.hasPendingWrite()) {
@@ -1090,7 +1094,7 @@ pub fn handleSmRequest(self: *Server, session: *Session, changes: *ChangeList) v
     w.writeAll("<a xmlns='urn:xmpp:sm:3' h='") catch return;
     std.fmt.format(w, "{d}", .{session.sm_in_h}) catch return;
     w.writeAll("'/>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
     // Attempt immediate flush — SM acks are latency-critical.
     // If flush leaves pending data (WouldBlock), fall back to kqueue write.
     _ = session.conn.flushSend() catch {};

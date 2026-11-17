@@ -20,6 +20,7 @@ const Listener = @import("../listener.zig").Listener;
 const Event = @import("../worker/loop.zig").Event;
 
 const ssl = @import("ssl");
+const net = @import("net");
 const IpcClient = @import("ipc_client").IpcClient;
 const ipc_protocol = @import("ipc_protocol");
 const backend_mod = @import("backend");
@@ -93,9 +94,24 @@ pub noinline fn noteJidOverflow(comptime fmt: []const u8, args: anytype) void {
 /// path: it is logged, and a full write buffer flags the session for
 /// overflow teardown (R1), the same classification dispatchStanza uses.
 pub fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
-    session.queueSendStanza(stanza) catch |err| {
-        noteQueueDrop(session, stanza, err, what);
-    };
+    if (session.stanza(stanza) == .failed_closed) noteSendDrop(session, stanza, what);
+}
+
+/// The SendResult twin of noteQueueDrop for converted call sites:
+/// failed_closed on a live conn is classified by noteQueueOverflow
+/// (oversize drop vs slow-reader teardown), on a dead conn it is the
+/// old ConnectionClosed path.
+pub noinline fn noteSendDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
+    @branchHint(.cold);
+    if (!session.conn.isClosed()) {
+        if (noteQueueOverflow(session, stanza)) {
+            log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, connection_mod.WRITE_BUF_SIZE });
+            return;
+        }
+        log.warn("connection {d}: {s} could not be queued (WriteBufferFull)", .{ session.conn.id, what });
+        return;
+    }
+    log.warn("connection {d}: {s} could not be queued (ConnectionClosed)", .{ session.conn.id, what });
 }
 
 /// Classify and log one refused queueSendStanza on the cold path (R5).
@@ -169,10 +185,11 @@ pub noinline fn answerOversizeIq(session: *Session, stanza: []const u8) void {
         noteJidOverflow("iq error reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
         return;
     };
-    session.queueSendStanza(reply) catch |err| {
-        if (err == error.WriteBufferFull) session.sm_overflow = true;
-        noteDrop("connection {d}: iq error reply could not be queued ({s})", .{ session.conn.id, @errorName(err) });
-    };
+    if (session.stanza(reply) == .failed_closed) {
+        const closed = session.conn.isClosed();
+        if (!closed) session.sm_overflow = true;
+        noteDrop("connection {d}: iq error reply could not be queued ({s})", .{ session.conn.id, if (closed) "ConnectionClosed" else "WriteBufferFull" });
+    }
 }
 
 /// Id of an `<iq type='result' ...>` opening tag, or null. The scan stops
@@ -563,15 +580,71 @@ pub const Session = struct {
         self.stanza_type = "";
     }
 
+    /// The outcome of handing one outbound element to the send path
+    /// (ADR-2). Only `.failed_closed` is a refusal; noteQueueDrop
+    /// classifies it (dead fd vs full ring vs oversize).
+    pub const SendResult = enum {
+        /// Buffered on the live connection.
+        queued,
+        /// Detached SM session: counted into the unacked queue with no
+        /// fd to write to; delivery happens on resume.
+        tracked_detached,
+        /// Accepted into the bounded spill behind the ring. Unreachable
+        /// at the M2 spill cap (spill_limit == WRITE_BUF_SIZE).
+        spilled,
+        /// Refused: the conn is closed or the outbox is full. The append
+        /// already bumped the per-worker drop counter by reason.
+        failed_closed,
+    };
+
     /// Queue a complete outbound stanza (message/presence/iq) and count it
     /// for XEP-0198 (S15). Counting is not optional: `<a h='...'/>` maps by
     /// position, so every stanza sent outside this helper shifts the ack
     /// window and makes a later ack discard a stanza the client never saw.
     /// Nonzas (`<r/>`, `<a/>`, features, SASL elements, stream errors) must
-    /// go through conn.queueSend directly.
+    /// go through nonza().
+    ///
+    /// Compat !void form of stanza() for call sites not yet converted to
+    /// the SendResult API: failed_closed maps back to the pre-Outbox
+    /// error pair, while tracked_detached is success — a detached SM
+    /// session that buffers for resume is delivering, not dropping.
     pub fn queueSendStanza(self: *Session, data: []const u8) !void {
-        try self.conn.queueSend(data);
+        switch (self.stanza(data)) {
+            .queued, .spilled, .tracked_detached => {},
+            .failed_closed => return if (self.conn.isClosed())
+                error.ConnectionClosed
+            else
+                error.WriteBufferFull,
+        }
+    }
+
+    /// Queue a complete outbound stanza (message/presence/iq) and count it
+    /// for XEP-0198 (S15, ADR-2). SM tracking happens before the socket
+    /// append: the unacked queue is authoritative, so a stanza the socket
+    /// refuses is still counted and replayed rather than silently dropped.
+    /// A detached session has no fd; its stanzas go straight to unacked.
+    pub fn stanza(self: *Session, data: []const u8) SendResult {
+        if (self.sm_detached) {
+            self.smTrackOutbound(data);
+            return .tracked_detached;
+        }
         self.smTrackOutbound(data);
+        return sendResult(self.conn.append(data));
+    }
+
+    /// Queue a nonza — anything that is not a message/presence/iq stanza:
+    /// SM elements, stream features and errors, SASL elements, the stream
+    /// close. Never counted for XEP-0198.
+    pub fn nonza(self: *Session, data: []const u8) SendResult {
+        return sendResult(self.conn.append(data));
+    }
+
+    fn sendResult(r: net.AppendResult) SendResult {
+        return switch (r) {
+            .queued => .queued,
+            .spilled => .spilled,
+            .failed_closed => .failed_closed,
+        };
     }
 
     /// Track an outbound stanza for SM purposes.
@@ -601,7 +674,7 @@ pub const Session = struct {
             if (!self.sm_detached and !self.sm_r_outstanding and
                 queue.pending() >= sm_state.SM_R_THRESHOLD)
             {
-                self.conn.queueSend("<r xmlns='urn:xmpp:sm:3'/>") catch return;
+                if (self.nonza("<r xmlns='urn:xmpp:sm:3'/>") == .failed_closed) return;
                 self.sm_r_outstanding = true;
             }
         }
@@ -1908,23 +1981,23 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
     switch (action) {
         .send_stream_open => |params| {
             xmpp.stream.writeStreamOpen(writer, params) catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
             session.stream.response_opened = true;
 
             // Immediately send features after stream open
             if (session.stream.getFeatures()) |features| {
                 var fbs2 = std.io.fixedBufferStream(session.write_scratch[fbs.pos..]);
                 xmpp.stream.writeFeatures(fbs2.writer(), self.applyDynamicMechanisms(features)) catch return;
-                session.conn.queueSend(fbs2.getWritten()) catch return;
+                if (session.nonza(fbs2.getWritten()) == .failed_closed) return;
             }
         },
         .send_features => |features| {
             xmpp.stream.writeFeatures(writer, self.applyDynamicMechanisms(features)) catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
         },
         .send_tls_proceed, .start_tls => {
             writer.writeAll("<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>") catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
 
             // T215: the handshake starts only after the plaintext
             // <proceed/> has fully flushed; leftover bytes would be
@@ -1941,7 +2014,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
             writer.writeAll("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch return;
             writer.writeAll(server_final) catch return;
             writer.writeAll("</success>") catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
             // Reset XML reader and clear read buffer for post-SASL stream restart
             // (same treatment as post-STARTTLS at line ~706)
             session.reader.reset();
@@ -1952,7 +2025,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
             writer.writeAll("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><") catch return;
             writer.writeAll(reason) catch return;
             writer.writeAll("/></failure>") catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
         },
         .send_bind_result => |bound_jid| {
             writer.writeAll("<iq type='result'") catch return;
@@ -1972,7 +2045,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
                 xml.escapeWrite(writer, bound_jid.resource) catch return;
             }
             writer.writeAll("</jid></bind></iq>") catch return;
-            session.queueSendStanza(fbs.getWritten()) catch return;
+            if (session.stanza(fbs.getWritten()) == .failed_closed) return;
         },
         .send_error => |err| {
             sendStreamError(self, session, err);
@@ -1982,7 +2055,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
         },
         .close => {
             writer.writeAll("</stream:stream>") catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
         },
         .none, .begin_sasl, .send_sasl_challenge => {},
     }
@@ -2093,12 +2166,12 @@ pub fn sendStreamError(self: *Server, session: *Session, err: xmpp.stream.Stream
         .id = &session.stream.stream_id_hex,
     };
     xmpp.stream.writeStreamError(fbs.writer(), err, open_params) catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
     session.stream.response_opened = true;
 }
 
 pub fn sendRaw(_: *Server, session: *Session, data: []const u8) void {
-    session.conn.queueSend(data) catch return;
+    _ = session.nonza(data);
 }
 
 /// Helper: fill the connection's write buffer so it has pending bytes that

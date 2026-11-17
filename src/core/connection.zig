@@ -292,14 +292,28 @@ pub const Connection = struct {
             if (metrics.get()) |c| metrics.bump(&c.drop_send_closed, 1);
             return error.ConnectionClosed;
         }
-        const parts = [_][]const u8{data};
-        switch (self.ob().append(&parts)) {
+        return switch (self.append(data)) {
             .queued, .spilled => {},
-            .failed_closed => {
-                if (metrics.get()) |c| metrics.bump(&c.drop_send_buffer_full, 1);
-                return error.WriteBufferFull;
-            },
+            .failed_closed => error.WriteBufferFull,
+        };
+    }
+
+    /// Append `data` to the outbox and report the ADR-2 outcome instead of
+    /// an error: the SendResult layer folds a dead fd and a full ring into
+    /// failed_closed (noteQueueDrop uses isClosed() to split them). A
+    /// refused append bumps the per-worker drop counter by reason here, so
+    /// every call site gets counted whether it inspects the result or not.
+    pub fn append(self: *Connection, data: []const u8) net.AppendResult {
+        if (self.closed) {
+            if (metrics.get()) |c| metrics.bump(&c.drop_send_closed, 1);
+            return .failed_closed;
         }
+        const parts = [_][]const u8{data};
+        const r = self.ob().append(&parts);
+        if (r == .failed_closed) {
+            if (metrics.get()) |c| metrics.bump(&c.drop_send_buffer_full, 1);
+        }
+        return r;
     }
 
     /// Queue `data`, first making room with one non-blocking flush when the

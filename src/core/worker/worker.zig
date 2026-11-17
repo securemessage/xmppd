@@ -2438,8 +2438,8 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
         .{ "c2s/lifecycle.zig", @embedFile("../c2s/lifecycle.zig"), 0 },
         .{ "worker/worker.zig", @embedFile("worker.zig"), 4 }, // stream/SASL/SM nonzas + M1 counter self-test.
         .{ "routing/deliver.zig", @embedFile("../routing/deliver.zig"), 1 }, // cross-worker drain queues the stanza raw.
-        .{ "c2s/session.zig", @embedFile("../c2s/session.zig"), 13 }, // queueSendStanza itself + stream/SASL nonzas.
-        .{ "c2s/sm.zig", @embedFile("../c2s/sm.zig"), 9 }, // SM enable/resume/failed nonzas.
+        .{ "c2s/session.zig", @embedFile("../c2s/session.zig"), 2 }, // stream/SASL nonzas went through nonza(); 2 test fillers remain.
+        .{ "c2s/sm.zig", @embedFile("../c2s/sm.zig"), 0 }, // SM enable/resume/failed nonzas go through nonza().
         .{ "iq/dispatch.zig", @embedFile("../iq/dispatch.zig"), 0 },
         .{ "iq/carbons.zig", @embedFile("../iq/carbons.zig"), 0 },
         .{ "muc/handler.zig", @embedFile("../muc/handler.zig"), 0 },

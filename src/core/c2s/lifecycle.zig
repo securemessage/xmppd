@@ -200,7 +200,7 @@ fn sendBindRejected(session: *Session) void {
     w.writeAll("><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>" ++
         "<error type='cancel'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>" ++
         "</error></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    if (session.stanza(fbs.getWritten()) == .failed_closed) return;
 }
 
 /// T154: the session_kick reply arrived — the full JID is free now. Retry
@@ -606,7 +606,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                     continue;
                 }
             }
-            session.queueSendStanza(wire) catch {
+            if (session.stanza(wire) == .failed_closed) {
                 // Send buffer full: stop here and let the writable handler
                 // drain the tail at the low-water mark. This message and the
                 // rest stay in the store, so nothing is lost.
@@ -615,7 +615,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                 session.offline_store_stalls = 0;
                 completed = false;
                 break;
-            };
+            }
             // Only delete what was actually handed to the connection. If the
             // delete fails the pointer survives, so record its sequence: the
             // next drain redoes the delete without sending the stanza twice.
