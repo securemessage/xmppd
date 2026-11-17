@@ -63,24 +63,26 @@ What core needs that lib/net lacks (stays in `src/core`):
 
 ### Ring backing, allocation, pinning
 
-`Connection.write_buf` (16 KiB, inline) becomes the Outbox ring storage.
-`Outbox.init` takes the ring as a `[]u8` the consumer owns, so no per
-connection heap allocation is added and the memory layout is unchanged.
-Because `Session.init` returns by value, the ring slice cannot be bound
-inside `init`; `Connection` therefore keeps an accessor `ob()` that
-re-derives `outbox.ring = write_buf[0..]` on every use, which also makes
-the binding survive the `session.* = Session.init(...)` move. The
-invariant that makes the TLS pin proof hold is unchanged from F3: a
-Session is heap-allocated once (`allocator.create(Session)`), stored as
-`*Session` in `sessions[]` and never moved afterward, so `write_buf`'s
-address is stable for the connection's life.
+`Connection.write_buf` is a 16 KiB heap block allocated lazily on the
+first append (`ensureWriteBuf`), so it is not moved by `Session.init`'s
+by-value return: the pointer is stable from allocation until `deinit()`.
+`Outbox.init` takes the ring as a `[]u8` the consumer owns; `Connection`
+starts with an empty ring and `ob()` rebinds `outbox.ring = write_buf`
+on every use, so the binding self-heals across the `sessions[]` move.
+The invariant that makes the TLS pin proof hold is unchanged from F3:
+a Session is heap-allocated once, stored as `*Session` in `sessions[]`,
+and never moved afterward. `deinit()` closes the fd, frees the spill
+list, then frees the ring block.
 
 `Connection.init` gains the allocator `Session.init` already receives
-(for M3 spill growth). Counters: `Server` owns one `net.Counters` per
-worker, bound at accept by `conn.bindOutbox(&server.net_counters)`;
-unbound connections fall back to a `threadlocal` counter block so tests
-need no ceremony. `Outbox.counters` is always non-null; nothing on the
-send path dereferences an undefined pointer.
+(for M3 spill growth and the ring block). Counters: connection.zig owns
+a static array of per-worker `net.Counters` slots, bound once the
+Connection lands in its heap slot by
+`conn.bindOutbox(countersForWorker(server.worker_id))`; unbound
+connections fall back to a `threadlocal` counter block so tests need no
+ceremony. `Outbox.counters` is always non-null; nothing on the send path
+dereferences an undefined pointer. The per-worker static keeps `Server`
+at its master size (the stack-frame ratchet caps it exactly).
 
 ## 2. The send API and its result type
 
@@ -227,13 +229,15 @@ it.
    once per dying session, not per stanza on the hot path; the
    end-of-iteration flush is bounded by `flush_budget_bytes` per conn
    per pass.
-5. **Connection economics.** Idle: `write_buf` 16 KiB inline +
-   ~80 B of `Outbox` bookkeeping (the removed
-   `write_start`/`write_end`/`tls_write_pending`/`compactWriteBuf`
-   state offsets most of it) — flat vs today. Step 1 cap: identical
-   16 KiB. Step 2 cap: up to `max_outbound_bytes` (1 MiB) of spill per
-   conn, freed back to a 64 KiB high-water mark on drain. The
-   connection cap itself is unchanged (`max_sessions`).
+5. **Connection economics.** Idle: no ring block at all until the first
+   append, then one 16 KiB heap block per conn + ~80 B of `Outbox`
+   bookkeeping (the removed `write_start`/`write_end`/`tls_write_pending`/
+   `compactWriteBuf` state offsets most of it) — flat or better vs today
+   (inline 16 KiB at idle). Step 1 cap: one 16 KiB ring + `Outbox` spill
+   list disabled (`spill_limit == ring.len`). Step 2 cap: up to
+   `max_outbound_bytes` (1 MiB) of spill per conn, freed back to a 64 KiB
+   high-water mark on drain. The connection cap itself is unchanged
+   (`max_sessions`).
 6. **Many requests per connection.** Unchanged; XMPP pipelining is
    unaffected.
 7. **Backpressure.** T110 watermarks keep their absolute thresholds on

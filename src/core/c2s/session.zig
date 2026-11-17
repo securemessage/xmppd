@@ -553,7 +553,7 @@ pub const Session = struct {
         }
         if (self.pep_payload.capacity > 0) self.pep_payload.deinit(self.reader.allocator);
         self.reader.deinit();
-        if (!self.conn.isClosed()) self.conn.close();
+        self.conn.deinit();
     }
 
     pub fn resetSasl(self: *Session) void {
@@ -3725,6 +3725,7 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     var session = Session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
+    try std.testing.expect(session.conn.ensureWriteBuf());
     @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
     session.conn.outbox.head = 0;
     session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;

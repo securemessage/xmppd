@@ -3662,6 +3662,7 @@ test "S16: mailbox-full bounce targets the sender and fails closed on overflow" 
     const cn = posix.read(carol_fds[1], &cbuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), cn);
 
+    try std.testing.expect(bob.conn.ensureWriteBuf());
     bob.conn.outbox.used = bob.conn.write_buf.len;
     bounceRoomMailboxFull(&server, msg, "room@conference.localhost", &changes);
     try std.testing.expect(bob.sm_overflow);
@@ -3917,6 +3918,7 @@ test "S16: local replaced-resource notice overflow fails the session" {
     target.stream.bound_jid = .{ .local = "eve", .domain = "localhost", .resource = "phone" };
     server.sessions[0] = target;
 
+    try std.testing.expect(target.conn.ensureWriteBuf());
     target.conn.outbox.used = target.conn.write_buf.len;
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -4625,6 +4627,7 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     var session = Session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
+    try std.testing.expect(session.conn.ensureWriteBuf());
     @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
     session.conn.outbox.head = 0;
     session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;

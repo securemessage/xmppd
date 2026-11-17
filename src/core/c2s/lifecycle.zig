@@ -72,7 +72,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
         session.conn = conn;
         // The conn reached its permanent home: point the outbox ring at
         // its write_buf and its counters at this worker's block (C2).
-        session.conn.bindOutbox(&server.net_counters);
+        session.conn.bindOutbox(connection_mod.countersForWorker(server.worker_id));
         server.sessions[id] = session;
 
         changes.addRead(conn.fd, id) catch {

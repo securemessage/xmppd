@@ -209,11 +209,6 @@ pub const Server = struct {
     free_ids: []usize = &.{},
     free_count: usize = 0,
 
-    /// Per-worker outbox counters (C2): every accepted Connection binds
-    /// its outbox here, so lib/net fail-closed and spill events have one
-    /// owner per loop thread.
-    net_counters: connection_mod.OutboxCounters = .{},
-
     /// TLS context — shared across all connections. Null if TLS is not configured.
     ssl_ctx: ?ssl.SslContext = null,
 
@@ -2591,6 +2586,7 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
             _ = posix.write(target.conn.fd, &chunk) catch break;
         }
     }
+    try std.testing.expect(target.conn.ensureWriteBuf());
     @memset(target.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
     target.conn.outbox.head = 0;
     target.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
