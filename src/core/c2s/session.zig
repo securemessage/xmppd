@@ -2142,6 +2142,18 @@ pub fn handleWritable(self: *Server, id: usize, changes: *ChangeList) void {
 /// the caller must stop touching it.
 pub fn startTlsUpgrade(self: *Server, session: *Session, changes: *ChangeList) bool {
     if (self.ssl_ctx) |ctx| {
+        // ADR-2 upgrade-point rule (net.Conn.startTls): anything queued
+        // behind the upgrade or buffered past it would be written
+        // through or parsed past the TLS layer. Callers hold
+        // starttls_pending until <proceed/> drains, so a non-empty
+        // outbox or read-ahead here is a real protocol violation.
+        if (!session.conn.outbox.empty() or session.conn.readableSlice().len != 0) {
+            log.warn("connection {d} STARTTLS refused: outbox={d} read-ahead={d} bytes", .{
+                session.conn.id, session.conn.outbox.bytes(), session.conn.readableSlice().len,
+            });
+            session_lifecycle.closeSession(self, session.conn.id, changes);
+            return false;
+        }
         if (self.fail_next_tls_upgrade) {
             self.fail_next_tls_upgrade = false;
             log.warn("connection {d} TLS upgrade failed", .{session.conn.id});
@@ -3311,6 +3323,61 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     // Buffer drained: the deferred upgrade has started the handshake.
     try std.testing.expect(session.conn.tls != null);
     try std.testing.expect(session.conn.isTlsHandshaking());
+}
+
+// ADR-2 upgrade-point rule: bytes queued behind <proceed/> or client
+// bytes read ahead of the upgrade would cross the TLS boundary in
+// plaintext, so the upgrade refuses and closes the session.
+test "Server: STARTTLS upgrade refuses a non-empty outbox" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(std.testing.allocator, tmp.dir);
+    defer std.testing.allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    _ = session.nonza("<proceed/>");
+    try std.testing.expect(!session.conn.outbox.empty());
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    try std.testing.expect(!startTlsUpgrade(&server, session, &changes));
+    try std.testing.expect(server.sessions[1] == null);
+}
+
+test "Server: STARTTLS upgrade refuses unread client bytes" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(std.testing.allocator, tmp.dir);
+    defer std.testing.allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    // Bytes pipelined past <starttls/> sit in the read buffer: upgrading
+    // now would feed them to the TLS layer as handshake bytes.
+    session.conn.read_end = 7;
+    try std.testing.expect(session.conn.readableSlice().len != 0);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    try std.testing.expect(!startTlsUpgrade(&server, session, &changes));
+    try std.testing.expect(server.sessions[1] == null);
 }
 
 test "Server: T215 failed deferred upgrade does not touch the freed session" {
