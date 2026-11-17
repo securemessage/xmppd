@@ -158,10 +158,10 @@ fn bounceCrossWorkerUnavailable(
             log.warn("cross-worker bounce for {s} dropped: sender slot empty", .{sender_full});
             return;
         };
-        session.queueSendStanza(stanza) catch |err| {
-            log.warn("cross-worker bounce for {s} not queued: {s}", .{ sender_full, @errorName(err) });
+        if (session.stanza(stanza) == .failed_closed) {
+            log.warn("cross-worker bounce for {s} not queued: {s}", .{ sender_full, if (session.conn.isClosed()) "ConnectionClosed" else "WriteBufferFull" });
             return;
-        };
+        }
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
@@ -276,14 +276,9 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
                 }
                 return;
             }
-            if (target_session.sm_detached) {
-                // T153: no live connection to deliver to — track for resume
-                // replay instead of silently dropping the stanza.
-                target_session.smTrackOutbound(payload);
-                return;
-            }
-            target_session.conn.queueSend(payload) catch return;
-            target_session.smTrackOutbound(payload);
+            // stanza() covers the T153 detached case itself: it tracks
+            // for resume replay and reports tracked_detached.
+            if (target_session.stanza(payload) == .failed_closed) return;
             if (target_session.conn.hasPendingWrite()) {
                 c.changes.addWrite(target_session.conn.fd, local_session_id) catch {};
             }

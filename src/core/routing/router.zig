@@ -72,23 +72,9 @@ noinline fn noteCrossWorkerDrop(comptime fmt: []const u8, args: anytype) void {
 /// path: it is logged, and a full write buffer flags the session for
 /// overflow teardown (R1), the same classification dispatchStanza uses.
 fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
-    session.queueSendStanza(stanza) catch |err| {
-        noteQueueDrop(session, stanza, err, what);
-    };
-}
-
-/// Classify and log one refused queueSendStanza on the cold path (R5).
-/// WriteBufferFull is two different refusals, split by noteQueueOverflow:
-/// a stanza longer than the whole buffer is dropped as oversize and the
-/// session lives; a deliverable stanza that cannot fit means a slow reader
-/// and flags overflow teardown (R1).
-noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerror, comptime what: []const u8) void {
-    @branchHint(.cold);
-    if (err == error.WriteBufferFull and server_mod.noteQueueOverflow(session, stanza)) {
-        log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, connection_mod.WRITE_BUF_SIZE });
-        return;
+    if (session.stanza(stanza) == .failed_closed) {
+        c2s_session.noteSendDrop(session, stanza, what);
     }
-    log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
 }
 
 pub const BARE_JID_MAX = jid_bounds.BARE_JID_MAX;
@@ -670,42 +656,25 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             }
             continue;
         }
-        // T153: a detached (SM resume pending) session has no live connection —
-        // its conn.fd was already closed by detachSession(). Attempting
-        // conn.queueSend()/changes.addWrite() here would register a kqueue
-        // watch on a stale fd number that the OS may have already recycled
-        // for an unrelated connection, misrouting future events onto this
-        // session slot. Track the stanza for resume replay instead of
-        // attempting live delivery.
-        if (target_session.sm_detached) {
-            target_session.smTrackOutbound(sent_data);
-            local_delivery_succeeded = true;
-            if (delivered_count < delivered_buf.len) {
-                delivered_buf[delivered_count] = entry;
-                delivered_count += 1;
-            }
-            continue;
-        }
         // Apply the MUC fan-out policy here too. A stanza that fits an empty
         // buffer but not the current one means the peer is not reading, so
         // mark it for the slow-reader teardown, as the MUC path does. A stanza
         // larger than the whole buffer can never be delivered to anyone.
-        target_session.conn.queueSendWithFlush(sent_data) catch |err| {
+        // stanzaWithFlush covers the T153 detached case itself: tracked_
+        // detached is delivered-for-replay, counted like a queued send.
+        if (target_session.stanzaWithFlush(sent_data) == .failed_closed) {
             delivery_failed = true;
-            if (err == error.WriteBufferFull) {
-                if (sent_data.len <= connection_mod.WRITE_BUF_SIZE) {
-                    target_session.sm_overflow = true;
-                    noteDrop("connection {d} outbound buffer full for {s}; marking the session for overflow teardown", .{ tid, to_str });
-                } else {
-                    _ = delivery_queue_mod.oversize_queue_drops.fetchAdd(1, .monotonic);
-                    noteDrop("connection {d} stanza for {s} of {d} bytes exceeds the write buffer", .{ tid, to_str, sent_data.len });
-                }
+            if (target_session.conn.isClosed()) {
+                noteDrop("connection {d} could not queue stanza for {s}: ConnectionClosed", .{ tid, to_str });
+            } else if (sent_data.len <= connection_mod.WRITE_BUF_SIZE) {
+                target_session.sm_overflow = true;
+                noteDrop("connection {d} outbound buffer full for {s}; marking the session for overflow teardown", .{ tid, to_str });
             } else {
-                noteDrop("connection {d} could not queue stanza for {s}: {s}", .{ tid, to_str, @errorName(err) });
+                _ = delivery_queue_mod.oversize_queue_drops.fetchAdd(1, .monotonic);
+                noteDrop("connection {d} stanza for {s} of {d} bytes exceeds the write buffer", .{ tid, to_str, sent_data.len });
             }
             continue;
-        };
-        target_session.smTrackOutbound(sent_data);
+        }
         local_delivery_succeeded = true;
         if (delivered_count < delivered_buf.len) {
             delivered_buf[delivered_count] = entry;

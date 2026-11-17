@@ -329,6 +329,17 @@ pub const Connection = struct {
         };
     }
 
+    /// append() with the queueSendWithFlush policy: one non-blocking flush
+    /// when the first append is refused on a live conn, then a second
+    /// append. A dead conn returns the first failed_closed as-is so the
+    /// drop counter is bumped once, not twice.
+    pub fn appendWithFlush(self: *Connection, data: []const u8) net.AppendResult {
+        const r = self.append(data);
+        if (r != .failed_closed or self.closed) return r;
+        _ = self.flushSend() catch 0;
+        return self.append(data);
+    }
+
     /// Returns true if there is unsent data in the write buffer.
     /// When true, the caller should register this fd for EVFILT_WRITE.
     pub fn hasPendingWrite(self: *const Connection) bool {

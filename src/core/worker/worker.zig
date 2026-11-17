@@ -2430,14 +2430,14 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
     };
     const cases = .{
         .{ "connection.zig", @embedFile("../connection.zig"), 17 }, // Connection layer self-tests incl. the M1 counter test; no Session.
-        .{ "muc/fanout.zig", @embedFile("../muc/fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
+        .{ "muc/fanout.zig", @embedFile("../muc/fanout.zig"), 1 }, // MockSession.stanza in tests; the live path uses Session.stanza().
         .{ "presence/handler.zig", @embedFile("../presence/handler.zig"), 0 },
         .{ "presence/subscription.zig", @embedFile("../presence/subscription.zig"), 0 },
         .{ "presence/broadcast.zig", @embedFile("../presence/broadcast.zig"), 0 },
-        .{ "routing/router.zig", @embedFile("../routing/router.zig"), 2 }, // one comment; queueSendWithFlush is tracked.
+        .{ "routing/router.zig", @embedFile("../routing/router.zig"), 0 }, // local delivery goes through stanzaWithFlush().
         .{ "c2s/lifecycle.zig", @embedFile("../c2s/lifecycle.zig"), 0 },
         .{ "worker/worker.zig", @embedFile("worker.zig"), 4 }, // stream/SASL/SM nonzas + M1 counter self-test.
-        .{ "routing/deliver.zig", @embedFile("../routing/deliver.zig"), 1 }, // cross-worker drain queues the stanza raw.
+        .{ "routing/deliver.zig", @embedFile("../routing/deliver.zig"), 0 }, // the cross-worker drain goes through stanza().
         .{ "c2s/session.zig", @embedFile("../c2s/session.zig"), 2 }, // stream/SASL nonzas went through nonza(); 2 test fillers remain.
         .{ "c2s/sm.zig", @embedFile("../c2s/sm.zig"), 0 }, // SM enable/resume/failed nonzas go through nonza().
         .{ "iq/dispatch.zig", @embedFile("../iq/dispatch.zig"), 0 },

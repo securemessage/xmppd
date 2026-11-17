@@ -632,6 +632,18 @@ pub const Session = struct {
         return sendResult(self.conn.append(data));
     }
 
+    /// stanza() with the queueSendWithFlush policy: one non-blocking
+    /// flush first when the outbox cannot fit the stanza whole, so a
+    /// buffer the server filled itself is drained rather than torn down.
+    pub fn stanzaWithFlush(self: *Session, data: []const u8) SendResult {
+        if (self.sm_detached) {
+            self.smTrackOutbound(data);
+            return .tracked_detached;
+        }
+        self.smTrackOutbound(data);
+        return sendResult(self.conn.appendWithFlush(data));
+    }
+
     /// Queue a nonza — anything that is not a message/presence/iq stanza:
     /// SM elements, stream features and errors, SASL elements, the stream
     /// close. Never counted for XEP-0198.
