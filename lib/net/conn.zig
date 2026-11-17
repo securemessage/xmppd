@@ -339,8 +339,14 @@ pub const Outbox = struct {
         return .{ .ring = ring, .spill_limit = spill_limit, .counters = counters, .alloc = alloc };
     }
 
+    /// Free the spill. Idempotent: the list is reset to `.empty` so a
+    /// second call frees nothing (core's Connection.deinit can run on
+    /// an already-torn-down conn).
     pub fn deinit(o: *Outbox) void {
         o.spill.deinit(o.alloc);
+        o.spill = .empty;
+        o.spill_head = 0;
+        o.pin = null;
     }
 
     /// Total unsent bytes (ring plus pending spill).
@@ -1649,6 +1655,21 @@ test "Outbox: spill bound fails closed and counts" {
     const big = [_][]const u8{&big_data};
     try std.testing.expectEqual(AppendResult.failed_closed, o.append(&big));
     try std.testing.expectEqual(@as(u64, 1), counters.outbox_failed_closed);
+    try std.testing.expectEqual(@as(usize, 0), o.bytes());
+}
+
+test "Outbox: deinit is idempotent" {
+    var counters: Counters = .{};
+    var ring: [8]u8 = undefined;
+    var o = Outbox.init(&ring, std.testing.allocator, 1 << 20, &counters);
+
+    // Grow the spill so the second deinit would double-free without
+    // the reset.
+    const data = [_]u8{0x42} ** 64;
+    const parts = [_][]const u8{&data};
+    try std.testing.expectEqual(AppendResult.spilled, o.append(&parts));
+    o.deinit();
+    o.deinit();
     try std.testing.expectEqual(@as(usize, 0), o.bytes());
 }
 

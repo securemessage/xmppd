@@ -3663,7 +3663,8 @@ test "S16: mailbox-full bounce targets the sender and fails closed on overflow" 
     try std.testing.expectEqual(@as(usize, 0), cn);
 
     try std.testing.expect(bob.conn.ensureWriteBuf());
-    bob.conn.outbox.used = bob.conn.write_buf.len;
+    bob.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    bob.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     bounceRoomMailboxFull(&server, msg, "room@conference.localhost", &changes);
     try std.testing.expect(bob.sm_overflow);
 }
@@ -3919,7 +3920,8 @@ test "S16: local replaced-resource notice overflow fails the session" {
     server.sessions[0] = target;
 
     try std.testing.expect(target.conn.ensureWriteBuf());
-    target.conn.outbox.used = target.conn.write_buf.len;
+    target.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    target.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
     notifyReplacedResource(&server, room, &before, &changes);
@@ -4050,6 +4052,7 @@ test "H5: the first fan-out after a genuine buffer-full loss still reaches the r
 
     // bob's connection is nearly full, so a small stanza no longer fits. This
     // is the genuinely-full case the teardown is for, not the H5 size case.
+    server.sessions[1].?.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     server.sessions[1].?.conn.outbox.used = connection_mod.WRITE_BUF_SIZE - 64;
 
     const body = "<body>one</body>";
@@ -4591,9 +4594,10 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     defer session.deinit();
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     session.iq_to = "conference.localhost";
+    // A reply longer than the outbound bound: the append refuses it even
+    // with the outbox empty, so this is oversize, not a slow reader.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
-    // A reply longer than the whole write buffer: queueSend refuses it even
-    // with the buffer empty, so this is oversize, not a slow reader.
     const stanza = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 32);
     defer allocator.free(stanza);
     const head = "<iq type='result' from='conference.localhost' to='alice@localhost/mobile' id='big1'><query>";
@@ -4631,6 +4635,7 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
     session.conn.outbox.head = 0;
     session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
     const drops_before = delivery_queue.oversize_queue_drops.load(.monotonic);
     queueStanzaOrDrop(&session, "<iq type='result' id='q1'/>", "small iq result");

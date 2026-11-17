@@ -1389,8 +1389,9 @@ test "S13: offline delivery keeps undelivered messages when the send buffer fill
         destroySession(&server, 1, session, &changes);
     }
 
-    // 40 messages of ~1 KiB each: roughly 40 KiB of backlog against the
-    // 16 KiB connection write buffer, so delivery must pause partway.
+    // 40 messages of ~1 KiB each: roughly 40 KiB of backlog against an
+    // outbox bounded at the 16 KiB ring, so delivery must pause partway.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     const total: usize = 40;
     var stanza_buf: [1024]u8 = undefined;
     const pad = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
@@ -1482,6 +1483,8 @@ test "S13: stalled offline drain resumes via drainOfflinePending" {
         _ = try offline_store.storePointer("bob@localhost", "alice@localhost", stanza_id, ts);
     }
 
+    // Bound the outbox at the ring so the backlog stalls mid-drain.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
     try std.testing.expect(session.offline_pending);
     try std.testing.expect(try offline_store.countMessages("bob@localhost") > 0);

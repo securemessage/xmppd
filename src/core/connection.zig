@@ -92,9 +92,13 @@ const READ_BUF_SIZE = 8192;
 /// Write buffer size — 16KB per connection.
 /// Larger than read because the server may need to send stream features + multiple
 /// stanzas before the client has a chance to ACK at the TCP level.
-/// A stanza larger than this can never be queued in one piece, so producers
-/// that can size a stanza up front (MUC fan-out) reject it instead.
 pub const WRITE_BUF_SIZE = 16384;
+
+/// Per-connection outbound bound (ring plus spill) — the lib/net
+/// max_outbound_bytes default for c2s (F3-DESIGN section 1). An append
+/// that cannot fit fails closed and the session is failed with
+/// resource-constraint; undelivered messages drain to offline storage.
+pub const MAX_OUTBOUND_BYTES: usize = 1 << 20;
 
 /// T110 backpressure: at/above this buffered-bytes level the server disables
 /// EVFILT_READ for the connection, so TCP-level flow control propagates to
@@ -130,9 +134,7 @@ pub const Connection = struct {
     write_buf: []u8 = &.{},
 
     /// Outbound queue over `write_buf` (lib/net Outbox): a fixed ring
-    /// first, a bounded spill behind it. `spill_limit == WRITE_BUF_SIZE`
-    /// preserves the pre-Outbox semantics: an append that cannot fit the
-    /// ring fails closed and the spill never holds bytes. The ring
+    /// first, a bounded spill behind it up to MAX_OUTBOUND_BYTES. The ring
     /// binding is re-derived on each use via ob() because a Connection
     /// is moved by value before the owning Session is placed on the heap.
     outbox: net.Outbox,
@@ -172,7 +174,7 @@ pub const Connection = struct {
         return .{
             .fd = fd,
             .id = id,
-            .outbox = net.Outbox.init(placeholder_outbox_ring[0..], alloc, WRITE_BUF_SIZE, &fallback_outbox_counters),
+            .outbox = net.Outbox.init(placeholder_outbox_ring[0..], alloc, MAX_OUTBOUND_BYTES, &fallback_outbox_counters),
         };
     }
 
@@ -736,6 +738,7 @@ test "Connection: M1 counters track bytes and queueSend drops" {
     defer posix.close(fds[1]);
 
     var conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer conn.deinit();
 
     try conn.queueSend("hello");
     _ = try conn.flushSend();
@@ -745,6 +748,9 @@ test "Connection: M1 counters track bytes and queueSend drops" {
     _ = try conn.recv();
     try std.testing.expectEqual(base_in + 4, c.bytes_in.load(.monotonic));
 
+    // The bounded spill makes the ring stop being the refusal bound;
+    // shrink it so an oversized append still exercises failed_closed.
+    conn.outbox.spill_limit = WRITE_BUF_SIZE;
     const big = [_]u8{'x'} ** (WRITE_BUF_SIZE + 1);
     try std.testing.expectError(error.WriteBufferFull, conn.queueSend(&big));
     try std.testing.expectEqual(base_full + 1, c.drop_send_buffer_full.load(.monotonic));

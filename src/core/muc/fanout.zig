@@ -248,12 +248,12 @@ pub fn deliverToSession(
         // (noteQueueOverflow): a stanza that can never fit is an oversize
         // drop, not a slow reader.
         if (session.conn.isClosed()) return;
-        if (data.len <= connection_mod.WRITE_BUF_SIZE) {
+        if (data.len <= session.conn.outbox.spill_limit) {
             session.sm_overflow = true;
             log.warn("local delivery to session {d} failed: WriteBufferFull; marking the session for overflow teardown", .{session_id});
         } else {
             _ = delivery_queue_mod.oversize_queue_drops.fetchAdd(1, .monotonic);
-            log.warn("local delivery to session {d} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session_id, data.len, connection_mod.WRITE_BUF_SIZE });
+            log.warn("local delivery to session {d} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session_id, data.len, session.conn.outbox.spill_limit });
         }
         return;
     }
@@ -474,6 +474,7 @@ const MockConn = struct {
     fail_full: bool = false,
     sent: [1024]u8 = undefined,
     sent_len: usize = 0,
+    outbox: struct { spill_limit: usize } = .{ .spill_limit = connection_mod.MAX_OUTBOUND_BYTES },
 
     pub fn queueSend(self: *MockConn, data: []const u8) !void {
         if (self.closed) return error.ConnectionClosed;
@@ -514,7 +515,7 @@ const MockSession = struct {
             return .tracked_detached;
         }
         self.conn.queueSend(data) catch {
-            if (data.len <= connection_mod.WRITE_BUF_SIZE) self.smTrackOutbound(data);
+            if (data.len <= self.conn.outbox.spill_limit) self.smTrackOutbound(data);
             return .failed_closed;
         };
         self.smTrackOutbound(data);
@@ -597,12 +598,14 @@ test "deliverToSession: oversized stanza keeps the session, full buffer flags it
     var session = MockSession{};
     session.conn.fail_full = true;
     var changes = MockChanges{};
+    // Small bound so the oversized case does not need a 1 MiB stanza.
+    session.conn.outbox.spill_limit = 64;
 
     const drops_before = delivery_queue_mod.oversize_queue_drops.load(.monotonic);
 
-    // A stanza longer than the whole write buffer is an oversize drop, not
-    // a slow reader: the session stays up and the drop is counted.
-    const big = "x" ** (connection_mod.WRITE_BUF_SIZE + 1);
+    // A stanza longer than the whole outbound bound is an oversize drop,
+    // not a slow reader: the session stays up and the drop is counted.
+    const big = "x" ** 65;
     deliverToSession(&session, big, 3, &changes);
     try std.testing.expect(!session.sm_overflow);
     try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.oversize_queue_drops.load(.monotonic));

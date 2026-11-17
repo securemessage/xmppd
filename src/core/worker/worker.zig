@@ -2385,6 +2385,9 @@ test "Server: M1 counters track client traffic through the read path" {
 
     // The drop counters are bumped at their choke points, not per session.
     const base_full = c.drop_send_buffer_full.load(.monotonic);
+    // The bounded spill makes the ring stop being the refusal bound;
+    // shrink it so an oversized append still exercises failed_closed.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     const big = [_]u8{'x'} ** (16384 + 1);
     try std.testing.expectError(error.WriteBufferFull, session.conn.queueSend(&big));
     try std.testing.expectEqual(base_full + 1, c.drop_send_buffer_full.load(.monotonic));
@@ -2590,6 +2593,7 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
     @memset(target.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
     target.conn.outbox.head = 0;
     target.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    target.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     try std.testing.expectError(error.WouldBlock, target.conn.flushSend());
 
     const alice_fds = try makeSocketPair();
@@ -2835,8 +2839,8 @@ test "Re-review 6.8: a successful retry delete clears the recorded sequence" {
     try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
 }
 
-// A delivery form between the write buffer and the scratch bank fits the
-// serializer but never the socket buffer. That is not a slow reader: the form
+// A delivery form between the outbound bound and the scratch bank fits the
+// serializer but never the outbox. That is not a slow reader: the form
 // could never be queued for anyone, so it bounces and the recipient stays
 // healthy.
 test "Re-review 7.6: a form over the write buffer but inside the bank does not mark overflow" {
@@ -2857,6 +2861,8 @@ test "Re-review 7.6: a form over the write buffer but inside the bank does not m
     bob.stream.authenticated = true;
     bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
     server.sessions[5] = bob;
+    // Bound bob's outbox at the ring so the form below cannot queue.
+    bob.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     _ = try sm.bind(0, 5, "bob", "localhost", "desk");
     sm.setPresenceAvailable("bob", "localhost", "desk", true);
 

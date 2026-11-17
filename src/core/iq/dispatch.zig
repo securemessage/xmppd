@@ -3166,9 +3166,10 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     defer session.deinit();
     session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
     session.iq_to = "localhost";
+    // A reply longer than the outbound bound: the append refuses it even
+    // with the outbox empty, so this is oversize, not a slow reader.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
-    // A reply longer than the whole write buffer: queueSend refuses it even
-    // with the buffer empty, so this is oversize, not a slow reader.
     const stanza = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 32);
     defer allocator.free(stanza);
     const head = "<iq type='result' from='localhost' to='alice@localhost/phone' id='big1'><query>";
@@ -3205,6 +3206,7 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
     session.conn.outbox.head = 0;
     session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
     const drops_before = delivery_queue.oversize_queue_drops.load(.monotonic);
     queueStanzaOrDrop(&session, "<iq type='result' id='q1'/>", "small iq result");

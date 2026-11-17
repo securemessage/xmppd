@@ -105,7 +105,7 @@ pub noinline fn noteSendDrop(session: *Session, stanza: []const u8, comptime wha
     @branchHint(.cold);
     if (!session.conn.isClosed()) {
         if (noteQueueOverflow(session, stanza)) {
-            log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, connection_mod.WRITE_BUF_SIZE });
+            log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, session.conn.outbox.spill_limit });
             return;
         }
         log.warn("connection {d}: {s} could not be queued (WriteBufferFull)", .{ session.conn.id, what });
@@ -122,7 +122,7 @@ pub noinline fn noteSendDrop(session: *Session, stanza: []const u8, comptime wha
 pub noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerror, comptime what: []const u8) void {
     @branchHint(.cold);
     if (err == error.WriteBufferFull and noteQueueOverflow(session, stanza)) {
-        log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, connection_mod.WRITE_BUF_SIZE });
+        log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, session.conn.outbox.spill_limit });
         return;
     }
     log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
@@ -135,7 +135,7 @@ pub noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerr
 /// reader: flag the session for the XEP-0198 overflow teardown. Returns
 /// true only for the oversize case.
 pub fn noteQueueOverflow(session: *Session, stanza: []const u8) bool {
-    if (stanza.len <= connection_mod.WRITE_BUF_SIZE) {
+    if (stanza.len <= session.conn.outbox.spill_limit) {
         session.sm_overflow = true;
         return false;
     }
@@ -589,8 +589,7 @@ pub const Session = struct {
         /// Detached SM session: counted into the unacked queue with no
         /// fd to write to; delivery happens on resume.
         tracked_detached,
-        /// Accepted into the bounded spill behind the ring. Unreachable
-        /// at the M2 spill cap (spill_limit == WRITE_BUF_SIZE).
+        /// Accepted into the bounded spill behind the ring.
         spilled,
         /// Refused: the conn is closed or the outbox is full. The append
         /// already bumped the per-worker drop counter by reason.
@@ -3284,6 +3283,8 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     // queued <proceed/> cannot flush at once.
     var drain_buf: [16384]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
+    // Bound the outbox at the ring until the dirty-list flush budget lands.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     try std.testing.expect(fillWriteBuffer(session));
 
     _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
@@ -3336,6 +3337,8 @@ test "Server: T215 failed deferred upgrade does not touch the freed session" {
     // the upgrade is deferred to handleWritable.
     var drain_buf: [16384]u8 = undefined;
     _ = posix.read(fds[1], &drain_buf) catch 0;
+    // Bound the outbox at the ring until the dirty-list flush budget lands.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     try std.testing.expect(fillWriteBuffer(session));
 
     _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
@@ -3690,6 +3693,8 @@ test "S15: an oversize stanza is refused untracked, a fitting refusal still coun
     const queue = try allocator.create(sm_state.SmUnackedQueue);
     queue.* = sm_state.SmUnackedQueue.init(allocator);
     session.sm_unacked = queue;
+    // Shrink the outbound bound to the ring so the fixtures stay small.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
     // A stanza longer than the whole outbound bound can never go out, on
     // this session or a resumed one: counting it would wedge the unacked
@@ -3724,9 +3729,10 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     defer session.deinit();
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     session.iq_to = "localhost";
+    // A reply longer than the outbound bound: the append refuses it even
+    // with the outbox empty, so this is oversize, not a slow reader.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
-    // A reply longer than the whole write buffer: queueSend refuses it even
-    // with the buffer empty, so this is oversize, not a slow reader.
     const stanza = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 32);
     defer allocator.free(stanza);
     const head = "<iq type='result' from='localhost' to='alice@localhost/mobile' id='big1'><query>";
@@ -3763,6 +3769,7 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
     session.conn.outbox.head = 0;
     session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
     const drops_before = delivery_queue_mod.oversize_queue_drops.load(.monotonic);
     queueStanzaOrDrop(&session, "<iq type='result' id='q1'/>", "small iq result");
