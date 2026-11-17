@@ -271,17 +271,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const ssl_test_mod = b.createModule(.{
-        .root_source_file = b.path("lib/tls/ssl.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    ssl_test_mod.linkSystemLibrary("ssl", .{});
-    ssl_test_mod.linkSystemLibrary("crypto", .{});
-    ssl_test_mod.addImport("dane", dane_mod);
-    ssl_test_mod.addImport("dane-openssl", dane_openssl_mod);
-
     const dns_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/dns/dns.zig"),
         .target = target,
@@ -365,7 +354,7 @@ pub fn build(b: *std.Build) void {
 
     const ssl_tests = b.addTest(.{
         .name = "ssl-tests",
-        .root_module = ssl_test_mod,
+        .root_module = ssl_mod,
     });
 
     const dns_tests = b.addTest(.{
@@ -542,7 +531,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    connection_test_mod.addImport("ssl", ssl_test_mod);
+    connection_test_mod.addImport("ssl", ssl_mod);
+    connection_test_mod.addImport("net", net_mod);
     connection_test_mod.linkSystemLibrary("ssl", .{});
     connection_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -559,7 +549,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    listener_test_mod.addImport("ssl", ssl_test_mod);
+    listener_test_mod.addImport("ssl", ssl_mod);
+    listener_test_mod.addImport("net", net_mod);
     listener_test_mod.linkSystemLibrary("ssl", .{});
     listener_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -703,7 +694,8 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
     server_test_mod.addImport("precis_username", precis_username_mod);
-    server_test_mod.addImport("ssl", ssl_test_mod);
+    server_test_mod.addImport("ssl", ssl_mod);
+    server_test_mod.addImport("net", net_mod);
     server_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     server_test_mod.addImport("ipc_client", ipc_client_test_mod);
     server_test_mod.addImport("roster_store", roster_store_mod_for_server);
@@ -1066,7 +1058,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    s2s_connector_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_connector_test_mod.addImport("ssl", ssl_mod);
     s2s_connector_test_mod.addImport("xml", xml_mod);
     s2s_connector_test_mod.addImport("dns", dns_mod);
     s2s_connector_test_mod.addImport("dns_async", dns_async_mod);
@@ -1092,7 +1084,7 @@ pub fn build(b: *std.Build) void {
     // dialback re-uses the session's XML escaping (S1); session.zig then
     // pulls in ssl/xml/connector for the test module.
     s2s_dialback_test_mod.addImport("xml", xml_mod);
-    s2s_dialback_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_dialback_test_mod.addImport("ssl", ssl_mod);
     s2s_dialback_test_mod.addImport("dns", dns_mod);
     s2s_dialback_test_mod.addImport("dns_async", dns_async_mod);
     s2s_dialback_test_mod.addImport("xmpp", xmpp_mod);
@@ -1114,7 +1106,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    s2s_session_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_session_test_mod.addImport("ssl", ssl_mod);
     s2s_session_test_mod.addImport("xml", xml_mod);
     s2s_session_test_mod.addImport("dns", dns_mod);
     s2s_session_test_mod.addImport("dns_async", dns_async_mod);
@@ -1147,7 +1139,7 @@ pub fn build(b: *std.Build) void {
     s2s_main_test_mod.addImport("ipc_server", ipc_server_test_mod);
     s2s_main_test_mod.addImport("event_loop", s2s_event_loop_mod);
     s2s_main_test_mod.addImport("xml", xml_mod);
-    s2s_main_test_mod.addImport("ssl", ssl_test_mod);
+    s2s_main_test_mod.addImport("ssl", ssl_mod);
     s2s_main_test_mod.addImport("dns", dns_mod);
     s2s_main_test_mod.addImport("wire", wire_mod);
     s2s_main_test_mod.addImport("dns_async", dns_async_mod);
@@ -1380,7 +1372,8 @@ pub fn build(b: *std.Build) void {
     fanout_test_mod.addImport("room_registry", room_registry_test_mod);
     fanout_test_mod.addImport("room_store", room_store_test_mod);
     fanout_test_mod.addImport("delivery_queue", delivery_queue_test_mod);
-    fanout_test_mod.addImport("ssl", ssl_test_mod);
+    fanout_test_mod.addImport("ssl", ssl_mod);
+    fanout_test_mod.addImport("net", net_mod);
 
     const fanout_tests = b.addTest(.{
         .name = "fanout-tests",
@@ -1627,7 +1620,8 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("xmpp", xmpp_mod);
     core_mod.addImport("sasl", sasl_mod);
     core_mod.addImport("precis_username", precis_username_mod);
-    core_mod.addImport("ssl", ssl_test_mod);
+    core_mod.addImport("ssl", ssl_mod);
+    core_mod.addImport("net", net_mod);
     core_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     core_mod.addImport("ipc_client", ipc_client_test_mod);
     core_mod.addImport("roster_store", roster_store_mod_for_server);
@@ -1967,7 +1961,7 @@ pub fn build(b: *std.Build) void {
     s2s_main_mod.addImport("ipc_server", s2s_ipc_server_mod);
     s2s_main_mod.addImport("event_loop", s2s_event_loop_exe_mod);
     s2s_main_mod.addImport("xml", xml_mod);
-    s2s_main_mod.addImport("ssl", ssl_test_mod);
+    s2s_main_mod.addImport("ssl", ssl_mod);
     s2s_main_mod.addImport("dns", dns_mod);
     s2s_main_mod.addImport("dns_async", dns_async_mod);
     s2s_main_mod.addImport("xmpp", xmpp_mod);
