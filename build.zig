@@ -230,6 +230,19 @@ pub fn build(b: *std.Build) void {
     });
     net_mod.addImport("ssl", ssl_mod);
 
+    // The core daemons link the net graph through its conn unit rather
+    // than the net.zig umbrella: net.zig file-imports frame.zig, whose
+    // other owner is the ipc "net_frame" module, and one file cannot
+    // belong to two modules in a single compilation. conn.zig supplies
+    // every type core needs (Outbox, Transport, Tls, Counters, Conn).
+    const net_conn_mod = b.createModule(.{
+        .root_source_file = b.path("lib/net/conn.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    net_conn_mod.addImport("ssl", ssl_mod);
+
     const xmpp_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
         .target = target,
@@ -532,7 +545,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     connection_test_mod.addImport("ssl", ssl_mod);
-    connection_test_mod.addImport("net", net_mod);
+    connection_test_mod.addImport("net", net_conn_mod);
     connection_test_mod.linkSystemLibrary("ssl", .{});
     connection_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -550,7 +563,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     listener_test_mod.addImport("ssl", ssl_mod);
-    listener_test_mod.addImport("net", net_mod);
+    listener_test_mod.addImport("net", net_conn_mod);
     listener_test_mod.linkSystemLibrary("ssl", .{});
     listener_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -695,7 +708,7 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("sasl", sasl_mod);
     server_test_mod.addImport("precis_username", precis_username_mod);
     server_test_mod.addImport("ssl", ssl_mod);
-    server_test_mod.addImport("net", net_mod);
+    server_test_mod.addImport("net", net_conn_mod);
     server_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     server_test_mod.addImport("ipc_client", ipc_client_test_mod);
     server_test_mod.addImport("roster_store", roster_store_mod_for_server);
@@ -1373,7 +1386,7 @@ pub fn build(b: *std.Build) void {
     fanout_test_mod.addImport("room_store", room_store_test_mod);
     fanout_test_mod.addImport("delivery_queue", delivery_queue_test_mod);
     fanout_test_mod.addImport("ssl", ssl_mod);
-    fanout_test_mod.addImport("net", net_mod);
+    fanout_test_mod.addImport("net", net_conn_mod);
 
     const fanout_tests = b.addTest(.{
         .name = "fanout-tests",
@@ -1621,7 +1634,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("sasl", sasl_mod);
     core_mod.addImport("precis_username", precis_username_mod);
     core_mod.addImport("ssl", ssl_mod);
-    core_mod.addImport("net", net_mod);
+    core_mod.addImport("net", net_conn_mod);
     core_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     core_mod.addImport("ipc_client", ipc_client_test_mod);
     core_mod.addImport("roster_store", roster_store_mod_for_server);
