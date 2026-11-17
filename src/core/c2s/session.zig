@@ -3678,6 +3678,40 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     try std.testing.expectEqual(@as(u32, 1), queue.pending());
 }
 
+test "S15: an oversize stanza is refused untracked, a fitting refusal still counts" {
+    const allocator = std.testing.allocator;
+    const fds = try makeSocketPair();
+    // session.deinit() closes fds[0].
+    defer posix.close(fds[1]);
+    var session = Session.init(fds[0], 1, "localhost", false, allocator);
+    defer session.deinit();
+    session.sm_enabled = true;
+    // Owned by session.deinit once assigned.
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    session.sm_unacked = queue;
+
+    // A stanza longer than the whole outbound bound can never go out, on
+    // this session or a resumed one: counting it would wedge the unacked
+    // queue over a stanza the client can never receive.
+    const big = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 32);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    try std.testing.expectEqual(Session.SendResult.failed_closed, session.stanza(big));
+    try std.testing.expectEqual(@as(u32, 0), session.sm_out_seq);
+    try std.testing.expectEqual(@as(u32, 0), queue.pending());
+
+    // A stanza that could still fit is tracked even when the ring refuses
+    // it: the unacked queue is authoritative and replay delivers it next.
+    try std.testing.expect(session.conn.ensureWriteBuf());
+    @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
+    session.conn.outbox.head = 0;
+    session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    try std.testing.expectEqual(Session.SendResult.failed_closed, session.stanza("<presence/>"));
+    try std.testing.expectEqual(@as(u32, 1), session.sm_out_seq);
+    try std.testing.expectEqual(@as(u32, 1), queue.pending());
+}
+
 test "R-385: an oversized queued iq result keeps the session and answers resource-constraint" {
     const allocator = std.testing.allocator;
 
