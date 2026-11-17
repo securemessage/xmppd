@@ -522,7 +522,7 @@ pub const Session = struct {
         // peer must not be able to spend the post-auth budget (H6).
         reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
         return .{
-            .conn = Connection.init(fd, id),
+            .conn = Connection.init(fd, id, allocator),
             .reader = reader,
             .stream = xmpp.Stream.init(server_host, direct_tls),
         };
@@ -619,9 +619,9 @@ pub fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes
         log.info("connection {d} TLS handshake complete", .{id});
         // AGENTS.md: kTLS engagement and cipher must be logged after
         // every handshake; userland fallback is otherwise silent.
-        if (session.conn.tls_conn) |*tls| {
+        if (session.conn.tls) |*t| {
             log.info("connection {d} tls: {s} cipher={s} ktls tx={} rx={}", .{
-                id, tls.versionName(), tls.cipherName(), tls.ktlsSend(), tls.ktlsRecv(),
+                id, t.conn.versionName(), t.conn.cipherName(), t.ktls_tx, t.ktls_rx,
             });
         }
         // Notify the stream FSM that TLS is established
@@ -705,7 +705,7 @@ pub fn handleReadable(self: *Server, id: usize, changes: *ChangeList) void {
         // type 0x16 = handshake, major version 0x03) on a fresh plaintext
         // stream and close with a clear log line instead.
         if (session.stream.state == .awaiting_stream_open and
-            session.conn.tls_conn == null and
+            session.conn.tls == null and
             data.len >= 2 and data[0] == 0x16 and data[1] == 0x03)
         {
             log.info("connection {d}: TLS handshake on the STARTTLS port — client is configured for direct TLS, closing", .{id});
@@ -2156,14 +2156,14 @@ test "Server: read backpressure toggles EVFILT_READ across write-buffer threshol
 
     // Suppression is sticky in the hysteresis band (between LOW and HIGH)
     changes.reset();
-    session.conn.write_end = connection_mod.WRITE_SUPPRESS_HIGH - 16;
+    session.conn.outbox.used = connection_mod.WRITE_SUPPRESS_HIGH - 16;
     applyReadBackpressure(&server, session, &changes);
     try std.testing.expect(session.conn.read_suppressed);
     try std.testing.expectEqual(@as(usize, 0), changes.count());
 
     // Drained at/below low-water: read watch re-enabled
     changes.reset();
-    session.conn.write_end = connection_mod.WRITE_SUPPRESS_LOW;
+    session.conn.outbox.used = connection_mod.WRITE_SUPPRESS_LOW;
     applyReadBackpressure(&server, session, &changes);
     try std.testing.expect(!session.conn.read_suppressed);
     var saw_enable = false;
@@ -3046,9 +3046,11 @@ test "F6: disco info to the MUC host in another case is the conference service" 
 test "F6: Session carries one shared IQ payload prep buffer" {
     // LOW-3: the roster/block item JID and the MAM 'with' JID share
     // iq_jid_prep_buf; a second 3071-octet payload buffer must not return.
-    // 80296 covers the 1023-octet auth_username_buf, iq_pubsub_verb and the
+    // 80512 covers the 1023-octet auth_username_buf, iq_pubsub_verb and the
     // SslConn DANE fields the shared verifier added (fatal, syscall_errno).
-    try std.testing.expect(@sizeOf(Session) <= 80296);
+    // 80512 adds the Outbox bookkeeping (ring ptr, spill list, counters)
+    // and the Transport/Tls union to the pre-C2 size.
+    try std.testing.expect(@sizeOf(Session) <= 80512);
 }
 
 test "Server: registration submits are PRECIS-prepared and invalid names get not-acceptable" {
@@ -3192,7 +3194,7 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
 
     // Upgrade deferred: FSM is pending but TLS has NOT started.
     try std.testing.expect(session.stream.state == .starttls_pending);
-    try std.testing.expect(session.conn.tls_conn == null);
+    try std.testing.expect(session.conn.tls == null);
     try std.testing.expect(session.conn.hasPendingWrite());
 
     // Drain the peer, then let the write-ready handler finish.
@@ -3203,7 +3205,7 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     try std.testing.expect(!session.conn.hasPendingWrite());
 
     // Buffer drained: the deferred upgrade has started the handshake.
-    try std.testing.expect(session.conn.tls_conn != null);
+    try std.testing.expect(session.conn.tls != null);
     try std.testing.expect(session.conn.isTlsHandshaking());
 }
 
@@ -3627,8 +3629,8 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     defer session.deinit();
 
     @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
-    session.conn.write_start = 0;
-    session.conn.write_end = connection_mod.WRITE_BUF_SIZE;
+    session.conn.outbox.head = 0;
+    session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
 
     const drops_before = delivery_queue_mod.oversize_queue_drops.load(.monotonic);
     queueStanzaOrDrop(&session, "<iq type='result' id='q1'/>", "small iq result");

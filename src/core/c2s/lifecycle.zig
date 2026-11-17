@@ -47,7 +47,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
             break;
         };
 
-        var conn = server.listener.accept(id) catch |err| {
+        var conn = server.listener.accept(id, server.allocator) catch |err| {
             releaseId(server, id);
             switch (err) {
                 error.WouldBlock => break,
@@ -70,6 +70,9 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
         // any aborted zombie exchange the auth daemon still held (T32).
         session.auth_ipc_gen = std.crypto.random.int(u16);
         session.conn = conn;
+        // The conn reached its permanent home: point the outbox ring at
+        // its write_buf and its counters at this worker's block (C2).
+        session.conn.bindOutbox(&server.net_counters);
         server.sessions[id] = session;
 
         changes.addRead(conn.fd, id) catch {
@@ -1103,6 +1106,10 @@ fn makeAuthenticatedSession(server: *Server, id: usize, local: []const u8) !*Ses
 
 // T158 regression test: SM detach timer (300s) must expire sessions correctly —
 // not early (which would kill resumable sessions) and not late/never (memory leak).
+
+/// Scratch for pendingOutboxCopy peeks in tests.
+var outbox_peek_buf: [connection_mod.WRITE_BUF_SIZE]u8 = undefined;
+
 test "T158: detach timer expires sessions at 300s, not before" {
     const allocator = std.testing.allocator;
 
@@ -2498,7 +2505,7 @@ test "S35: a stanza that only fits unstamped is sent without a stamp" {
 
     // The stored bytes went out untouched and the pointer is gone: the drain
     // neither stalls on the stamp nor loses the message.
-    const pending = session.conn.write_buf[0..session.conn.write_end];
+    const pending = session.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expectEqualStrings(stanza, pending);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(!session.offline_pending);
@@ -2556,7 +2563,7 @@ test "S35: an unsendable stored stanza is dropped and the drain continues" {
     // The oversized pointer is counted and deleted, and the message behind it
     // was still delivered: one bad row cannot park the queue.
     try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.offline_drain_drops.load(.monotonic));
-    const pending = session.conn.write_buf[0..session.conn.write_end];
+    const pending = session.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, pending, "<body>small</body>") != null);
     try std.testing.expect(std.mem.indexOf(u8, pending, "id='big'") == null);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));

@@ -210,6 +210,11 @@ pub const Server = struct {
     free_ids: []usize = &.{},
     free_count: usize = 0,
 
+    /// Per-worker outbox counters (C2): every accepted Connection binds
+    /// its outbox here, so lib/net fail-closed and spill events have one
+    /// owner per loop thread.
+    net_counters: connection_mod.OutboxCounters = .{},
+
     /// TLS context — shared across all connections. Null if TLS is not configured.
     ssl_ctx: ?ssl.SslContext = null,
 
@@ -1531,8 +1536,8 @@ pub const Server = struct {
                 // internally. kqueue won't fire for data already consumed from
                 // the socket. Drain the SSL buffer immediately — same pattern
                 // as post-TLS and the S2S post-SASL fix.
-                if (session.conn.tls_conn) |*tls| {
-                    if (tls.pending() > 0) {
+                if (session.conn.tls) |*t| {
+                    if (t.conn.pending() > 0) {
                         c2s_session.handleReadable(self, conn_id, changes);
                     }
                 }
@@ -2225,7 +2230,7 @@ test "Server: S28 stale writable event does not destroy a detached session" {
     // fillWriteBuffer rather than a raw conn.queueSend, which the S15 ratchet
     // deliberately rejects outside its allowlist.
     try std.testing.expect(fillWriteBuffer(session));
-    try std.testing.expect(session.conn.write_end > session.conn.write_start);
+    try std.testing.expect(session.conn.outbox.used > session.conn.outbox.head);
 
     // Detach for SM resume: purge the fd, close it, keep the session.
     session.sm_resume_enabled = true;
@@ -2513,7 +2518,7 @@ test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down
 
     // The buffer is nearly full, but the peer's socket is empty: a flush frees
     // all of it.
-    target.conn.write_end = connection_mod.WRITE_BUF_SIZE - 16;
+    target.conn.outbox.used = connection_mod.WRITE_BUF_SIZE - 16;
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
@@ -2588,8 +2593,8 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
         }
     }
     @memset(target.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
-    target.conn.write_start = 0;
-    target.conn.write_end = connection_mod.WRITE_BUF_SIZE;
+    target.conn.outbox.head = 0;
+    target.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
     try std.testing.expectError(error.WouldBlock, target.conn.flushSend());
 
     const alice_fds = try makeSocketPair();

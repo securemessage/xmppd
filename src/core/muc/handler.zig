@@ -3316,6 +3316,9 @@ fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8,
     };
 }
 
+/// Scratch for pendingOutboxCopy peeks in tests.
+var outbox_peek_buf: [connection_mod.WRITE_BUF_SIZE]u8 = undefined;
+
 test "S6: self-kick is rejected and the room survives actor processing" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
@@ -3439,7 +3442,7 @@ test "S1: a wrong room secret of the same decoded length is still refused" {
 
     handleMucPresence(&server, bob, "secret", "bob", "", &changes);
     try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
-    const out = bob.conn.write_buf[bob.conn.write_start..bob.conn.write_end];
+    const out = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "not-authorized") != null);
 }
 
@@ -3502,7 +3505,7 @@ test "S1: room config form values are stored decoded, escaped once on output" {
 
     // The config form response escapes exactly once: no &amp;amp; growth.
     handleMucOwnerGet(&server, session, "room", "cfg2", &changes);
-    const out = session.conn.write_buf[session.conn.write_start..session.conn.write_end];
+    const out = session.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "A&amp;B &lt;C&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "&amp;amp;") == null);
 }
@@ -3571,7 +3574,7 @@ test "G1: an overflowing room secret rejects the whole config form" {
     var changes = ChangeList.init(&scratch);
     handleMucOwnerSet(&server, session, "room", "cfg1", &changes);
 
-    const out = session.conn.write_buf[session.conn.write_start..session.conn.write_end];
+    const out = session.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "type='error'") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "not-acceptable") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "type='modify'") != null);
@@ -3611,7 +3614,7 @@ test "G1: a protected room with no stored secret refuses the join" {
     handleMucPresence(&server, bob, "room", "bob", "", &changes);
 
     try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
-    const out = bob.conn.write_buf[bob.conn.write_start..bob.conn.write_end];
+    const out = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "not-authorized") != null);
 }
 
@@ -3672,7 +3675,7 @@ test "S16: mailbox-full bounce targets the sender and fails closed on overflow" 
     const cn = posix.read(carol_fds[1], &cbuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), cn);
 
-    bob.conn.write_end = bob.conn.write_buf.len;
+    bob.conn.outbox.used = bob.conn.write_buf.len;
     bounceRoomMailboxFull(&server, msg, "room@conference.localhost", &changes);
     try std.testing.expect(bob.sm_overflow);
 }
@@ -3927,7 +3930,7 @@ test "S16: local replaced-resource notice overflow fails the session" {
     target.stream.bound_jid = .{ .local = "eve", .domain = "localhost", .resource = "phone" };
     server.sessions[0] = target;
 
-    target.conn.write_end = target.conn.write_buf.len;
+    target.conn.outbox.used = target.conn.write_buf.len;
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
     notifyReplacedResource(&server, room, &before, &changes);
@@ -3973,7 +3976,7 @@ test "S16: a maximum-length escape-heavy replaced-resource notice is built in a 
     try std.testing.expect(server.byte_scratch.len > 0);
     for (server.byte_scratch_in_use) |in_use| try std.testing.expect(!in_use);
 
-    const queued = target.conn.write_buf[target.conn.write_start..target.conn.write_end];
+    const queued = target.conn.pendingOutboxCopy(&outbox_peek_buf);
     const expected = "<presence from='" ++ ("&apos;" ** 512) ++ "/" ++ ("&apos;" ** 64) ++
         "' to='" ++ ("&apos;" ** 511) ++ "@" ++ ("&apos;" ** 500) ++ "/" ++ ("&apos;" ** 11) ++
         "' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='member' role='none'/><status code='110'/></x></presence>";
@@ -4058,7 +4061,7 @@ test "H5: the first fan-out after a genuine buffer-full loss still reaches the r
 
     // bob's connection is nearly full, so a small stanza no longer fits. This
     // is the genuinely-full case the teardown is for, not the H5 size case.
-    server.sessions[1].?.conn.write_end = connection_mod.WRITE_BUF_SIZE - 64;
+    server.sessions[1].?.conn.outbox.used = connection_mod.WRITE_BUF_SIZE - 64;
 
     const body = "<body>one</body>";
     handleMucGroupchat(&server, server.sessions[0].?, "arena", body, "m1", &changes);
@@ -4074,7 +4077,7 @@ test "H5: the first fan-out after a genuine buffer-full loss still reaches the r
     }
     var sink: [8192]u8 = undefined;
     while ((posix.read(peer_fds[1], &sink) catch 0) > 0) {}
-    server.sessions[1].?.conn.write_end = 0;
+    server.sessions[1].?.conn.outbox.used = 0;
     const body2 = "<body>two</body>";
     handleMucGroupchat(&server, server.sessions[0].?, "arena", body2, "m2", &changes);
     for (0..3) |idx| {
@@ -4208,7 +4211,7 @@ test "H5: an oversized groupchat body is rejected with a bounce, not a room tear
     // The sender is told, and neither session is marked for teardown.
     try std.testing.expect(!alice.sm_overflow);
     try std.testing.expect(!bob.sm_overflow);
-    const reply = alice.conn.write_buf[alice.conn.write_start..alice.conn.write_end];
+    const reply = alice.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "id='big1'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "resource-constraint") != null);
@@ -4361,7 +4364,7 @@ test "H5: ingress sizing accounts for an occupant JID that escapes wider" {
 
     // Rejected at ingress: the sender is told and no session is torn down.
     try std.testing.expect(!alice.sm_overflow);
-    const reply = alice.conn.write_buf[alice.conn.write_start..alice.conn.write_end];
+    const reply = alice.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "resource-constraint") != null);
 }
@@ -4542,7 +4545,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     handleMucOwnerSet(&server, owner, "room", "cfg1", &changes);
 
     // Read-side: the bound 'NaplesTB@localhost' is the stored owner.
-    const set_out = owner.conn.write_buf[owner.conn.write_start..owner.conn.write_end];
+    const set_out = owner.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, set_out, "type='result'") != null);
     try std.testing.expect(std.mem.indexOf(u8, set_out, "forbidden") == null);
     // Write-side: the re-persisted affiliation lands under the folded key.
@@ -4550,7 +4553,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     try std.testing.expectEqual(Affiliation.none, try store.getAffiliation("room@conference.localhost", "NaplesTB@localhost"));
 
     handleMucOwnerGet(&server, owner, "room", "cfg2", &changes);
-    const out = owner.conn.write_buf[owner.conn.write_start..owner.conn.write_end];
+    const out = owner.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "forbidden") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "muc#roomconfig") != null);
 
@@ -4569,7 +4572,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     const occupants_before = room.occupant_count;
     handleMucPresence(&server, carol, "room", "carolx", "", &changes);
     try std.testing.expectEqual(occupants_before, room.occupant_count);
-    const cout = carol.conn.write_buf[carol.conn.write_start..carol.conn.write_end];
+    const cout = carol.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, cout, "forbidden") != null);
 
     // Remote join path: the same folded lookup applies to a member
@@ -4636,8 +4639,8 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     defer session.deinit();
 
     @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
-    session.conn.write_start = 0;
-    session.conn.write_end = connection_mod.WRITE_BUF_SIZE;
+    session.conn.outbox.head = 0;
+    session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
 
     const drops_before = delivery_queue.oversize_queue_drops.load(.monotonic);
     queueStanzaOrDrop(&session, "<iq type='result' id='q1'/>", "small iq result");

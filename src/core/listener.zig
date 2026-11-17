@@ -103,7 +103,7 @@ pub const Listener = struct {
     /// ## Errors
     /// - `error.WouldBlock` — no more pending connections
     /// - `error.SystemResources` — fd exhaustion
-    pub fn accept(self: *const Listener, conn_id: usize) !Connection {
+    pub fn accept(self: *const Listener, conn_id: usize, alloc: std.mem.Allocator) !Connection {
         // sockaddr.storage so IPv6 peers (sockaddr.in6) fit without truncation
         var addr: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
@@ -125,7 +125,7 @@ pub const Listener = struct {
         posix.setsockopt(client_fd, 6, 1, std.mem.asBytes(&nodelay)) catch {};
 
         // Format peer IP into the connection
-        var conn = Connection.init(client_fd, conn_id);
+        var conn = Connection.init(client_fd, conn_id, alloc);
         formatPeerAddr(&addr, &conn.peer_addr_buf, &conn.peer_addr_len);
         return conn;
     }
@@ -218,7 +218,7 @@ test "Listener: bind and accept on high port" {
     std.Thread.sleep(10 * std.time.ns_per_ms);
 
     // Accept should succeed
-    var conn = try listener.accept(42);
+    var conn = try listener.accept(42, std.testing.allocator);
     defer conn.close();
 
     try std.testing.expectEqual(@as(usize, 42), conn.id);
@@ -230,7 +230,7 @@ test "Listener: accept returns WouldBlock when no clients" {
     var listener = try Listener.init("127.0.0.1", 0, false, 5);
     defer listener.deinit();
 
-    const result = listener.accept(1);
+    const result = listener.accept(1, std.testing.allocator);
     try std.testing.expectError(error.WouldBlock, result);
 }
 
@@ -309,7 +309,7 @@ test "Listener: bind and accept on IPv6 loopback" {
 
     std.Thread.sleep(10 * std.time.ns_per_ms);
 
-    var conn = try listener.accept(43);
+    var conn = try listener.accept(43, std.testing.allocator);
     defer conn.close();
 
     try std.testing.expectEqual(@as(usize, 43), conn.id);
