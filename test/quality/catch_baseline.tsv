@@ -81,8 +81,8 @@ src/core/worker/worker.zig	catch {}	31
 src/core/xworker/envelope.zig	catch return	100
 src/core/xworker/ring.zig	catch return	1
 src/core/xworker/ring.zig	catch {}	1
-src/ctl/main.zig	catch return	16
-src/ctl/main.zig	catch {}	3
+src/ctl/main.zig	catch return	15
+src/ctl/main.zig	catch {}	2
 src/ctl/migrate_archive.zig	catch return	1
 src/ctl/migrate_precis.zig	catch continue	1
 src/ctl/migrate_precis.zig	catch return	6
