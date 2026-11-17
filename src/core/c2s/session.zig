@@ -1983,7 +1983,7 @@ pub fn handlePresence(self: *Server, session: *Session, elem: xml.Element, chang
     presence_handler.handlePresence(self, session, elem, changes);
 }
 
-pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction, changes: *ChangeList) void {
+pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction, _: *ChangeList) void {
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const writer = fbs.writer();
 
@@ -2007,17 +2007,12 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
         .send_tls_proceed, .start_tls => {
             writer.writeAll("<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>") catch return;
             if (session.nonza(fbs.getWritten()) == .failed_closed) return;
-
             // T215: the handshake starts only after the plaintext
             // <proceed/> has fully flushed; leftover bytes would be
-            // written through the TLS record layer. handleWritable
-            // completes the upgrade once the buffer drains.
-            _ = session.conn.flushSend() catch {};
-            if (session.conn.hasPendingWrite()) return;
-            // Nothing in this branch touches the session afterwards, and
-            // every caller returns on reaching it, so a failed upgrade
-            // that frees the session is not read here.
-            _ = startTlsUpgrade(self, session, changes);
+            // written through the TLS record layer. The batch tail (or
+            // handleWritable) completes the upgrade once the outbox
+            // drains — readableSlice() is only honest after consume(),
+            // so no upgrade decision may be taken inside the parse.
         },
         .send_sasl_success => |server_final| {
             writer.writeAll("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch return;
@@ -3378,6 +3373,46 @@ test "Server: STARTTLS upgrade refuses unread client bytes" {
     var changes = ChangeList.init(&change_buf);
     try std.testing.expect(!startTlsUpgrade(&server, session, &changes));
     try std.testing.expect(server.sessions[1] == null);
+}
+
+// The normal negotiation: nothing after <starttls/>, <proceed/> flushes
+// promptly. The upgrade must still run at the deferred flush; a guard
+// that reads the un-consumed parse window would refuse it here.
+test "Server: STARTTLS upgrade proceeds through the deferred flush" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(std.testing.allocator, tmp.dir);
+    defer std.testing.allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    handleReadable(&server, 1, &changes);
+
+    _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
+    handleReadable(&server, 1, &changes);
+
+    // handleReadable's tail flush already put <proceed/> on the wire,
+    // but the upgrade itself waits for the deferred continuation.
+    try std.testing.expect(session.stream.state == .starttls_pending);
+    try std.testing.expect(session.conn.tls == null);
+    try std.testing.expect(session.conn.outbox.empty());
+
+    try std.testing.expect(flushSessionOutbox(&server, session, &changes));
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expect(session.conn.isTlsHandshaking());
 }
 
 test "Server: T215 failed deferred upgrade does not touch the freed session" {
