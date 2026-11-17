@@ -302,7 +302,21 @@ pub const ChangeList = struct {
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.READ, std.c.EV.DISABLE, 0));
     }
 
+    /// Add an fd's write filter registered but disabled, in DISPATCH
+    /// mode: every delivery auto-disables the knote, so arming after a
+    /// real EAGAIN is a bare `enableWrite` and a drained flush needs no
+    /// EV_DELETE (ADR-2). Registered once at accept for the fd's life;
+    /// a second registration for the same fd updates udata and keeps
+    /// the disabled+dispatch flags.
+    pub fn addWriteDisabled(self: *ChangeList, fd: posix.fd_t, udata: usize) !void {
+        if (self.skipClosedFd(fd, "addWriteDisabled")) return;
+        self.untrackPurged(fd);
+        try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ADD | std.c.EV.DISABLE | std.c.EV.DISPATCH, udata));
+    }
+
     /// Enable write monitoring for an fd (must be previously added).
+    /// On a DISPATCH knote this is the only arm needed after EAGAIN:
+    /// one delivery auto-disables it again.
     pub fn enableWrite(self: *ChangeList, fd: posix.fd_t) !void {
         if (self.skipClosedFd(fd, "enableWrite")) return;
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.ENABLE, 0));

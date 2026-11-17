@@ -123,6 +123,7 @@ fn bounceCrossWorkerUnavailable(
     tag_name: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = self.session_map orelse return;
     // sender_wire is the raw on-wire attribute, still entity-encoded.
     var sender_buf: [512]u8 = undefined;
@@ -161,9 +162,6 @@ fn bounceCrossWorkerUnavailable(
         if (session.stanza(stanza) == .failed_closed) {
             log.warn("cross-worker bounce for {s} not queued: {s}", .{ sender_full, if (session.conn.isClosed()) "ConnectionClosed" else "WriteBufferFull" });
             return;
-        }
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
     } else if (self.delivery_system) |ds| {
         ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, stanza) catch {
@@ -279,9 +277,6 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
             // stanza() covers the T153 detached case itself: it tracks
             // for resume replay and reports tracked_detached.
             if (target_session.stanza(payload) == .failed_closed) return;
-            if (target_session.conn.hasPendingWrite()) {
-                c.changes.addWrite(target_session.conn.fd, local_session_id) catch {};
-            }
         }
     }.handle);
 }
@@ -290,6 +285,7 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
 /// Decodes the payload (room_jid + prefix + suffix), finds the room,
 /// and delivers the pre-built stanza to all local occupants.
 fn handleMulticastDelivery(self: *Server, payload: []const u8, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const decoded = fanout_mod.decodeMulticastPayload(payload) orelse {
         log.warn("malformed multicast payload ({d} bytes)", .{payload.len});
         return;
@@ -309,7 +305,7 @@ fn handleMulticastDelivery(self: *Server, payload: []const u8, changes: *ChangeL
         if (occ.session_id == room_registry_mod.REMOTE_OCCUPANT) continue;
 
         const target_session = self.sessions[occ.session_id] orelse continue;
-        fanout_mod.deliverPrebuiltToSession(target_session, deliver_lease.buf, decoded.prefix, occ.getRealJid(), decoded.suffix, occ.session_id, changes);
+        fanout_mod.deliverPrebuiltToSession(target_session, deliver_lease.buf, decoded.prefix, occ.getRealJid(), decoded.suffix, occ.session_id);
     }
 }
 

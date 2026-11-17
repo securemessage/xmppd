@@ -301,9 +301,6 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
                     var query_buf: [1024]u8 = undefined;
                     if (caps_mod.buildCapsQuery(&query_buf, server.server_host, full_jid, node, ver, @intCast(session.conn.id))) |query_xml| {
                         _ = session.stanza(query_xml);
-                        if (session.conn.hasPendingWrite()) {
-                            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-                        }
                     }
                 }
             }
@@ -590,9 +587,6 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             // the contact is on — we already have their resource from the
             // session map; no need to ask the remote worker.
             if (session.stanza(presence_xml) == .failed_closed) continue;
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
         }
 
         contact_i = end;
@@ -602,6 +596,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
 /// RFC 6120 4.9.3.10: a subscription stanza whose over-long `to` would
 /// overflow the 511-byte store key is rejected, not dropped (S4).
 fn rejectOversizeSubscriptionTo(session: *Session, to_str: []const u8, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const jid = session.stream.authenticated_jid orelse return;
     var buf: [4608]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -628,9 +623,6 @@ fn rejectOversizeSubscriptionTo(session: *Session, to_str: []const u8, changes: 
         return;
     };
     if (session.stanza(err_xml) == .failed_closed) return;
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 // ========================================================================
@@ -868,9 +860,6 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             };
             // Deliver to the approver's session
             if (session.stanza(cpres_xml) == .failed_closed) continue;
-        }
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
     }
 
@@ -1117,6 +1106,7 @@ fn storePendingSubscription(server: *Server, contact_bare: []const u8, sub_pres_
 /// Deliver any pending subscription requests to a user who just became available.
 /// Called from dispatchPresence on initial available presence.
 pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const roster = server.roster orelse return;
 
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
@@ -1146,9 +1136,6 @@ pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []
     }
 
     if (delivered > 0) {
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
         log.info("delivered {d} pending subscriptions to {s}", .{ delivered, bare_jid });
     }
 }
@@ -1168,6 +1155,7 @@ fn broadcastToOwnResources(
     resource: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
 
     // Build the from full JID
@@ -1221,9 +1209,6 @@ fn broadcastToOwnResources(
             // resume replay and reports tracked_detached.
             if (target.stanza(presence_xml) == .failed_closed) continue;
             _ = target.conn.flushSend() catch {};
-            if (target.conn.hasPendingWrite()) {
-                changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
-            }
         } else if (server.delivery_system) |ds| {
             ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
         }
@@ -1241,6 +1226,7 @@ fn sendOtherResourcesPresence(
     new_resource: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
 
     var lease_b = server.leaseScratch(.b);
@@ -1279,9 +1265,6 @@ fn sendOtherResourcesPresence(
         };
 
         if (new_session.stanza(presence_xml) == .failed_closed) continue;
-        if (new_session.conn.hasPendingWrite()) {
-            changes.addWrite(new_session.conn.fd, new_session.conn.id) catch {};
-        }
     }
 }
 
@@ -1295,6 +1278,7 @@ pub fn dispatchDirectedPresenceToBareJid(
     target_domain: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     defer sender_session.resetStanza();
 
     const sm = server.session_map orelse return;
@@ -1348,7 +1332,7 @@ pub fn dispatchDirectedPresenceToBareJid(
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
-            fanout.deliverToSession(target, presence_xml, entry.local_session_id, changes);
+            fanout.deliverToSession(target, presence_xml, entry.local_session_id);
         } else if (server.delivery_system) |ds| {
             ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
         }
@@ -1413,7 +1397,7 @@ fn deliverPresenceToSubscribers(
         for (entries[0..count]) |entry| {
             if (entry.worker_id != server.worker_id) continue;
             const target_session = server.sessions[entry.local_session_id] orelse continue;
-            fanout.deliverToSession(target_session, presence_xml, entry.local_session_id, changes);
+            fanout.deliverToSession(target_session, presence_xml, entry.local_session_id);
         }
 
         // Remote targets: bucket by worker, wake each worker once.
@@ -1444,6 +1428,7 @@ pub fn deliverPresenceToTarget(
     presence_xml: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
     // Leaf delivery: bank C so callers iterating bank B keep their results.
     var lease_c = server.leaseScratch(.c);
@@ -1454,7 +1439,7 @@ pub fn deliverPresenceToTarget(
     for (entries[0..count]) |ent| {
         if (ent.worker_id == server.worker_id) {
             const target_session = server.sessions[ent.local_session_id] orelse continue;
-            fanout.deliverToSession(target_session, presence_xml, ent.local_session_id, changes);
+            fanout.deliverToSession(target_session, presence_xml, ent.local_session_id);
         } else if (server.delivery_system) |ds| {
             ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, presence_xml) catch {};
         }

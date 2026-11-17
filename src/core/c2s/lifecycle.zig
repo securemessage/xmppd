@@ -71,21 +71,39 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
         session.auth_ipc_gen = std.crypto.random.int(u16);
         session.conn = conn;
         // The conn reached its permanent home: point the outbox ring at
-        // its write_buf and its counters at this worker's block (C2).
-        session.conn.bindOutbox(connection_mod.countersForWorker(server.worker_id));
+        // its write_buf, its counters at this worker's block, and its
+        // dirty links at this worker's end-of-iteration flush list (C2).
+        session.conn.bindOutbox(connection_mod.countersForWorker(server.worker_id), connection_mod.dirtyForWorker(server.worker_id));
         server.sessions[id] = session;
 
         changes.addRead(conn.fd, id) catch {
             log.err("changelist full on accept", .{});
-            session.deinit();
-            server.allocator.destroy(session);
-            server.sessions[id] = null;
-            releaseId(server, id);
+            failAcceptedSession(server, session, id);
+            break;
+        };
+
+        // The write knote lives for the fd's life, registered disabled in
+        // DISPATCH mode: every delivery auto-disables it, so a stall arms
+        // with a bare enableWrite and a drained flush needs no EV_DELETE
+        // (ADR-2).
+        changes.addWriteDisabled(conn.fd, id) catch {
+            log.err("changelist full on accept (write knote)", .{});
+            failAcceptedSession(server, session, id);
             break;
         };
 
         log.info("accepted connection id={d} fd={d}", .{ id, conn.fd });
     }
+}
+
+/// Accept-path teardown for a session whose kqueue registration failed:
+/// the same deinit/destroy/slot/id release destroySession does before its
+/// stream-state cleanup, which does not exist yet at accept.
+fn failAcceptedSession(server: *Server, session: *Session, id: usize) void {
+    session.deinit();
+    server.allocator.destroy(session);
+    server.sessions[id] = null;
+    releaseId(server, id);
 }
 
 /// Process resource bind and register session in the unified session map.
@@ -218,9 +236,6 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
             log.info("connection {d} session established (kicked remote resource)", .{sess.conn.id});
             if (sess.conn.hasPendingWrite()) {
                 _ = sess.conn.flushSend() catch {};
-                if (sess.conn.hasPendingWrite()) {
-                    changes_.addWrite(sess.conn.fd, sess.conn.id) catch {};
-                }
             }
             // Answered — the id's job is done.
             sess.bind_iq_id = "";
@@ -256,9 +271,6 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
         sendBindRejected(session);
         session.bind_iq_id = "";
         session.bind_iq_id_len = 0;
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
     }
 }
 
@@ -711,7 +723,10 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
         if (arrived_mid_drain) {
             session.offline_pending = true;
             if (!session.conn.hasPendingWrite()) {
-                changes.addWriteOnce(session.conn.fd, session.conn.id) catch |stage_err| {
+                // Nothing queued means nothing re-drives the drain
+                // continuation; one enableWrite on the DISPATCH knote
+                // prompts a single writable event for it.
+                changes.enableWrite(session.conn.fd) catch |stage_err| {
                     server.offline_retry_sweep_needed = true;
                     log.warn("offline re-drain arm for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
                 };
@@ -720,10 +735,6 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
             cancelOfflineRetryTimer(session, changes);
             session.offline_pending = false;
         }
-    }
-
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
 
     log.info("delivered {d} offline messages to {s}", .{ delivered, bare_jid });
@@ -989,10 +1000,10 @@ const OFFLINE_STALL_RETRY_MAX: u8 = 8;
 pub const OFFLINE_RETRY_DELAY_MS: u32 = 5_000;
 
 /// Mark the drain stalled after a store error and make sure something will
-/// retry it. A buffer-full stall leaves data in the write buffer, so
-/// EVFILT_WRITE fires again; a store error with an empty buffer leaves
-/// nothing armed and the tail would sit undelivered until the next presence
-/// stanza or reconnect.
+/// retry it. A buffer-full stall leaves data in the outbox, so the dirty
+/// link or armed knote already re-drives the drain continuation; a store
+/// error with an empty outbox leaves nothing pending, so one enableWrite
+/// on the DISPATCH knote prompts a writable event for the retry.
 fn stallOnStoreError(
     server: *Server,
     session: *Session,
@@ -1003,13 +1014,6 @@ fn stallOnStoreError(
     session.offline_pending = true;
     if (session.offline_store_stalls < std.math.maxInt(u8)) {
         session.offline_store_stalls += 1;
-    }
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch |stage_err| {
-            server.offline_retry_sweep_needed = true;
-            log.warn("offline retry write arm for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
-        };
-        return;
     }
     if (session.offline_store_stalls > OFFLINE_STALL_RETRY_MAX) {
         if (!session.offline_retry_timer_armed) {
@@ -1025,9 +1029,10 @@ fn stallOnStoreError(
         });
         return;
     }
-    // One-shot so the retry is a single prompt attempt, not a level-triggered
-    // wake that fires on every loop pass while the store stays broken.
-    changes.addWriteOnce(session.conn.fd, session.conn.id) catch |stage_err| {
+    // The DISPATCH knote auto-disables on delivery, so one enable is a
+    // single prompt attempt, not a level-triggered wake that fires on
+    // every loop pass while the store stays broken.
+    changes.enableWrite(session.conn.fd) catch |stage_err| {
         server.offline_retry_sweep_needed = true;
         log.warn("offline prompt retry for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
     };
@@ -1379,14 +1384,14 @@ test "S13: a row stored mid-drain is re-armed for rather than stranded" {
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(session.offline_pending);
 
-    // It also armed a pass of its own, so no presence event is needed. With
-    // bytes still buffered the level-triggered write registration carries the
-    // resume; with none, the drain arms a one-shot. Either one wakes it.
-    var armed = false;
+    // It also re-armed a pass of its own, so no presence event is needed.
+    // Bytes still buffered mean the dirty-list flush drives the drain
+    // continuation; an empty outbox stages a bare enableWrite on the
+    // DISPATCH knote instead. Either one wakes it.
+    var armed = session.conn.hasPendingWrite();
     for (changes.slice()) |ev| {
         if (ev.ident != @as(usize, @intCast(session.conn.fd))) continue;
         if (ev.filter != std.c.EVFILT.WRITE) continue;
-        if (ev.udata != 1) continue;
         armed = true;
     }
     try std.testing.expect(armed);
@@ -2029,13 +2034,13 @@ test "S13: store-error stall with an empty buffer re-arms the drain" {
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(!session.conn.hasPendingWrite());
 
-    // Nothing else can wake this session, so the drain armed its own retry.
+    // Nothing else can wake this session, so the drain armed its own
+    // retry: a bare EV_ENABLE on the DISPATCH write knote.
     var armed = false;
     for (changes.slice()) |ev| {
         if (ev.ident != @as(usize, @intCast(session.conn.fd))) continue;
         if (ev.filter != std.c.EVFILT.WRITE) continue;
-        if ((ev.flags & std.c.EV.ONESHOT) == 0) continue;
-        if (ev.udata != 1) continue;
+        if ((ev.flags & std.c.EV.ENABLE) == 0) continue;
         armed = true;
     }
     try std.testing.expect(armed);
@@ -2110,7 +2115,7 @@ test "S13: store-error retries are bounded, then a one-shot timer resumes" {
 
         var armed = false;
         for (changes.slice()) |ev| {
-            if (ev.filter == std.c.EVFILT.WRITE and (ev.flags & std.c.EV.ONESHOT) != 0) armed = true;
+            if (ev.filter == std.c.EVFILT.WRITE and (ev.flags & std.c.EV.ENABLE) != 0) armed = true;
         }
         if (!armed) break;
     }

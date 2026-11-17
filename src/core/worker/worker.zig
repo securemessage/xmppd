@@ -183,6 +183,13 @@ const CHANGE_BUF_SIZE = 1024;
 /// dropIpcAuth's per-session writes stay best-effort because one entry per
 /// mid-SASL session cannot be bounded by a fixed tail.
 const IPC_RECONCILE_RESERVED = 8;
+
+/// Upper bound on dirty-list pops per batch tail. A link placed during
+/// the walk (a flush error's close broadcasts, a re-drive after a lost
+/// arm) extends the walk; the cap keeps that bounded and leftovers
+/// re-drive through the wake pipe.
+const DIRTY_FLUSH_POPS_MAX: u32 = 256;
+
 /// The XMPP core server.
 pub const Server = struct {
     loop: EventLoop,
@@ -562,9 +569,6 @@ pub const Server = struct {
             session.auth_state = .none;
             session.sasl_collecting = .none;
             c2s_session.executeAction(self, session, session.stream.saslFailure("temporary-auth-failure"), changes);
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
         }
         // The mechanism list is re-sent by the daemon on connect; don't
         // advertise a dead daemon's set meanwhile.
@@ -1049,6 +1053,11 @@ pub const Server = struct {
             // Fail sessions whose outbound delivery overflowed in this batch.
             session_lifecycle.reapOutboundOverflow(self, &changes);
 
+            // ADR-2 end-of-iteration flush: every conn that accepted
+            // outbound bytes this batch sits on outbox_dirty; flush each
+            // once so EVFILT_WRITE arms only after a real EAGAIN.
+            self.flushDirtyOutboxes(&changes);
+
             // S10: single point of truth for IPC write interest; heals
             // any re-arm lost while handling this batch.
             self.reconcileIpcWriteInterest(&changes);
@@ -1095,11 +1104,40 @@ pub const Server = struct {
 
     fn handleReadableOrHandshake(self: *Server, id: usize, changes: *ChangeList) void {
         const session = self.sessions[id] orelse return;
+        // A flush that stalled on TLS want_read gets its read event now:
+        // re-link so the batch tail retries it (ADR-2).
+        if (session.conn.flush_want_read) {
+            session.conn.flush_want_read = false;
+            session.conn.linkDirty();
+        }
         if (session.conn.isTlsHandshaking()) {
             c2s_session.continueTlsHandshake(self, id, session, changes);
             return;
         }
         c2s_session.handleReadable(self, id, changes);
+    }
+
+    /// The ADR-2 end-of-iteration walk: each conn that accepted outbound
+    /// bytes this batch links itself on the worker's dirty list and is
+    /// flushed once here. Pop count is bounded so a link placed mid-walk
+    /// (a flush error's close broadcasts, a re-drive after a lost arm)
+    /// cannot spin the tail forever; leftovers re-drive on the wake pipe.
+    fn flushDirtyOutboxes(self: *Server, changes: *ChangeList) void {
+        const dirty = connection_mod.dirtyForWorker(self.worker_id);
+        var pops: u32 = 0;
+        while (pops < DIRTY_FLUSH_POPS_MAX) : (pops += 1) {
+            const conn = dirty.pop() orelse break;
+            // close() unlinks, so a popped conn is normally live; a link
+            // that raced an inline close pops a dead conn — skip it.
+            if (conn.closed) continue;
+            const session: *Session = @fieldParentPtr("conn", conn);
+            _ = c2s_session.flushSessionOutbox(self, session, changes);
+        }
+        if (!dirty.empty()) {
+            // The pop cap or a lost arm left conns linked; the wake pipe
+            // guarantees another iteration to finish them.
+            if (self.delivery_system) |ds| ds.wakeWorker(self.worker_id);
+        }
     }
 
     fn handleWritableOrHandshake(self: *Server, id: usize, changes: *ChangeList) void {
@@ -1202,6 +1240,7 @@ pub const Server = struct {
     /// on the per-stanza path only while inlined it cost one probed frame
     /// inside handleElementStart.
     pub noinline fn sendIngressJidMalformed(self: *Server, session: *Session, elem: *xml.Element, changes: *ChangeList) void {
+        _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
         _ = self;
         var to_attr: []const u8 = "";
         var id_attr: []const u8 = "";
@@ -1239,9 +1278,6 @@ pub const Server = struct {
             return;
         };
         queueStanzaOrDrop(session, stanza, "jid-malformed reply");
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
     }
 
     // ========================================================================
@@ -1454,10 +1490,6 @@ pub const Server = struct {
                     return;
                 }
                 session.auth_state = .none;
-
-                if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, conn_id) catch {};
-                }
             },
             .auth_success => |m| {
                 // Base64-encode server_final for the <success> element
@@ -1522,9 +1554,6 @@ pub const Server = struct {
                     // Flush immediately rather than deferring to kqueue
                     // EVFILT_WRITE which intermittently fails to fire.
                     _ = session.conn.flushSend() catch {};
-                    if (session.conn.hasPendingWrite()) {
-                        changes.addWrite(session.conn.fd, conn_id) catch {};
-                    }
                 }
                 // OpenSSL may have buffered the client's post-auth stream open
                 // internally. kqueue won't fire for data already consumed from
@@ -1541,10 +1570,6 @@ pub const Server = struct {
                 const fail_action = session.stream.saslFailure(m.reason);
                 c2s_session.executeAction(self, session, fail_action, changes);
                 session.resetSasl();
-
-                if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, conn_id) catch {};
-                }
             },
             .register_result => |m| {
                 const iq_id = session.reg_pending_iq_id;
@@ -1571,10 +1596,6 @@ pub const Server = struct {
                     c2s_session.noteSendDrop(session, reply_xml, "register result");
                     return;
                 }
-
-                if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, conn_id) catch {};
-                }
             },
             .password_change_result => |m| {
                 const iq_id = session.reg_pending_iq_id;
@@ -1598,10 +1619,6 @@ pub const Server = struct {
                     return;
                 };
                 queueStanzaOrDrop(session, reply_xml, "password-change result");
-
-                if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, conn_id) catch {};
-                }
             },
             .account_delete_result => |m| {
                 const iq_id = session.reg_pending_iq_id;
@@ -1630,10 +1647,6 @@ pub const Server = struct {
 
                     // Close the stream per XEP-0077 §3.2
                     _ = session.nonza("</stream:stream>");
-
-                    if (session.conn.hasPendingWrite()) {
-                        changes.addWrite(session.conn.fd, conn_id) catch {};
-                    }
                 } else {
                     var fbs = std.io.fixedBufferStream(&session.write_scratch);
                     const w = fbs.writer();
@@ -1648,10 +1661,6 @@ pub const Server = struct {
                         return;
                     };
                     queueStanzaOrDrop(session, reply_xml, "account-delete error");
-
-                    if (session.conn.hasPendingWrite()) {
-                        changes.addWrite(session.conn.fd, conn_id) catch {};
-                    }
                 }
             },
             else => {},
@@ -1746,6 +1755,7 @@ pub const Server = struct {
     }
 
     pub fn dispatchS2sResponse(self: *Server, msg: ipc_protocol.Message, changes: *ChangeList) void {
+        _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
         switch (msg) {
             .s2s_inbound => |m| {
                 // Inbound stanza from remote — deliver to local session(s) by
@@ -1867,7 +1877,7 @@ pub const Server = struct {
                             }
                             continue;
                         }
-                        fanout_mod.deliverToSession(target_session, m.stanza_xml, entry.local_session_id, changes);
+                        fanout_mod.deliverToSession(target_session, m.stanza_xml, entry.local_session_id);
                     } else if (self.delivery_system) |ds| {
                         // Carry this dispatch's token: the receiving worker holds
                         // under the same identity, so the store writes one row
@@ -1911,7 +1921,7 @@ pub const Server = struct {
                 for (sender_entries[0..sender_count]) |sentry| {
                     if (sentry.worker_id == self.worker_id) {
                         const sender_session = self.sessions[sentry.local_session_id] orelse continue;
-                        fanout_mod.deliverToSession(sender_session, err_xml, sentry.local_session_id, changes);
+                        fanout_mod.deliverToSession(sender_session, err_xml, sentry.local_session_id);
                     } else if (self.delivery_system) |ds| {
                         ds.deliver(sentry.worker_id, sentry.local_session_id, sentry.generation, err_xml) catch {};
                     }
@@ -2393,6 +2403,82 @@ test "Server: M1 counters track client traffic through the read path" {
     try std.testing.expectEqual(base_full + 1, c.drop_send_buffer_full.load(.monotonic));
 }
 
+// ADR-2: an append links the conn on the worker's dirty list and the
+// end-of-iteration walk flushes it once; the socket took everything, so
+// no EVFILT_WRITE arm may appear.
+test "Server: an appended conn rides the dirty list to the batch-tail flush" {
+    const allocator = std.testing.allocator;
+    // The worker slot is process-global; reset it after server.deinit so a
+    // failed run leaves no links into a freed Session for the next test.
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+    var ctrs: connection_mod.OutboxCounters = .{};
+    const dirty = connection_mod.dirtyForWorker(server.worker_id);
+    session.conn.bindOutbox(&ctrs, dirty);
+
+    _ = session.nonza("<features/>");
+
+    // The append linked the conn; nothing reached the peer yet.
+    try std.testing.expect(session.conn.on_dirty);
+    try std.testing.expect(!dirty.empty());
+    var buf: [256]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, posix.read(fds[1], &buf));
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.flushDirtyOutboxes(&changes);
+
+    try std.testing.expect(!session.conn.on_dirty);
+    try std.testing.expect(dirty.empty());
+    const n = try posix.read(fds[1], &buf);
+    try std.testing.expectEqualStrings("<features/>", buf[0..n]);
+    for (changes.slice()) |ev| {
+        try std.testing.expect(ev.filter != std.c.EVFILT.WRITE);
+    }
+}
+
+// ADR-2: when the tail's flush stalls on a real EAGAIN the conn arms
+// EVFILT_WRITE once (a bare EV_ENABLE on the DISPATCH knote).
+test "Server: a stalled batch-tail flush arms EVFILT_WRITE once" {
+    const allocator = std.testing.allocator;
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+    var ctrs: connection_mod.OutboxCounters = .{};
+    const dirty = connection_mod.dirtyForWorker(server.worker_id);
+    session.conn.bindOutbox(&ctrs, dirty);
+
+    // Pack the kernel side so the tail flush cannot drain.
+    try std.testing.expect(c2s_session.fillWriteBuffer(session));
+    _ = session.nonza("<more/>");
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.flushDirtyOutboxes(&changes);
+
+    try std.testing.expect(session.conn.hasPendingWrite());
+    var armed = false;
+    for (changes.slice()) |ev| {
+        if (ev.ident == @as(usize, @intCast(session.conn.fd)) and
+            ev.filter == std.c.EVFILT.WRITE and
+            (ev.flags & std.c.EV.ENABLE) != 0) armed = true;
+    }
+    try std.testing.expect(armed);
+}
+
 test "Server: M1 SIGUSR1 dump runs against a live worker block" {
     metrics.bind(10);
     defer metrics.current = null;
@@ -2590,7 +2676,7 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
         }
     }
     try std.testing.expect(target.conn.ensureWriteBuf());
-    @memset(target.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
+    @memset(target.conn.write_buf.?[0..], 'x');
     target.conn.outbox.head = 0;
     target.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
     target.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
@@ -3465,12 +3551,13 @@ test "Re-review 6.4: a failed count arms a retry instead of parking the session"
 
     session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
 
-    // The stall is recorded and a prompt retry is staged on the connection.
+    // The stall is recorded and a prompt retry is staged on the connection:
+    // a bare EV_ENABLE re-arms the accept-time DISPATCH write knote.
     try std.testing.expect(session.offline_pending);
     try std.testing.expectEqual(@as(u8, 1), session.offline_store_stalls);
     var staged_write = false;
     for (changes.buf[0..changes.len]) |ev| {
-        if (ev.filter == std.c.EVFILT.WRITE and ev.udata == session.conn.id) staged_write = true;
+        if (ev.filter == std.c.EVFILT.WRITE and ev.ident == @as(usize, @intCast(session.conn.fd))) staged_write = true;
     }
     try std.testing.expect(staged_write);
 
@@ -4784,16 +4871,18 @@ test "Server: S10 handshake write interest is one-shot" {
     c2s_session.continueTlsHandshake(&server, 1, session, &changes);
     try std.testing.expectEqual(connection_mod.TlsState.handshake_want_write, session.conn.tls_state.?);
 
-    // The staged re-arm must be EV_ONESHOT; a persistent filter fires on
-    // every kevent while the client's next flight is in flight (S10).
-    var found_oneshot = false;
+    // The staged re-arm must be a bare EV_ENABLE on the accept-time
+    // DISPATCH write knote: one delivery auto-disables it, so it cannot
+    // fire on every kevent while the client's next flight is in flight
+    // (S10). A fresh ADD|ENABLE would be a persistent filter.
+    var found_enable = false;
     for (changes.slice()) |ev| {
         if (ev.filter == std.c.EVFILT.WRITE) {
-            try std.testing.expect((ev.flags & std.c.EV.ONESHOT) != 0);
-            found_oneshot = true;
+            try std.testing.expectEqual(@as(u16, std.c.EV.ENABLE), ev.flags);
+            found_enable = true;
         }
     }
-    try std.testing.expect(found_oneshot);
+    try std.testing.expect(found_enable);
 }
 
 test "S13: offline archive failure injection stays out of production" {

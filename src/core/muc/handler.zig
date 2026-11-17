@@ -279,7 +279,7 @@ pub fn handleMucGroupchat(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -360,6 +360,7 @@ pub fn drainPendingFanout(
     pf: *PendingFanout,
     changes: *ChangeList,
 ) bool {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const reg = server.room_registry orelse {
         pf.complete();
         return true;
@@ -393,7 +394,7 @@ pub fn drainPendingFanout(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -425,6 +426,7 @@ fn deliverRemainingSync(
     suffix: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     // Only local occupants — multicast was already sent in initial call
     var i: usize = start_slot;
     while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
@@ -434,7 +436,7 @@ fn deliverRemainingSync(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, buf, prefix, occ.getRealJid(), suffix, local_sid);
     }
 }
 
@@ -445,6 +447,7 @@ pub fn handleMucDiscoInfo(
     iq_id: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const muc_host = server.muc_host orelse return;
     var buf: [2048]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -470,9 +473,6 @@ pub fn handleMucDiscoInfo(
     };
 
     queueStanzaOrDrop(session, reply_xml, "disco#info reply");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 /// Handle disco#items for the MUC service domain (list public rooms).
@@ -482,6 +482,7 @@ pub fn handleMucDiscoItems(
     iq_id: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
@@ -597,9 +598,6 @@ pub fn handleMucDiscoItems(
     } else {
         queueStanzaOrDrop(session, fbs.getWritten(), "disco#items reply");
     }
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 /// Handle disco#info for a specific room.
@@ -610,6 +608,7 @@ pub fn handleRoomDiscoInfo(
     iq_id: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
@@ -701,9 +700,6 @@ pub fn handleRoomDiscoInfo(
     };
 
     queueStanzaOrDrop(session, reply_xml, "room disco#info reply");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 /// Handle MUC admin IQ (kick/ban/voice).
@@ -842,9 +838,6 @@ pub fn handleMucAdminIq(
     };
 
     queueStanzaOrDrop(session, result_xml, "admin result");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 fn sendIqErrorFromRoom(
@@ -867,6 +860,7 @@ fn sendIqErrorFromRoomTyped(
     err_type: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = server;
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -891,9 +885,6 @@ fn sendIqErrorFromRoomTyped(
     };
 
     queueStanzaOrDrop(session, err_xml, "IQ error reply");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 // ============================================================================
@@ -982,9 +973,6 @@ pub fn handleMucOwnerGet(
     };
 
     queueStanzaOrDrop(session, form_xml, "config form reply");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 /// Handle IQ set for room configuration form submission.
@@ -1077,9 +1065,6 @@ pub fn handleMucOwnerSet(
     };
 
     queueStanzaOrDrop(session, result_xml, "owner-set result");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 
     // Broadcast status 104 (room config changed) to occupants
     broadcastConfigChange(server, room, muc_host, changes);
@@ -1147,6 +1132,7 @@ fn parseFormValue(xml_data: []const u8, field_var: []const u8, buf: []u8) !?[]co
 
 /// Broadcast status code 104 (config changed) to all room occupants.
 fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u8, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
@@ -1166,7 +1152,7 @@ fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u
             noteJidOverflow("config-change notice for '{s}' exceeds {d} bytes; not sent to session {d}", .{ room.getJid(), router.JID_STANZA_MAX, occ.session_id });
             continue;
         };
-        fanout.deliverToSession(target, notice_xml, target.conn.id, changes);
+        fanout.deliverToSession(target, notice_xml, target.conn.id);
     }
 }
 
@@ -1458,6 +1444,7 @@ fn sendOccupantPresence(
     status_code: ?[]const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -1494,7 +1481,7 @@ fn sendOccupantPresence(
         return;
     };
 
-    fanout.deliverToSession(target, stanza_xml, target.conn.id, changes);
+    fanout.deliverToSession(target, stanza_xml, target.conn.id);
 }
 
 fn sendSelfPresence(
@@ -1505,6 +1492,7 @@ fn sendSelfPresence(
     muc_host: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
     _ = server;
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
@@ -1530,9 +1518,6 @@ fn sendSelfPresence(
     };
 
     queueStanzaOrDrop(session, stanza_xml, "self presence");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 fn broadcastOccupantJoin(
@@ -1546,6 +1531,7 @@ fn broadcastOccupantJoin(
     new_session_id: usize,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
 
     // Look up avatar hash for the joining user
@@ -1625,7 +1611,7 @@ fn broadcastOccupantJoin(
         const target = server.sessions[occ.session_id] orelse continue;
 
         const use_suffix = if (occ.session_id == new_session_id) suffix_110 else suffix;
-        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), use_suffix, occ.session_id, changes);
+        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), use_suffix, occ.session_id);
     }
 }
 
@@ -1637,6 +1623,7 @@ fn broadcastOccupantLeave(
     status_code: ?[]const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
 
     // Build prefix/suffix for multicast (no status 110)
@@ -1696,7 +1683,7 @@ fn broadcastOccupantLeave(
         if (occ.worker_id != server.worker_id) continue;
         const target = server.sessions[occ.session_id] orelse continue;
 
-        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.session_id, changes);
+        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.session_id);
     }
 
     // Send unavailable presence to the removed occupant themselves (with status 110)
@@ -1725,7 +1712,7 @@ fn broadcastOccupantLeave(
             return;
         };
 
-        fanout.deliverPrebuiltToSession(self_target, deliver_lease.buf, prefix, removed.getRealJid(), suffix_110, removed.session_id, changes);
+        fanout.deliverPrebuiltToSession(self_target, deliver_lease.buf, prefix, removed.getRealJid(), suffix_110, removed.session_id);
     }
 }
 
@@ -1778,6 +1765,7 @@ comptime {
 /// never receives it; a target on another worker goes through the
 /// generation-checked unicast.
 fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupant, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     // Every variable byte may become a six-byte XML entity; the remaining
     // 256 bytes cover the literal markup and affiliation name. The worst
     // case is ~10 KB, so the notice is built in a leased scratch bank, not
@@ -1817,7 +1805,7 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
     var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
     const target_jid = buildFullJid(&jid_buf, bound.local, bound.domain, bound.resource) orelse return;
     if (!std.mem.eql(u8, target_jid, before.getRealJid())) return;
-    fanout.deliverToSession(target, stanza, before.session_id, changes);
+    fanout.deliverToSession(target, stanza, before.session_id);
 }
 
 /// Presence error to a joiner on another worker.
@@ -1853,6 +1841,7 @@ fn sendRoomHistory(
     muc_host: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
     const archive = server.archive orelse return;
     const history_max = room.config.history_length;
@@ -1945,10 +1934,6 @@ fn sendRoomHistory(
             break;
         }
     }
-
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 /// Format a unix timestamp as ISO 8601 (XEP-0203): YYYY-MM-DDThh:mm:ssZ
@@ -1981,6 +1966,7 @@ fn sendRoomSubject(
     muc_host: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = server;
     _ = muc_host;
     const subject = room.config.getSubject();
@@ -2006,9 +1992,6 @@ fn sendRoomSubject(
     };
 
     queueStanzaOrDrop(session, subj_xml, "room subject");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 // ============================================================================
@@ -2023,6 +2006,7 @@ fn sendPresenceError(
     condition: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = server;
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -2045,9 +2029,6 @@ fn sendPresenceError(
     };
 
     queueStanzaOrDrop(session, stanza_xml, "presence error");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 fn sendMessageError(
@@ -2059,6 +2040,7 @@ fn sendMessageError(
     condition: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = server;
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -2087,9 +2069,6 @@ fn sendMessageError(
     };
 
     queueStanzaOrDrop(session, stanza_xml, "message error");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 // ============================================================================
@@ -2451,7 +2430,7 @@ pub fn processRemoteGroupchat(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -3073,6 +3052,7 @@ fn sendIqWaitError(server: *Server, room_jid: []const u8, iq_id: []const u8, wor
 /// Deliver a small stanza to a (worker, session, generation) triple, locally
 /// when the session lives on this worker or via the MPSC otherwise.
 fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id: usize, generation: u32, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     if (worker == server.worker_id) {
         // The triple may be stale: a reused session slot must never get a
         // stanza meant for its previous holder.
@@ -3082,9 +3062,6 @@ fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id:
         if (session.stanza(stanza) == .failed_closed) {
             c2s_session.noteSendDrop(session, stanza, "local MUC delivery");
             return;
-        }
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
     } else {
         const ds = server.delivery_system orelse return;
@@ -4632,7 +4609,7 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     defer session.deinit();
 
     try std.testing.expect(session.conn.ensureWriteBuf());
-    @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
+    @memset(session.conn.write_buf.?[0..], 'x');
     session.conn.outbox.head = 0;
     session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
     session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;

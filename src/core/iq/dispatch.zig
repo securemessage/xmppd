@@ -2092,6 +2092,7 @@ fn sendPepNotification(
     payload: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const roster = server.roster orelse return;
     const sm = server.session_map orelse return;
 
@@ -2159,7 +2160,7 @@ fn sendPepNotification(
                     noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ bound.local, bound.domain, entry.resource(), self_msg_lease.buf.len });
                     continue;
                 };
-                fanout.deliverToSession(target, notif_xml, entry.local_session_id, changes);
+                fanout.deliverToSession(target, notif_xml, entry.local_session_id);
             } else {
                 // Cross-thread: build full stanza and deliver via MPSC
                 if (server.delivery_system) |ds| {
@@ -2252,7 +2253,7 @@ fn sendPepNotification(
                     noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ sub_local, sub_domain, entry.resource(), sub_msg_lease.buf.len });
                     continue;
                 };
-                fanout.deliverToSession(target, notif_xml, entry.local_session_id, changes);
+                fanout.deliverToSession(target, notif_xml, entry.local_session_id);
             } else {
                 if (server.delivery_system) |ds| {
                     var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
@@ -2456,6 +2457,7 @@ fn pushBlockPush(
     item_jid: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
     var lease_b = server.leaseScratch(.b);
     defer lease_b.release();
@@ -2496,7 +2498,7 @@ fn pushBlockPush(
                 continue;
             };
 
-            fanout.deliverToSession(target, push_xml, entry.local_session_id, changes);
+            fanout.deliverToSession(target, push_xml, entry.local_session_id);
         }
         // Cross-thread push: deferred to post-V1 (T89 pattern)
     }
@@ -2594,6 +2596,7 @@ pub fn pushRosterItem(
     ask: bool,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
     var lease_b = server.leaseScratch(.b);
     defer lease_b.release();
@@ -2686,7 +2689,7 @@ pub fn pushRosterItem(
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
             if (!target.roster_interested) continue;
-            fanout.deliverToSession(target, full_xml, entry.local_session_id, changes);
+            fanout.deliverToSession(target, full_xml, entry.local_session_id);
         } else if (server.delivery_system) |ds| {
             ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, full_xml) catch |err| {
                 noteCrossWorkerDrop("roster push to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.local_session_id, @errorName(err) });
@@ -3203,7 +3206,7 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     defer session.deinit();
 
     try std.testing.expect(session.conn.ensureWriteBuf());
-    @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
+    @memset(session.conn.write_buf.?[0..], 'x');
     session.conn.outbox.head = 0;
     session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
     session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;

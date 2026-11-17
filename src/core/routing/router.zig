@@ -214,16 +214,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     const from_jid = session.stream.bound_jid orelse {
         if (session.stanza_kind == .message and !std.mem.eql(u8, type_str, "error")) {
             sendNotAuthorized(session, id_str, to_str);
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
         } else if (session.stanza_kind == .iq and
             (std.mem.eql(u8, type_str, "get") or std.mem.eql(u8, type_str, "set")))
         {
             sendNotAuthorized(session, id_str, to_str);
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
         }
         return;
     };
@@ -346,9 +340,6 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             if (std.mem.eql(u8, type_str, "groupchat") or std.mem.eql(u8, type_str, "error")) {
                 if (std.mem.eql(u8, type_str, "groupchat")) {
                     sendServiceUnavailable(session, id_str, to_str, from_str);
-                    if (session.conn.hasPendingWrite()) {
-                        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-                    }
                 }
                 // type='error' to bare JID: silently drop (no error response for error stanzas)
                 return;
@@ -501,9 +492,6 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             if (std.mem.eql(u8, type_str, "error")) return;
             if (std.mem.eql(u8, type_str, "groupchat")) {
                 sendServiceUnavailable(session, id_str, to_str, from_str);
-                if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, session.conn.id) catch {};
-                }
                 return;
             }
         }
@@ -572,9 +560,6 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         // No offline store configured or store full — bounce
         log.info("connection {d} message to {s} — recipient unavailable", .{ session.conn.id, to_str });
         sendServiceUnavailable(session, id_str, to_str, from_str);
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
         return;
     }
 
@@ -650,9 +635,6 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 _ = delivery_queue_mod.offline_hold_bounces.fetchAdd(1, .monotonic);
                 log.info("connection {d} message to {s} not held, offline queue unavailable or full", .{ session.conn.id, to_str });
                 sendServiceUnavailable(session, id_str, to_str, from_str);
-                if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, session.conn.id) catch {};
-                }
             }
             continue;
         }
@@ -680,9 +662,6 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             delivered_buf[delivered_count] = entry;
             delivered_count += 1;
         }
-        if (target_session.conn.hasPendingWrite()) {
-            changes.addWrite(target_session.conn.fd, tid) catch {};
-        }
     }
 
     const bounceable = (session.stanza_kind == .message and !std.mem.eql(u8, type_str, "error")) or
@@ -690,9 +669,6 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     if (delivery_failed and !local_delivery_succeeded and !remote_delivered and !hold_bounced and bounceable) {
         log.info("connection {d} stanza to {s} could not be delivered to any resource", .{ session.conn.id, to_str });
         sendServiceUnavailable(session, id_str, to_str, from_str);
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
     }
 
     // XEP-0280: Message Carbons - send copies to sender's and recipient's other resources.
@@ -820,12 +796,10 @@ fn buildDeliveryStanza(
 
 /// Forward a stanza to a remote domain via the S2S daemon IPC.
 pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to_str: []const u8, type_str: []const u8, id_str: []const u8, inner_xml: []const u8, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     if (!server.s2s_ipc.connected) {
         log.info("connection {d} stanza to remote {s} — no S2S daemon", .{ session.conn.id, to_str });
         sendServiceUnavailable(session, id_str, to_str, from_str);
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
         return;
     }
 
@@ -888,9 +862,6 @@ pub fn forwardToS2s(server: *Server, session: *Session, from_str: []const u8, to
     } }) catch {
         log.err("connection {d} failed to forward stanza to S2S daemon", .{session.conn.id});
         sendServiceUnavailable(session, id_str, to_str, from_str);
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
         return;
     };
 
@@ -971,6 +942,7 @@ fn sendCarbons(
     delivered: []const SessionEntry,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
     var lease_b = server.leaseScratch(.b);
     defer lease_b.release();
@@ -1058,7 +1030,7 @@ fn sendCarbons(
                 noteDrop("{s} carbon for session {d} exceeds {d} bytes; skipped", .{ carbon_type, entry.local_session_id, cbuf.len });
                 continue;
             };
-            fanout.deliverToSession(target, carbon_data, entry.local_session_id, changes);
+            fanout.deliverToSession(target, carbon_data, entry.local_session_id);
         } else {
             // T89: Cross-thread carbon delivery via MPSC
             const ds = server.delivery_system orelse {
@@ -1300,7 +1272,7 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     defer session.deinit();
 
     try std.testing.expect(session.conn.ensureWriteBuf());
-    @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
+    @memset(session.conn.write_buf.?[0..], 'x');
     session.conn.outbox.head = 0;
     session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
     session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;

@@ -56,8 +56,15 @@ var placeholder_outbox_ring: [0]u8 = .{};
 /// fallback block instead.
 const OutboxCounterSlot = struct {
     counters: OutboxCounters align(std.atomic.cache_line) = .{},
+    /// The worker's ADR-2 end-of-iteration flush list; kept in the slot so
+    /// Server stays the same size as before the outbox work.
+    dirty: DirtyList = .{},
 };
 pub var worker_outbox_counters: [metrics.MAX_WORKERS]OutboxCounterSlot = @splat(.{});
+
+/// Dirty list for a Connection never bound to a worker (unit tests, the
+/// window before bindOutbox). threadlocal matches fallback_outbox_counters.
+threadlocal var fallback_dirty_list: DirtyList = .{};
 
 /// The counter block a connection on `worker_id` binds at accept. Ids past
 /// the table share the threadlocal fallback so a misconfigured worker can
@@ -65,6 +72,13 @@ pub var worker_outbox_counters: [metrics.MAX_WORKERS]OutboxCounterSlot = @splat(
 pub fn countersForWorker(worker_id: u16) *OutboxCounters {
     if (worker_id < metrics.MAX_WORKERS) return &worker_outbox_counters[worker_id].counters;
     return &fallback_outbox_counters;
+}
+
+/// The dirty list a connection on `worker_id` binds at accept. Ids past
+/// the table share the threadlocal fallback.
+pub fn dirtyForWorker(worker_id: u16) *DirtyList {
+    if (worker_id < metrics.MAX_WORKERS) return &worker_outbox_counters[worker_id].dirty;
+    return &fallback_dirty_list;
 }
 
 /// Create a non-blocking Unix socketpair. Used in tests.
@@ -100,6 +114,11 @@ pub const WRITE_BUF_SIZE = 16384;
 /// resource-constraint; undelivered messages drain to offline storage.
 pub const MAX_OUTBOUND_BYTES: usize = 1 << 20;
 
+/// Per-connection, per-pass flush budget for the end-of-iteration dirty
+/// walk (F3 flush_budget_bytes). Bounds how long one conn can hold the
+/// batch tail before the walk moves on.
+pub const FLUSH_BUDGET_BYTES: usize = 64 << 10;
+
 /// T110 backpressure: at/above this buffered-bytes level the server disables
 /// EVFILT_READ for the connection, so TCP-level flow control propagates to
 /// the sender's kernel instead of us reading ever more stanzas we cannot
@@ -109,6 +128,47 @@ pub const WRITE_SUPPRESS_HIGH: usize = WRITE_BUF_SIZE * 3 / 4;
 /// T110 backpressure: reading resumes once the buffer drained to or below
 /// this level. 50% — hysteresis against flapping at the threshold.
 pub const WRITE_SUPPRESS_LOW: usize = WRITE_BUF_SIZE / 2;
+
+/// Intrusive per-worker dirty list over `*Connection` (FIFO, O(1)
+/// link/unlink): an append links its conn, and the worker's
+/// end-of-iteration walk pops and flushes each link once (ADR-2), so
+/// EVFILT_WRITE arms only after a real EAGAIN instead of per send.
+/// Same shape as lib/net's ConnList.
+pub const DirtyList = struct {
+    head: ?*Connection = null,
+    tail: ?*Connection = null,
+
+    /// Append `c` if it is not linked already (idempotent).
+    pub fn link(l: *DirtyList, c: *Connection) void {
+        if (c.on_dirty) return;
+        c.on_dirty = true;
+        c.dirty_prev = l.tail;
+        c.dirty_next = null;
+        if (l.tail) |t| t.dirty_next = c else l.head = c;
+        l.tail = c;
+    }
+
+    /// Detach `c` without disturbing the order of the rest.
+    pub fn unlink(l: *DirtyList, c: *Connection) void {
+        if (!c.on_dirty) return;
+        if (c.dirty_prev) |p| p.dirty_next = c.dirty_next else l.head = c.dirty_next;
+        if (c.dirty_next) |n| n.dirty_prev = c.dirty_prev else l.tail = c.dirty_prev;
+        c.dirty_next = null;
+        c.dirty_prev = null;
+        c.on_dirty = false;
+    }
+
+    /// Remove and return the head, or null.
+    pub fn pop(l: *DirtyList) ?*Connection {
+        const c = l.head orelse return null;
+        l.unlink(c);
+        return c;
+    }
+
+    pub fn empty(l: *const DirtyList) bool {
+        return l.head == null;
+    }
+};
 
 /// Per-client XMPP connection state.
 pub const Connection = struct {
@@ -129,15 +189,31 @@ pub const Connection = struct {
     /// deinit(). Keeping it out of the struct lets the M4 stack-frame caps
     /// hold where by-value Connection moves occur (accept, Session.init);
     /// heap memory is also what makes the TLS (ptr, len) pin stable across
-    /// every by-value move. Empty means "never sent" — recv-only
+    /// every by-value move. Null means "never sent" — recv-only
     /// connections never pay for it.
-    write_buf: []u8 = &.{},
+    write_buf: ?*[WRITE_BUF_SIZE]u8 = null,
 
     /// Outbound queue over `write_buf` (lib/net Outbox): a fixed ring
-    /// first, a bounded spill behind it up to MAX_OUTBOUND_BYTES. The ring
-    /// binding is re-derived on each use via ob() because a Connection
-    /// is moved by value before the owning Session is placed on the heap.
+    /// first, a bounded spill behind it up to MAX_OUTBOUND_BYTES. The
+    /// ring binding is re-derived on each use via ob() because a
+    /// Connection is moved by value before the owning Session is placed
+    /// on the heap.
     outbox: net.Outbox,
+
+    /// Intrusive links for the owning worker's dirty list, bound at
+    /// accept by bindOutbox. An append links the conn so the batch tail
+    /// flushes it; close()/deinit() unlink.
+    dirty_next: ?*Connection = null,
+    dirty_prev: ?*Connection = null,
+    on_dirty: bool = false,
+    /// The worker's dirty list, or null before bindOutbox and in unit
+    /// tests — unbound conns link nowhere.
+    dirty_list: ?*DirtyList = null,
+
+    /// The last flush stalled on TLS want_read (a write that needs a
+    /// read event); the next readable event re-links the conn so the
+    /// tail retries the flush.
+    flush_want_read: bool = false,
 
     /// TLS state — null for plain TCP, set after STARTTLS upgrade.
     tls: ?net.Tls = null,
@@ -161,8 +237,10 @@ pub const Connection = struct {
     peer_addr_buf: [64]u8 = undefined,
     peer_addr_len: usize = 0,
 
-    /// Stable buffer for channel binding data (outlives the getChannelBinding call).
-    cb_data_buf: [32]u8 = undefined,
+    /// Stable buffer for channel binding data (outlives the getChannelBinding
+    /// call). Lazy like write_buf: only TLS sessions doing SASL channel
+    /// binding ever allocate it.
+    cb_data_buf: ?*[32]u8 = null,
 
     /// Initialize a new connection from an accepted socket.
     ///
@@ -183,7 +261,7 @@ pub const Connection = struct {
     /// placement (the Session.init return, the accept-time field copy)
     /// never leaves a dangling ring slice behind.
     fn ob(self: *Connection) *net.Outbox {
-        self.outbox.ring = self.write_buf;
+        self.outbox.ring = if (self.write_buf) |p| p[0..] else placeholder_outbox_ring[0..];
         return &self.outbox;
     }
 
@@ -197,8 +275,8 @@ pub const Connection = struct {
     /// Allocate the ring backing once; later calls are a no-op. The block
     /// comes from the outbox's allocator and is freed by deinit().
     pub fn ensureWriteBuf(self: *Connection) bool {
-        if (self.write_buf.len != 0) return true;
-        if (self.outbox.alloc.alloc(u8, WRITE_BUF_SIZE)) |buf| {
+        if (self.write_buf != null) return true;
+        if (self.outbox.alloc.create([WRITE_BUF_SIZE]u8)) |buf| {
             self.write_buf = buf;
             return true;
         } else |_| {
@@ -206,13 +284,28 @@ pub const Connection = struct {
         }
     }
 
-    /// Bind the per-worker counter block once the Connection has reached
-    /// its permanent home (the heap Session slot). ob() keeps the ring
-    /// binding self-healing; this call is what points counters at the
-    /// worker-owned block.
-    pub fn bindOutbox(self: *Connection, counters: *OutboxCounters) void {
-        self.outbox.ring = self.write_buf;
+    /// Bind the per-worker counter block and dirty list once the
+    /// Connection has reached its permanent home (the heap Session
+    /// slot). ob() keeps the ring binding self-healing; this call is
+    /// what points counters at the worker-owned block and dirty links
+    /// at the worker's end-of-iteration flush list.
+    pub fn bindOutbox(self: *Connection, counters: *OutboxCounters, dirty: *DirtyList) void {
+        self.outbox.ring = if (self.write_buf) |p| p[0..] else placeholder_outbox_ring[0..];
         self.outbox.counters = counters;
+        self.dirty_list = dirty;
+    }
+
+    /// Link this conn on the bound dirty list so the worker's batch
+    /// tail flushes it once (ADR-2). A no-op for unbound conns (unit
+    /// tests); idempotent through DirtyList.link.
+    pub fn linkDirty(self: *Connection) void {
+        if (self.dirty_list) |l| l.link(self);
+    }
+
+    /// Detach from the bound dirty list (close/deinit paths). Safe on
+    /// unbound or unlinked conns.
+    fn unlinkDirty(self: *Connection) void {
+        if (self.dirty_list) |l| l.unlink(self);
     }
 
     /// Derived fresh on each call: the .tls arm points at this
@@ -236,8 +329,14 @@ pub const Connection = struct {
         if (self.tls) |*t| {
             if (t.conn.getChannelBinding()) |cb| {
                 // Store in a stable buffer so the slice outlives this call
-                self.cb_data_buf = cb.data;
-                return .{ .cb_type = @intFromEnum(cb.cb_type), .data = &self.cb_data_buf };
+                const buf = self.cb_data_buf orelse blk: {
+                    const b = self.outbox.alloc.create([32]u8) catch
+                        return .{ .cb_type = 0, .data = "" };
+                    self.cb_data_buf = b;
+                    break :blk b;
+                };
+                buf.* = cb.data;
+                return .{ .cb_type = @intFromEnum(cb.cb_type), .data = buf[0..] };
             }
         }
         return .{ .cb_type = 0, .data = "" };
@@ -361,7 +460,11 @@ pub const Connection = struct {
         const r = o.append(&parts);
         if (r == .failed_closed) {
             if (metrics.get()) |c| metrics.bump(&c.drop_send_buffer_full, 1);
+            return r;
         }
+        // Accepted bytes owe the worker's batch tail one flush; the tail
+        // arms EVFILT_WRITE only when the flush stalls on a real EAGAIN.
+        self.linkDirty();
         return r;
     }
 
@@ -406,6 +509,28 @@ pub const Connection = struct {
         return self.outbox.bytes();
     }
 
+    /// Flush the outbox to the socket with a byte budget, reporting the
+    /// lib/net FlushResult so the caller arms the right interest: the
+    /// batch tail arms EVFILT_WRITE only on want_write or a spent
+    /// budget, and marks flush_want_read for the next readable event
+    /// (ADR-2).
+    ///
+    /// The outbox owns the TLS (ptr, len) pin: a pending want_* retry
+    /// presents the identical slice OpenSSL was first given, formed
+    /// only from ring memory (S23, kTLS D3).
+    pub fn flushOutbox(self: *Connection, budget: usize) net.FlushResult {
+        if (self.closed) return .{ .err = error.ConnectionClosed };
+        const o = self.ob();
+        const before = o.bytes();
+        var tr = self.transport();
+        const result = o.flush(&tr, budget);
+        const wrote = before - o.bytes();
+        if (wrote > 0) {
+            if (metrics.get()) |c| metrics.bump(&c.bytes_out, wrote);
+        }
+        return result;
+    }
+
     /// Flush the write buffer to the socket.
     ///
     /// Returns the number of bytes written. The caller should keep this fd
@@ -422,17 +547,10 @@ pub const Connection = struct {
         if (self.closed) return error.ConnectionClosed;
         if (!self.hasPendingWrite()) return 0;
 
-        // The outbox owns the TLS (ptr, len) pin: a pending want_* retry
-        // presents the identical slice OpenSSL was first given, formed
-        // only from ring memory (S23, kTLS D3).
         const o = self.ob();
         const before = o.bytes();
-        var tr = self.transport();
-        const result = o.flush(&tr, WRITE_BUF_SIZE);
+        const result = self.flushOutbox(WRITE_BUF_SIZE);
         const wrote = before - o.bytes();
-        if (wrote > 0) {
-            if (metrics.get()) |c| metrics.bump(&c.bytes_out, wrote);
-        }
         return switch (result) {
             .drained, .budget_left => wrote,
             .want_read, .want_write => if (wrote > 0) wrote else error.WouldBlock,
@@ -517,6 +635,9 @@ pub const Connection = struct {
 
     /// Close the connection and release resources.
     pub fn close(self: *Connection) void {
+        // A closed fd cannot drain; leave nothing linked that the
+        // worker's dirty walk could pop after the Session is freed.
+        self.unlinkDirty();
         if (!self.closed) {
             if (self.tls) |*t| {
                 t.conn.shutdown();
@@ -545,14 +666,18 @@ pub const Connection = struct {
     pub fn deinit(self: *Connection) void {
         self.close();
         self.outbox.deinit();
-        if (self.write_buf.len != 0) {
-            self.outbox.alloc.free(self.write_buf);
-            self.write_buf = &.{};
+        if (self.write_buf) |p| {
+            self.outbox.alloc.free(p[0..]);
+            self.write_buf = null;
             // A freed conn reports an empty outbox rather than a dangling ring.
             self.outbox.ring = &.{};
             self.outbox.head = 0;
             self.outbox.used = 0;
             self.outbox.pin = null;
+        }
+        if (self.cb_data_buf) |p| {
+            self.outbox.alloc.destroy(p);
+            self.cb_data_buf = null;
         }
     }
 
@@ -720,7 +845,7 @@ test "Connection: queueSend on closed connection is rejected (T155)" {
 
     try std.testing.expectError(error.ConnectionClosed, conn.queueSend("<message/>"));
     // Critically, the rejected data must not leave the connection looking
-    // writable — callers gate `changes.addWrite(conn.fd, ..)` on this.
+    // writable — the dirty-list flush is gated on this.
     try std.testing.expect(!conn.hasPendingWrite());
 }
 
