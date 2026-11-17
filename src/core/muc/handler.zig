@@ -28,6 +28,7 @@ const Affiliation = room_store.Affiliation;
 
 const connection_mod = @import("../connection.zig");
 const server_mod = @import("../worker/worker.zig");
+const c2s_session = @import("../c2s/session.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const ChangeList = @import("../worker/loop.zig").ChangeList;
@@ -85,23 +86,9 @@ noinline fn logJoin(real_jid: []const u8, room_jid: []const u8, nick: []const u8
 /// path: it is logged, and a full write buffer flags the session for
 /// overflow teardown (R1), the same classification deliverToTriple uses.
 fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
-    session.queueSendStanza(stanza) catch |err| {
-        noteQueueDrop(session, stanza, err, what);
-    };
-}
-
-/// Classify and log one refused queueSendStanza on the cold path (R5).
-/// WriteBufferFull is two different refusals, split by noteQueueOverflow:
-/// a stanza longer than the whole buffer is dropped as oversize and the
-/// session lives; a deliverable stanza that cannot fit means a slow reader
-/// and flags overflow teardown (R1).
-noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerror, comptime what: []const u8) void {
-    @branchHint(.cold);
-    if (err == error.WriteBufferFull and server_mod.noteQueueOverflow(session, stanza)) {
-        log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, connection_mod.WRITE_BUF_SIZE });
-        return;
+    if (session.stanza(stanza) == .failed_closed) {
+        c2s_session.noteSendDrop(session, stanza, what);
     }
-    log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
 }
 
 /// Handle a presence stanza addressed to a MUC room JID.
@@ -1951,12 +1938,12 @@ fn sendRoomHistory(
             continue;
         };
 
-        session.queueSendStanza(hist_xml) catch |err| {
+        if (session.stanza(hist_xml) == .failed_closed) {
             // A refused queue means the session's buffer is full; the rest
             // of the replay would fail the same way, so stop here (R5).
-            noteQueueDrop(session, hist_xml, err, "room history stanza");
+            c2s_session.noteSendDrop(session, hist_xml, "room history stanza");
             break;
-        };
+        }
     }
 
     if (session.conn.hasPendingWrite()) {
@@ -3092,10 +3079,10 @@ fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id:
         const sm = server.session_map orelse return;
         if (!sm.getGenerationById(worker, @intCast(session_id), generation)) return;
         const session = server.sessions[session_id] orelse return;
-        session.queueSendStanza(stanza) catch |err| {
-            noteQueueDrop(session, stanza, err, "local MUC delivery");
+        if (session.stanza(stanza) == .failed_closed) {
+            c2s_session.noteSendDrop(session, stanza, "local MUC delivery");
             return;
-        };
+        }
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }

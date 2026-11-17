@@ -242,25 +242,21 @@ pub fn deliverToSession(
     session_id: usize,
     changes: anytype,
 ) void {
-    if (session.sm_detached) {
-        session.smTrackOutbound(data);
-        return;
-    }
-    session.conn.queueSend(data) catch |err| {
-        if (err == error.WriteBufferFull) {
-            // Two cases share the error (noteQueueOverflow): a stanza that
-            // can never fit is an oversize drop, not a slow reader.
-            if (data.len <= connection_mod.WRITE_BUF_SIZE) {
-                session.sm_overflow = true;
-                log.warn("local delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
-            } else {
-                _ = delivery_queue_mod.oversize_queue_drops.fetchAdd(1, .monotonic);
-                log.warn("local delivery to session {d} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session_id, data.len, connection_mod.WRITE_BUF_SIZE });
-            }
+    if (session.stanza(data) == .failed_closed) {
+        // A dead conn needs no classification (the old ConnectionClosed
+        // path was silent). On a live conn a full outbox is two cases
+        // (noteQueueOverflow): a stanza that can never fit is an oversize
+        // drop, not a slow reader.
+        if (session.conn.isClosed()) return;
+        if (data.len <= connection_mod.WRITE_BUF_SIZE) {
+            session.sm_overflow = true;
+            log.warn("local delivery to session {d} failed: WriteBufferFull; marking the session for overflow teardown", .{session_id});
+        } else {
+            _ = delivery_queue_mod.oversize_queue_drops.fetchAdd(1, .monotonic);
+            log.warn("local delivery to session {d} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session_id, data.len, connection_mod.WRITE_BUF_SIZE });
         }
         return;
-    };
-    session.smTrackOutbound(data);
+    }
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session_id) catch {};
     }
@@ -489,6 +485,10 @@ const MockConn = struct {
     pub fn hasPendingWrite(self: *const MockConn) bool {
         return self.sent_len > 0;
     }
+
+    pub fn isClosed(self: *const MockConn) bool {
+        return self.closed;
+    }
 };
 
 const MockSession = struct {
@@ -503,6 +503,18 @@ const MockSession = struct {
         @memcpy(self.tracked[self.tracked_len .. self.tracked_len + data.len], data);
         self.tracked_len += data.len;
         self.track_calls += 1;
+    }
+
+    /// Mirrors Session.stanza: detached sessions are tracked for resume,
+    /// live sessions count then append.
+    pub fn stanza(self: *MockSession, data: []const u8) enum { queued, tracked_detached, spilled, failed_closed } {
+        if (self.sm_detached) {
+            self.smTrackOutbound(data);
+            return .tracked_detached;
+        }
+        self.smTrackOutbound(data);
+        self.conn.queueSend(data) catch return .failed_closed;
+        return .queued;
     }
 };
 
