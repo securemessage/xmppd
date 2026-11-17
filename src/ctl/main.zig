@@ -470,13 +470,10 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, command, "oidc-links")) {
         var it = try binding_store.iterateBindings();
         defer it.deinit();
-        while (try it.next()) |b| {
-            var line: [1024]u8 = undefined;
-            const s = std.fmt.bufPrint(&line, "{s}\t{s}\t{s}\t{s}\t{d}\n", .{
-                b.localpart, b.iss, b.sub, @tagName(b.source), b.bound_at,
-            }) catch continue;
-            printOut(s);
-        }
+        var out_buf: [4096]u8 = undefined;
+        var stdout = std.fs.File.stdout().writer(&out_buf);
+        try printOidcBindings(&it, &stdout.interface);
+        try stdout.interface.flush();
     } else if (std.mem.eql(u8, command, "oidc-link-import")) {
         if (remaining_args.items.len < 2) {
             printErr("oidc-link-import requires a file\n");
@@ -539,6 +536,17 @@ pub fn main() !void {
         printErr("\n");
         printUsage();
         return error.InvalidArgs;
+    }
+}
+
+/// `xmppctl oidc-links` row printer: one tab-separated line per binding,
+/// streamed straight to `out`. No fixed line buffer, so a stored row wider
+/// than any staging buffer is still listed instead of silently dropped.
+fn printOidcBindings(it: anytype, out: *std.Io.Writer) !void {
+    while (try it.next()) |b| {
+        try out.print("{s}\t{s}\t{s}\t{s}\t{d}\n", .{
+            b.localpart, b.iss, b.sub, @tagName(b.source), b.bound_at,
+        });
     }
 }
 
@@ -608,8 +616,8 @@ fn cmdOidcUnclaimed(allocator: std.mem.Allocator, binding_store: *BindingStore, 
     defer if (op_be) |*b| b.close();
     if (op_be) |*op| {
         const probe_nss = [_][]const u8{
-            ROSTERS_NS,    OFFLINE_NS, VCARDS_NS, LASTACT_NS,
-            PEP_NS,        BLOCKLIST_NS, PENDING_SUB_NS,
+            ROSTERS_NS, OFFLINE_NS,   VCARDS_NS,      LASTACT_NS,
+            PEP_NS,     BLOCKLIST_NS, PENDING_SUB_NS,
         };
         for (probe_nss) |ns| {
             try scanOwners(op, ns, false, &owners, allocator);
@@ -1414,4 +1422,37 @@ test "addUserCanonical: invalid names refused; conflicts are on the canonical na
     // The Kelvin sign folds to 'k' (PR #21 account-key semantics).
     try addUserCanonical(&store, allocator, "\u{212A}", "pw");
     try std.testing.expectError(error.UserExists, addUserCanonical(&store, allocator, "k", "pw"));
+}
+
+test "oidc-links lists a binding row wider than any fixed line buffer" {
+    // Goal: every stored binding row reaches the audit listing, uncut.
+    // Method: stage a reverse-index row whose printed form exceeds the old
+    // 1024-byte line buffer (bind() caps iss/sub below that, so the row is
+    // written directly, as a pre-cap or hand-edited store would hold it)
+    // and require its full text in the output.
+    var db = try backend_mod.MemoryBackend.open("", .{});
+    defer db.close();
+    var store = oidc_ids.Store(backend_mod.MemoryBackend).init(&db);
+
+    const lp = "l" ** 255;
+    const iss = "i" ** 1500;
+    const sub = "s" ** 500;
+    var vbuf: [2048]u8 = undefined;
+    std.mem.writeInt(u16, vbuf[0..2], @intCast(iss.len), .big);
+    @memcpy(vbuf[2..][0..iss.len], iss);
+    @memcpy(vbuf[2 + iss.len ..][0..sub.len], sub);
+    vbuf[2 + iss.len + sub.len] = @intFromEnum(oidc_ids.Source.operator);
+    std.mem.writeInt(i64, vbuf[2 + iss.len + sub.len + 1 ..][0..8], 1_763_000_000, .big);
+    const val = vbuf[0 .. 2 + iss.len + sub.len + 9];
+    var key_buf: [512]u8 = undefined;
+    const key = try oidc_ids.reverseKey(&key_buf, lp);
+    try db.put(oidc_ids.NAMESPACE, key, val);
+
+    var it = try store.iterateBindings();
+    defer it.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    try printOidcBindings(&it, &out);
+    const want = lp ++ "\t" ++ iss ++ "\t" ++ sub ++ "\toperator\t1763000000\n";
+    try std.testing.expectEqualStrings(want, out.buffered());
 }
