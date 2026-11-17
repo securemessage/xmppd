@@ -300,7 +300,7 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
 
                     var query_buf: [1024]u8 = undefined;
                     if (caps_mod.buildCapsQuery(&query_buf, server.server_host, full_jid, node, ver, @intCast(session.conn.id))) |query_xml| {
-                        session.queueSendStanza(query_xml) catch {};
+                        _ = session.stanza(query_xml);
                         if (session.conn.hasPendingWrite()) {
                             changes.addWrite(session.conn.fd, session.conn.id) catch {};
                         }
@@ -589,7 +589,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             // became available). Deliver locally regardless of which worker
             // the contact is on — we already have their resource from the
             // session map; no need to ask the remote worker.
-            session.queueSendStanza(presence_xml) catch continue;
+            if (session.stanza(presence_xml) == .failed_closed) continue;
             if (session.conn.hasPendingWrite()) {
                 changes.addWrite(session.conn.fd, session.conn.id) catch {};
             }
@@ -627,7 +627,7 @@ fn rejectOversizeSubscriptionTo(session: *Session, to_str: []const u8, changes: 
         noteJidOverflow("jid-malformed reply exceeds {d} bytes; over-long subscription target unanswered", .{buf.len});
         return;
     };
-    session.queueSendStanza(err_xml) catch return;
+    if (session.stanza(err_xml) == .failed_closed) return;
     if (session.conn.hasPendingWrite()) {
         changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
@@ -867,7 +867,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
                 continue;
             };
             // Deliver to the approver's session
-            session.queueSendStanza(cpres_xml) catch continue;
+            if (session.stanza(cpres_xml) == .failed_closed) continue;
         }
         if (session.conn.hasPendingWrite()) {
             changes.addWrite(session.conn.fd, session.conn.id) catch {};
@@ -1138,7 +1138,7 @@ pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []
     var delivered: usize = 0;
     while (iter.next()) |kv| {
         // Value is the stored subscribe presence XML
-        session.queueSendStanza(kv.value) catch continue;
+        if (session.stanza(kv.value) == .failed_closed) continue;
         delivered += 1;
 
         // Delete after delivery (dequeue)
@@ -1217,12 +1217,9 @@ fn broadcastToOwnResources(
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
-            // T153: detached (SM resume pending) session — no live connection.
-            if (target.sm_detached) {
-                target.smTrackOutbound(presence_xml);
-                continue;
-            }
-            target.queueSendStanza(presence_xml) catch continue;
+            // stanza() handles the T153 detached case: it tracks for
+            // resume replay and reports tracked_detached.
+            if (target.stanza(presence_xml) == .failed_closed) continue;
             _ = target.conn.flushSend() catch {};
             if (target.conn.hasPendingWrite()) {
                 changes.addWrite(target.conn.fd, entry.local_session_id) catch {};
@@ -1281,7 +1278,7 @@ fn sendOtherResourcesPresence(
             continue;
         };
 
-        new_session.queueSendStanza(presence_xml) catch continue;
+        if (new_session.stanza(presence_xml) == .failed_closed) continue;
         if (new_session.conn.hasPendingWrite()) {
             changes.addWrite(new_session.conn.fd, new_session.conn.id) catch {};
         }
