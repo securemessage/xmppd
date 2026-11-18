@@ -1187,6 +1187,45 @@ fn listenUnix(sock_path: []const u8) !posix.fd_t {
     return fd;
 }
 
+/// A private directory with a short absolute path for unix socket
+/// tests. testing.tmpDir lives under the checkout's .zig-cache, and
+/// sun_path is 104 bytes on FreeBSD, so socket paths built there break
+/// on a deep checkout (T436). mkdtemp creates the dir mode 0700; the
+/// path stays well under sun_path for any checkout depth.
+extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+
+const SockDir = struct {
+    buf: [104]u8 = undefined,
+    len: usize = 0,
+
+    fn path(self: *const SockDir) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    /// "{dir}/{name}" into `buf`; always shorter than sun_path.
+    fn sockPath(self: *const SockDir, buf: []u8, name: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{ self.path(), name });
+    }
+
+    fn cleanup(self: *const SockDir) void {
+        std.fs.cwd().deleteTree(self.path()) catch |err|
+            std.debug.print("sockDir cleanup {s}: {s}\n", .{ self.path(), @errorName(err) });
+    }
+};
+
+fn sockDir() !SockDir {
+    var tmpl: [104:0]u8 = @splat(0);
+    const base = "/tmp/xmppd-rt-XXXXXX";
+    @memcpy(tmpl[0..base.len], base);
+    const dir = mkdtemp(&tmpl) orelse return error.SockDirFailed;
+    const p = std.mem.sliceTo(dir, 0);
+    var sd: SockDir = .{};
+    try testing.expect(p.len < sd.buf.len);
+    @memcpy(sd.buf[0..p.len], p);
+    sd.len = p.len;
+    return sd;
+}
+
 test "Runtime: a readiness byte completes the gated startup" {
     const pipe_fds = try posix.pipe();
     const pid = try posix.fork();
@@ -1230,12 +1269,10 @@ test "Runtime: a readiness byte completes the gated startup" {
 }
 
 test "Runtime: the socket prober completes a gate on a listening socket" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const run_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
-    defer testing.allocator.free(run_dir);
-    const sock_path = try std.fmt.allocPrint(testing.allocator, "{s}/probe.sock", .{run_dir});
-    defer testing.allocator.free(sock_path);
+    var sd = try sockDir();
+    defer sd.cleanup();
+    var sock_buf: [104]u8 = undefined;
+    const sock_path = try sd.sockPath(&sock_buf, "probe.sock");
 
     const listener = try listenUnix(sock_path);
     defer posix.close(listener);
@@ -1274,14 +1311,12 @@ test "Runtime: the socket prober completes a gate on a listening socket" {
 }
 
 test "Runtime: a missed readiness deadline fails the startup" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const run_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
-    defer testing.allocator.free(run_dir);
+    var sd = try sockDir();
+    defer sd.cleanup();
+    var sock_buf: [104]u8 = undefined;
     // Inside the watched directory but never bound: the prober only
     // ever sees refusals until the deadline fires.
-    const sock_path = try std.fmt.allocPrint(testing.allocator, "{s}/never.sock", .{run_dir});
-    defer testing.allocator.free(sock_path);
+    const sock_path = try sd.sockPath(&sock_buf, "never.sock");
 
     const pid = try posix.fork();
     if (pid == 0) pauseForever();
@@ -1453,12 +1488,11 @@ fn readableWithin(fd: posix.fd_t, ms: i64) !bool {
 }
 
 test "Runtime: a missing ready socket is not polled; its directory event probes it" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const run_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
-    defer testing.allocator.free(run_dir);
-    const sock_path = try std.fmt.allocPrint(testing.allocator, "{s}/late.sock", .{run_dir});
-    defer testing.allocator.free(sock_path);
+    var sd = try sockDir();
+    defer sd.cleanup();
+    const run_dir = sd.path();
+    var sock_buf: [104]u8 = undefined;
+    const sock_path = try sd.sockPath(&sock_buf, "late.sock");
 
     var sup = try Supervisor.init("/nonexistent", &.{}, 1);
     var children = [_]ChildCtl{
@@ -1492,12 +1526,11 @@ test "Runtime: a missing ready socket is not polled; its directory event probes 
 }
 
 test "Runtime: a stale socket file is retried a bounded number of times, not polled" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const run_dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
-    defer testing.allocator.free(run_dir);
-    const sock_path = try std.fmt.allocPrint(testing.allocator, "{s}/stale.sock", .{run_dir});
-    defer testing.allocator.free(sock_path);
+    var sd = try sockDir();
+    defer sd.cleanup();
+    const run_dir = sd.path();
+    var sock_buf: [104]u8 = undefined;
+    const sock_path = try sd.sockPath(&sock_buf, "stale.sock");
     // A crashed child's socket: the file stays, connects are refused.
     posix.close(try listenUnix(sock_path));
 
@@ -1524,7 +1557,7 @@ test "Runtime: a stale socket file is retried a bounded number of times, not pol
 
     // The child replacing its socket wakes the prober through the
     // directory watch.
-    try tmp.dir.deleteFile("stale.sock");
+    try std.fs.cwd().deleteFile(sock_path);
     const listener = try listenUnix(sock_path);
     defer posix.close(listener);
     while (rt.ready_count == 0 and !rt.start_failed) try rt.step();
