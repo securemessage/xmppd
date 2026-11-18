@@ -2118,7 +2118,7 @@ test "a rejected credential replays as not-authorized and records the failure" {
     // lockout_threshold 1 alice is now locked.
     try std.testing.expectEqualStrings(
         "account-disabled",
-        fx.handler.policy.check("alice", "10.0.0.9") orelse return error.ExpectedLock,
+        (fx.handler.policy.check("alice", "10.0.0.9") orelse return error.ExpectedLock).text(),
     );
 }
 
