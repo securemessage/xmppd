@@ -1773,6 +1773,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const auth_runner_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    auth_runner_mod.addImport("ipc_protocol", auth_ipc_protocol_mod);
+    auth_runner_mod.addImport("ipc_server", auth_ipc_server_mod);
+    auth_runner_mod.addImport("event_loop", auth_event_loop_mod);
+    auth_runner_mod.addImport("handler", auth_handler_mod);
+
     const auth_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/main.zig"),
         .target = target,
@@ -1792,6 +1802,7 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("event_loop", auth_event_loop_mod);
     auth_mod.addImport("config", config_mod);
     auth_mod.addImport("backend", auth_backend_mod);
+    auth_mod.addImport("runner", auth_runner_mod);
     auth_mod.addImport("xmppd_log", xmppd_log_mod);
     auth_mod.addImport("root_allocator", root_allocator_mod);
 
@@ -1888,12 +1899,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const oidc_runner_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    oidc_runner_mod.addImport("ipc_protocol", oidc_ipc_protocol_mod);
+    oidc_runner_mod.addImport("ipc_server", oidc_ipc_server_mod);
+    oidc_runner_mod.addImport("event_loop", oidc_event_loop_mod);
+    oidc_runner_mod.addImport("handler", oidc_handler_mod);
+
     const oidc_main_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/oidc_main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    oidc_main_mod.addImport("runner", oidc_runner_mod);
     oidc_main_mod.addImport("ipc_protocol", oidc_ipc_protocol_mod);
     oidc_main_mod.addImport("ipc_server", oidc_ipc_server_mod);
     oidc_main_mod.addImport("handler", oidc_handler_mod);
