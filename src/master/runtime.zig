@@ -289,8 +289,8 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Runtime) void {
         // Join a refresh thread before its pipe dies: a write into a
-        // closed read end would SIGPIPE the process. NSS on local files
-        // is bounded, so the join cannot stall deinit.
+        // closed read end would SIGPIPE the process. The join is bounded
+        // with files NSS; an LDAP or NIS nsswitch can delay shutdown.
         if (self.ident_thread) |thr| thr.join();
         if (self.ident_h) |h| {
             self.loop.close(h) catch |err| {
