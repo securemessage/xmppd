@@ -946,7 +946,8 @@ test "Connection: channel binding OOM is an error, not a downgrade" {
     var client_done = false;
     var iter: usize = 0;
     while (iter < 10000 and !(server_conn.isTlsEstablished() and client_done)) : (iter += 1) {
-        if (!server_conn.isTlsEstablished()) _ = server_conn.continueHandshake() catch {};
+        // ConnectionReset is fatal: bail to the established-check below.
+        if (!server_conn.isTlsEstablished()) _ = server_conn.continueHandshake() catch break;
         if (!client_done) {
             client_done = (client_tls.doHandshake() catch .want_read) == .complete;
         }
