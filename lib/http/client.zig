@@ -7,9 +7,10 @@
 //! ## Threading
 //!
 //! A `Client` is safe to share across threads: after `init` its `SSL_CTX`s
-//! are only read, never mutated. Each request owns its socket, `SSL`,
-//! resolver and kqueue for its whole lifetime; nothing is shared between
-//! in-flight requests.
+//! are only read, never mutated; the verification-path log table is the
+//! only shared mutable state and sits behind its own mutex. Each request
+//! owns its socket, `SSL`, resolver and kqueue for its whole lifetime;
+//! nothing else is shared between in-flight requests.
 //!
 //! ## Features
 //!
@@ -120,6 +121,64 @@ const MAX_RESPONSE_SIZE: usize = 256 * 1024;
 /// Maximum request head size (request line + headers).
 const MAX_HEAD_SIZE: usize = 4096;
 
+/// Signature of Client.test_info_hook.
+const InfoHook = fn (host: []const u8, port: u16, path: []const u8) void;
+
+/// Bounded table of the last verification path logged at info per
+/// (host, port): the Client is shared across IdP worker threads, so
+/// entries sit behind a mutex. An endpoint repeats its info line only
+/// when its path changes (or its slot was evicted).
+const PathLog = struct {
+    mutex: std.Thread.Mutex = .{},
+    entries: [max_entries]Entry = @splat(.{}),
+    /// Oldest-slot cursor for eviction once the table is full.
+    next: usize = 0,
+
+    const max_entries = 16;
+
+    const Entry = struct {
+        used: bool = false,
+        host: [256]u8 = undefined,
+        host_len: u8 = 0,
+        port: u16 = 0,
+        /// One of the string literals from danePathName or "pkix".
+        path: []const u8 = "",
+    };
+
+    /// Record `path` for (host, port); returns true when the caller
+    /// should emit the info line (first sighting or a changed path).
+    fn note(self: *PathLog, host: []const u8, port: u16, path: []const u8) bool {
+        std.debug.assert(host.len <= 255);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var free: ?*Entry = null;
+        for (&self.entries) |*e| {
+            if (!e.used) {
+                free = free orelse e;
+                continue;
+            }
+            if (e.port == port and e.host_len == host.len and
+                std.mem.eql(u8, e.host[0..e.host_len], host))
+            {
+                if (std.mem.eql(u8, e.path, path)) return false;
+                e.path = path;
+                return true;
+            }
+        }
+        const e = free orelse blk: {
+            const victim = &self.entries[self.next];
+            self.next = (self.next + 1) % max_entries;
+            break :blk victim;
+        };
+        e.used = true;
+        @memcpy(e.host[0..host.len], host);
+        e.host_len = @intCast(host.len);
+        e.port = port;
+        e.path = path;
+        return true;
+    }
+};
+
 /// Persistent HTTPS client: one PKIX SSL_CTX and one DANE SSL_CTX per
 /// daemon, parsing the CA bundle once instead of per request (T357/S8).
 pub const Client = struct {
@@ -128,10 +187,16 @@ pub const Client = struct {
     /// target's TLSA records; kept separate from ssl_ctx so a present
     /// RRset can never be satisfied by a PKIX anchor (fail closed).
     dane_ctx: ssl.SslContext,
+    /// Which (host, port) last logged which verification path at info;
+    /// the only Client state mutated after init, under its own mutex.
+    path_log: PathLog,
     /// Test seam: requests resolve through this nameserver instead of
     /// the host's resolver configuration, the same seam
     /// lib/dns/async.zig's own fixtures use.
     test_nameserver: if (builtin.is_test) ?std.net.Address else void = if (builtin.is_test) null else {},
+    /// Test seam: invoked exactly where the per-endpoint info line is
+    /// emitted, so tests count emissions instead of scraping stderr.
+    test_info_hook: if (builtin.is_test) ?*const InfoHook else void = if (builtin.is_test) null else {},
 
     pub fn init(ca_file: ?[]const u8) HttpError!Client {
         const ctx = initTlsClient(ca_file) orelse return HttpError.TlsInitFailed;
@@ -140,7 +205,7 @@ pub const Client = struct {
         // initClientDane arms kernel TLS like every shared initializer;
         // this client stays userland (module header).
         dane_ctx.disableKtls();
-        return .{ .ssl_ctx = ctx, .dane_ctx = dane_ctx };
+        return .{ .ssl_ctx = ctx, .dane_ctx = dane_ctx, .path_log = .{} };
     }
 
     pub fn deinit(self: *Client) void {
@@ -151,7 +216,7 @@ pub const Client = struct {
     /// Perform an HTTPS GET request. Caller owns the returned Response.
     /// Runs entirely on the calling thread; safe to call from any worker.
     pub fn get(
-        self: *const Client,
+        self: *Client,
         allocator: Allocator,
         url: []const u8,
         options: RequestOptions,
@@ -162,7 +227,7 @@ pub const Client = struct {
     /// Perform an HTTPS POST with form-urlencoded body. Caller owns the
     /// returned Response.
     pub fn post(
-        self: *const Client,
+        self: *Client,
         allocator: Allocator,
         url: []const u8,
         body: []const u8,
@@ -255,7 +320,7 @@ const Conn = struct {
 /// Core HTTP request implementation. Owns one socket, one SSL, one
 /// resolver and one kqueue for the exchange's duration.
 fn request(
-    client: *const Client,
+    client: *Client,
     allocator: Allocator,
     method: []const u8,
     url: []const u8,
@@ -390,7 +455,7 @@ fn tcpConnect(
 /// (freebsd-ktls D5: the handshake is part of connect). Every resolved
 /// address is tried in order; Caller owns the returned fd and SSL.
 fn connectAndHandshake(
-    client: *const Client,
+    client: *Client,
     allocator: Allocator,
     kq: posix.fd_t,
     host_z: [*:0]const u8,
@@ -461,7 +526,7 @@ fn danePathName(usage: ssl.Usage) []const u8 {
 /// context that fails closed on mismatch, or the PKIX context with the
 /// URL-host pin.
 fn handshakeTarget(
-    client: *const Client,
+    client: *Client,
     allocator: Allocator,
     kq: posix.fd_t,
     fd: posix.fd_t,
@@ -608,9 +673,15 @@ fn handshakeTarget(
             },
         }
     } else "pkix";
-    // Once per endpoint at info, once per request at debug (a request
-    // completes at most one endpoint): the path that verified the peer.
-    log.info("https: {s}:{d} peer verified via {s}", .{ parsed.host, parsed.port, path_name });
+    // The verification path at debug per request, and at info only when
+    // the endpoint's path is first seen or changes (path_log dedupes it
+    // across the worker threads that share this Client).
+    if (client.path_log.note(parsed.host, parsed.port, path_name)) {
+        if (builtin.is_test) {
+            if (client.test_info_hook) |hook| hook(parsed.host, parsed.port, path_name);
+        }
+        log.info("https: {s}:{d} peer verified via {s}", .{ parsed.host, parsed.port, path_name });
+    }
     log.debug("https: {s}:{d} request verification path {s}", .{ parsed.host, parsed.port, path_name });
     return .{ .fd = fd, .ssl_ptr = ssl_ptr };
 }
@@ -1600,6 +1671,71 @@ test "TLS: the in-process server keeps serving across a pause between requests" 
     var resp2 = try client.get(std.testing.allocator, second_url, testOptions(5000, 2000));
     defer resp2.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp2.status);
+}
+
+// --- verification-path info log dedup -------------------------------
+
+var info_hook_count: usize = 0;
+
+fn countInfoHook(_: []const u8, _: u16, _: []const u8) void {
+    info_hook_count += 1;
+}
+
+test "TLS: the verification path logs at info once per endpoint" {
+    // Two requests to one endpoint emit one info line; the per-request
+    // copy rides debug only. The server thread serves two replies.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var port = std.atomic.Value(usize).init(0);
+    const th = try std.Thread.spawn(
+        .{},
+        serveTlsResponses,
+        .{ cert_path.ptr, key_path.ptr, &port },
+    );
+    defer th.join();
+    const dl = std.time.milliTimestamp() + 3000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    const dns_srv = try startFakeDns(.{});
+    defer stopFakeDns(dns_srv);
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    useFakeDns(&client, dns_srv);
+    info_hook_count = 0;
+    client.test_info_hook = &countInfoHook;
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{p});
+    var resp1 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp1.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp1.status);
+    var resp2 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp2.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp2.status);
+
+    try std.testing.expectEqual(@as(usize, 1), info_hook_count);
 }
 
 test "responseComplete: a huge declared length is rejected, not panicked on" {
