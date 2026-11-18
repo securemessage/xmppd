@@ -2265,7 +2265,9 @@ pub fn build(b: *std.Build) void {
     test_master_step.dependOn(&run_master_tests.step);
     test_master_step.dependOn(&run_supervisor_tests.step);
     const test_core_step = b.step("test-core", "Run only the core daemon tests");
+    const test_s2s_step = b.step("test-s2s", "Run only the s2s daemon tests");
     test_core_step.dependOn(&run_core_tests.step);
+    test_s2s_step.dependOn(&run_s2s_main_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
     // A green test suite must also prove every install artifact compiles.

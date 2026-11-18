@@ -57,6 +57,8 @@ const S2sStreamAction = stream_mod.S2sStreamAction;
 const StreamError = stream_mod.StreamError;
 const dialback = @import("dialback.zig");
 const xmpp = @import("xmpp");
+const conf = @import("conf");
+const schema = @import("schema");
 
 const log = std.log.scoped(.@"xmppd-s2s");
 
@@ -1127,87 +1129,61 @@ pub fn main() !void {
     defer root.deinit();
     const allocator = root.allocator();
 
-    // Parse arguments
+    // Configuration: lib/conf applies default < file < forwarded < CLI
+    // with per-field provenance (ADR-9). --conf-fd and --config are
+    // prescanned because the fd must be read and the file loaded before
+    // the CLI applies. Unknown arguments, unknown file keys and bad
+    // values are startup errors with the Diag; --config is honored now
+    // (it used to be consumed and ignored).
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
+    _ = args.next(); // argv[0]
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    while (args.next()) |arg| try argv.append(allocator, arg);
 
-    var host: []const u8 = "localhost";
-    var address: []const u8 = "0.0.0.0";
-    var port: u16 = 5269;
-    var core_socket: ?[]const u8 = null;
-    var cert_path: ?[:0]const u8 = null;
-    var key_path: ?[:0]const u8 = null;
-    var listen_fd: ?posix.fd_t = null;
-    var muc_host: ?[]const u8 = null;
+    var diag: conf.Diag = .{};
+    var loaded = loadS2sConfig(allocator, argv.items, &diag) catch |err| {
+        log.err("{f}", .{diag});
+        return err;
+    };
+    defer loaded.deinit();
+    const v = &loaded.values;
 
-    _ = args.next(); // Skip argv[0]
-
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--host")) {
-            host = args.next() orelse {
-                log.err("--host requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--address") or std.mem.eql(u8, arg, "--bind")) {
-            address = args.next() orelse {
-                log.err("--address requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--port")) {
-            const val = args.next() orelse {
-                log.err("--port requires a value", .{});
-                return error.InvalidArgs;
-            };
-            port = std.fmt.parseInt(u16, val, 10) catch {
-                log.err("invalid port: {s}", .{val});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--core-socket")) {
-            core_socket = args.next() orelse {
-                log.err("--core-socket requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--cert")) {
-            cert_path = args.next() orelse {
-                log.err("--cert requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--key")) {
-            key_path = args.next() orelse {
-                log.err("--key requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--muc-host")) {
-            muc_host = args.next() orelse {
-                log.err("--muc-host requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--listen-fd")) {
-            const val = args.next() orelse {
-                log.err("--listen-fd requires a value", .{});
-                return error.InvalidArgs;
-            };
-            listen_fd = std.fmt.parseInt(posix.fd_t, val, 10) catch {
-                log.err("invalid fd number: {s}", .{val});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
-            // Consume and ignore — passed by master but not used by S2S
-            _ = args.next();
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            printUsage();
-            return;
-        } else {
-            log.warn("unknown argument: {s}", .{arg});
-        }
+    if (v.meta.help) {
+        try printUsage(allocator);
+        return;
     }
+
+    const host = v.server.hostname;
+    // s2s.bind_address overrides; empty follows server.bind_address.
+    const address: []const u8 = if (v.s2s.bind_address.len != 0) v.s2s.bind_address else v.server.bind_address;
+    const port = v.s2s.port;
+    const core_socket: ?[]const u8 = if (v.s2s.socket.len != 0) v.s2s.socket else null;
+    const listen_fd: ?posix.fd_t = if (v.s2s.listen_fd >= 0) v.s2s.listen_fd else null;
+
+    // cert/key are valid only as a pair and are sentinel-terminated for
+    // the C TLS API; tls.enabled=false or an empty pair leaves TLS off.
+    if ((v.tls.cert.len == 0) != (v.tls.key.len == 0)) {
+        log.err("tls.cert and tls.key must be set together", .{});
+        return error.InvalidArgs;
+    }
+    const tls_on = v.tls.enabled and v.tls.cert.len != 0;
+    const cert_path: ?[:0]const u8 = if (tls_on) try loaded.arena_state.allocator().dupeZ(u8, v.tls.cert) else null;
+    const key_path: ?[:0]const u8 = if (tls_on) try loaded.arena_state.allocator().dupeZ(u8, v.tls.key) else null;
 
     log.info("xmppd-s2s starting host={s} port={d} listen_fd={any}", .{ host, port, listen_fd });
 
     var daemon = try S2sDaemon.init(allocator, host);
     defer daemon.deinit();
     daemon.bindResolver();
-    daemon.muc_host = muc_host;
+    // An empty muc.host resolves to conference.<hostname>, matching the
+    // value the master used to compute and forward (ADR-9).
+    var muc_host_buf: [256]u8 = undefined;
+    daemon.muc_host = if (v.muc.host.len != 0)
+        v.muc.host
+    else
+        std.fmt.bufPrint(&muc_host_buf, "conference.{s}", .{host}) catch null;
 
     // Configure TLS if cert and key are provided
     if (cert_path) |cert| {
@@ -3532,24 +3508,30 @@ fn handleIpcWritable(daemon: *S2sDaemon, batch: *ChangeList, ipc_slot: usize) vo
     }
 }
 
-fn printUsage() void {
-    const usage =
-        \\Usage: xmppd-s2s [OPTIONS]
-        \\
-        \\Options:
-        \\  --host HOST         Local XMPP domain (default: localhost)
-        \\  --address ADDR      Bind address (default: 0.0.0.0)
-        \\  --port PORT         S2S listener port (default: 5269)
-        \\  --core-socket PATH  IPC socket for xmppd-core communication
-        \\  --cert PATH         TLS certificate file (PEM)
-        \\  --key PATH          TLS private key file (PEM)
-        \\  --muc-host HOST     Served MUC domain for the to= check (from master's [muc] host)
-        \\  --help, -h          Show this help
-        \\
-    ;
-    var buf: [0]u8 = .{};
+/// Loads the s2s configuration through the shared loader (ADR-9): the
+/// inherited --conf-fd blob is prescanned alongside --config, so a
+/// supervised child gets file < forwarded < CLI and a manual run gets
+/// default < file < CLI.
+fn loadS2sConfig(gpa: std.mem.Allocator, argv: []const []const u8, diag: *conf.Diag) conf.Error!schema.S2sLoader {
+    return schema.S2sLoader.load(gpa, .{
+        .conf_fd = schema.confFdArg(argv),
+        .path = schema.configPathArg(argv),
+        .args = argv,
+    }, diag);
+}
+
+/// --help is generated from the schema: every s2s_cli spelling plus
+/// the shared file keys and their defaults. A fresh loader is used so
+/// the defaults shown come from the schema initializers, not the
+/// resolved values of this run.
+fn printUsage(allocator: std.mem.Allocator) std.Io.Writer.Error!void {
+    var gen = schema.S2sLoader.init(allocator);
+    defer gen.deinit();
+    var buf: [4096]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
-    stdout.interface.writeAll(usage) catch {};
+    try stdout.interface.writeAll("Usage: xmppd-s2s [OPTIONS]\n\n");
+    try gen.writeHelp(&stdout.interface);
+    try stdout.interface.flush();
 }
 
 // ============================================================================
@@ -8842,4 +8824,70 @@ test "S2sDaemon: a timer ident below the deadline base never reaches the connect
     try std.testing.expect(conn.deadline_ident == 0);
     try std.testing.expect(daemon.pool.connections.get("them.example") == conn);
     try std.testing.expect(conn.retry_ident != 0);
+}
+
+// ============================================================================
+// lib/conf loading tests (X4 part 2a, ADR-9)
+// ============================================================================
+
+fn writeTempConfigForLoader(dir: *std.fs.Dir, name: []const u8, content: []const u8, buf: []u8) ![]const u8 {
+    const f = try dir.createFile(name, .{});
+    defer f.close();
+    try f.writeAll(content);
+    return try dir.realpath(name, buf);
+}
+
+test "s2s config: --config is honored through the shared loader" {
+    // Goal: a manual or dev run loads its file (it used to be consumed
+    // and ignored): file values land with .file provenance and the
+    // s2s-specific fields resolve through the shared schema.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfigForLoader(&tmp.dir, "s2s.ini",
+        \\[server]
+        \\hostname = file.test
+        \\bind_address = 10.0.0.9
+        \\[s2s]
+        \\port = 5399
+        \\socket = /run/custom-s2s.sock
+        \\bind_address = 10.0.0.10
+        \\[muc]
+        \\host = muc.file.test
+        \\
+    , &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try loadS2sConfig(std.testing.allocator, &.{ "--config", path }, &diag);
+    defer l.deinit();
+    try std.testing.expectEqualStrings("file.test", l.values.server.hostname);
+    try std.testing.expectEqual(.file, l.provenanceOf("server", "hostname"));
+    try std.testing.expectEqual(@as(u16, 5399), l.values.s2s.port);
+    try std.testing.expectEqualStrings("/run/custom-s2s.sock", l.values.s2s.socket);
+    try std.testing.expectEqualStrings("10.0.0.10", l.values.s2s.bind_address);
+    try std.testing.expectEqualStrings("muc.file.test", l.values.muc.host);
+
+    // A child CLI flag still wins over the file.
+    var diag2: conf.Diag = .{};
+    var l2 = try loadS2sConfig(std.testing.allocator, &.{ "--config", path, "--port", "5400" }, &diag2);
+    defer l2.deinit();
+    try std.testing.expectEqual(@as(u16, 5400), l2.values.s2s.port);
+    try std.testing.expectEqual(.cli, l2.provenanceOf("s2s", "port"));
+}
+
+test "s2s config: an unknown file key is a startup error with file:line" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfigForLoader(&tmp.dir, "bad.ini", "[s2s]\nprot = 5269\n", &path_buf);
+
+    var diag: conf.Diag = .{};
+    try std.testing.expectError(error.UnknownKey, loadS2sConfig(std.testing.allocator, &.{ "--config", path }, &diag));
+    try std.testing.expectEqual(@as(u32, 2), diag.line);
+    try std.testing.expectEqualStrings("prot", diag.key);
+}
+
+test "s2s config: an unknown argument is a startup error, not a warning" {
+    var diag: conf.Diag = .{};
+    try std.testing.expectError(error.UnknownArgument, loadS2sConfig(std.testing.allocator, &.{"--bogus-arg"}, &diag));
 }
