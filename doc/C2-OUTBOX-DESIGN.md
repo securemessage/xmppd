@@ -159,6 +159,7 @@ watermark checks read unchanged.
 |--------|--------------------------------------|------------|
 | conn closed, stanza/nonza refused | `drop_send_closed` | write buffer full or connection closed |
 | over append bound (slow reader) | `drop_send_buffer_full` + `sm_overflow` teardown | same |
+| `write_buf` lazy alloc OOM | `drop_send_alloc` | write buffer full or connection closed (memory pressure, not backpressure) |
 | stanza over the cap outright | `oversize_queue_drops` (module global) | same |
 | stanza tracked for a detached session | `send_tracked_detached` (new) | not a drop; visibility for R1 |
 | `net.Outbox` `failed_closed` | `net.Counters.outbox_failed_closed` per worker | same |

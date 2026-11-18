@@ -2616,6 +2616,93 @@ test "Server: STARTTLS negotiation upgrades through the batch-tail dirty flush" 
     try std.testing.expect(session.conn.isTlsHandshaking());
 }
 
+// Channel binding must not silently downgrade: on a session that has
+// binding data, a cb_data_buf allocation failure ends the exchange with
+// temporary-auth-failure before any auth_request leaves for the auth
+// daemon. Fails when getChannelBinding's error return is reverted to
+// the (0, "") "no binding" answer.
+test "Server: channel binding OOM fails the SASL exchange" {
+    const allocator = std.testing.allocator;
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    // A socketpair stands in for the auth daemon link; its peer is read
+    // at the end to prove no auth_request was encoded.
+    const ipc_fds = try makeSocketPair();
+    defer posix.close(ipc_fds[1]);
+    server.ipc.fd = ipc_fds[0];
+    server.ipc.connected = true;
+
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    var ctrs: connection_mod.OutboxCounters = .{};
+    const dirty = connection_mod.dirtyForWorker(server.worker_id);
+    session.conn.bindOutbox(&ctrs, dirty);
+    server.sessions[1] = session;
+
+    var client_tls = try ssl.SslConn.initClient(client_ctx, fds[1], null);
+    defer client_tls.deinit();
+
+    try session.conn.upgradeToTls(server.ssl_ctx.?);
+    var client_done = false;
+    var iter: usize = 0;
+    while (iter < 10000 and !(session.conn.isTlsEstablished() and client_done)) : (iter += 1) {
+        if (!session.conn.isTlsEstablished()) _ = session.conn.continueHandshake() catch {};
+        if (!client_done) {
+            client_done = (client_tls.doHandshake() catch .want_read) == .complete;
+        }
+    }
+    try std.testing.expect(session.conn.isTlsEstablished());
+    try std.testing.expect(client_done);
+
+    // write_buf must exist before the allocator starts failing, or the
+    // failure stanza itself could not queue.
+    try std.testing.expect(session.conn.ensureWriteBuf());
+
+    session.sasl_mechanism = "SCRAM-SHA-256";
+    const payload = "biwsbj11c2VyLHI9YWJjZGVm"; // "n,,n=user,r=abcdef"
+    @memcpy(session.sasl_buf[0..payload.len], payload);
+    session.sasl_buf_len = payload.len;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const real_alloc = session.conn.outbox.alloc;
+    session.conn.outbox.alloc = failing.allocator();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    c2s_session.processSaslAuthComplete(&server, session, &changes);
+    session.conn.outbox.alloc = real_alloc;
+
+    // The exchange failed closed and the peer gets temporary-auth-failure.
+    try std.testing.expect(server.sessions[1] != null);
+    server.flushDirtyOutboxes(&changes);
+    var buf: [4096]u8 = undefined;
+    var got: usize = 0;
+    iter = 0;
+    while (iter < 1000) : (iter += 1) {
+        switch (client_tls.read(buf[got..]) catch .want_read) {
+            .ok => |n| got += n,
+            else => break,
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..got], "<temporary-auth-failure") != null);
+
+    // No auth_request ever reached the auth daemon link.
+    var ibuf: [64]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, posix.read(ipc_fds[1], &ibuf));
+}
+
 test "Server: M1 SIGUSR1 dump runs against a live worker block" {
     metrics.bind(10);
     defer metrics.current = null;

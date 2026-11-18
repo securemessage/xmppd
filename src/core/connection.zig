@@ -330,14 +330,16 @@ pub const Connection = struct {
     /// Extract channel binding data from the TLS session.
     /// Returns cb_type (0=none, 1=tls-server-end-point, 2=tls-exporter) and
     /// a pointer to 32 bytes of binding data. Returns (0, empty) if no TLS or
-    /// binding data unavailable.
-    pub fn getChannelBinding(self: *Connection) struct { cb_type: u8, data: []const u8 } {
+    /// binding data unavailable. An allocation failure is
+    /// error.ChannelBindingUnavailable: it must not pass for "no binding"
+    /// or a -PLUS exchange would silently downgrade to unbound.
+    pub fn getChannelBinding(self: *Connection) error{ChannelBindingUnavailable}!struct { cb_type: u8, data: []const u8 } {
         if (self.tls) |*t| {
             if (t.conn.getChannelBinding()) |cb| {
                 // Store in a stable buffer so the slice outlives this call
                 const buf = self.cb_data_buf orelse blk: {
                     const b = self.outbox.alloc.create([32]u8) catch
-                        return .{ .cb_type = 0, .data = "" };
+                        return error.ChannelBindingUnavailable;
                     self.cb_data_buf = b;
                     break :blk b;
                 };
@@ -459,8 +461,9 @@ pub const Connection = struct {
         }
         const parts = [_][]const u8{data};
         const o = self.obSend() orelse {
-            // OOM on the lazy ring backing: counted like a full buffer.
-            if (metrics.get()) |c| metrics.bump(&c.drop_send_buffer_full, 1);
+            // OOM on the lazy ring backing is not slow-reader
+            // backpressure: it gets its own drop reason (App. C).
+            if (metrics.get()) |c| metrics.bump(&c.drop_send_alloc, 1);
             return .failed_closed;
         };
         const r = o.append(&parts);
@@ -889,6 +892,79 @@ test "Connection: M1 counters track bytes and queueSend drops" {
     conn.deinit();
     try std.testing.expectError(error.ConnectionClosed, conn.queueSend("x"));
     try std.testing.expectEqual(base_closed + 1, c.drop_send_closed.load(.monotonic));
+}
+
+// The lazy write_buf allocation failing is memory pressure, not
+// slow-reader backpressure: the refusal still reads failed_closed to the
+// caller but lands on drop_send_alloc, not drop_send_buffer_full.
+test "Connection: write_buf OOM counts drop_send_alloc" {
+    metrics.bind(7);
+    defer metrics.current = null;
+    const c = metrics.get().?;
+    const base_alloc = c.drop_send_alloc.load(.monotonic);
+    const base_full = c.drop_send_buffer_full.load(.monotonic);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    var conn = Connection.init(fds[0], 1, failing.allocator());
+    defer conn.deinit();
+
+    // append(), not queueSend(): the S15 raw-send ratchet bounds the
+    // queueSend call count in this file.
+    try std.testing.expectEqual(net.AppendResult.failed_closed, conn.append("x"));
+    try std.testing.expectEqual(base_alloc + 1, c.drop_send_alloc.load(.monotonic));
+    try std.testing.expectEqual(base_full, c.drop_send_buffer_full.load(.monotonic));
+}
+
+// A session that has channel binding data must never report (0, "") on
+// an allocation failure: the SASL layer would read it as "no binding"
+// and a -PLUS exchange would silently downgrade. getChannelBinding fails
+// the call instead.
+test "Connection: channel binding OOM is an error, not a downgrade" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+
+    var server_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+    defer server_ctx.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+
+    const fds = try makeSocketPair();
+    var server_conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer server_conn.deinit();
+    var client_tls = try ssl.SslConn.initClient(client_ctx, fds[1], null);
+    defer client_tls.deinit();
+
+    try server_conn.upgradeToTls(server_ctx);
+
+    var client_done = false;
+    var iter: usize = 0;
+    while (iter < 10000 and !(server_conn.isTlsEstablished() and client_done)) : (iter += 1) {
+        if (!server_conn.isTlsEstablished()) _ = server_conn.continueHandshake() catch {};
+        if (!client_done) {
+            client_done = (client_tls.doHandshake() catch .want_read) == .complete;
+        }
+    }
+    try std.testing.expect(server_conn.isTlsEstablished());
+    try std.testing.expect(client_done);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const real_alloc = server_conn.outbox.alloc;
+    server_conn.outbox.alloc = failing.allocator();
+    try std.testing.expectError(error.ChannelBindingUnavailable, server_conn.getChannelBinding());
+    try std.testing.expect(server_conn.cb_data_buf == null);
+
+    // Same session with a working allocator proves binding data exists.
+    server_conn.outbox.alloc = real_alloc;
+    const cb = try server_conn.getChannelBinding();
+    try std.testing.expect(cb.cb_type != 0);
+    try std.testing.expectEqual(@as(usize, 32), cb.data.len);
 }
 
 test "Connection: a closed connection with a full buffer is not pending (S28)" {

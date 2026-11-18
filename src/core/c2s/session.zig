@@ -1706,8 +1706,15 @@ pub fn processSaslAuthComplete(self: *Server, session: *Session, changes: *Chang
         return;
     };
 
-    // Extract channel binding data from TLS session
-    const cb = session.conn.getChannelBinding();
+    // Extract channel binding data from TLS session. An allocation
+    // failure is not "no binding": the exchange fails closed rather than
+    // silently downgrading a -PLUS client to an unbound exchange.
+    const cb = session.conn.getChannelBinding() catch {
+        log.warn("connection {d} channel binding unavailable (allocation failure)", .{session.conn.id});
+        const fail_action = session.stream.saslFailure("temporary-auth-failure");
+        executeAction(self, session, fail_action, changes);
+        return;
+    };
 
     // Increment generation before encoding — the response must carry this gen
     session.auth_ipc_gen +%= 1;

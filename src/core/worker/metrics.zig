@@ -61,6 +61,7 @@ pub const Counters = struct {
     envelopes_xworker: Counter = .init(0),
     // Appendix C drop reasons counted at their central choke points.
     drop_send_buffer_full: Counter = .init(0),
+    drop_send_alloc: Counter = .init(0),
     drop_send_closed: Counter = .init(0),
     drop_changelist_full: Counter = .init(0),
     drop_no_route: Counter = .init(0),
@@ -143,9 +144,10 @@ pub fn dump(worker_id: u16, ext: Externals) void {
     log.info("worker {d} loop: iterations={d} kevent events={d} changes={d} envelopes xworker={d}", .{
         worker_id, read(&c.loop_iterations), read(&c.kevent_events), read(&c.kevent_changes), read(&c.envelopes_xworker),
     });
-    log.info("worker {d} drops (App. C): send_buf_full={d} send_closed={d} changelist_full={d} no_route={d} ring_full={d} ring_payload={d} room_mailbox={d}", .{
-        worker_id,              read(&c.drop_send_buffer_full), read(&c.drop_send_closed), read(&c.drop_changelist_full),
-        read(&c.drop_no_route), ext.ring_drops_full,            ext.ring_drops_payload,    ext.room_mailbox_drops,
+    log.info("worker {d} drops (App. C): send_buf_full={d} send_alloc={d} send_closed={d} changelist_full={d} no_route={d} ring_full={d} ring_payload={d} room_mailbox={d}", .{
+        worker_id,                     read(&c.drop_send_buffer_full), read(&c.drop_send_alloc), read(&c.drop_send_closed),
+        read(&c.drop_changelist_full), read(&c.drop_no_route),         ext.ring_drops_full,      ext.ring_drops_payload,
+        ext.room_mailbox_drops,
     });
     log.info("worker {d} drops (module-global): jid_overflow={d} xworker={d} s2s_bounces={d} offline_not_stored={d} offline_hold_bounces={d} offline_drain={d}", .{
         worker_id,              ext.jid_overflow_drops,   ext.cross_worker_drops,  ext.s2s_bounces,
