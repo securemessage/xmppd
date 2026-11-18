@@ -2060,11 +2060,15 @@ test "Runtime: a gated wait that outlives .starting cannot fail or advance the s
 
 var nss_lookup_count: usize = 0;
 var nss_lookup_gid: posix.gid_t = 65534;
+var nss_lookup_tid: std.Thread.Id = 0;
 
 /// Counts invocations and returns a fixed gid so tests never touch the
-/// real NSS. Any path that must not consult NSS asserts the count flat.
+/// real NSS. Any path that must not consult NSS asserts the count flat;
+/// the SIGHUP test also asserts the lookup ran on the refresh worker,
+/// not the loop thread.
 fn countingGidLookup(uid: posix.uid_t) error{PasswdLookupFailed}!posix.gid_t {
     _ = uid;
+    nss_lookup_tid = std.Thread.getCurrentId();
     nss_lookup_count += 1;
     return nss_lookup_gid;
 }
@@ -2148,7 +2152,12 @@ test "Runtime: SIGHUP re-resolves the run identity off the loop and applies it (
     // only armed wake, so step() returns right after applying it.
     nss_lookup_gid = 42500;
     rt.onSignal(.{ .signo = posix.SIG.HUP, .count = 1 });
+    // Without requestIdentityRefresh the byte never arrives: bound the
+    // wait so the regression fails here instead of hanging in step().
+    try testing.expect(try readableWithin(rt.ident_pipe[0], 5000));
     try rt.step();
     try testing.expectEqual(@as(usize, 2), nss_lookup_count);
+    // A synchronous lookup inside onSignal would run on this thread.
+    try testing.expect(nss_lookup_tid != std.Thread.getCurrentId());
     try testing.expectEqual(@as(posix.gid_t, 42500), sup.gid);
 }
