@@ -294,11 +294,11 @@ pub fn main() !void {
     // with the sealed conf fd once children load lib/conf.
     var argv_arena = std.heap.ArenaAllocator.init(allocator);
     defer argv_arena.deinit();
-    const child_argv = buildChildArgv(argv_arena.allocator(), v, .{
+    const child_argv = try buildChildArgv(argv_arena.allocator(), v, .{
         .s2s_listen = s2s_listen_fd >= 0,
         .c2s_fd_str = c2s_fd_str,
         .s2s_fd_str = s2s_fd_str,
-    }) catch return error.OutOfMemory;
+    });
 
     // Initialize supervisors for all children
     var auth_sup = try initSupervisor(auth_path, child_argv.auth, child_uid, child_gid, euid);
