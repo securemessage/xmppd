@@ -602,7 +602,10 @@ pub const S2sDaemon = struct {
             posix.connect(sock, &t.addr.any, t.addr.getOsSockLen()) catch |err| {
                 switch (err) {
                     error.WouldBlock => {},
+                    // A synchronous connect error is this target's
+                    // failure: log it and try the next one.
                     else => {
+                        log.warn("outbound {s}: connect to {s}:{d} failed synchronously: {s}", .{ conn.remote_domain, t.host, t.addr.getPort(), @errorName(err) });
                         posix.close(sock);
                         continue;
                     },
@@ -6277,17 +6280,17 @@ fn drainTlsPeer(peer: *SslConn, buf: []u8) usize {
     return total;
 }
 
-/// Wait for the readable event the daemon's kqueue would deliver on a
-/// conn fd. A peer close lands in the socket buffer asynchronously, so a
+/// Wait for the kqueue event the daemon's loop would deliver on a conn
+/// fd. A peer close lands in the socket buffer asynchronously, so a
 /// handler driven right after close() can see WouldBlock where production
 /// simply gets the event again; waiting on the fd first makes a single
 /// drive deterministic.
-fn waitFdReadable(fd: posix.fd_t, timeout_ms: u32) !bool {
+fn waitFdEvent(fd: posix.fd_t, filter: i16, timeout_ms: u32) !bool {
     const kq = try posix.kqueue();
     defer posix.close(kq);
     const ch = [1]posix.Kevent{.{
         .ident = @intCast(fd),
-        .filter = std.c.EVFILT.READ,
+        .filter = filter,
         .flags = std.c.EV.ADD,
         .fflags = 0,
         .data = 0,
@@ -6299,6 +6302,36 @@ fn waitFdReadable(fd: posix.fd_t, timeout_ms: u32) !bool {
         .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms),
     };
     return (try posix.kevent(kq, &ch, &ev, &ts)) != 0;
+}
+
+fn waitFdReadable(fd: posix.fd_t, timeout_ms: u32) !bool {
+    return waitFdEvent(fd, std.c.EVFILT.READ, timeout_ms);
+}
+
+/// Reset an established conn fd deterministically: accept its peer off
+/// the listener, then linger-close the peer so the kernel sends a RST.
+/// Nothing is ever written on conn_fd, so its read edge can only be that
+/// reset and firing means SO_ERROR already holds ECONNRESET for the
+/// consumer to read. A bound-but-not-listening port cannot be used for
+/// this: FreeBSD may refuse inside connect(2) without latching SO_ERROR,
+/// and requiring connect(2) to return EINPROGRESS is a timing flake.
+/// Both waits bound only kernel queueing delay: the accept entry and
+/// the RST are produced by the local kernel, never by a network peer.
+fn latchPeerReset(listen_fd: posix.fd_t, conn_fd: posix.fd_t) !void {
+    // The accept queue holds the peer only after the handshake finished,
+    // so this wait also covers a conn still completing its connect.
+    if (!try waitFdReadable(listen_fd, 5_000)) return error.PeerAcceptTimeout;
+    try lingerCloseAccepted(listen_fd);
+    if (!try waitFdReadable(conn_fd, 5_000)) return error.ResetLatchTimeout;
+}
+
+/// Accept one pending connection and close it with SO_LINGER zero, so
+/// the kernel sends its peer a RST inside close(2).
+fn lingerCloseAccepted(listen_fd: posix.fd_t) !void {
+    const peer = try posix.accept(listen_fd, null, null, posix.SOCK.CLOEXEC);
+    defer posix.close(peer);
+    const lg = extern struct { onoff: c_int, linger: c_int }{ .onoff = 1, .linger = 0 };
+    try posix.setsockopt(peer, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&lg));
 }
 
 /// A TLS-protected outbound link to a test peer. The conn owns its fd;
@@ -8184,6 +8217,35 @@ test "S2sDaemon: a connect deadline advances to the next target" {
     try std.testing.expectEqual(l2.port, conn.target_port);
 }
 
+test "S2sDaemon: a synchronous connect error advances to the next target" {
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "us.example");
+    defer daemon.deinit();
+    daemon.bindResolver();
+
+    const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
+    var scratch: [8]posix.Kevent = undefined;
+    var cl = ChangeList.init(&scratch);
+
+    // 255.255.255.255 is the broadcast address: connect(2) fails it
+    // synchronously (EACCES without SO_BROADCAST). The failure belongs
+    // to that target, so the live listener behind it is tried and the
+    // conn ends up armed on it.
+    const live = try silentListener(false);
+    defer posix.close(live.fd);
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{
+        .{ .addr = "255.255.255.255" },
+        .{ .addr = "127.0.0.1", .port = live.port },
+    }));
+
+    try std.testing.expectEqual(@as(usize, 1), conn.target_idx);
+    try std.testing.expect(conn.fd >= 0);
+    try std.testing.expect(conn.deadline_ident != 0);
+    try std.testing.expectEqual(live.port, conn.target_port);
+    const slot = daemon.findOutboundSlot(conn).?;
+    try std.testing.expect(daemon.outbound[slot] == conn);
+}
+
 test "S2sDaemon: targets that all failed TLSA lookup bounce temporary" {
     const alloc = std.testing.allocator;
     var daemon = try S2sDaemon.init(alloc, "us.example");
@@ -8348,14 +8410,24 @@ test "S2sDaemon: SO_ERROR on the last target backs the conn off" {
     defer daemon.deinit();
     daemon.bindResolver();
     makeBufferOnlyClient(&daemon, alloc);
-    // A closed loopback port: nonblocking connect pends, then SO_ERROR=ECONNREFUSED.
+
+    // The attempt runs against a live listener: a connect to it never
+    // refuses, so the conn stays armed for the writable path this test
+    // names.
+    const live = try silentListener(false);
+    defer posix.close(live.fd);
     const conn = try daemon.pool.getOrCreate(daemon.local_domain, "them.example");
     var scratch: [8]posix.Kevent = undefined;
     var cl = ChangeList.init(&scratch);
-    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = 1 }}));
-    if (daemon.pool.connections.get("them.example") == null) return error.SkipZigTest; // refused synchronously
+    daemon.deliverResolution(&cl, conn, .resolved, try fabricateResolution(alloc, &.{.{ .addr = "127.0.0.1", .port = live.port }}));
     const slot = daemon.findOutboundSlot(conn).?;
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try std.testing.expect(conn.fd >= 0);
+
+    // Latch the connect error on the conn's own fd: the listener's
+    // accepted peer is linger-closed, so SO_ERROR reads ECONNRESET on
+    // every run regardless of how connect(2) returned.
+    try latchPeerReset(live.fd, conn.fd);
+
     handleOutboundWritable(&daemon, &cl, slot);
     // Temporary (ADR-13): the attempt is torn down but the conn keeps its
     // slot entry and queue for the backoff retry.
