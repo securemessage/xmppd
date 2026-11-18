@@ -3,10 +3,12 @@
 All configuration lives in a single INI file shared by every daemon, selected
 with `--config PATH` (`-c`). `xmppd-auth-oidc` defaults to
 `/usr/local/etc/xmppd/xmppd.conf` when `--config` is absent. Precedence is
-default < file < CLI, tracked per field. An unknown section or key, a bad
-value, or a malformed line is a startup error that names the file and line;
-defaults live only in the schema (`src/config/schema.zig`), so `xmppd --help`
-is the authoritative option list.
+default < file < CLI, tracked per field, with the master's resolved values
+forwarded to its children in between (see "Config forwarding" below). An
+unknown section or key, a bad value, or a malformed line is a startup error
+that names the file and line; defaults live only in the schema
+(`src/config/schema.zig`), so `xmppd --help` is the authoritative option
+list.
 
 ## Sections
 
@@ -213,13 +215,27 @@ from the schema, so it cannot drift from what the parser accepts:
   --help, -h              show this help
 ```
 
-The master forwards the *resolved* values to its children: `--host` and
-`--db` reach core and s2s (and auth for `--db`) after file and CLI
-precedence, so `xmppd -c xmppd.conf --host x.test` overrides the file's
-hostname for every daemon, not just s2s.
+## Config forwarding
+
+The master forwards the *resolved* values to its children. After loading
+the file and its own CLI it serializes the effective fields once into a
+sealed in-memory fd that `xmppd-core` and `xmppd-s2s` inherit through
+the supervisor's `pass_fds` remap, named on their argv as `--conf-fd N`.
+Their precedence is therefore default < file < forwarded < CLI: a file
+key or a master CLI flag (`xmppd -c xmppd.conf --host x.test`) reaches
+every child exactly once, and a child-side CLI flag still wins for a
+manual run. The child argv carries only what the file grammar cannot
+express: the inherited listen-fd remap slots (`--listen-fd`) and the
+conf-fd slot itself. `xmppd-auth` still receives its resolved values on
+argv until it moves to the same loader. A core or s2s started by hand
+without `--conf-fd` reads `--config` directly. On SIGHUP the master
+rebuilds the fd from the reloaded configuration before forwarding the
+signal, so a respawned child sees the new values; no child re-reads the
+file.
 
 `xmppctl` accepts:
-- `--db PATH` - database directory
+- `-c`, `--config PATH` - read the shared config file
+- `--db PATH` - database directory (default: the shared `[server] db_path`)
 - `--auth-socket PATH` - auth daemon IPC socket (tries IPC first, falls back to direct DB)
 - `--password VALUE` - non-interactive password
 - `--password-file PATH` - read password from file
