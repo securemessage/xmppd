@@ -1,4 +1,4 @@
-//! # Account management — registration, password change, delete
+//! # Account management: registration, password change, delete
 //!
 //! The IPC account operations: in-band registration gated by
 //! RegistrationConfig and an optional invite validator, password change
@@ -111,7 +111,7 @@ pub fn handleAccountDelete(comptime Store: type, self: *handler_mod.AuthHandler(
         } };
     };
 
-    // Remove from UserStore (ignore UserNotFound — may be external auth)
+    // Remove from UserStore (ignore UserNotFound, may be external auth)
     self.store.removeUser(self.allocator, account_username) catch |err| {
         switch (err) {
             error.UserNotFound => {},
@@ -127,7 +127,7 @@ pub fn handleAccountDelete(comptime Store: type, self: *handler_mod.AuthHandler(
     };
 
     // Remove from LockStore (if lock_checker is configured, the LockStore exists)
-    // The lock checker holds a reference to LockStore — we use a dedicated
+    // The lock checker holds a reference to LockStore. We use a dedicated
     // delete callback for cleanup. For now, locks are cleaned via xmppctl unlock
     // or naturally don't apply once the account is gone.
 
@@ -225,7 +225,7 @@ pub fn handleRegisterRequest(comptime Store: type, self: *handler_mod.AuthHandle
                 } };
             }
         } else {
-            // No validator configured but invites required — reject
+            // No validator configured but invites required: reject
             return protocol.Message{ .register_result = regResult{
                 .conn_id = req.conn_id,
                 .success = false,

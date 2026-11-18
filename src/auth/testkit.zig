@@ -1,4 +1,4 @@
-//! # Auth test kit — shared helpers for the handler test files
+//! # Auth test kit: shared helpers for the handler test files
 //!
 //! The memory-backed user store, the synchronous handleMessage driver, the
 //! crypto-pool wake waiter, the IdP-delegating store, and the PLAIN payload

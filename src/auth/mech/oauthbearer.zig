@@ -14,7 +14,7 @@ const log = std.log.scoped(.auth_handler);
 const localpartOf = policy_mod.localpartOf;
 const authFailure = handler_mod.authFailure;
 
-/// Handle OAUTHBEARER mechanism — delegates to Store.validateToken.
+/// Handle OAUTHBEARER mechanism. Delegates to Store.validateToken.
 /// The SASL initial response is RFC 7628 format:
 ///   gs2-header kvsep "auth=Bearer " token kvsep kvsep
 ///   n,,\x01auth=Bearer TOKEN\x01\x01

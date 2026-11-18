@@ -3,7 +3,7 @@
 //! Two-step challenge-response over per-connection state: the auth request
 //! opens a ScramServer and emits the server-first challenge; the SASL
 //! response completes the proof. Sessions live in the handler-owned table
-//! keyed by (lane, conn_id) — the same conn_id legitimately recurs once per
+//! keyed by (lane, conn_id). The same conn_id legitimately recurs once per
 //! core worker lane (T279).
 
 const std = @import("std");
@@ -16,7 +16,7 @@ const authFailure = handler_mod.authFailure;
 const hashUsername = handler_mod.hashUsername;
 
 /// Maximum concurrent SCRAM exchanges (one per XMPP connection doing auth).
-/// Must cover a full-worker login burst — xmppd-core defaults to 4096
+/// Must cover a full-worker login burst: xmppd-core defaults to 4096
 /// sessions per worker, and every one of them can be mid-SASL at once.
 pub const MAX_SCRAM_SESSIONS = 8192;
 
@@ -60,7 +60,7 @@ pub const ScramSession = struct {
     }
 };
 
-/// Handle SCRAM-SHA-256 mechanism — multi-step challenge-response.
+/// Handle SCRAM-SHA-256 mechanism (multi-step challenge-response).
 pub fn handleScramInit(comptime Store: type, self: *handler_mod.AuthHandler(Store), req: protocol.AuthRequest, ipc_slot: usize) protocol.Message {
     const caps = handler_mod.AuthHandler(Store).capabilities;
     const auth_precis_scratch = &handler_mod.auth_precis_scratch;
@@ -117,7 +117,7 @@ pub fn handleScramInit(comptime Store: type, self: *handler_mod.AuthHandler(Stor
         }
         session.setClientIp(req.client_ip);
 
-        // Look up credentials — try cache first, fall back to store
+        // Look up credentials: try cache first, fall back to store
         const name_hash = hashUsername(account_username);
         const now = std.time.timestamp();
         const creds = self.cacheLookup(name_hash, now) orelse blk: {
@@ -205,7 +205,7 @@ pub fn handleSaslResponse(comptime Store: type, self: *handler_mod.AuthHandler(S
         .server_final = server_final,
     } };
 
-    // Don't deinit yet — the username/server_final slices are borrowed from the arena.
+    // Don't deinit yet: the username/server_final slices are borrowed from the arena.
     // They'll be valid until the next message for this slot.
 
     return result;
@@ -247,7 +247,7 @@ pub fn findOrCreateScramSlot(comptime Store: type, self: *handler_mod.AuthHandle
         const s = &self.scram_sessions[slot];
         if (!s.active) return slot;
         // Reclaim slots abandoned by connections that died before a
-        // final auth response — otherwise they leak until restart.
+        // final auth response; otherwise they leak until restart.
         if (now - s.touched_at > SCRAM_SLOT_STALE_SECONDS) {
             s.deinit();
             return slot;
@@ -349,7 +349,7 @@ test "AuthHandler: SCRAM slot table full means null, not aliasing" {
         try std.testing.expect(reply == .auth_challenge);
     }
 
-    // One more: the table is uniquely exhausted — temporary-auth-failure.
+    // One more: the table is uniquely exhausted, so temporary-auth-failure.
     const overflow = handleSync(&handler, .{
         .auth_request = .{
             .conn_id = 65537, // generation 1, slot 1
@@ -786,7 +786,7 @@ test "AuthHandler: credential cache hit on second SCRAM auth" {
     var handler = TestHandler.init(allocator, &store);
     defer handler.deinit();
 
-    // First auth — populates cache
+    // First auth populates the cache
     {
         var client = sasl.ScramClient.init(allocator, "cached", "pass123");
         defer client.deinit();
@@ -815,7 +815,7 @@ test "AuthHandler: credential cache hit on second SCRAM auth" {
     // Verify cache is populated
     try std.testing.expect(handler.cacheLookup(hashUsername("cached"), std.time.timestamp()) != null);
 
-    // Second auth — uses cache (store lookup skipped)
+    // Second auth uses the cache (store lookup skipped)
     {
         var client = sasl.ScramClient.init(allocator, "cached", "pass123");
         defer client.deinit();
@@ -881,7 +881,7 @@ test "AuthHandler: credential cache invalidated on password change" {
     // Cache should be populated
     try std.testing.expect(handler.cacheLookup(hashUsername("rotate"), std.time.timestamp()) != null);
 
-    // Change password — invalidates cache
+    // Change password invalidates the cache
     _ = handleSync(&handler, .{ .password_change_request = .{
         .conn_id = 31,
         .username = "rotate",

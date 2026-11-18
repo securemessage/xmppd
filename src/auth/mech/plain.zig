@@ -22,7 +22,7 @@ const authFailure = handler_mod.authFailure;
 /// touched on the event-loop thread.
 pub const PendingPlain = struct {
     slot: u32,
-    /// Accept-generation of the IPC client slot at request time — guards
+    /// Accept-generation of the IPC client slot at request time. Guards
     /// against a deferred reply landing on a different core connection that
     /// reused the slot.
     slot_gen: u32,
@@ -216,8 +216,8 @@ pub fn handlePlainAuth(comptime Store: type, self: *handler_mod.AuthHandler(Stor
         // T121: with a pool attached, the loop returns immediately and
         // the derive runs on a pool thread; the reply is rendered by
         // takeCryptoReply when the completion wakes the loop. The pool
-        // deep-copies the password — payload's backing buffer dies
-        // with this dispatch.
+        // deep-copies the password (payload's backing buffer dies
+        // with this dispatch).
         if (self.crypto_pool) |pool| {
             const job_id = pool.put(password, creds.salt, creds.iteration_count, creds.stored_key) catch {
                 return .{ .reply = authFailure(req.conn_id, .temporary_auth_failure) };
@@ -678,7 +678,7 @@ test "AuthHandler: unlimited attempts when rate limiter is not attached" {
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "hammer", "pass");
 
-    // No setRateLimiter call — the [auth] rate_limit = false configuration.
+    // No setRateLimiter call: the [auth] rate_limit = false configuration.
     var handler = TestHandler.init(allocator, &store);
     defer handler.deinit();
 
