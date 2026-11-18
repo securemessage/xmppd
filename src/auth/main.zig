@@ -46,6 +46,14 @@ const InviteStore = invite_store_mod.InviteStore(OpBackendType);
 const InviteValidator = handler_mod.InviteValidator;
 const RegistrationConfig = handler_mod.RegistrationConfig;
 
+/// Mechanisms this daemon advertises on connect; each must have a store
+/// capability behind it (checked at compile time).
+const AUTH_MECHS = [_]protocol.MechanismId{ .scram_sha_256, .plain };
+
+comptime {
+    handler_mod.assertMechanisms(UserStore, &AUTH_MECHS);
+}
+
 const log = std.log.scoped(.xmppd_auth);
 
 /// Certify the users namespace before any request is served. There is
@@ -300,10 +308,13 @@ pub fn main() !void {
     } else {
         log.warn("auth rate limiting DISABLED — no brute-force protection (benchmark/testing only)", .{});
     }
-    handler.setLockChecker(handler_mod.makeLockChecker(OpBackendType, &lock_store, allocator));
+    var lock_checker: handler_mod.LockStoreChecker(OpBackendType) = undefined;
+    lock_checker.init(&lock_store, allocator);
+    handler.setLockChecker(lock_checker.checker);
     handler.reg_config = reg_config;
+    var invite_ctx = InviteValidatorCtx{ .invite_store = &invite_store, .allocator = allocator };
     if (reg_config.enabled and reg_config.require_invite) {
-        handler.invite_validator = makeInviteValidator(&invite_store, allocator);
+        handler.invite_validator = makeInviteValidator(&invite_ctx);
     }
     defer handler.deinit();
 
@@ -404,8 +415,7 @@ pub fn main() !void {
                             };
 
                             // Send MechanismList immediately on connect
-                            const mechs = [_]protocol.MechanismId{ .scram_sha_256, .plain };
-                            const ml_msg = protocol.Message{ .mechanism_list = protocol.MechanismList.init(&mechs) };
+                            const ml_msg = protocol.Message{ .mechanism_list = protocol.MechanismList.init(&AUTH_MECHS) };
                             conn.queueSend(ml_msg) catch {
                                 batch.purgeFd(conn.fd);
                                 closeIpcLane(ipc, &handler, slot);
@@ -616,18 +626,16 @@ const InviteValidatorCtx = struct {
 };
 
 /// Create an InviteValidator interface backed by an InviteStore.
-fn makeInviteValidator(is: *InviteStore, alloc: std.mem.Allocator) InviteValidator {
+/// The context is owned by the caller and must outlive the validator.
+fn makeInviteValidator(ctx: *InviteValidatorCtx) InviteValidator {
     const S = struct {
-        var ctx: InviteValidatorCtx = undefined;
-
         fn check(raw_ctx: *anyopaque, code: []const u8) bool {
-            _ = raw_ctx;
-            return ctx.invite_store.validate(ctx.allocator, code) catch false;
+            const c: *InviteValidatorCtx = @ptrCast(@alignCast(raw_ctx));
+            return c.invite_store.validate(c.allocator, code) catch false;
         }
     };
-    S.ctx = .{ .invite_store = is, .allocator = alloc };
     return .{
-        .ctx = @ptrCast(&S.ctx),
+        .ctx = @ptrCast(ctx),
         .validateFn = &S.check,
     };
 }
