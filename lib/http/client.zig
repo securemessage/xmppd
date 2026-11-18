@@ -10,7 +10,9 @@
 //! are only read, never mutated; the verification-path log table is the
 //! only shared mutable state and sits behind its own mutex. Each request
 //! owns its socket, `SSL`, resolver and kqueue for its whole lifetime;
-//! nothing else is shared between in-flight requests.
+//! nothing else is shared between in-flight requests. The idle pool is
+//! threadlocal: each worker thread parks its own connections, so the
+//! request path takes no lock for reuse.
 //!
 //! ## Features
 //!
@@ -26,7 +28,14 @@
 //!   absent RRset (NXDOMAIN/NODATA) falls back to PKIX with the
 //!   configured CA bundle and the URL-host pin. A failed TLSA lookup
 //!   (timeout, SERVFAIL) skips the target and never falls back.
-//! - Connection-per-request (no keepalive -- simplicity for 3 fixed endpoints)
+//! - Keep-alive per endpoint: one idle connection per (host, port) parked
+//!   per worker thread. Reuse skips DNS, TCP and the TLS handshake; the
+//!   parked conn must be under 5 s idle and pass a zero-timeout
+//!   EVFILT_READ probe (no pending bytes, no EOF) or it is closed and a
+//!   fresh connect runs. HTTP/1.0 responses, `Connection: close` replies
+//!   and EOF-framed bodies are never parked. A GET that dies on a reused
+//!   conn before the first response byte retries once on a fresh conn;
+//!   POST never retries. Peer verification stays at connect time only.
 //! - Response limited to 256KB (JWKS/token responses are small)
 //!
 //! ## Known limits
@@ -113,6 +122,14 @@ pub const Response = struct {
         std.crypto.secureZero(u8, @constCast(self.body));
         self.allocator.free(self.body);
     }
+};
+
+/// What a finished exchange tells the request loop: whether any response
+/// byte arrived (the GET retry rule needs zero) and whether the response
+/// leaves the connection reusable for the idle pool.
+const ReadOutcome = struct {
+    saw_byte: bool = false,
+    reusable: bool = false,
 };
 
 /// Maximum response size (256KB, headers + body).
@@ -317,8 +334,128 @@ const Conn = struct {
     ssl_ptr: *c.SSL,
 };
 
+/// One non-blocking shutdown, never waited on (freebsd-ktls D6), then
+/// the SSL and the socket.
+fn closeConn(conn: Conn) void {
+    _ = c.SSL_shutdown(conn.ssl_ptr);
+    c.SSL_free(conn.ssl_ptr);
+    posix.close(conn.fd);
+}
+
+/// Bounded idle-connection table owned by one thread: at most one parked
+/// connection per (host, port). The pool is threadlocal, so reuse adds
+/// no lock to the request path; hosts are fixed 256-byte cells like
+/// PathLog's. A conn that ages out or reads dead at take time is closed
+/// on the spot.
+const IdlePool = struct {
+    entries: [max_entries]Entry = @splat(.{}),
+
+    const max_entries = 8;
+    const max_idle_ns = 5 * std.time.ns_per_s;
+
+    const Entry = struct {
+        used: bool = false,
+        host: [256]u8 = undefined,
+        host_len: u8 = 0,
+        port: u16 = 0,
+        fd: posix.fd_t = -1,
+        ssl_ptr: ?*c.SSL = null,
+        idle_since_ns: u64 = 0,
+    };
+
+    /// Park `conn` under (host, port). A parked conn for the endpoint is
+    /// displaced by the one that just completed; a full table drops the
+    /// newcomer. Both keep the table bounded.
+    fn put(self: *IdlePool, host: []const u8, port: u16, conn: Conn) void {
+        std.debug.assert(host.len <= 255);
+        var free: ?*Entry = null;
+        for (&self.entries) |*e| {
+            if (!e.used) {
+                free = free orelse e;
+                continue;
+            }
+            if (e.port == port and e.host_len == host.len and
+                std.mem.eql(u8, e.host[0..e.host_len], host))
+            {
+                closeConn(connOf(e));
+                e.fd = conn.fd;
+                e.ssl_ptr = conn.ssl_ptr;
+                e.idle_since_ns = monotonicNs();
+                return;
+            }
+        }
+        const e = free orelse {
+            closeConn(conn);
+            return;
+        };
+        e.used = true;
+        @memcpy(e.host[0..host.len], host);
+        e.host_len = @intCast(host.len);
+        e.port = port;
+        e.fd = conn.fd;
+        e.ssl_ptr = conn.ssl_ptr;
+        e.idle_since_ns = monotonicNs();
+    }
+
+    /// Hand back the parked conn for (host, port) when it is under the
+    /// idle ceiling and still live, else close it and return null.
+    fn take(self: *IdlePool, kq: posix.fd_t, host: []const u8, port: u16) ?Conn {
+        for (&self.entries) |*e| {
+            if (!e.used) continue;
+            if (e.port != port or e.host_len != host.len or
+                !std.mem.eql(u8, e.host[0..e.host_len], host)) continue;
+            const conn = connOf(e);
+            e.used = false;
+            if (monotonicNs() - e.idle_since_ns >= max_idle_ns or
+                !connLive(kq, conn.fd))
+            {
+                if (builtin.is_test) stale_detects += 1;
+                closeConn(conn);
+                return null;
+            }
+            return conn;
+        }
+        return null;
+    }
+
+    fn connOf(e: *const Entry) Conn {
+        return .{ .fd = e.fd, .ssl_ptr = e.ssl_ptr.? };
+    }
+};
+
+/// Per-thread idle pool: IdP workers reuse their own connections only.
+threadlocal var idle_pool: IdlePool = .{};
+
+/// Test seam: counts parked connections the take-time probe discarded.
+var stale_detects: usize = 0;
+
+/// Zero-timeout liveness probe for a parked connection: any pending
+/// byte, an EOF or an error event means the peer already closed or is
+/// speaking out of turn, and the conn is not safe to reuse.
+fn connLive(kq: posix.fd_t, fd: posix.fd_t) bool {
+    const changes = [_]posix.Kevent{
+        makeKev(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ONESHOT),
+    };
+    var events: [1]posix.Kevent = undefined;
+    const zero: posix.timespec = .{ .sec = 0, .nsec = 0 };
+    const n = posix.kevent(kq, &changes, &events, &zero) catch return false;
+    return n == 0;
+}
+
+/// Close every parked connection owned by the calling thread. Worker
+/// threads call this at shutdown; tests call it to release their
+/// fixture server.
+pub fn drainIdlePool() void {
+    for (&idle_pool.entries) |*e| {
+        if (!e.used) continue;
+        closeConn(IdlePool.connOf(e));
+        e.used = false;
+    }
+}
+
 /// Core HTTP request implementation. Owns one socket, one SSL, one
-/// resolver and one kqueue for the exchange's duration.
+/// resolver and one kqueue for the exchange's duration; a reused conn
+/// brings only its socket and SSL from the per-thread idle pool.
 fn request(
     client: *Client,
     allocator: Allocator,
@@ -347,16 +484,44 @@ fn request(
     const kq = posix.kqueue() catch return HttpError.ConnectionFailed;
     defer posix.close(kq);
 
-    const conn = try connectAndHandshake(client, allocator, kq, host_z, parsed, connect_deadline, options);
-    defer posix.close(conn.fd);
-    defer {
-        // One non-blocking shutdown, never waited on (freebsd-ktls D6).
-        _ = c.SSL_shutdown(conn.ssl_ptr);
-        c.SSL_free(conn.ssl_ptr);
+    // Reuse comes first: a live pooled conn skips DNS, TCP and the TLS
+    // handshake. A parked conn that aged out or reads dead at the probe
+    // is closed inside take and the request falls through to a fresh
+    // connect; verification stays at connect time only.
+    var conn: Conn = undefined;
+    var reused = false;
+    if (idle_pool.take(kq, parsed.host, parsed.port)) |c0| {
+        conn = c0;
+        reused = true;
+    } else {
+        conn = try connectAndHandshake(client, allocator, kq, host_z, parsed, connect_deadline, options);
     }
 
-    try sendRequest(conn, kq, allocator, method, parsed, body, content_type, options);
-    return readResponse(conn, kq, allocator, options);
+    // A GET that dies on a reused conn before the first response byte
+    // retries once on a fresh conn (the conn may have died between the
+    // probe and the exchange). POST is never retried: the caller's
+    // exchange policy owns that decision.
+    const retryable = std.mem.eql(u8, method, "GET");
+    while (true) {
+        var outcome: ReadOutcome = .{};
+        const resp = exchange(conn, kq, allocator, method, parsed, body, content_type, options, &outcome) catch |err| {
+            closeConn(conn);
+            if (reused and retryable and !outcome.saw_byte and
+                err != HttpError.Timeout and err != HttpError.Cancelled)
+            {
+                conn = try connectAndHandshake(client, allocator, kq, host_z, parsed, connect_deadline, options);
+                reused = false;
+                continue;
+            }
+            return err;
+        };
+        if (outcome.reusable) {
+            idle_pool.put(parsed.host, parsed.port, conn);
+        } else {
+            closeConn(conn);
+        }
+        return resp;
+    }
 }
 
 /// The request's resolver completion slot: the callback may fire inside
@@ -715,7 +880,8 @@ fn sendRequest(
         w.print("{s} {s} HTTP/1.1\r\n", .{ method, parsed.path }) catch return HttpError.InvalidUrl;
         w.print("Host: {s}\r\n", .{parsed.host_header}) catch return HttpError.InvalidUrl;
         w.writeAll("User-Agent: xmppd/0.1\r\n") catch return HttpError.InvalidUrl;
-        w.writeAll("Connection: close\r\n") catch return HttpError.InvalidUrl;
+        // No Connection header: HTTP/1.1 defaults to keep-alive, which
+        // the per-thread idle pool relies on.
         if (body) |b| {
             if (content_type) |ct| {
                 w.print("Content-Type: {s}\r\n", .{ct}) catch return HttpError.InvalidUrl;
@@ -769,6 +935,24 @@ fn sendRequest(
     }
 }
 
+/// One request/response exchange on `conn`: write the head plus body,
+/// then read the response. `outcome` reports how far the exchange got
+/// for the caller's reuse and retry decisions.
+fn exchange(
+    conn: Conn,
+    kq: posix.fd_t,
+    allocator: Allocator,
+    method: []const u8,
+    parsed: ParsedUrl,
+    body: ?[]const u8,
+    content_type: ?[]const u8,
+    options: RequestOptions,
+    outcome: *ReadOutcome,
+) HttpError!Response {
+    try sendRequest(conn, kq, allocator, method, parsed, body, content_type, options);
+    return readResponse(conn, kq, allocator, options, outcome);
+}
+
 /// Read the response against the total deadline, parse it and copy the
 /// body into a right-sized allocation the caller owns.
 fn readResponse(
@@ -776,6 +960,7 @@ fn readResponse(
     kq: posix.fd_t,
     allocator: Allocator,
     options: RequestOptions,
+    outcome: *ReadOutcome,
 ) HttpError!Response {
     const resp_buf = allocator.alloc(u8, MAX_RESPONSE_SIZE) catch return HttpError.OutOfMemory;
     defer {
@@ -785,10 +970,14 @@ fn readResponse(
 
     var total: usize = 0;
     var saw_eof = false;
+    var framed = false;
     while (!saw_eof) {
         if (total >= MAX_RESPONSE_SIZE) return HttpError.ResponseTooLarge;
         if (total > 0) switch (responseComplete(resp_buf[0..total])) {
             .done => |need| {
+                // Bytes beyond the declared frame are a protocol
+                // violation; the conn is not trustworthy to park.
+                framed = need == total;
                 total = need;
                 break;
             },
@@ -802,6 +991,7 @@ fn readResponse(
             @intCast(MAX_RESPONSE_SIZE - total),
         );
         if (ret > 0) {
+            outcome.saw_byte = true;
             total += @intCast(ret);
             continue;
         }
@@ -872,6 +1062,13 @@ fn readResponse(
             .done => |cs| body_slice = body_slice[0..cs.decoded],
         },
     }
+
+    // Reuse requires a response that finished on its declared framing
+    // (never an EOF-delimited body), HTTP/1.1 persistence, and no
+    // Connection: close from the peer.
+    outcome.reusable = framed and
+        std.mem.eql(u8, resp_data[0..8], "HTTP/1.1") and
+        !responseWantsClose(resp_data[0..header_end]);
 
     // Copy body to a right-sized allocation
     const body_copy = allocator.alloc(u8, body_slice.len) catch return HttpError.OutOfMemory;
@@ -978,6 +1175,25 @@ fn parseResponseHead(head: []const u8) HeadParse {
         return .chunked;
     }
     return if (content_length) |cl| .{ .length = cl } else .eof_body;
+}
+
+/// Does the response head's Connection field ask for close? RFC 9110
+/// 7.6.1: Connection is a comma-separated option list; any "close"
+/// token ends the conn after this response.
+fn responseWantsClose(head: []const u8) bool {
+    var it = std.mem.splitScalar(u8, head, '\n');
+    _ = it.next(); // status line
+    const prefix = "connection:";
+    while (it.next()) |line_raw| {
+        const line = std.mem.trimRight(u8, line_raw, "\r");
+        if (line.len < prefix.len or
+            !std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix)) continue;
+        var tok = std.mem.splitScalar(u8, line[prefix.len..], ',');
+        while (tok.next()) |t| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, t, " \t"), "close")) return true;
+        }
+    }
+    return false;
 }
 
 /// A Content-Length field value: ASCII digits only. No sign, no
@@ -1736,6 +1952,365 @@ test "TLS: the verification path logs at info once per endpoint" {
     try std.testing.expectEqual(@as(u16, 200), resp2.status);
 
     try std.testing.expectEqual(@as(usize, 1), info_hook_count);
+}
+
+// --- keep-alive: per-thread idle pool --------------------------------
+
+/// Shared state for the keep-alive fixture server: a small accept loop
+/// that spawns one handler thread per connection so an idle pooled conn
+/// never blocks a fresh accept.
+const KaState = struct {
+    port: std.atomic.Value(usize) = .init(0),
+    /// Accepted connections; the tests' reuse oracle.
+    accepts: std.atomic.Value(usize) = .init(0),
+    /// Request heads read, 1-based numbering for the script fields.
+    requests: std.atomic.Value(usize) = .init(0),
+    /// This request's conn closes without a reply (0 = never).
+    close_on: std.atomic.Value(usize) = .init(0),
+    /// After replying to this request the conn closes (0 = never).
+    close_after: std.atomic.Value(usize) = .init(0),
+    /// Set to the request number once close_after's conn was closed:
+    /// the FIN is queued before the flag, so a client probing afterwards
+    /// sees the EOF deterministically.
+    closed_after: std.atomic.Value(usize) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+};
+
+const KaConn = struct {
+    ctx: *c.SSL_CTX,
+    fd: posix.fd_t,
+    st: *KaState,
+};
+
+/// One accepted connection: TLS, then a read-head/reply loop honoring
+/// the script fields in `st`. Poll keeps the handler responsive to
+/// `stop` while the client holds the conn idle in its pool.
+fn kaConn(a: KaConn) void {
+    var fd = a.fd;
+    defer if (fd >= 0) posix.close(fd);
+    const ssl_ptr = c.SSL_new(a.ctx) orelse return;
+    defer c.SSL_free(ssl_ptr);
+    _ = c.SSL_set_fd(ssl_ptr, a.fd);
+    if (c.SSL_accept(ssl_ptr) != 1) return;
+    const deadline = std.time.milliTimestamp() + 10000;
+    var buf: [8192]u8 = undefined;
+    var total: usize = 0;
+    while (!a.st.stop.load(.acquire) and std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = a.fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 250) catch break;
+        if (pn <= 0) continue;
+        const r = c.SSL_read(ssl_ptr, @ptrCast(buf[total..].ptr), @intCast(buf.len - total));
+        if (r <= 0) return; // peer closed or TLS error
+        total += @intCast(r);
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") == null) continue;
+        const n = a.st.requests.fetchAdd(1, .acq_rel) + 1;
+        if (n == a.st.close_on.load(.acquire)) return; // silent close
+        const resp = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nok\r\n";
+        _ = c.SSL_write(ssl_ptr, resp.ptr, resp.len);
+        total = 0;
+        if (n == a.st.close_after.load(.acquire)) {
+            // close_notify, then the socket: the flag is set only after
+            // close() queues the FIN.
+            _ = c.SSL_shutdown(ssl_ptr);
+            posix.close(fd);
+            fd = -1;
+            a.st.closed_after.store(n, .release);
+            return;
+        }
+    }
+}
+
+/// Keep-alive fixture listener: each accepted conn gets a handler
+/// thread, so a parked idle conn never stalls a later accept.
+fn serveKeepAlive(cert_path: [*:0]const u8, key_path: [*:0]const u8, st: *KaState) void {
+    const method = c.TLS_server_method() orelse return;
+    const ctx = c.SSL_CTX_new(method) orelse return;
+    defer c.SSL_CTX_free(ctx);
+    if (c.SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1) return;
+    if (c.SSL_CTX_use_PrivateKey_file(ctx, key_path, c.SSL_FILETYPE_PEM) != 1) return;
+
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) catch return;
+    posix.listen(listen_fd, 4) catch return;
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    posix.getsockname(listen_fd, @ptrCast(&addr), &alen) catch return;
+    st.port.store(std.mem.nativeToBig(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + 15000;
+    var handlers: [8]std.Thread = undefined;
+    var n_handlers: usize = 0;
+    while (!st.stop.load(.acquire) and std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const pn = posix.poll(&fds, 250) catch break;
+        if (pn <= 0) continue;
+        const conn = posix.accept(listen_fd, null, null, 0) catch continue;
+        _ = st.accepts.fetchAdd(1, .acq_rel);
+        if (n_handlers >= handlers.len) {
+            posix.close(conn);
+            continue;
+        }
+        const h = std.Thread.spawn(.{}, kaConn, .{KaConn{ .ctx = ctx, .fd = conn, .st = st }}) catch {
+            posix.close(conn);
+            continue;
+        };
+        handlers[n_handlers] = h;
+        n_handlers += 1;
+    }
+    for (handlers[0..n_handlers]) |h| h.join();
+}
+
+test "TLS: keep-alive reuses one connection for two GETs to an endpoint" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var st = KaState{};
+    const th = try std.Thread.spawn(.{}, serveKeepAlive, .{ cert_path.ptr, key_path.ptr, &st });
+    defer {
+        st.stop.store(true, .release);
+        th.join();
+    }
+    const dl = std.time.milliTimestamp() + 3000;
+    while (st.port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = st.port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    const dns_srv = try startFakeDns(.{});
+    defer stopFakeDns(dns_srv);
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    defer drainIdlePool();
+    useFakeDns(&client, dns_srv);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/jwks", .{p});
+    var resp1 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp1.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp1.status);
+    var resp2 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp2.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp2.status);
+
+    // Both exchanges ran over the first (and only) accept.
+    try std.testing.expectEqual(@as(usize, 1), st.accepts.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), st.requests.load(.acquire));
+}
+
+test "TLS: keep-alive retries a GET once when a reused conn dies mid-exchange" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var st = KaState{};
+    // Request 2 closes without a reply: it reaches the reused conn
+    // after the liveness probe, so the probe passes and the read fails.
+    st.close_on.store(2, .release);
+    const th = try std.Thread.spawn(.{}, serveKeepAlive, .{ cert_path.ptr, key_path.ptr, &st });
+    defer {
+        st.stop.store(true, .release);
+        th.join();
+    }
+    const dl = std.time.milliTimestamp() + 3000;
+    while (st.port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = st.port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    const dns_srv = try startFakeDns(.{});
+    defer stopFakeDns(dns_srv);
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    defer drainIdlePool();
+    useFakeDns(&client, dns_srv);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/token", .{p});
+    var resp1 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp1.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp1.status);
+
+    // Request 2 dies on the pooled conn before any response byte; the
+    // retry lands on a second accept and succeeds.
+    var resp2 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp2.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp2.status);
+
+    try std.testing.expectEqual(@as(usize, 2), st.accepts.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), st.requests.load(.acquire));
+}
+
+test "TLS: keep-alive discards a parked conn the server already closed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var st = KaState{};
+    // After replying to request 2 the server closes the conn while the
+    // client has it parked.
+    st.close_after.store(2, .release);
+    const th = try std.Thread.spawn(.{}, serveKeepAlive, .{ cert_path.ptr, key_path.ptr, &st });
+    defer {
+        st.stop.store(true, .release);
+        th.join();
+    }
+    const dl = std.time.milliTimestamp() + 3000;
+    while (st.port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = st.port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    const dns_srv = try startFakeDns(.{});
+    defer stopFakeDns(dns_srv);
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    defer drainIdlePool();
+    useFakeDns(&client, dns_srv);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/keys", .{p});
+    stale_detects = 0;
+    var resp1 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp1.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp1.status);
+    var resp2 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp2.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp2.status);
+    // Both ran over the same accept; without pooling this is 2 already.
+    try std.testing.expectEqual(@as(usize, 1), st.accepts.load(.acquire));
+
+    // The server has now closed the parked conn; closed_after is set
+    // only after close() queued the FIN.
+    while (st.closed_after.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 2), st.closed_after.load(.acquire));
+
+    var resp3 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp3.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp3.status);
+
+    // The probe discarded the dead conn; a blind reuse would have been
+    // retried on a third accept.
+    try std.testing.expectEqual(@as(usize, 1), stale_detects);
+    try std.testing.expectEqual(@as(usize, 2), st.accepts.load(.acquire));
+}
+
+test "TLS: keep-alive never retries a POST" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var st = KaState{};
+    // The POST is request 2: it dies on the reused conn without a reply.
+    st.close_on.store(2, .release);
+    const th = try std.Thread.spawn(.{}, serveKeepAlive, .{ cert_path.ptr, key_path.ptr, &st });
+    defer {
+        st.stop.store(true, .release);
+        th.join();
+    }
+    const dl = std.time.milliTimestamp() + 3000;
+    while (st.port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = st.port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    const dns_srv = try startFakeDns(.{});
+    defer stopFakeDns(dns_srv);
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    defer drainIdlePool();
+    useFakeDns(&client, dns_srv);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/token", .{p});
+    var resp1 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp1.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp1.status);
+    try std.testing.expectEqual(@as(usize, 1), st.accepts.load(.acquire));
+
+    if (client.post(std.testing.allocator, url, "grant_type=x", testOptions(5000, 2000))) |*resp| {
+        var r = resp.*;
+        defer r.deinit();
+        return error.TestExpectedError;
+    } else |_| {}
+
+    // No retry happened: still one accept, and the error surfaced.
+    try std.testing.expectEqual(@as(usize, 1), st.accepts.load(.acquire));
 }
 
 test "responseComplete: a huge declared length is rejected, not panicked on" {
