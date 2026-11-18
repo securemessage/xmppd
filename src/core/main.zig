@@ -230,6 +230,13 @@ pub fn main() !void {
 
     // Parse listen fd list (comma-separated)
     const MAX_LISTEN_FDS = 64;
+    comptime {
+        // One worker per listen fd; a worker id past these bounds would
+        // drop counters and room delivery into threadlocal fallbacks the
+        // SIGUSR1 dump never reads (gate R5).
+        std.debug.assert(MAX_LISTEN_FDS <= metrics.MAX_WORKERS);
+        std.debug.assert(MAX_LISTEN_FDS <= room_registry_mod.MAX_WORKERS);
+    }
     var listen_fds: [MAX_LISTEN_FDS]std.posix.fd_t = undefined;
     var listen_fd_count: usize = 0;
 

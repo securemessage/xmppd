@@ -21,6 +21,8 @@ const log = std.log.scoped(.muc);
 pub const MAX_ROOMS = 256;
 
 /// Maximum workers the master will spawn (src/master/main.zig MAX_WORKERS).
+/// comptime-pinned in core main: MAX_LISTEN_FDS must not exceed this, so
+/// every spawned worker id fits a WorkerMask bit (gate R5).
 pub const MAX_WORKERS = 64;
 
 /// Bitmask of workers that have >=1 occupant of a room.
