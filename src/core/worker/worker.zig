@@ -2552,6 +2552,70 @@ test "Server: dirty-list leftovers re-drive on the loop self-wake" {
     try std.testing.expect(dirty.empty());
 }
 
+// ADR-2 STARTTLS on the real path: a plaintext session drives
+// <starttls/> through handleReadable and the batch-tail
+// flushDirtyOutboxes with no manual flushSend. <proceed/> must reach
+// the peer and the deferred upgrade must start the handshake. A guard
+// that runs the upgrade inside the parse loop reads the un-consumed
+// read window and refuses, so this fails when the deferred-only upgrade
+// is reverted.
+test "Server: STARTTLS negotiation upgrades through the batch-tail dirty flush" {
+    const allocator = std.testing.allocator;
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    // A real cert so upgradeToTls runs; without ssl_ctx the upgrade path
+    // only logs and the handshake assert could never fire.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    var ctrs: connection_mod.OutboxCounters = .{};
+    const dirty = connection_mod.dirtyForWorker(server.worker_id);
+    session.conn.bindOutbox(&ctrs, dirty);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    c2s_session.handleReadable(&server, 1, &changes);
+
+    _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
+    c2s_session.handleReadable(&server, 1, &changes);
+
+    // A refusal inside the parse loop closes the session outright.
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expect(session.stream.state == .starttls_pending);
+    try std.testing.expect(session.conn.tls == null);
+    try std.testing.expect(session.conn.on_dirty);
+
+    // The batch tail flushes the queued <proceed/> and runs the upgrade.
+    server.flushDirtyOutboxes(&changes);
+
+    var buf: [4096]u8 = undefined;
+    var got: usize = 0;
+    while (true) {
+        const n = posix.read(fds[1], buf[got..]) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        got += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..got], "<proceed") != null);
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expect(session.conn.isTlsHandshaking());
+}
+
 test "Server: M1 SIGUSR1 dump runs against a live worker block" {
     metrics.bind(10);
     defer metrics.current = null;
