@@ -183,10 +183,16 @@ pub const ExchangeOptions = struct {
     cancel_fd: posix.fd_t = -1,
 };
 
-/// Cached JWK key (supports RSA and EdDSA/OKP).
+/// Cached JWK key (supports RSA and EdDSA/OKP). `pkey` is the key
+/// material parsed once at refresh: the cache owns one reference, a
+/// worker borrows a second via EVP_PKEY_up_ref at lookup and frees it
+/// after verification. Null marks a key that failed to parse; it is
+/// unusable, not absent.
 const JwkKey = struct {
     kid: []const u8,
     kty: KeyType,
+    /// Parsed key material, one cache-owned reference (jwks_mutex).
+    pkey: ?*jwt.Pkey = null,
     // RSA fields
     n: []const u8 = "",
     e: []const u8 = "",
@@ -207,6 +213,10 @@ const JWKS_MAX_AGE_SECONDS: i64 = 3600;
 /// copied out under the lock.
 const KeyCopy = struct {
     kty: KeyType,
+    /// Worker's own reference on the cached key material; the caller
+    /// frees it with jwt.pkeyFree after verification. Always set by
+    /// findKeyLocked before .found leaves the lock.
+    pkey: *jwt.Pkey = undefined,
     /// base64url modulus; 1408 bytes covers an 8192-bit RSA key (1366
     /// chars) with headroom. Anything larger is unusable, see KeyLookup.
     n_buf: [1408]u8 = undefined,
@@ -244,6 +254,9 @@ const KeyLookup = union(enum) {
     /// The kid exists but a component exceeds the copy bound: an unusable
     /// cached key is a service problem, never a bad credential.
     oversize,
+    /// The kid exists but its key material failed to parse at refresh:
+    /// an IdP-side defect, reported like oversize.
+    unusable,
     absent,
 };
 
@@ -391,6 +404,7 @@ pub const OidcStore = struct {
 
     pub fn deinit(self: *OidcStore) void {
         if (self.http_client) |*cl| cl.deinit();
+        self.freeKeyPkeys();
         if (self.jwks_body) |body| {
             self.allocator.free(body);
             self.jwks_body = null;
@@ -649,9 +663,12 @@ pub const OidcStore = struct {
             },
         };
 
+        // Verify against the cached EVP_PKEY: the JWK was parsed into key
+        // material once at refresh, so a token verification never reparses.
+        defer jwt.pkeyFree(key.pkey);
         const sig_valid = switch (key.kty) {
-            .rsa => jwt.verifyRs256(&parsed, key.n(), key.e()),
-            .okp => jwt.verifyEdDSA(&parsed, key.x()),
+            .rsa => jwt.verifyRs256Pkey(&parsed, key.pkey),
+            .okp => jwt.verifyEdDSAPkey(&parsed, key.pkey),
         };
         if (!sig_valid) {
             log.info("JWT: signature verification failed for sub='{s}'", .{parsed.claims.sub});
@@ -959,7 +976,7 @@ pub const OidcStore = struct {
 
         switch (self.findKeyLocked(kid)) {
             .found => |k| return .{ .key = k },
-            .oversize => return .{ .failed = .unavailable },
+            .oversize, .unusable => return .{ .failed = .unavailable },
             .absent => {},
         }
         if (cache_stale) {
@@ -991,7 +1008,7 @@ pub const OidcStore = struct {
         };
         return switch (self.findKeyLocked(kid)) {
             .found => |k| .{ .key = k },
-            .oversize => .{ .failed = .unavailable },
+            .oversize, .unusable => .{ .failed = .unavailable },
             .absent => .absent,
         };
     }
@@ -1028,6 +1045,10 @@ pub const OidcStore = struct {
                     copy.x_len = @intCast(k.x.len);
                 },
             }
+            // The worker gets its own reference on the cached key
+            // material; it frees it after verification.
+            const pk = k.pkey orelse return .unusable;
+            copy.pkey = jwt.pkeyUpRef(pk) orelse return .unusable;
             return .{ .found = copy };
         }
         return .absent;
@@ -1077,7 +1098,10 @@ pub const OidcStore = struct {
         ) catch return JwksError.OutOfMemory;
         @memcpy(body_copy, response.body);
 
-        // Replace old JWKS body
+        // Replace the old key set and body together: cached pkeys die
+        // with the set that parsed them (in-flight verifications hold
+        // their own references).
+        self.freeKeyPkeys();
         if (self.jwks_body) |old| {
             self.allocator.free(old);
         }
@@ -1088,6 +1112,15 @@ pub const OidcStore = struct {
         self.key_count = 0;
         self.parseJwksKeys();
         ok = true;
+    }
+
+    /// Release the cache's reference on every parsed key. Caller holds
+    /// jwks_mutex; keys' own refs stay with in-flight verifications.
+    fn freeKeyPkeys(self: *OidcStore) void {
+        for (self.keys[0..self.key_count]) |*k| {
+            jwt.pkeyFree(k.pkey);
+            k.pkey = null;
+        }
     }
 
     /// Parse JWKS JSON and extract key components (RSA and EdDSA/OKP).
@@ -1131,9 +1164,13 @@ pub const OidcStore = struct {
                 self.keys[self.key_count] = JwkKey{
                     .kid = kid_value,
                     .kty = .rsa,
+                    .pkey = jwt.pkeyFromRsa(n_value, e_value),
                     .n = n_value,
                     .e = e_value,
                 };
+                if (self.keys[self.key_count].pkey == null) {
+                    log.warn("JWKS: RSA key '{s}' failed to parse into a public key", .{kid_value});
+                }
                 self.key_count += 1;
             } else if (std.mem.eql(u8, kty_value, "OKP")) {
                 // EdDSA (Ed25519) key -- need x
@@ -1145,8 +1182,12 @@ pub const OidcStore = struct {
                 self.keys[self.key_count] = JwkKey{
                     .kid = kid_value,
                     .kty = .okp,
+                    .pkey = jwt.pkeyFromEd25519(x_value),
                     .x = x_value,
                 };
+                if (self.keys[self.key_count].pkey == null) {
+                    log.warn("JWKS: OKP key '{s}' failed to parse into a public key", .{kid_value});
+                }
                 self.key_count += 1;
             }
             // Skip unknown key types
@@ -1988,14 +2029,20 @@ test "OidcStore: an oversized JWKS key is unavailable, never a rejection" {
     }
     // The 8192-bit key fits the copy bound and is served normally.
     switch (store.signingKey("rsa8k", testOptions(5000))) {
-        .key => |k| try std.testing.expectEqual(@as(usize, 1366), k.n().len),
+        .key => |k| {
+            defer jwt.pkeyFree(k.pkey);
+            try std.testing.expectEqual(@as(usize, 1366), k.n().len);
+        },
         else => return error.ExpectedKey,
     }
 }
 
 fn fetchSigningKey(store: *OidcStore, kid: []const u8, hits: *std.atomic.Value(usize)) void {
     switch (store.signingKey(kid, testOptions(8000))) {
-        .key => _ = hits.fetchAdd(1, .monotonic),
+        .key => |k| {
+            jwt.pkeyFree(k.pkey);
+            _ = hits.fetchAdd(1, .monotonic);
+        },
         else => {},
     }
 }
@@ -2083,7 +2130,7 @@ test "OidcStore: a failed JWKS fetch suppresses refetch on kid-miss until the in
     try std.testing.expectEqual(@as(usize, 1), store.jwks_suppressed.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 1), store.jwks_failures.load(.monotonic));
     switch (store.signingKey("k1", testOptions(5000))) {
-        .key => {},
+        .key => |k| jwt.pkeyFree(k.pkey),
         else => return error.ExpectedKey,
     }
 
@@ -2094,6 +2141,54 @@ test "OidcStore: a failed JWKS fetch suppresses refetch on kid-miss until the in
         else => return error.ExpectedFailure,
     }
     try std.testing.expectEqual(@as(usize, 2), store.jwks_failures.load(.monotonic));
+}
+
+test "OidcStore: token verification reuses the cached EVP_PKEY" {
+    const allocator = std.testing.allocator;
+    var store = testStore(allocator, .{});
+    defer store.deinit();
+
+    // A cached RSA key parsed once at refresh; verification of any token
+    // carrying kid k1 must run on that EVP_PKEY, not a fresh parse.
+    store.jwks_body = try allocator.dupe(
+        u8,
+        "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"k1\",\"n\":\"AQAB\",\"e\":\"AQAB\"}]}",
+    ); // deinit frees it
+    store.jwks_last_refresh = std.time.timestamp();
+    jwt.pkey_parse_calls = 0;
+    store.parseJwksKeys();
+    try std.testing.expectEqual(@as(usize, 1), store.key_count);
+    const after_refresh = jwt.pkey_parse_calls;
+    try std.testing.expectEqual(@as(usize, 1), after_refresh);
+
+    // Well-formed RS256 token for kid k1: issuer, audience and lifetime
+    // all valid, so every checkJwt reaches signature verification on the
+    // cached key. The signature is junk, which is fine: the parse count
+    // is the oracle, not the verdict.
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    var hbuf: [128]u8 = undefined;
+    const h = enc.encode(&hbuf, "{\"alg\":\"RS256\",\"kid\":\"k1\"}");
+    var pbuf: [256]u8 = undefined;
+    const p = enc.encode(
+        &pbuf,
+        "{\"iss\":\"https://idp.example/\",\"aud\":\"xmppd\",\"sub\":\"alice\",\"exp\":9999999999}",
+    );
+    var tbuf: [512]u8 = undefined;
+    const token = try std.fmt.bufPrint(&tbuf, "{s}.{s}.dGVzdA", .{ h, p });
+
+    var out: Identity = .{};
+    try std.testing.expectEqual(
+        JwtCheck.invalid,
+        store.checkJwt(allocator, token, testOptions(5000), &out),
+    );
+    try std.testing.expectEqual(
+        JwtCheck.invalid,
+        store.checkJwt(allocator, token, testOptions(5000), &out),
+    );
+
+    // Two verifications ran and neither reparsed the JWK into an
+    // EVP_PKEY.
+    try std.testing.expectEqual(after_refresh, jwt.pkey_parse_calls);
 }
 
 test "OidcStore: replay returns identity, rejection and temporary failure" {
