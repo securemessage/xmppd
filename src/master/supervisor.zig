@@ -228,7 +228,7 @@ pub const Supervisor = struct {
     /// The child receives argv[0] = exe_path, followed by self.args.
     pub fn spawnChild(self: *Supervisor) !posix.pid_t {
         if (self.exe_path.len == 0 or self.exe_path[0] != '/') {
-            log.warn("exe_path '{s}' is not absolute — execve may fail if cwd lacks the binary", .{self.exe_path});
+            log.warn("exe_path '{s}' is not absolute: execve may fail if cwd lacks the binary", .{self.exe_path});
         }
 
         // The run identity is resolved before the loop runs and
