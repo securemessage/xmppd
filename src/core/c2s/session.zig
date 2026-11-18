@@ -605,7 +605,7 @@ pub const Session = struct {
     ///
     /// Compat !void form of stanza() for call sites not yet converted to
     /// the SendResult API: failed_closed maps back to the pre-Outbox
-    /// error pair, while tracked_detached is success — a detached SM
+    /// error pair, while tracked_detached is success: a detached SM
     /// session that buffers for resume is delivering, not dropping.
     pub fn queueSendStanza(self: *Session, data: []const u8) !void {
         switch (self.stanza(data)) {
@@ -646,7 +646,7 @@ pub const Session = struct {
 
     /// Track after the append: delivered results count like the
     /// pre-Outbox path, and a refused stanza that could fit the bound
-    /// counts too — SM replay is where it goes next. The oversize drop
+    /// counts too: SM replay is where it goes next. The oversize drop
     /// (len > spill_limit) stays untracked.
     fn finishTrack(self: *Session, data: []const u8, r: SendResult) SendResult {
         if (r != .failed_closed or data.len <= self.conn.outbox.spill_limit) {
@@ -655,7 +655,7 @@ pub const Session = struct {
         return r;
     }
 
-    /// Queue a nonza — anything that is not a message/presence/iq stanza:
+    /// Queue a nonza: anything that is not a message/presence/iq stanza:
     /// SM elements, stream features and errors, SASL elements, the stream
     /// close. Never counted for XEP-0198.
     pub fn nonza(self: *Session, data: []const u8) SendResult {
@@ -2018,7 +2018,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
             // <proceed/> has fully flushed; leftover bytes would be
             // written through the TLS record layer. The batch tail (or
             // handleWritable) completes the upgrade once the outbox
-            // drains — readableSlice() is only honest after consume(),
+            // drains: readableSlice() is only honest after consume(),
             // so no upgrade decision may be taken inside the parse.
         },
         .send_sasl_success => |server_final| {
@@ -2082,7 +2082,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
 /// every drain path, not just the fd_writable event: a batch-tail
 /// drain arms nothing, so they would never fire otherwise. Returns
 /// false when the flush error or a failed STARTTLS upgrade closed the
-/// session — callers must stop touching it.
+/// session: callers must stop touching it.
 pub fn flushSessionOutbox(self: *Server, session: *Session, changes: *ChangeList) bool {
     const conn = &session.conn;
     switch (conn.flushOutbox(connection_mod.FLUSH_BUDGET_BYTES)) {

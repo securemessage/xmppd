@@ -106,7 +106,7 @@ fn nonza(session: *Session, changes: *ChangeList, data: []const u8) SendResult; 
   `sm_detached` returns `tracked_detached`: counted, queued for replay,
   nothing appended to a dead conn.
 - `nonza()` never counts. Stream features, `<r/>`, `<a/>`, SASL
-  elements, stream errors and closing tags keep going through it — and
+  elements, stream errors and closing tags keep going through it, and
   so does SM replay (`c2s/sm.zig` resend sites), because replayed
   stanzas are already in the unacked queue and must not be tracked a
   second time.
@@ -196,7 +196,7 @@ watermark checks read unchanged.
 
 The session fails with `resource-constraint` (the existing
 `reapOutboundOverflow` path). Undelivered **messages** go to offline
-storage through `OfflineStore.storeHeldPointer` — the same path
+storage through `OfflineStore.storeHeldPointer`, the same path
 `holdBehindOfflineTail` (`routing/deliver.zig`) and the router's
 no-available-resource branch (`routing/router.zig`) use, keyed
 `(recipient_bare, sender_bare, stanza_id)` with the held payload
@@ -207,7 +207,7 @@ teardown of a session with `sm_unacked`, pending entries that are
 non-message stanzas follow the RFC rules (errors never stored, presence
 never stored). Sessions without SM have no unacked list: their
 in-outbox stanza bytes are unrecoverable and die with the session,
-counted — identical to today's loss, not a regression. C11 builds the
+counted, identical to today's loss, not a regression. C11 builds the
 full XEP-0198 section 5 policy (replay-through-Outbox, expiry timer
 wheel, offline/bounce on expiry) on this drain; C2 does not implement
 it.
@@ -233,7 +233,7 @@ it.
 5. **Connection economics.** Idle: no ring block at all until the first
    append, then one 16 KiB heap block per conn + ~80 B of `Outbox`
    bookkeeping (the removed `write_start`/`write_end`/`tls_write_pending`/
-   `compactWriteBuf` state offsets most of it) — flat or better vs today
+   `compactWriteBuf` state offsets most of it), flat or better vs today
    (inline 16 KiB at idle). Step 1 cap: one 16 KiB ring + `Outbox` spill
    list disabled (`spill_limit == ring.len`). Step 2 cap: up to
    `max_outbound_bytes` (1 MiB) of spill per conn, freed back to a 64 KiB

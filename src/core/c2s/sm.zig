@@ -1083,7 +1083,7 @@ pub fn handleSmRequest(self: *Server, session: *Session, changes: *ChangeList) v
     std.fmt.format(w, "{d}", .{session.sm_in_h}) catch return;
     w.writeAll("'/>") catch return;
     if (session.nonza(fbs.getWritten()) == .failed_closed) return;
-    // Attempt immediate flush — SM acks are latency-critical. A stall
+    // Attempt immediate flush: SM acks are latency-critical. A stall
     // leaves the conn dirty-linked; the batch tail arms EVFILT_WRITE
     // only on a real EAGAIN.
     _ = session.conn.flushSend() catch {};

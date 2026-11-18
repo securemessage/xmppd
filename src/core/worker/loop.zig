@@ -566,8 +566,8 @@ pub const EventLoop = struct {
     /// event, in single-worker as well as multi-worker topology.
     ///
     /// ## Errors
-    /// - `error.SystemResources` — kernel rejected the trigger
-    /// - `error.EventNotFound` — the knote is gone (loop half-closed)
+    /// - `error.SystemResources`: kernel rejected the trigger
+    /// - `error.EventNotFound`: the knote is gone (loop half-closed)
     pub fn selfWake(self: *EventLoop) !void {
         const trigger = posix.Kevent{
             .ident = SELF_WAKE_IDENT,

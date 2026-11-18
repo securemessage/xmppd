@@ -108,7 +108,7 @@ const READ_BUF_SIZE = 8192;
 /// stanzas before the client has a chance to ACK at the TCP level.
 pub const WRITE_BUF_SIZE = 16384;
 
-/// Per-connection outbound bound (ring plus spill) — the lib/net
+/// Per-connection outbound bound (ring plus spill): the lib/net
 /// max_outbound_bytes default for c2s (F3-DESIGN section 1). An append
 /// that cannot fit fails closed and the session is failed with
 /// resource-constraint; undelivered messages drain to offline storage.
@@ -195,7 +195,7 @@ pub const Connection = struct {
     /// deinit(). Keeping it out of the struct lets the M4 stack-frame caps
     /// hold where by-value Connection moves occur (accept, Session.init);
     /// heap memory is also what makes the TLS (ptr, len) pin stable across
-    /// every by-value move. Null means "never sent" — recv-only
+    /// every by-value move. Null means "never sent": recv-only
     /// connections never pay for it.
     write_buf: ?*[WRITE_BUF_SIZE]u8 = null,
 
@@ -213,7 +213,7 @@ pub const Connection = struct {
     dirty_prev: ?*Connection = null,
     on_dirty: bool = false,
     /// The worker's dirty list, or null before bindOutbox and in unit
-    /// tests — unbound conns link nowhere.
+    /// tests: unbound conns link nowhere.
     dirty_list: ?*DirtyList = null,
 
     /// The last flush stalled on TLS want_read (a write that needs a
@@ -221,10 +221,10 @@ pub const Connection = struct {
     /// tail retries the flush.
     flush_want_read: bool = false,
 
-    /// TLS state — null for plain TCP, set after STARTTLS upgrade.
+    /// TLS state: null for plain TCP, set after STARTTLS upgrade.
     tls: ?net.Tls = null,
 
-    /// TLS handshake progress — only meaningful when tls is set.
+    /// TLS handshake progress: only meaningful when tls is set.
     tls_state: ?TlsState = null,
 
     /// Unique connection ID (for use as kqueue udata).
@@ -252,7 +252,7 @@ pub const Connection = struct {
     ///
     /// - `fd` — the accepted client socket (must already be non-blocking)
     /// - `id` — unique identifier for this connection (used as kqueue udata)
-    /// - `alloc` — allocator for outbox spill growth (bounded by the
+    /// - `alloc`: allocator for outbox spill growth (bounded by the
     ///   outbox's own spill_limit)
     pub fn init(fd: posix.fd_t, id: usize, alloc: std.mem.Allocator) Connection {
         return .{
@@ -854,7 +854,7 @@ test "Connection: queueSend on closed connection is rejected (T155)" {
 
     try std.testing.expectError(error.ConnectionClosed, conn.queueSend("<message/>"));
     // Critically, the rejected data must not leave the connection looking
-    // writable — the dirty-list flush is gated on this.
+    // writable: the dirty-list flush is gated on this.
     try std.testing.expect(!conn.hasPendingWrite());
 }
 
