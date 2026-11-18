@@ -66,7 +66,7 @@ pub fn main() !void {
 
     var diag: conf.Diag = .{};
     var loaded = MasterLoader.load(allocator, .{
-        .path = configPathArg(argv.items),
+        .path = schema.configPathArg(argv.items),
         .args = argv.items,
     }, &diag) catch |err| {
         log.err("{f}", .{diag});
@@ -438,33 +438,6 @@ fn writeUsage(w: *std.Io.Writer, gen: *const MasterLoader) std.Io.Writer.Error!v
     try gen.writeHelp(w);
 }
 
-/// The config file path the argv carries, in every accepted spelling
-/// (--config, -c, and the = forms). Returns null past "--" and when the
-/// option has no value; the loader diagnoses those cases itself.
-fn configPathArg(argv: []const []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i < argv.len) : (i += 1) {
-        const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--")) return null;
-        if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
-            if (i + 1 < argv.len) return argv[i + 1];
-            return null;
-        }
-        const rest = if (std.mem.startsWith(u8, arg, "--"))
-            arg[2..]
-        else if (arg.len > 1 and arg[0] == '-')
-            arg[1..]
-        else
-            continue;
-        const eq = std.mem.indexOfScalar(u8, rest, '=') orelse continue;
-        const name = rest[0..eq];
-        if (std.mem.eql(u8, name, "config") or std.mem.eql(u8, name, "c")) {
-            return rest[eq + 1 ..];
-        }
-    }
-    return null;
-}
-
 /// The argv each child is spawned with. Slices borrow the loaded values
 /// and arena: they must outlive the children's spawn, not their exec.
 const ChildArgv = struct {
@@ -811,14 +784,23 @@ test "master --help lists every CLI spelling from the schema" {
 }
 
 test "master config: --config path is scanned from argv in every spelling" {
-    try std.testing.expectEqualStrings("a.ini", configPathArg(&.{ "--config", "a.ini" }).?);
-    try std.testing.expectEqualStrings("b.ini", configPathArg(&.{ "-c", "b.ini" }).?);
-    try std.testing.expectEqualStrings("c.ini", configPathArg(&.{"--config=c.ini"}).?);
-    try std.testing.expectEqualStrings("d.ini", configPathArg(&.{"-c=d.ini"}).?);
-    try std.testing.expect(configPathArg(&.{ "--", "--config", "x.ini" }) == null);
-    try std.testing.expect(configPathArg(&.{ "--host", "h.test" }) == null);
+    try std.testing.expectEqualStrings("a.ini", schema.configPathArg(&.{ "--config", "a.ini" }).?);
+    try std.testing.expectEqualStrings("b.ini", schema.configPathArg(&.{ "-c", "b.ini" }).?);
+    try std.testing.expectEqualStrings("c.ini", schema.configPathArg(&.{"--config=c.ini"}).?);
+    try std.testing.expectEqualStrings("d.ini", schema.configPathArg(&.{"-c=d.ini"}).?);
+    try std.testing.expect(schema.configPathArg(&.{ "--", "--config", "x.ini" }) == null);
+    try std.testing.expect(schema.configPathArg(&.{ "--host", "h.test" }) == null);
     // No value: the loader reports the missing value itself.
-    try std.testing.expect(configPathArg(&.{"--config"}) == null);
+    try std.testing.expect(schema.configPathArg(&.{"--config"}) == null);
+}
+
+test "conf fd slot is scanned from argv in every spelling" {
+    try std.testing.expectEqual(@as(i32, 7), schema.confFdArg(&.{ "--conf-fd", "7" }).?);
+    try std.testing.expectEqual(@as(i32, 9), schema.confFdArg(&.{"--conf-fd=9"}).?);
+    try std.testing.expect(schema.confFdArg(&.{ "--", "--conf-fd", "3" }) == null);
+    try std.testing.expect(schema.confFdArg(&.{ "--conf-fd", "notanfd" }) == null);
+    try std.testing.expect(schema.confFdArg(&.{"--conf-fd"}) == null);
+    try std.testing.expect(schema.confFdArg(&.{ "--host", "h.test" }) == null);
 }
 
 /// The value argv carries for a two-token option; null when absent.
