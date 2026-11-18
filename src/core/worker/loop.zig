@@ -59,6 +59,8 @@
 const std = @import("std");
 const posix = std.posix;
 const metrics = @import("metrics.zig");
+const token_kinds = @import("token_kinds");
+const Token = @import("net_token").Token;
 
 // ============================================================================
 // Public Types
@@ -120,6 +122,9 @@ pub const FdEvent = struct {
 pub const TimerEvent = struct {
     /// The timer identifier (set during `addTimer()`).
     ident: usize,
+    /// Opaque user data associated with this timer (set during `addTimer()`).
+    /// Core registrations carry a Token here.
+    udata: usize,
     /// Number of times the timer has fired since last `poll()` call.
     /// Normally 1, but can be >1 if the event loop was delayed.
     overrun: i64,
@@ -344,11 +349,12 @@ pub const ChangeList = struct {
         try self.append(makeKevent(@intCast(fd), std.c.EVFILT.WRITE, std.c.EV.DISABLE, 0));
     }
 
-    /// Add a one-shot or repeating timer.
-    pub fn addTimer(self: *ChangeList, ident: usize, interval_ms: u32, one_shot: bool) !void {
+    /// Add a one-shot or repeating timer. `udata` is returned with every
+    /// firing event; core registrations carry a Token there (ADR-4).
+    pub fn addTimer(self: *ChangeList, ident: usize, interval_ms: u32, one_shot: bool, udata: usize) !void {
         var flags: u16 = std.c.EV.ADD | std.c.EV.ENABLE;
         if (one_shot) flags |= std.c.EV.ONESHOT;
-        var ev = makeKevent(ident, std.c.EVFILT.TIMER, flags, 0);
+        var ev = makeKevent(ident, std.c.EVFILT.TIMER, flags, udata);
         ev.data = @intCast(interval_ms);
         try self.append(ev);
     }
@@ -474,14 +480,15 @@ pub const EventLoop = struct {
         const result_buf = try allocator.alloc(Event, max_events);
 
         // The self-wake knote lives for the loop's lifetime; EV_CLEAR so a
-        // delivered trigger resets state and a fresh trigger refires.
+        // delivered trigger resets state and a fresh trigger refires. Its
+        // udata carries a token like every other core registration (ADR-4).
         const add_user = posix.Kevent{
             .ident = SELF_WAKE_IDENT,
             .filter = std.c.EVFILT.USER,
             .flags = std.c.EV.ADD | std.c.EV.CLEAR,
             .fflags = 0,
             .data = 0,
-            .udata = 0,
+            .udata = (Token{ .index = 0, .gen = 0, .kind = token_kinds.self_wake }).toUdata(),
         };
         keventctl(kq, &.{add_user}) catch |err| {
             allocator.free(result_buf);
@@ -705,16 +712,17 @@ pub const EventLoop = struct {
     /// - `interval_ms` — timer interval in milliseconds
     /// - `one_shot` — if `true`, the timer fires once and is automatically removed.
     ///   If `false`, the timer repeats at the given interval until explicitly removed.
+    /// - `udata` — opaque user data returned with each firing event
     ///
     /// If a timer with the same `ident` already exists, it is replaced.
     ///
     /// ## Errors
     /// - `error.SystemResources` — too many timers
-    pub fn addTimer(self: *EventLoop, ident: usize, interval_ms: u32, one_shot: bool) !void {
+    pub fn addTimer(self: *EventLoop, ident: usize, interval_ms: u32, one_shot: bool, udata: usize) !void {
         var flags: u16 = std.c.EV.ADD | std.c.EV.ENABLE;
         if (one_shot) flags |= std.c.EV.ONESHOT;
 
-        var ev = makeKevent(ident, std.c.EVFILT.TIMER, flags, 0);
+        var ev = makeKevent(ident, std.c.EVFILT.TIMER, flags, udata);
         // NOTE_MSECONDS not defined in std.c; the default unit for EVFILT_TIMER
         // on FreeBSD is milliseconds, so we just set data directly.
         ev.data = @intCast(interval_ms);
@@ -1006,6 +1014,7 @@ pub const EventLoop = struct {
             } },
             std.c.EVFILT.TIMER => .{ .timer = .{
                 .ident = kev.ident,
+                .udata = kev.udata,
                 .overrun = kev.data,
             } },
             std.c.EVFILT.SIGNAL => .{ .signal = .{
@@ -1186,13 +1195,14 @@ test "EventLoop: timer one-shot" {
     defer loop.deinit();
 
     // Add a 50ms one-shot timer
-    try loop.addTimer(42, 50, true);
+    try loop.addTimer(42, 50, true, 0x1234);
 
     // Poll with 200ms timeout — timer should fire
     const events = try loop.poll(200);
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expect(events[0] == .timer);
     try std.testing.expectEqual(@as(usize, 42), events[0].timer.ident);
+    try std.testing.expectEqual(@as(usize, 0x1234), events[0].timer.udata);
 
     // Poll again — timer was one-shot, should NOT fire again
     const events2 = try loop.poll(100);
@@ -1204,7 +1214,7 @@ test "EventLoop: timer repeating" {
     defer loop.deinit();
 
     // Add a 30ms repeating timer
-    try loop.addTimer(99, 30, false);
+    try loop.addTimer(99, 30, false, 0);
 
     // Wait enough for at least 2 fires
     std.Thread.sleep(80 * std.time.ns_per_ms);

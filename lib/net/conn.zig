@@ -13,7 +13,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const ssl = @import("ssl");
 const loop_mod = @import("loop.zig");
-const Token = @import("token.zig").Token;
+const Token = @import("net_token").Token;
 const SlotMap = @import("slotmap.zig").SlotMap;
 
 pub const Loop = loop_mod.Loop;

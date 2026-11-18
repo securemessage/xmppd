@@ -13,7 +13,7 @@
 //! underestimate into a spin.
 
 const std = @import("std");
-const Token = @import("token.zig").Token;
+const Token = @import("net_token").Token;
 const SlotMap = @import("slotmap.zig").SlotMap;
 
 pub const TimerId = Token;

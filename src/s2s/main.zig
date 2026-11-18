@@ -646,7 +646,7 @@ pub const S2sDaemon = struct {
                 self.failOutboundInitiation(batch, conn, "internal-error");
                 return;
             };
-            batch.addTimer(conn.deadline_ident, CONNECT_DEADLINE_MS, true) catch {
+            batch.addTimer(conn.deadline_ident, CONNECT_DEADLINE_MS, true, 0) catch {
                 self.abortConnectAttempt(batch, conn);
                 self.failOutboundInitiation(batch, conn, "internal-error");
                 return;
@@ -888,7 +888,7 @@ pub const S2sDaemon = struct {
         const delay: u32 = @intCast(@min(@as(i64, backoff), remaining));
         conn.retry_attempt +|= 1;
         const ident = self.nextLifecycleIdent();
-        batch.addTimer(ident, delay, true) catch {
+        batch.addTimer(ident, delay, true, 0) catch {
             self.failOutboundInitiation(batch, conn, "internal-error");
             return;
         };
@@ -8727,7 +8727,7 @@ test "S2sDaemon: a failed read-hold on the DANE wait closes the session" {
     var cl = ChangeList.init(&scratch);
     var i: usize = 0;
     while (true) {
-        cl.addTimer(4096 + i, 1, true) catch break;
+        cl.addTimer(4096 + i, 1, true, 0) catch break;
         i += 1;
     }
 
@@ -8762,7 +8762,7 @@ test "S2sDaemon: a failed read re-arm on DANE completion closes the session" {
     var full_cl = ChangeList.init(&full_scratch);
     var i: usize = 0;
     while (true) {
-        full_cl.addTimer(4096 + i, 1, true) catch break;
+        full_cl.addTimer(4096 + i, 1, true, 0) catch break;
         i += 1;
     }
     daemon.batch = &full_cl;
@@ -8797,7 +8797,7 @@ test "S2sDaemon: a full changelist cannot stall a pending resolve" {
     var cl = ChangeList.init(&scratch);
     var i: usize = 0;
     while (true) {
-        cl.addTimer(4096 + i, 1, true) catch break;
+        cl.addTimer(4096 + i, 1, true, 0) catch break;
         i += 1;
     }
 

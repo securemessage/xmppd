@@ -344,11 +344,9 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     self.allocator.destroy(detached);
     self.sessions[detached_id] = null;
 
-    // Return detached slot to free-list
-    if (self.free_count < self.free_ids.len) {
-        self.free_ids[self.free_count] = detached_id;
-        self.free_count += 1;
-    }
+    // Return the detached slot to the free-list; the generation bump
+    // retires every token minted for the detached session (ADR-4).
+    self.releaseSessionSlot(detached_id);
 
     // T177 occupant migration: replay the room moves before <resumed/> —
     // the detached slot was just destroyed, so every room record pointing
@@ -593,10 +591,8 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
     detached.deinit();
     self.allocator.destroy(detached);
     self.sessions[detached_id] = null;
-    if (self.free_count < self.free_ids.len) {
-        self.free_ids[self.free_count] = detached_id;
-        self.free_count += 1;
-    }
+    // See the local-resume path: one release, one generation bump (ADR-4).
+    self.releaseSessionSlot(detached_id);
 
     // Breadcrumb: the SM-ID prefix still names THIS worker; a repeat
     // resume of the relocated session must find worker req.req_worker.

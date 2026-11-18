@@ -101,6 +101,8 @@ const metrics = @import("metrics.zig");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const pep_store_mod = @import("pep_store");
 const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
+const token_kinds = @import("token_kinds");
+const Token = @import("net_token").Token;
 
 const log = std.log.scoped(.xmppd);
 
@@ -122,29 +124,39 @@ const isStaleSessionEvent = c2s_session.isStaleSessionEvent;
 /// Default maximum simultaneous connections (configurable via init).
 pub const DEFAULT_MAX_SESSIONS: usize = 4096;
 
-/// Sentinel value for listener fd in kqueue udata.
-const LISTENER_UDATA = std.math.maxInt(usize);
+/// udata for the listener fd knote: a Token, like every core registration
+/// (ADR-4). Kind-only sentinels (index 0, gen 0) never name a session slot.
+const LISTENER_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.listener }).toUdata();
 
-/// Sentinel value for auth IPC fd in kqueue udata.
-pub const IPC_AUTH_UDATA = LISTENER_UDATA - 1;
+/// udata for the auth IPC fd knote.
+pub const IPC_AUTH_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.ipc_auth }).toUdata();
 
-/// Sentinel value for S2S IPC fd in kqueue udata.
-pub const IPC_S2S_UDATA = LISTENER_UDATA - 2;
+/// udata for the S2S IPC fd knote.
+pub const IPC_S2S_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.ipc_s2s }).toUdata();
 
-/// Sentinel value for delivery system wake pipe fd in kqueue udata.
-const WAKE_PIPE_UDATA = LISTENER_UDATA - 3;
+/// udata for the delivery system wake pipe knote.
+const WAKE_PIPE_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.wake_pipe }).toUdata();
 
-/// Timer ident for periodic SM resume expiry sweep.
-const SM_EXPIRY_TIMER_IDENT = LISTENER_UDATA - 4;
+/// udata for the fixed periodic timers. Dispatch stays keyed on ident;
+/// the kind tag exists so a stale session token cannot impersonate one.
+const SM_EXPIRY_TIMER_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.timer_sm_expiry }).toUdata();
+const AUTH_RECONNECT_TIMER_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.timer_auth_reconnect }).toUdata();
+const OFFLINE_RETRY_TIMER_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.timer_offline_sweep }).toUdata();
+const S2S_RECONNECT_TIMER_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.timer_s2s_reconnect }).toUdata();
+
+/// Timer ident for periodic SM resume expiry sweep. Per-session retry
+/// timers use the session id as ident; the fixed idents live far above
+/// every possible session id.
+const SM_EXPIRY_TIMER_IDENT = std.math.maxInt(usize) - 10;
 
 /// Timer ident for auth-IPC reconnect retries.
-const AUTH_RECONNECT_TIMER_IDENT = LISTENER_UDATA - 5;
+const AUTH_RECONNECT_TIMER_IDENT = std.math.maxInt(usize) - 11;
 
 /// Timer ident for retrying offline drains stalled on a store error (S13).
-const OFFLINE_RETRY_TIMER_IDENT = LISTENER_UDATA - 6;
+const OFFLINE_RETRY_TIMER_IDENT = std.math.maxInt(usize) - 12;
 
 /// Timer ident for S2S-IPC reconnect retries (S10).
-const S2S_RECONNECT_TIMER_IDENT = LISTENER_UDATA - 7;
+const S2S_RECONNECT_TIMER_IDENT = std.math.maxInt(usize) - 13;
 
 /// Interval for SM detached session expiry sweep (milliseconds).
 const SM_EXPIRY_SWEEP_MS: u32 = 30_000;
@@ -215,6 +227,13 @@ pub const Server = struct {
     /// Free-list stack for O(1) session ID allocation (T128).
     free_ids: []usize = &.{},
     free_count: usize = 0,
+
+    /// Generation per session slot (ADR-4). Bumped when a slot returns to
+    /// the free pool, so a Token minted before the free no longer resolves:
+    /// a stale kqueue event or cross-worker delivery aimed at a reused slot
+    /// is counted and dropped instead of hitting the next session in it.
+    /// Generation 0 is never issued (see lib/net/token.zig).
+    slot_gen: []u24 = &.{},
 
     /// TLS context — shared across all connections. Null if TLS is not configured.
     ssl_ctx: ?ssl.SslContext = null,
@@ -360,6 +379,15 @@ pub const Server = struct {
     /// debug so a regression here is visible instead of silent.
     stale_event_skips: u64 = 0,
 
+    /// Tokens that failed generation or kind validation: stale kqueue
+    /// udata, stale session retry timers, and cross-worker deliveries
+    /// addressed to a freed-then-reused slot (ADR-4, V13).
+    stale_token_skips: u64 = 0,
+
+    /// destroySession calls against an already-released slot (T316):
+    /// counted no-ops instead of a second free_ids push.
+    double_destroy_skips: u64 = 0,
+
     /// SM-ID → session slot index map for O(1) resume lookup (T127, S17).
     /// AutoHashMapUnmanaged: the old fixed 64-entry open-addressing table
     /// silently failed inserts when full and broke probe chains on remove
@@ -432,6 +460,9 @@ pub const Server = struct {
             if (idx == 1) break;
         }
 
+        const slot_gen = try allocator.alloc(u24, max_sessions);
+        @memset(slot_gen, 1);
+
         const loop = try EventLoop.init(allocator, 256);
         errdefer {
             var l = loop;
@@ -451,6 +482,7 @@ pub const Server = struct {
             .max_sessions = max_sessions,
             .free_ids = free_ids,
             .free_count = fc,
+            .slot_gen = slot_gen,
             .allocator = allocator,
             .server_host = host,
             .start_time = std.time.timestamp(),
@@ -495,6 +527,9 @@ pub const Server = struct {
             if (idx == 1) break;
         }
 
+        const slot_gen = try allocator.alloc(u24, max_sessions);
+        @memset(slot_gen, 1);
+
         const loop = try EventLoop.init(allocator, 256);
         errdefer {
             var l = loop;
@@ -510,6 +545,7 @@ pub const Server = struct {
             .max_sessions = max_sessions,
             .free_ids = free_ids,
             .free_count = fc,
+            .slot_gen = slot_gen,
             .allocator = allocator,
             .server_host = host,
             .start_time = std.time.timestamp(),
@@ -740,6 +776,7 @@ pub const Server = struct {
         }
         self.allocator.free(self.sessions);
         if (self.free_ids.len > 0) self.allocator.free(self.free_ids);
+        if (self.slot_gen.len > 0) self.allocator.free(self.slot_gen);
         if (self.scratch_entries_a.len > 0) self.allocator.free(self.scratch_entries_a);
         if (self.scratch_entries_b.len > 0) self.allocator.free(self.scratch_entries_b);
         if (self.scratch_entries_c.len > 0) self.allocator.free(self.scratch_entries_c);
@@ -755,6 +792,48 @@ pub const Server = struct {
         if (self.s2s_ipc.connected) self.s2s_ipc.close();
         self.ipc.deinit();
         self.s2s_ipc.deinit();
+    }
+
+    /// ADR-4: the token that names session slot `id` at its current
+    /// generation. Minted at kqueue registration and when addressing a
+    /// session across workers; validation always happens on the receiver.
+    pub fn sessionToken(self: *const Server, id: usize) Token {
+        return .{
+            .index = @intCast(id),
+            .gen = self.slot_gen[id],
+            .kind = token_kinds.session,
+        };
+    }
+
+    /// ADR-4: does this token still name a live session slot on this
+    /// worker? One kind check, one bounds check, one generation compare —
+    /// no lock, no map scan.
+    pub fn validateSessionToken(self: *const Server, token: Token) bool {
+        return token.kind == token_kinds.session and
+            token.index < self.sessions.len and
+            self.slot_gen[token.index] == token.gen;
+    }
+
+    /// Resolve an event token to its session, counting and dropping stale
+    /// ones: a freed-then-reused slot, or a non-session udata that fell
+    /// through dispatch.
+    pub fn sessionForEventToken(self: *Server, token: Token) ?*Session {
+        if (!self.validateSessionToken(token)) {
+            self.stale_token_skips += 1;
+            return null;
+        }
+        return self.sessions[token.index];
+    }
+
+    /// ADR-4: return a session slot to the free pool exactly once per live
+    /// session (T316). Bumping the generation retires every token minted
+    /// before the free. A slot whose generation would wrap is retired
+    /// rather than reissued under a generation an ancient token could hold.
+    pub fn releaseSessionSlot(self: *Server, id: usize) void {
+        if (self.slot_gen[id] == std.math.maxInt(u24)) return;
+        self.slot_gen[id] += 1;
+        self.free_ids[self.free_count] = id;
+        self.free_count += 1;
     }
 
     /// Presence batching resolves this many bare JIDs per lock hold.
@@ -968,10 +1047,10 @@ pub const Server = struct {
         }
 
         // Register periodic timer for SM resume expiry sweep
-        try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
+        try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false, SM_EXPIRY_TIMER_UDATA);
 
         // Fallback for offline retry timers that could not be staged.
-        try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false);
+        try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false, OFFLINE_RETRY_TIMER_UDATA);
 
         // Auth daemon not connected at boot (standalone run or it crashed
         // before we came up): owe a reconnect attempt (T243).
@@ -1102,8 +1181,9 @@ pub const Server = struct {
     // TLS handshake dispatch
     // ========================================================================
 
-    fn handleReadableOrHandshake(self: *Server, id: usize, changes: *ChangeList) void {
-        const session = self.sessions[id] orelse return;
+    fn handleReadableOrHandshake(self: *Server, token: Token, changes: *ChangeList) void {
+        const session = self.sessionForEventToken(token) orelse return;
+        const id: usize = token.index;
         // A flush that stalled on TLS want_read gets its read event now:
         // re-link so the batch tail retries it (ADR-2).
         if (session.conn.flush_want_read) {
@@ -1149,8 +1229,9 @@ pub const Server = struct {
         }
     }
 
-    fn handleWritableOrHandshake(self: *Server, id: usize, changes: *ChangeList) void {
-        const session = self.sessions[id] orelse return;
+    fn handleWritableOrHandshake(self: *Server, token: Token, changes: *ChangeList) void {
+        const session = self.sessionForEventToken(token) orelse return;
+        const id: usize = token.index;
         if (session.conn.isTlsHandshaking()) {
             c2s_session.continueTlsHandshake(self, id, session, changes);
             return;
@@ -1174,7 +1255,7 @@ pub const Server = struct {
                     } else if (e.udata == WAKE_PIPE_UDATA) {
                         // Already handled in the first pass
                     } else {
-                        self.handleReadableOrHandshake(e.udata, changes);
+                        self.handleReadableOrHandshake(Token.fromUdata(e.udata), changes);
                     }
                 },
                 .user => |u| {
@@ -1190,7 +1271,7 @@ pub const Server = struct {
                     } else if (e.udata == IPC_S2S_UDATA) {
                         self.flushS2sIpc(changes);
                     } else {
-                        self.handleWritableOrHandshake(e.udata, changes);
+                        self.handleWritableOrHandshake(Token.fromUdata(e.udata), changes);
                     }
                 },
                 .signal => |s| {
@@ -1210,7 +1291,16 @@ pub const Server = struct {
                     } else if (t.ident == S2S_RECONNECT_TIMER_IDENT) {
                         self.tryS2sReconnect(changes);
                     } else {
-                        session_lifecycle.retryOfflineDrain(self, t.ident, changes);
+                        // Per-session offline retry: the token in udata is
+                        // checked against the slot's live generation so a
+                        // timer queued for a freed slot cannot fire on the
+                        // session that reused it (ADR-4).
+                        const timer_token = Token.fromUdata(t.udata);
+                        if (self.validateSessionToken(timer_token)) {
+                            session_lifecycle.retryOfflineDrain(self, timer_token.index, changes);
+                        } else {
+                            self.stale_token_skips += 1;
+                        }
                     }
                 },
                 .fd_error => |e| {
@@ -1219,7 +1309,7 @@ pub const Server = struct {
                     } else if (e.udata == IPC_S2S_UDATA) {
                         self.dropS2sIpc(changes);
                     } else if (e.udata != LISTENER_UDATA and e.udata != WAKE_PIPE_UDATA) {
-                        self.handleSessionError(e.udata, changes);
+                        self.handleSessionError(Token.fromUdata(e.udata), changes);
                     }
                 },
                 else => {},
@@ -1230,9 +1320,9 @@ pub const Server = struct {
     /// kqueue reported an error on a session fd (EV_ERROR / EV_EOF with an
     /// error). Detached or already-closed sessions are skipped for the same
     /// reason as a stale readable/writable event (S28).
-    fn handleSessionError(self: *Server, id: usize, changes: *ChangeList) void {
-        if (id >= self.sessions.len) return;
-        const session = self.sessions[id] orelse return;
+    fn handleSessionError(self: *Server, token: Token, changes: *ChangeList) void {
+        const session = self.sessionForEventToken(token) orelse return;
+        const id: usize = token.index;
         if (isStaleSessionEvent(session)) {
             self.stale_event_skips += 1;
             log.debug("connection {d} stale error event on a detached or closed session, skipped", .{id});
@@ -1353,14 +1443,14 @@ pub const Server = struct {
         if (self.auth_reconnect_pending) {
             // Keep the flag set if the arm could not be staged, so the next
             // iteration retries it rather than losing the only trigger.
-            if (changes.addTimer(AUTH_RECONNECT_TIMER_IDENT, AUTH_RECONNECT_MS, true)) |_| {
+            if (changes.addTimer(AUTH_RECONNECT_TIMER_IDENT, AUTH_RECONNECT_MS, true, AUTH_RECONNECT_TIMER_UDATA)) |_| {
                 self.auth_reconnect_pending = false;
             } else |err| {
                 log.warn("auth IPC reconnect timer deferred ({})", .{err});
             }
         }
         if (self.s2s_reconnect_pending) {
-            if (changes.addTimer(S2S_RECONNECT_TIMER_IDENT, S2S_RECONNECT_MS, true)) |_| {
+            if (changes.addTimer(S2S_RECONNECT_TIMER_IDENT, S2S_RECONNECT_MS, true, S2S_RECONNECT_TIMER_UDATA)) |_| {
                 self.s2s_reconnect_pending = false;
             } else |err| {
                 log.warn("s2s IPC reconnect timer deferred ({})", .{err});
@@ -2283,7 +2373,7 @@ test "Server: S28 stale writable event does not destroy a detached session" {
     try std.testing.expect(server.sessions[1] != null);
     try std.testing.expectEqual(@as(u64, 2), server.stale_event_skips);
 
-    server.handleSessionError(1, &changes);
+    server.handleSessionError(server.sessionToken(1), &changes);
     try std.testing.expect(server.sessions[1] != null);
     try std.testing.expect(server.sessions[1].?.sm_detached);
     try std.testing.expectEqual(@as(u64, 3), server.stale_event_skips);
@@ -2314,8 +2404,8 @@ test "Server: S28 a same-batch kqueue race keeps a detached session resumable" {
     // Arm both filters on the production event loop.
     var change_buf: [32]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    try changes.addRead(session.conn.fd, 1);
-    try changes.addWrite(session.conn.fd, 1);
+    try changes.addRead(session.conn.fd, server.sessionToken(1).toUdata());
+    try changes.addWrite(session.conn.fd, server.sessionToken(1).toUdata());
 
     // Peer data makes the fd readable; a full write buffer keeps it pending.
     _ = try posix.write(fds[1], "<presence/>");
@@ -4631,8 +4721,8 @@ test "Server: S10 a reconnect owed by a full batch still gets its timer" {
     // handling gets this iteration; the third slot below is reserved.
     var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
     var changes = initLoopChangeList(&change_buf);
-    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
-    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false);
+    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false, SM_EXPIRY_TIMER_UDATA);
+    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false, OFFLINE_RETRY_TIMER_UDATA);
     try std.testing.expectError(error.ChangeListFull, changes.addRead(3, 1));
 
     // The link dies while the batch is full: the drop stages nothing and owes
@@ -4757,8 +4847,8 @@ test "Server: S10 reconcile arms IPC write interest from a full batch" {
     // two slots below are all event handling gets this iteration.
     var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
     var changes = initLoopChangeList(&change_buf);
-    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
-    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false);
+    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false, SM_EXPIRY_TIMER_UDATA);
+    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false, OFFLINE_RETRY_TIMER_UDATA);
     try std.testing.expectEqual(@as(usize, 2), changes.count());
     try std.testing.expectError(error.ChangeListFull, changes.addRead(fds[1], 1));
 
@@ -4791,7 +4881,7 @@ test "Server: S10 a deferred IPC disarm keeps the armed flag set" {
         // Spending the reserved tail too, which is the worst case: even the
         // reconcile's own budget is gone, so nothing can be staged at all.
         changes.beginReserved();
-        changes.addTimer(SM_EXPIRY_TIMER_IDENT, @intCast(i), false) catch {};
+        changes.addTimer(SM_EXPIRY_TIMER_IDENT, @intCast(i), false, SM_EXPIRY_TIMER_UDATA) catch {};
         changes.endReserved();
     }
     try std.testing.expectEqual(change_buf.len, changes.count());
@@ -4956,8 +5046,8 @@ test "Server: G6 an auth reconnect owed by a full batch still gets its timer" {
     // builds it so the tail budget is production's. The third slot is reserved.
     var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
     var changes = initLoopChangeList(&change_buf);
-    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false);
-    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false);
+    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false, SM_EXPIRY_TIMER_UDATA);
+    try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false, OFFLINE_RETRY_TIMER_UDATA);
     try std.testing.expectError(error.ChangeListFull, changes.addRead(3, 1));
 
     server.armAuthReconnect();
@@ -5336,4 +5426,56 @@ test "hold token: a second incarnation in the same second mints a new token" {
     try std.testing.expect(a != b);
     try std.testing.expect(a != 0);
     try std.testing.expect(b != 0);
+}
+
+// ADR-4: a kevent or timer delivered for a slot that was freed and handed
+// to a new session carries the old generation. The token must not resolve
+// to the reused slot's session and the drop must be counted.
+test "ADR-4: a stale token for a reused slot is dropped and counted" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+    server.free_count -= 1;
+
+    const stale = server.sessionToken(1);
+    try std.testing.expectEqual(session, server.sessionForEventToken(stale).?);
+    try std.testing.expectEqual(@as(u64, 0), server.stale_token_skips);
+
+    // Free the slot, then reuse it: the LIFO hands slot 1 to a new
+    // session, but events queued under the old generation stay dropped.
+    session.deinit();
+    allocator.destroy(session);
+    server.sessions[1] = null;
+    server.releaseSessionSlot(1);
+    const fds2 = try makeSocketPair();
+    defer posix.close(fds2[1]);
+    const replacement = try allocator.create(Session);
+    replacement.* = Session.init(fds2[0], 1, "localhost", false, allocator);
+    defer allocator.destroy(replacement);
+    defer replacement.deinit();
+    server.sessions[1] = replacement;
+    server.free_count -= 1;
+
+    try std.testing.expectEqual(@as(?*Session, null), server.sessionForEventToken(stale));
+    try std.testing.expectEqual(@as(u64, 1), server.stale_token_skips);
+
+    // The slot's current token still resolves, and a non-session kind is
+    // dropped without matching by index alone.
+    try std.testing.expectEqual(replacement, server.sessionForEventToken(server.sessionToken(1)).?);
+    try std.testing.expectEqual(@as(?*Session, null), server.sessionForEventToken(.{
+        .index = 1,
+        .gen = server.slot_gen[1],
+        .kind = token_kinds.ipc_auth,
+    }));
+    try std.testing.expectEqual(@as(u64, 2), server.stale_token_skips);
+
+    // The replacement's teardown is owned by the defers above, not the
+    // server table sweep.
+    server.sessions[1] = null;
 }

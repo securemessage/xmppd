@@ -17,7 +17,7 @@
 const std = @import("std");
 const posix = std.posix;
 const kev = @import("kevent.zig");
-const Token = @import("token.zig").Token;
+const Token = @import("net_token").Token;
 const loop_mod = @import("loop.zig");
 
 pub const Wake = struct {

@@ -739,7 +739,7 @@ pub fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes
             handleReadable(self, id, changes);
         }
         if (self.sessions[id] != null and !session.conn.isClosed()) {
-            changes.addRead(session.conn.fd, id) catch {};
+            changes.addRead(session.conn.fd, self.sessionToken(id).toUdata()) catch {};
         }
     } else {
         // Re-arm the appropriate kqueue filter. The write knote is the
@@ -747,7 +747,7 @@ pub fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes
         // it, and the next delivery auto-disables it again (S10).
         if (session.conn.tls_state) |state| {
             switch (state) {
-                .handshake_want_read => changes.addRead(session.conn.fd, id) catch {},
+                .handshake_want_read => changes.addRead(session.conn.fd, self.sessionToken(id).toUdata()) catch {},
                 .handshake_want_write => changes.enableWrite(session.conn.fd) catch {},
                 .established => {},
             }

@@ -76,7 +76,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
         session.conn.bindOutbox(connection_mod.countersForWorker(server.worker_id), connection_mod.dirtyForWorker(server.worker_id));
         server.sessions[id] = session;
 
-        changes.addRead(conn.fd, id) catch {
+        changes.addRead(conn.fd, server.sessionToken(id).toUdata()) catch {
             log.err("changelist full on accept", .{});
             failAcceptedSession(server, session, id);
             break;
@@ -86,7 +86,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
         // DISPATCH mode: every delivery auto-disables it, so a stall arms
         // with a bare enableWrite and a drained flush needs no EV_DELETE
         // (ADR-2).
-        changes.addWriteDisabled(conn.fd, id) catch {
+        changes.addWriteDisabled(conn.fd, server.sessionToken(id).toUdata()) catch {
             log.err("changelist full on accept (write knote)", .{});
             failAcceptedSession(server, session, id);
             break;
@@ -380,6 +380,14 @@ fn detachSession(server: *Server, id: usize, session: *Session, changes: *Change
 /// Full session teardown: MUC cleanup, presence broadcast, session map unbind,
 /// kqueue deregistration, and memory deallocation.
 fn destroySession(server: *Server, id: usize, session: *Session, changes: *ChangeList) void {
+    // T316: a second destroy on an already-released slot must not push the
+    // id onto free_ids again. The destroyed slot is marked by
+    // sessions[id] == null (or a different session after reuse), so the
+    // repeat call is a counted no-op.
+    if (id >= server.sessions.len or server.sessions[id] != session) {
+        server.double_destroy_skips += 1;
+        return;
+    }
     if (session.sm_detached and server.detached_count > 0) {
         server.detached_count -= 1;
         c2s_sm.smIdMapRemove(server, session.sm_id[0..session.sm_id_len]);
@@ -434,9 +442,9 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
     server.allocator.destroy(session);
     server.sessions[id] = null;
 
-    // Return ID to free-list (T128)
-    server.free_ids[server.free_count] = id;
-    server.free_count += 1;
+    // Return the slot to the free-list (T128); the generation bump retires
+    // every token minted for this session (ADR-4).
+    server.releaseSessionSlot(id);
 }
 
 /// T164: write the account's last-offline timestamp after its final resource
@@ -1019,7 +1027,7 @@ fn stallOnStoreError(
     }
     if (session.offline_store_stalls > OFFLINE_STALL_RETRY_MAX) {
         if (!session.offline_retry_timer_armed) {
-            changes.addTimer(session.conn.id, OFFLINE_RETRY_DELAY_MS, true) catch |stage_err| {
+            changes.addTimer(session.conn.id, OFFLINE_RETRY_DELAY_MS, true, server.sessionToken(session.conn.id).toUdata()) catch |stage_err| {
                 server.offline_retry_sweep_needed = true;
                 log.warn("offline retry timer for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
                 return;
@@ -2159,7 +2167,7 @@ test "S13: full changelist preserves the offline retry fallback" {
     var change_buf: [1]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
     defer destroySession(&server, 1, session, &changes);
-    try changes.addTimer(42, 1, true);
+    try changes.addTimer(42, 1, true, 0);
 
     session.offline_store_stalls = OFFLINE_STALL_RETRY_MAX;
     stallOnStoreError(&server, session, "bob@localhost", error.StorageError, &changes);
@@ -2725,4 +2733,38 @@ test "Server: accept and close session" {
     }
     try std.testing.expect(found);
     try std.testing.expect(changes.count() > 0); // Should have addRead in changelist
+}
+
+// T316: after destroySession returns the slot to the free list, a repeated
+// destroy for the same (id, session) pair must not push the id a second
+// time or write past free_ids. The destroyed slot is marked by
+// sessions[id] no longer holding the session.
+test "T316: a repeated destroySession is a counted no-op" {
+    const allocator = std.testing.allocator;
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    server.sessions[1] = session;
+    server.free_count -= 1;
+
+    var change_buf: [8]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    destroySession(&server, 1, session, &changes);
+    try std.testing.expectEqual(@as(?*Session, null), server.sessions[1]);
+    const free_count_after = server.free_count;
+
+    // The dangling session pointer is only compared, never dereferenced.
+    destroySession(&server, 1, session, &changes);
+    try std.testing.expectEqual(free_count_after, server.free_count);
+    try std.testing.expectEqual(@as(u64, 1), server.double_destroy_skips);
+
+    // An out-of-range id is also a counted no-op, not an index panic.
+    destroySession(&server, server.sessions.len, session, &changes);
+    try std.testing.expectEqual(free_count_after, server.free_count);
+    try std.testing.expectEqual(@as(u64, 2), server.double_destroy_skips);
 }
