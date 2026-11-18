@@ -113,6 +113,18 @@
   `migrate-precis` to absorb every row written under an old spelling in the
   meantime.
 
+- **The master validates its configuration file strictly.** An unknown
+  section or key, a bad value or a malformed line is a startup error
+  printed with `file:line` and the master exits non-zero; v0.9.0 ignored
+  or silently defaulted these. Pre-flight check before restarting:
+  `xmppd -c <conf> --help` exits 0 and prints the generated option list
+  when the file parses, or the same `file:line` diagnostic with a
+  non-zero exit when it does not. Two file keys also changed meaning:
+  `[s2s] enabled = false` now suppresses the s2s child (v0.9.0 read only
+  `--no-s2s`; the file key was ignored), and `[core] workers` accepts a
+  number or `auto`; any other value is a startup error (v0.9.0 treated
+  it as `auto`). See doc/UPGRADING.md.
+
 ### Fixed
 
 - S33 disco/caps: removed the `http://jabber.org/protocol/pubsub#subscribe`

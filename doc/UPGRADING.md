@@ -58,3 +58,27 @@ must hold across every process on `{db}/auth`. RocksDB serializes that
 check inside the process only, so `xmppd-auth-oidc` now refuses to start
 when the operational storage backend is RocksDB. OIDC requires
 `-Dop-storage=lmdb` (the default) or `-Dop-storage=sqlite`.
+
+## 0.9.0 -> 0.9.1: strict master configuration
+
+The master (`xmppd`) now parses the configuration file through the shared
+strict loader before it starts children. A file that started v0.9.0 can
+fail v0.9.1:
+
+- an unknown section or key, a bad value or a malformed line is a startup
+  error printed as `conf:LINE: [section] key 'name': ...` and the master
+  exits non-zero (v0.9.0 ignored these or silently defaulted them);
+- `[s2s] enabled = false` in the file now suppresses the s2s child
+  (v0.9.0 read only the `--no-s2s` flag; the file key was ignored); and
+- `[core] workers` accepts a number or `auto`; any other value is a
+  startup error (v0.9.0 treated it as `auto`).
+
+Pre-flight check before restarting:
+
+    xmppd -c /path/to/xmppd.conf --help
+
+Exit status 0 with the generated option list on stdout means the file
+parses and every key is known. Exit status 1 with a `file:line`
+diagnostic on stderr names the first problem; fix it and rerun. `--help`
+prints and exits before any child is spawned, so the check is safe
+against a running install.
