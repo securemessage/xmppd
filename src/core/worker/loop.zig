@@ -94,7 +94,15 @@ pub const Event = union(enum) {
     /// An error occurred on a file descriptor (e.g., connection reset).
     /// The fd should be closed and cleaned up.
     fd_error: FdEvent,
+
+    /// An EVFILT_USER knote fired. The loop owns one self-wake knote
+    /// (SELF_WAKE_IDENT), registered at init, for intra-thread re-drives.
+    user: UserEvent,
 };
+
+/// Ident of the loop's self-wake knote (EVFILT_USER): an intra-thread
+/// re-drive that exists on every loop regardless of worker topology.
+pub const SELF_WAKE_IDENT: usize = std.math.maxInt(usize);
 
 /// Information about a file descriptor event.
 pub const FdEvent = struct {
@@ -129,6 +137,14 @@ pub const ProcessEvent = struct {
     pid: posix.pid_t,
     /// The raw exit status (use `std.posix.W` helpers to interpret).
     status: u32,
+};
+
+/// Information about an EVFILT_USER event.
+pub const UserEvent = struct {
+    /// The knote identifier (SELF_WAKE_IDENT for the loop's own re-drive).
+    ident: usize,
+    /// The knote's data payload.
+    data: i64,
 };
 
 /// Which I/O direction to monitor on a file descriptor.
@@ -457,6 +473,25 @@ pub const EventLoop = struct {
 
         const result_buf = try allocator.alloc(Event, max_events);
 
+        // The self-wake knote lives for the loop's lifetime; EV_CLEAR so a
+        // delivered trigger resets state and a fresh trigger refires.
+        const add_user = posix.Kevent{
+            .ident = SELF_WAKE_IDENT,
+            .filter = std.c.EVFILT.USER,
+            .flags = std.c.EV.ADD | std.c.EV.CLEAR,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        };
+        keventctl(kq, &.{add_user}) catch |err| {
+            allocator.free(result_buf);
+            allocator.free(event_buf);
+            posix.close(kq);
+            return switch (err) {
+                else => error.SystemResources,
+            };
+        };
+
         return EventLoop{
             .kq = kq,
             .event_buf = event_buf,
@@ -524,6 +559,25 @@ pub const EventLoop = struct {
         )};
 
         try keventctl(self.kq, &changelist);
+    }
+
+    /// Trigger the loop's self-wake knote: leftover work queued during the
+    /// current iteration re-drives on the very next wait with no external
+    /// event, in single-worker as well as multi-worker topology.
+    ///
+    /// ## Errors
+    /// - `error.SystemResources` — kernel rejected the trigger
+    /// - `error.EventNotFound` — the knote is gone (loop half-closed)
+    pub fn selfWake(self: *EventLoop) !void {
+        const trigger = posix.Kevent{
+            .ident = SELF_WAKE_IDENT,
+            .filter = std.c.EVFILT.USER,
+            .flags = 0,
+            .fflags = std.c.NOTE.TRIGGER,
+            .data = 0,
+            .udata = 0,
+        };
+        try keventctl(self.kq, &.{trigger});
     }
 
     /// Remove a file descriptor from monitoring.
@@ -960,6 +1014,10 @@ pub const EventLoop = struct {
             std.c.EVFILT.PROC => .{ .process_exit = .{
                 .pid = @intCast(kev.ident),
                 .status = @intCast(kev.data),
+            } },
+            std.c.EVFILT.USER => .{ .user = .{
+                .ident = kev.ident,
+                .data = kev.data,
             } },
             else => .{ .fd_error = .{
                 .fd = @intCast(kev.ident),

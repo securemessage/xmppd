@@ -1119,24 +1119,33 @@ pub const Server = struct {
 
     /// The ADR-2 end-of-iteration walk: each conn that accepted outbound
     /// bytes this batch links itself on the worker's dirty list and is
-    /// flushed once here. Pop count is bounded so a link placed mid-walk
-    /// (a flush error's close broadcasts, a re-drive after a lost arm)
-    /// cannot spin the tail forever; leftovers re-drive on the wake pipe.
+    /// flushed once here. Only the population linked at walk start belongs
+    /// to this iteration; a link placed mid-walk (a failed write arm's
+    /// re-link, a flush error's close broadcasts) appends at the tail past
+    /// that bound, so no conn is ever popped twice in one walk. Pop count
+    /// is bounded so the tail cannot spin forever; leftovers re-drive on
+    /// the loop's own EVFILT_USER knote, which exists on every worker
+    /// whether or not a delivery system does.
     fn flushDirtyOutboxes(self: *Server, changes: *ChangeList) void {
         const dirty = connection_mod.dirtyForWorker(self.worker_id);
+        var todo = dirty.count;
         var pops: u32 = 0;
-        while (pops < DIRTY_FLUSH_POPS_MAX) : (pops += 1) {
+        while (pops < DIRTY_FLUSH_POPS_MAX and todo > 0) : (pops += 1) {
             const conn = dirty.pop() orelse break;
+            todo -= 1;
             // close() unlinks, so a popped conn is normally live; a link
-            // that raced an inline close pops a dead conn — skip it.
+            // that raced an inline close pops a dead conn, skip it.
             if (conn.closed) continue;
             const session: *Session = @fieldParentPtr("conn", conn);
             _ = c2s_session.flushSessionOutbox(self, session, changes);
         }
         if (!dirty.empty()) {
-            // The pop cap or a lost arm left conns linked; the wake pipe
-            // guarantees another iteration to finish them.
-            if (self.delivery_system) |ds| ds.wakeWorker(self.worker_id);
+            // The pop cap or a mid-walk link left conns queued; the
+            // self-wake knote guarantees another iteration to finish
+            // them (single-worker mode has no delivery pipe to lean on).
+            self.loop.selfWake() catch |err| {
+                log.warn("dirty-list self-wake failed: {s}; leftovers wait for the next event", .{@errorName(err)});
+            };
         }
     }
 
@@ -1166,6 +1175,13 @@ pub const Server = struct {
                         // Already handled in the first pass
                     } else {
                         self.handleReadableOrHandshake(e.udata, changes);
+                    }
+                },
+                .user => |u| {
+                    // The dirty-list self-wake carries no work itself; the
+                    // batch tail below re-flushes whatever stayed linked.
+                    if (u.ident != @import("loop.zig").SELF_WAKE_IDENT) {
+                        log.warn("unknown EVFILT_USER event ident={d}", .{u.ident});
                     }
                 },
                 .fd_writable => |e| {
@@ -2477,6 +2493,63 @@ test "Server: a stalled batch-tail flush arms EVFILT_WRITE once" {
             (ev.flags & std.c.EV.ENABLE) != 0) armed = true;
     }
     try std.testing.expect(armed);
+}
+
+// ADR-2 stranding fix: with no delivery system (single-worker mode) the
+// loop's own EVFILT_USER knote re-drives dirty-list leftovers. More than
+// DIRTY_FLUSH_POPS_MAX conns are linked; one tail walk pops only the cap
+// and triggers the knote, so the next wait returns a .user event with no
+// external input and a second walk drains the rest. Fails when the knote
+// registration or the leftover trigger is removed.
+test "Server: dirty-list leftovers re-drive on the loop self-wake" {
+    const allocator = std.testing.allocator;
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    try std.testing.expect(server.delivery_system == null);
+
+    const total = DIRTY_FLUSH_POPS_MAX + 16;
+    const dirty = connection_mod.dirtyForWorker(server.worker_id);
+    var ctrs: connection_mod.OutboxCounters = .{};
+    var peers: [total]posix.fd_t = undefined;
+    defer {
+        for (peers) |fd| posix.close(fd);
+    }
+
+    for (0..total) |i| {
+        const fds = try makeSocketPair();
+        peers[i] = fds[1];
+        const session = try allocator.create(Session);
+        session.* = Session.init(fds[0], i + 1, "localhost", false, allocator);
+        session.conn.bindOutbox(&ctrs, dirty);
+        server.sessions[i + 1] = session;
+        _ = session.nonza("<x/>");
+    }
+    try std.testing.expectEqual(total, dirty.count);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.flushDirtyOutboxes(&changes);
+
+    // The walk stopped at the pop cap and triggered the self-wake.
+    try std.testing.expectEqual(total - DIRTY_FLUSH_POPS_MAX, dirty.count);
+
+    // The next wait returns the .user event with no external input; a
+    // 100 ms timeout caps the wait when the wake is broken.
+    const events = try server.loop.submitAndPoll(&.{}, 100);
+    var woke = false;
+    for (events) |ev| {
+        switch (ev) {
+            .user => |u| {
+                if (u.ident == @import("loop.zig").SELF_WAKE_IDENT) woke = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(woke);
+
+    server.flushDirtyOutboxes(&changes);
+    try std.testing.expect(dirty.empty());
 }
 
 test "Server: M1 SIGUSR1 dump runs against a live worker block" {

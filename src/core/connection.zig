@@ -137,6 +137,10 @@ pub const WRITE_SUPPRESS_LOW: usize = WRITE_BUF_SIZE / 2;
 pub const DirtyList = struct {
     head: ?*Connection = null,
     tail: ?*Connection = null,
+    /// Linked-conn count; a flush walk bounded by the count at its start
+    /// leaves mid-walk links (re-drives, close broadcasts) to the next
+    /// iteration instead of popping them twice.
+    count: usize = 0,
 
     /// Append `c` if it is not linked already (idempotent).
     pub fn link(l: *DirtyList, c: *Connection) void {
@@ -146,6 +150,7 @@ pub const DirtyList = struct {
         c.dirty_next = null;
         if (l.tail) |t| t.dirty_next = c else l.head = c;
         l.tail = c;
+        l.count += 1;
     }
 
     /// Detach `c` without disturbing the order of the rest.
@@ -156,6 +161,7 @@ pub const DirtyList = struct {
         c.dirty_next = null;
         c.dirty_prev = null;
         c.on_dirty = false;
+        l.count -= 1;
     }
 
     /// Remove and return the head, or null.
