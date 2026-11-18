@@ -58,7 +58,7 @@ test "carbons: a phone with carbons off on another worker gets only the routed m
     phone.stream.authenticated = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
@@ -117,7 +117,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     desk.stream.authenticated = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w0.sessions[5] = desk;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -135,7 +135,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
@@ -193,7 +193,7 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     desk.stream.authenticated = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w0.sessions[5] = desk;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -211,7 +211,7 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = false;
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
@@ -276,7 +276,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     desk.offline_pending = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w0.sessions[5] = desk;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -294,7 +294,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     phone.carbons_enabled = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
@@ -372,7 +372,7 @@ test "carbons: a delivered resource gets no received copy on the same dispatch" 
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
@@ -429,7 +429,7 @@ test "carbons: the local received-carbon path skips a resource that got the orig
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     w0.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
@@ -483,7 +483,7 @@ test "carbons: a resource the delivery loop skipped still gets the received carb
     phone.carbons_enabled = true;
     phone.csi_active = false;
     w0.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const laptop_fds = try makeSocketPair();
@@ -495,7 +495,7 @@ test "carbons: a resource the delivery loop skipped still gets the received carb
     laptop.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "laptop" };
     laptop.carbons_enabled = true;
     w0.sessions[5] = laptop;
-    _ = try sm.bind(0, 5, "bob", "localhost", "laptop");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "laptop");
     sm.setPresenceAvailable("bob", "localhost", "laptop", true);
 
     const alice_fds = try makeSocketPair();
@@ -570,7 +570,7 @@ test "carbons: a nested private-looking payload does not suppress the carbon" {
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     w0.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const watch_fds = try makeSocketPair();
@@ -582,7 +582,7 @@ test "carbons: a nested private-looking payload does not suppress the carbon" {
     watch.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "watch" };
     watch.carbons_enabled = true;
     w0.sessions[5] = watch;
-    _ = try sm.bind(0, 5, "bob", "localhost", "watch");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "watch");
     sm.setPresenceAvailable("bob", "localhost", "watch", true);
     sm.setPriority("bob", "localhost", "watch", -1);
 
@@ -636,7 +636,7 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     desk.stream.authenticated = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w0.sessions[5] = desk;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -654,7 +654,7 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();

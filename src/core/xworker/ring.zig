@@ -18,12 +18,15 @@
 //!
 //! ## ABA Protection
 //!
-//! Each delivery carries `target_generation` from the shared registry at enqueue time.
-//! The consumer validates the generation still matches before delivering — if the
-//! session disconnected and the slot was reused, the stale delivery is silently dropped.
+//! Each delivery carries the target slot's `Token` (ADR-4) captured at
+//! enqueue time. The consumer validates kind, bounds and generation against
+//! its own slot table — no lock, no map scan — and a slot that was freed
+//! and reused makes the token stale, so the delivery is counted and dropped.
 
 const std = @import("std");
 const posix = std.posix;
+const token_kinds = @import("token_kinds");
+pub const Token = @import("net_token").Token;
 
 const log = std.log.scoped(.delivery_queue);
 
@@ -58,24 +61,22 @@ pub var oversize_queue_drops = std.atomic.Value(u64).init(0);
 pub var ring_drops_full = std.atomic.Value(u64).init(0);
 pub var ring_drops_payload = std.atomic.Value(u64).init(0);
 
-/// Sentinel value for target_session_id indicating a multicast delivery.
-/// When the consumer sees this, it interprets the payload as a MUC multicast
+/// Pseudo-targets: they address a broadcast or actor channel, never a
+/// session slot. The drain dispatches on token kind before any session
+/// validation; index and gen are always zero.
+/// Multicast delivery: the payload is a MUC multicast
 /// (room_jid + prefix + suffix) rather than a unicast stanza.
-///
-/// Safety: session IDs are array indices (0..max_sessions-1), not monotonic
-/// counters. max_sessions is validated at Server.init to be < MULTICAST_SENTINEL.
-pub const MULTICAST_SENTINEL: u32 = 0xFFFFFFFF;
+pub const MULTICAST_TARGET: Token = .{ .index = 0, .gen = 0, .kind = token_kinds.multicast };
 
-/// Sentinel value for target_session_id indicating a room actor message.
-/// When the consumer sees this, it decodes the payload as a message.zig-encoded
-/// actor message (JoinRequest, PartRequest, GroupchatMessage, etc.) and dispatches
+/// Room actor message: the payload is a message.zig-encoded
+/// actor message (JoinRequest, PartRequest, GroupchatMessage, etc.) dispatched
 /// to the local room shard for processing.
-pub const ROOM_ACTOR_SENTINEL: u32 = 0xFFFFFFFE;
+pub const ROOM_ACTOR_TARGET: Token = .{ .index = 0, .gen = 0, .kind = token_kinds.room_actor };
 
-/// Sentinel value for target_session_id indicating an SM resume handoff
-/// message (T177). Payload decodes as a message.zig sm_resume_request (on the
-/// owning worker) or sm_resume_reply (on the requesting worker).
-pub const SM_ACTOR_SENTINEL: u32 = 0xFFFFFFFD;
+/// SM resume handoff actor message (T177). The payload decodes as a
+/// message.zig sm_resume_request (on the owning worker) or
+/// sm_resume_reply (on the requesting worker).
+pub const SM_ACTOR_TARGET: Token = .{ .index = 0, .gen = 0, .kind = token_kinds.sm_actor };
 
 /// Number of slots per worker queue.
 pub const QUEUE_SLOTS: u32 = 256;
@@ -96,10 +97,9 @@ pub const DeliveryKind = enum(u8) {
 
 /// A single delivery slot in the MPSC ring buffer.
 pub const DeliverySlot = struct {
-    /// Target session ID (index into shared registry / Server.sessions).
-    target_session_id: u32 = 0,
-    /// Generation at enqueue time — verified by consumer for ABA protection.
-    target_generation: u32 = 0,
+    /// Target slot address (ADR-4): a session token, or one of the
+    /// *_TARGET pseudo-targets dispatched on kind before validation.
+    target: Token = .none,
     /// Length of the stanza payload in bytes.
     payload_len: u16 = 0,
     /// Delivery class the consumer applies to this slot.
@@ -151,11 +151,10 @@ pub const MpscQueue = struct {
     /// Called by any producer thread. Returns error.QueueFull if no slots available.
     pub fn enqueue(
         self: *MpscQueue,
-        target_session_id: u32,
-        target_generation: u32,
+        target: Token,
         payload: []const u8,
     ) !void {
-        return self.enqueueDelivery(target_session_id, target_generation, payload, 0, 0, .stanza);
+        return self.enqueueDelivery(target, payload, 0, 0, .stanza);
     }
 
     /// Enqueue a stanza with its dispatch identity, producer receipt time
@@ -164,8 +163,7 @@ pub const MpscQueue = struct {
     /// applies the class to the remote session as the local path would.
     pub fn enqueueDelivery(
         self: *MpscQueue,
-        target_session_id: u32,
-        target_generation: u32,
+        target: Token,
         payload: []const u8,
         hold_token: u64,
         receipt_ts: u64,
@@ -198,8 +196,7 @@ pub const MpscQueue = struct {
             const slot = &self.slots[slot_idx];
 
             // Write payload (non-atomic — we own this slot until ready.store)
-            slot.target_session_id = target_session_id;
-            slot.target_generation = target_generation;
+            slot.target = target;
             slot.payload_len = @intCast(payload.len);
             slot.hold_token = hold_token;
             slot.receipt_ts = receipt_ts;
@@ -215,8 +212,8 @@ pub const MpscQueue = struct {
     /// Drain all ready slots from the queue.
     /// Called by the consumer (owning worker thread) only.
     /// Returns the number of slots processed.
-    /// Calls `handler` for each ready delivery with (session_id, generation, payload).
-    pub fn drain(self: *MpscQueue, ctx: anytype, handler: fn (@TypeOf(ctx), u32, u32, []const u8) void) u32 {
+    /// Calls `handler` for each ready delivery with (target token, payload).
+    pub fn drain(self: *MpscQueue, ctx: anytype, handler: fn (@TypeOf(ctx), Token, []const u8) void) u32 {
         var processed: u32 = 0;
         const current_tail = self.tail.load(.acquire);
 
@@ -236,7 +233,7 @@ pub const MpscQueue = struct {
             self.current_slot_token = slot.hold_token;
             self.current_slot_kind = slot.kind;
             self.current_slot_receipt_ts = slot.receipt_ts;
-            handler(ctx, slot.target_session_id, slot.target_generation, slot.payload[0..slot.payload_len]);
+            handler(ctx, slot.target, slot.payload[0..slot.payload_len]);
             self.current_slot_token = 0;
             self.current_slot_kind = .stanza;
             self.current_slot_receipt_ts = 0;
@@ -392,11 +389,10 @@ pub const DeliverySystem = struct {
     pub fn deliver(
         self: *DeliverySystem,
         target_worker: u16,
-        target_session_id: u32,
-        target_generation: u32,
+        target: Token,
         payload: []const u8,
     ) !void {
-        return self.deliverDelivery(target_worker, target_session_id, target_generation, payload, 0, 0, .stanza);
+        return self.deliverDelivery(target_worker, target, payload, 0, 0, .stanza);
     }
 
     /// Deliver a stanza with its dispatch identity, producer receipt time
@@ -404,14 +400,13 @@ pub const DeliverySystem = struct {
     pub fn deliverDelivery(
         self: *DeliverySystem,
         target_worker: u16,
-        target_session_id: u32,
-        target_generation: u32,
+        target: Token,
         payload: []const u8,
         hold_token: u64,
         receipt_ts: u64,
         kind: DeliveryKind,
     ) !void {
-        try self.enqueueDelivery(target_worker, target_session_id, target_generation, payload, hold_token, receipt_ts, kind);
+        try self.enqueueDelivery(target_worker, target, payload, hold_token, receipt_ts, kind);
 
         self.wakeWorker(target_worker);
     }
@@ -423,11 +418,10 @@ pub const DeliverySystem = struct {
     pub fn enqueue(
         self: *DeliverySystem,
         target_worker: u16,
-        target_session_id: u32,
-        target_generation: u32,
+        target: Token,
         payload: []const u8,
     ) !void {
-        return self.enqueueDelivery(target_worker, target_session_id, target_generation, payload, 0, 0, .stanza);
+        return self.enqueueDelivery(target_worker, target, payload, 0, 0, .stanza);
     }
 
     /// Enqueue a delivery with its dispatch identity, producer receipt time
@@ -436,15 +430,14 @@ pub const DeliverySystem = struct {
     pub fn enqueueDelivery(
         self: *DeliverySystem,
         target_worker: u16,
-        target_session_id: u32,
-        target_generation: u32,
+        target: Token,
         payload: []const u8,
         hold_token: u64,
         receipt_ts: u64,
         kind: DeliveryKind,
     ) !void {
         if (target_worker >= self.worker_count) return error.InvalidWorker;
-        try self.queues[target_worker].enqueueDelivery(target_session_id, target_generation, payload, hold_token, receipt_ts, kind);
+        try self.queues[target_worker].enqueueDelivery(target, payload, hold_token, receipt_ts, kind);
         if (self.envelope_hook) |h| h();
     }
 
@@ -506,23 +499,23 @@ test "MpscQueue: basic enqueue and drain" {
     var queue = MpscQueue{};
     const payload = "hello world";
 
-    try queue.enqueue(42, 7, payload);
+    try queue.enqueue(Token.init(42, 7, token_kinds.session), payload);
 
     var received_id: u32 = 0;
-    var received_gen: u32 = 0;
+    var received_gen: u24 = 0;
     var received_payload: []const u8 = "";
 
     const Ctx = struct {
         id: *u32,
-        gen: *u32,
+        gen: *u24,
         pl: *[]const u8,
     };
     const ctx = Ctx{ .id = &received_id, .gen = &received_gen, .pl = &received_payload };
 
     const handler = struct {
-        fn handle(c: Ctx, sid: u32, gen: u32, pl: []const u8) void {
-            c.id.* = sid;
-            c.gen.* = gen;
+        fn handle(c: Ctx, target: Token, pl: []const u8) void {
+            c.id.* = target.index;
+            c.gen.* = target.gen;
             c.pl.* = pl;
         }
     }.handle;
@@ -530,15 +523,15 @@ test "MpscQueue: basic enqueue and drain" {
     const processed = queue.drain(ctx, handler);
     try std.testing.expectEqual(@as(u32, 1), processed);
     try std.testing.expectEqual(@as(u32, 42), received_id);
-    try std.testing.expectEqual(@as(u32, 7), received_gen);
+    try std.testing.expectEqual(@as(u24, 7), received_gen);
     try std.testing.expectEqualStrings("hello world", received_payload);
 }
 
 test "MpscQueue: receipt timestamp reaches the drain handler" {
     var queue = MpscQueue{};
 
-    try queue.enqueueDelivery(42, 7, "timed", 0xdeadbeef, 12345, .stanza);
-    try queue.enqueue(43, 8, "untimed");
+    try queue.enqueueDelivery(Token.init(42, 7, token_kinds.session), "timed", 0xdeadbeef, 12345, .stanza);
+    try queue.enqueue(Token.init(43, 8, token_kinds.session), "untimed");
 
     const Ctx = struct {
         queue: *MpscQueue,
@@ -552,9 +545,7 @@ test "MpscQueue: receipt timestamp reaches the drain handler" {
     // Each slot reports its own receipt time; the field is back to zero
     // after the handler returns so an untimed slot inherits nothing.
     const handler = struct {
-        fn handle(c: Ctx, sid: u32, gen: u32, payload: []const u8) void {
-            _ = sid;
-            _ = gen;
+        fn handle(c: Ctx, _: Token, payload: []const u8) void {
             _ = payload;
             c.stamps[c.seen.*] = c.queue.current_slot_receipt_ts;
             c.seen.* += 1;
@@ -570,8 +561,8 @@ test "MpscQueue: receipt timestamp reaches the drain handler" {
 test "MpscQueue: hold token survives the round trip and is cleared after each slot" {
     var queue = MpscQueue{};
 
-    try queue.enqueueDelivery(42, 7, "tagged", 0xdeadbeef, 0, .stanza);
-    try queue.enqueue(43, 8, "untagged");
+    try queue.enqueueDelivery(Token.init(42, 7, token_kinds.session), "tagged", 0xdeadbeef, 0, .stanza);
+    try queue.enqueue(Token.init(43, 8, token_kinds.session), "untagged");
 
     const Ctx = struct {
         queue: *MpscQueue,
@@ -585,11 +576,9 @@ test "MpscQueue: hold token survives the round trip and is cleared after each sl
     // Each slot reports its own token, and the field is back to zero after the
     // handler returns so a later untagged slot cannot inherit the previous one.
     const handler = struct {
-        fn handle(c: Ctx, sid: u32, gen: u32, pl: []const u8) void {
-            _ = gen;
+        fn handle(c: Ctx, _: Token, pl: []const u8) void {
             _ = pl;
             c.tokens.*[c.seen.*] = c.queue.current_slot_token;
-            _ = sid;
             c.seen.* += 1;
         }
     }.handle;
@@ -606,8 +595,8 @@ test "MpscQueue: hold token survives the round trip and is cleared after each sl
 test "MpscQueue: delivery kind survives the round trip and is cleared after each slot" {
     var queue = MpscQueue{};
 
-    try queue.enqueueDelivery(42, 7, "carbon copy", 0, 0, .carbon);
-    try queue.enqueue(43, 8, "plain stanza");
+    try queue.enqueueDelivery(Token.init(42, 7, token_kinds.session), "carbon copy", 0, 0, .carbon);
+    try queue.enqueue(Token.init(43, 8, token_kinds.session), "plain stanza");
 
     const Ctx = struct {
         queue: *MpscQueue,
@@ -619,9 +608,7 @@ test "MpscQueue: delivery kind survives the round trip and is cleared after each
     const ctx = Ctx{ .queue = &queue, .kinds = &kinds, .seen = &seen };
 
     const handler = struct {
-        fn handle(c: Ctx, sid: u32, gen: u32, pl: []const u8) void {
-            _ = sid;
-            _ = gen;
+        fn handle(c: Ctx, _: Token, pl: []const u8) void {
             _ = pl;
             c.kinds.*[c.seen.*] = c.queue.current_slot_kind;
             c.seen.* += 1;
@@ -641,24 +628,24 @@ test "MpscQueue: queue full" {
     // Fill the queue
     var i: u32 = 0;
     while (i < QUEUE_SLOTS) : (i += 1) {
-        try queue.enqueue(i, 0, "x");
+        try queue.enqueue(Token.init(i, 1, token_kinds.session), "x");
     }
 
     // Next enqueue should fail
-    try std.testing.expectError(error.QueueFull, queue.enqueue(999, 0, "overflow"));
+    try std.testing.expectError(error.QueueFull, queue.enqueue(Token.init(999, 1, token_kinds.session), "overflow"));
 }
 
 test "MpscQueue: payload too large" {
     var queue = MpscQueue{};
     const big_payload = [_]u8{0} ** (MAX_PAYLOAD_SIZE + 1);
-    try std.testing.expectError(error.PayloadTooLarge, queue.enqueue(0, 0, &big_payload));
+    try std.testing.expectError(error.PayloadTooLarge, queue.enqueue(Token.init(0, 1, token_kinds.session), &big_payload));
 }
 
 test "MpscQueue: hasPending" {
     var queue = MpscQueue{};
     try std.testing.expect(!queue.hasPending());
 
-    try queue.enqueue(1, 0, "test");
+    try queue.enqueue(Token.init(1, 1, token_kinds.session), "test");
     try std.testing.expect(queue.hasPending());
 }
 
@@ -680,9 +667,9 @@ test "DeliverySystem: a burst of deliveries costs one pipe byte (Q2)" {
     defer sys.deinit();
 
     var buf: [8]u8 = undefined;
-    try sys.deliver(1, 1, 1, "a");
-    try sys.deliver(1, 2, 1, "b");
-    try sys.deliver(1, 3, 1, "c");
+    try sys.deliver(1, Token.init(1, 1, token_kinds.session), "a");
+    try sys.deliver(1, Token.init(2, 1, token_kinds.session), "b");
+    try sys.deliver(1, Token.init(3, 1, token_kinds.session), "c");
     try std.testing.expectEqual(@as(usize, 1), try posix.read(sys.getPipeReadFd(1), &buf));
     try std.testing.expectError(error.WouldBlock, posix.read(sys.getPipeReadFd(1), &buf));
 
@@ -691,7 +678,7 @@ test "DeliverySystem: a burst of deliveries costs one pipe byte (Q2)" {
     try std.testing.expect(!sys.getState(1).wake_pending.load(.seq_cst));
 
     // A delivery after the clear writes a fresh byte.
-    try sys.deliver(1, 4, 1, "d");
+    try sys.deliver(1, Token.init(4, 1, token_kinds.session), "d");
     try std.testing.expectEqual(@as(usize, 1), try posix.read(sys.getPipeReadFd(1), &buf));
 }
 
@@ -703,10 +690,10 @@ test "DeliverySystem: a publish inside the clear-then-drain window still wakes" 
     var sys = try DeliverySystem.init(std.testing.allocator, 2);
     defer sys.deinit();
 
-    try sys.deliver(1, 1, 1, "first");
+    try sys.deliver(1, Token.init(1, 1, token_kinds.session), "first");
     sys.drainPipe(1); // consumes the byte, clears wake_pending
 
-    try sys.deliver(1, 2, 1, "second");
+    try sys.deliver(1, Token.init(2, 1, token_kinds.session), "second");
 
     // The second publish saw flag=false and wrote: pipe is readable again.
     var buf: [8]u8 = undefined;
@@ -716,7 +703,7 @@ test "DeliverySystem: a publish inside the clear-then-drain window still wakes" 
     var count: u32 = 0;
     const ctx = Ctx{ .count = &count };
     const handler = struct {
-        fn handle(c: Ctx, _: u32, _: u32, _: []const u8) void {
+        fn handle(c: Ctx, _: Token, _: []const u8) void {
             c.count.* += 1;
         }
     }.handle;
@@ -746,7 +733,7 @@ test "DeliverySystem: racing producers lose no wakeups" {
             while (i < n) : (i += 1) {
                 // QueueFull drops are legitimate backpressure; only slots
                 // that landed are owed a wake.
-                ds.deliverDelivery(1, 0, 0, "race", 0, 0, .stanza) catch |err| switch (err) {
+                ds.deliverDelivery(1, Token.init(0, 0, token_kinds.session), "race", 0, 0, .stanza) catch |err| switch (err) {
                     error.QueueFull => continue,
                     error.InvalidWorker, error.PayloadTooLarge => unreachable,
                 };
@@ -778,7 +765,7 @@ test "DeliverySystem: racing producers lose no wakeups" {
             const Ctx = struct { count: *usize };
             const ctx = Ctx{ .count = &consumed };
             const handler = struct {
-                fn handle(c: Ctx, _: u32, _: u32, _: []const u8) void {
+                fn handle(c: Ctx, _: Token, _: []const u8) void {
                     c.count.* += 1;
                 }
             }.handle;
@@ -845,14 +832,14 @@ test "DeliverySystem: deliver and drain" {
     defer sys.deinit();
 
     // Deliver to worker 1
-    try sys.deliver(1, 10, 3, "test stanza");
+    try sys.deliver(1, Token.init(10, 3, token_kinds.session), "test stanza");
 
     // Drain worker 1's queue
     var received: bool = false;
     const Ctx = struct { flag: *bool };
     const ctx = Ctx{ .flag = &received };
     const handler = struct {
-        fn handle(c: Ctx, _: u32, _: u32, _: []const u8) void {
+        fn handle(c: Ctx, _: Token, _: []const u8) void {
             c.flag.* = true;
         }
     }.handle;
@@ -871,14 +858,14 @@ test "DeliverySystem: coalesced signaling skips wake when active" {
 
     // Deliver — should NOT write to pipe (we can't easily verify this,
     // but at least verify it doesn't crash or block)
-    try sys.deliver(1, 5, 1, "coalesced");
+    try sys.deliver(1, Token.init(5, 1, token_kinds.session), "coalesced");
 
     // Drain should still find the message
     const Ctx = struct { count: *u32 };
     var count: u32 = 0;
     const ctx = Ctx{ .count = &count };
     const handler = struct {
-        fn handle(c: Ctx, _: u32, _: u32, _: []const u8) void {
+        fn handle(c: Ctx, _: Token, _: []const u8) void {
             c.count.* += 1;
         }
     }.handle;

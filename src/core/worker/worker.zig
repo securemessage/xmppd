@@ -443,8 +443,8 @@ pub const Server = struct {
         allocator: std.mem.Allocator,
         max_sessions: usize,
     ) !Server {
-        if (max_sessions >= delivery_queue_mod.MULTICAST_SENTINEL) {
-            log.err("max_sessions ({d}) must be < MULTICAST_SENTINEL (0xFFFFFFFF)", .{max_sessions});
+        if (max_sessions > std.math.maxInt(u32)) {
+            log.err("max_sessions ({d}) exceeds the u32 token index space", .{max_sessions});
             return error.MaxSessionsTooLarge;
         }
         const sessions = try allocator.alloc(?*Session, max_sessions);
@@ -510,8 +510,8 @@ pub const Server = struct {
         max_sessions: usize,
         skip_tls: bool,
     ) !Server {
-        if (max_sessions >= delivery_queue_mod.MULTICAST_SENTINEL) {
-            log.err("max_sessions ({d}) must be < MULTICAST_SENTINEL (0xFFFFFFFF)", .{max_sessions});
+        if (max_sessions > std.math.maxInt(u32)) {
+            log.err("max_sessions ({d}) exceeds the u32 token index space", .{max_sessions});
             return error.MaxSessionsTooLarge;
         }
         const sessions = try allocator.alloc(?*Session, max_sessions);
@@ -1965,7 +1965,7 @@ pub const Server = struct {
                 const s2s_hold_token = self.mintHoldToken();
                 for (s2s_entries[0..target_count]) |entry| {
                     if (entry.worker_id == self.worker_id) {
-                        const target_session = self.sessions[entry.local_session_id] orelse continue;
+                        const target_session = self.sessionForEventToken(entry.token) orelse continue;
                         if (target_session.offline_pending and live_parts.is_message and !std.mem.eql(u8, live_parts.msg_type, "error")) {
                             // One bare JID, one row: every draining resource on
                             // this worker asks, and the store collapses them.
@@ -1983,12 +1983,12 @@ pub const Server = struct {
                             }
                             continue;
                         }
-                        fanout_mod.deliverToSession(target_session, m.stanza_xml, entry.local_session_id);
+                        fanout_mod.deliverToSession(target_session, m.stanza_xml, entry.token.index);
                     } else if (self.delivery_system) |ds| {
                         // Carry this dispatch's token: the receiving worker holds
                         // under the same identity, so the store writes one row
                         // whichever worker reaches it first.
-                        ds.deliverDelivery(entry.worker_id, entry.local_session_id, entry.generation, m.stanza_xml, s2s_hold_token, s2s_archive_ts, .stanza) catch {
+                        ds.deliverDelivery(entry.worker_id, entry.token, m.stanza_xml, s2s_hold_token, s2s_archive_ts, .stanza) catch {
                             _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
                         };
                     }
@@ -2026,10 +2026,10 @@ pub const Server = struct {
 
                 for (sender_entries[0..sender_count]) |sentry| {
                     if (sentry.worker_id == self.worker_id) {
-                        const sender_session = self.sessions[sentry.local_session_id] orelse continue;
-                        fanout_mod.deliverToSession(sender_session, err_xml, sentry.local_session_id);
+                        const sender_session = self.sessionForEventToken(sentry.token) orelse continue;
+                        fanout_mod.deliverToSession(sender_session, err_xml, sentry.token.index);
                     } else if (self.delivery_system) |ds| {
-                        ds.deliver(sentry.worker_id, sentry.local_session_id, sentry.generation, err_xml) catch {};
+                        ds.deliver(sentry.worker_id, sentry.token, err_xml) catch {};
                     }
                 }
                 log.info("S2S delivery failed: {s} → {s}: {s}", .{ m.from_jid, m.to_jid, m.error_type });
@@ -2911,7 +2911,7 @@ test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down
     target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     // The buffer is nearly full, but the peer's socket is empty: a flush frees
@@ -2979,7 +2979,7 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
     target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
     // Pack the kernel's send side until it refuses more, so the flush below
     // cannot free anything. That is the genuine slow-reader case the teardown
@@ -3108,7 +3108,7 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
     target.stream.authenticated = true;
     target.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     // bob's phone already drained the shared tail; this resource is still
@@ -3264,7 +3264,7 @@ test "Re-review 7.6: a form over the write buffer but inside the bank does not m
     server.sessions[5] = bob;
     // Bound bob's outbox at the ring so the form below cannot queue.
     bob.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desk");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desk");
     sm.setPresenceAvailable("bob", "localhost", "desk", true);
 
     const alice_fds = try makeSocketPair();
@@ -3449,7 +3449,7 @@ test "Server: H4 an inbound S2S message lands behind an existing offline tail" {
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     const live = "<message from='carol@example.com/res' to='bob@localhost' id='live-1' type='chat'><body>live</body></message>";
@@ -3524,7 +3524,7 @@ test "Server: H4 a type normal message lands behind an existing offline tail" {
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     const alice_fds = try makeSocketPair();
@@ -4465,7 +4465,7 @@ test "Server: R5 S2S cross-worker delivery drops are counted" {
     server.session_map = &sm;
     server.delivery_system = &delivery_sys;
 
-    _ = try sm.bind(1, 7, "bob", "localhost", "mobile");
+    _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "mobile");
     sm.setPresenceAvailable("bob", "localhost", "mobile", true);
 
     const stanza = try allocator.alloc(u8, 4200);

@@ -144,7 +144,7 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
         return true;
     };
 
-    if (sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, eff_resource)) |_| {
+    if (sm.bind(server.worker_id, server.sessionToken(session.conn.id), local.local, local.domain, eff_resource)) |_| {
         const action = session.stream.handleBind(eff_resource);
         c2s_session.executeAction(server, session, action, changes);
         log.info("connection {d} session established: {s}@{s}/{s}", .{
@@ -170,7 +170,7 @@ pub fn handleBind(server: *Server, session: *Session, resource: []const u8, chan
 
             // local (or vanished) entry — the T152 in-worker eviction path
             if (evictStaleResource(server, sm, local.local, local.domain, eff_resource, changes)) {
-                _ = sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, eff_resource) catch |err2| {
+                _ = sm.bind(server.worker_id, server.sessionToken(session.conn.id), local.local, local.domain, eff_resource) catch |err2| {
                     log.err("connection {d} session_map bind failed after eviction: {}", .{ session.conn.id, err2 });
                     c2s_session.sendStreamError(server, session, .conflict);
                     forceCloseSession(server, session.conn.id, changes);
@@ -243,7 +243,7 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
         }
     }.run;
 
-    if (sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, resource)) |_| {
+    if (sm.bind(server.worker_id, server.sessionToken(session.conn.id), local.local, local.domain, resource)) |_| {
         bind_and_finish(server, session, resource, changes);
         return;
     } else |err| {
@@ -255,7 +255,7 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
                     return; // parked again — id intentionally survives
                 }
                 if (entry.worker_id == server.worker_id and evictStaleResource(server, sm, local.local, local.domain, resource, changes)) {
-                    if (sm.bind(server.worker_id, @intCast(session.conn.id), local.local, local.domain, resource)) |_| {
+                    if (sm.bind(server.worker_id, server.sessionToken(session.conn.id), local.local, local.domain, resource)) |_| {
                         bind_and_finish(server, session, resource, changes);
                         return;
                     } else |_| {}
@@ -294,9 +294,9 @@ fn evictStaleResource(
     const entry = sm.findByFullJid(local, domain, resource) orelse return false;
     if (entry.worker_id != server.worker_id) return false;
 
-    const old_id: usize = @intCast(entry.local_session_id);
-    const old_session = server.sessions[old_id] orelse {
-        // Entry is stale but the slot is already empty — just unbind and retry.
+    const old_id: usize = entry.token.index;
+    const old_session = server.sessionForEventToken(entry.token) orelse {
+        // Stale entry or an already-empty slot — just unbind and retry.
         _ = sm.unbind(local, domain, resource);
         return true;
     };
@@ -1765,7 +1765,7 @@ test "T152: rebind with same resource evicts stale session" {
     try std.testing.expect(alive1);
     try std.testing.expect(server.sessions[1] != null);
     const entry1 = sm.findByFullJid("alice", "localhost", "phone").?;
-    try std.testing.expectEqual(@as(u32, 1), entry1.local_session_id);
+    try std.testing.expectEqual(@as(u32, 1), entry1.token.index);
 
     // Second connection (same worker) binds the SAME resource — simulates a
     // reconnect racing ahead of the old session's cleanup.
@@ -1779,7 +1779,7 @@ test "T152: rebind with same resource evicts stale session" {
     // ...and the session map must now point at the NEW session, not be left
     // stale or unregistered.
     const entry2 = sm.findByFullJid("alice", "localhost", "phone").?;
-    try std.testing.expectEqual(@as(u32, 2), entry2.local_session_id);
+    try std.testing.expectEqual(@as(u32, 2), entry2.token.index);
 }
 
 test "S19: startup loader loads more than 256 persistent rooms" {

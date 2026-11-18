@@ -32,6 +32,7 @@ const SessionEntry = session_map_mod.SessionEntry;
 
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
+const Token = delivery_queue_mod.Token;
 const offline_store_mod = @import("generic_offline_store");
 const GenericOfflineStore = offline_store_mod.GenericOfflineStore;
 const OfflinePointer = offline_store_mod.OfflinePointer;
@@ -321,11 +322,11 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     session.last_presence_inner_len = detached.last_presence_inner_len;
 
     // Re-bind in session map: unbind old slot, bind new slot with same JID
-    var bound_generation: ?u32 = null;
+    var bound_token: ?Token = null;
     if (self.session_map) |sm| {
         _ = sm.unbind(detached_jid.local, detached_jid.domain, detached_jid.resource);
-        if (sm.bind(self.worker_id, @intCast(session.conn.id), detached_jid.local, detached_jid.domain, detached_jid.resource)) |gen| {
-            bound_generation = gen;
+        if (sm.bind(self.worker_id, self.sessionToken(session.conn.id), detached_jid.local, detached_jid.domain, detached_jid.resource)) |_| {
+            bound_token = self.sessionToken(session.conn.id);
         } else |err| {
             log.err("SM resume: session_map re-bind failed for {s}@{s}/{s}: {}", .{
                 detached_jid.local, detached_jid.domain, detached_jid.resource, err,
@@ -355,8 +356,8 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     // moves. Same-worker moves apply in place on the owning worker
     // (possibly remote); roomOwner == self applies synchronously.
     if (move_room_count > 0) {
-        if (bound_generation) |gen| {
-            replayOccupantMoves(self, session, move_rooms_buf[0..move_room_count], gen, self.worker_id);
+        if (bound_token) |tok| {
+            replayOccupantMoves(self, session, move_rooms_buf[0..move_room_count], tok, self.worker_id);
         } else {
             log.warn("connection {d} resumed with {d} MUC rooms but no session-map generation — occupant moves skipped", .{
                 session.conn.id, move_room_count,
@@ -704,10 +705,10 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
     @memcpy(session.last_presence_inner[0..bundle.last_presence.len], bundle.last_presence);
     session.last_presence_inner_len = bundle.last_presence.len;
 
-    var bound_generation: ?u32 = null;
+    var bound_token: ?Token = null;
     if (self.session_map) |sm| {
-        if (sm.bind(self.worker_id, @intCast(session.conn.id), bundle.username, self.server_host, bundle.resource)) |gen| {
-            bound_generation = gen;
+        if (sm.bind(self.worker_id, self.sessionToken(session.conn.id), bundle.username, self.server_host, bundle.resource)) |_| {
+            bound_token = self.sessionToken(session.conn.id);
         } else |err| {
             log.err("cross-worker SM resume: session_map bind failed for {s}@{s}/{s}: {}", .{
                 bundle.username, self.server_host, bundle.resource, err,
@@ -720,9 +721,9 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
     // has not been told yet, so its post-resume traffic is ordered after
     // the moves. Old worker identity comes from the SM-ID prefix.
     if (bundle.rooms.items.len > 0) {
-        if (bound_generation) |gen| {
+        if (bound_token) |tok| {
             const old_worker = sm_state.workerIdFromSmId(&bundle.previd) orelse self.worker_id;
-            replayOccupantMoves(self, session, bundle.rooms.items, gen, old_worker);
+            replayOccupantMoves(self, session, bundle.rooms.items, tok, old_worker);
         } else {
             log.warn("connection {d} resumed with {d} MUC rooms but no session-map generation — occupant moves skipped (client should MAM/rejoin)", .{
                 session.conn.id, bundle.rooms.items.len,
@@ -823,8 +824,8 @@ pub fn handleSessionKickRequest(self: *Server, req: actor_message.SessionKickReq
     if (self.session_map) |sm| {
         if (sm.findByFullJid(req.local, req.domain, req.resource)) |entry| {
             if (entry.worker_id == self.worker_id) {
-                const old_id: usize = @intCast(entry.local_session_id);
-                if (self.sessions[old_id]) |old| {
+                const old_id: usize = entry.token.index;
+                if (self.sessionForEventToken(entry.token)) |old| {
                     log.warn("session {d} evicted: resource {s}@{s}/{s} taken by worker {d}", .{
                         old_id, req.local, req.domain, req.resource, req.req_worker,
                     });
@@ -866,7 +867,7 @@ pub fn enqueueSmActor(self: *Server, target_worker: u16, msg: actor_message.Mess
     const ds = self.delivery_system orelse return error.NoDeliverySystem;
     var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
     const len = actor_message.encode(&buf, msg) orelse return error.EncodeFailed;
-    try ds.deliver(target_worker, delivery_queue_mod.SM_ACTOR_SENTINEL, 0, buf[0..len]);
+    try ds.deliver(target_worker, delivery_queue_mod.SM_ACTOR_TARGET, buf[0..len]);
 }
 
 /// Append the JIDs of every MUC room the given session occupies into the
@@ -912,7 +913,7 @@ pub fn gatherSessionRooms(self: *Server, worker_id: u16, session_id: usize, bund
 /// If the resumed connection dies before or while these apply,
 /// destroySession's session_closed broadcast removes the occupant by
 /// full JID everywhere — no ghost occupancy.
-pub fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const []const u8, generation: u32, old_worker: u16) void {
+pub fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const []const u8, token: Token, old_worker: u16) void {
     const bound = session.stream.bound_jid orelse return;
     var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
     const real_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
@@ -926,8 +927,8 @@ pub fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const 
             .real_jid = real_jid,
             .old_worker_id = old_worker,
             .new_worker_id = self.worker_id,
-            .new_session_id = @intCast(session.conn.id),
-            .new_generation = generation,
+            .new_session_id = token.index,
+            .new_generation = token.gen,
         };
         const owner = room_registry_mod.roomOwner(room_jid, muc_actor.getWorkerCount(self));
         if (owner == self.worker_id) {
@@ -1186,9 +1187,8 @@ test "Server: replaced-resource notice fits worst-case XML escaping" {
         len: usize = 0,
         complete: bool = false,
 
-        fn onDelivery(self: *@This(), session_id: u32, generation: u32, payload: []const u8) void {
-            _ = session_id;
-            _ = generation;
+        fn onDelivery(self: *@This(), target: Token, payload: []const u8) void {
+            _ = target;
             if (std.mem.indexOf(u8, payload, "type='unavailable'") == null) return;
             self.seen = true;
             self.len = payload.len;
@@ -1527,7 +1527,7 @@ pub const CapturedResumeStatus = struct {
 pub fn captureSmResumeStatus(ds: *DeliverySystem, req_worker: u16, out: *CapturedResumeStatus) void {
     const Ctx = struct { dst: *CapturedResumeStatus };
     _ = ds.getQueue(req_worker).drain(Ctx{ .dst = out }, struct {
-        fn handle(c: Ctx, _: u32, _: u32, payload: []const u8) void {
+        fn handle(c: Ctx, _: Token, payload: []const u8) void {
             const msg = actor_message.decode(payload) orelse return;
             switch (msg) {
                 .sm_resume_reply => |r| {

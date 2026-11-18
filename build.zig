@@ -2347,11 +2347,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    bench_session_map_mod.addImport("net_token", net_token_mod);
+    bench_session_map_mod.addImport("token_kinds", token_kinds_mod);
     const bench_delivery_mod = b.createModule(.{
         .root_source_file = b.path("src/core/xworker/ring.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
+    bench_delivery_mod.addImport("net_token", net_token_mod);
+    bench_delivery_mod.addImport("token_kinds", token_kinds_mod);
     const bench_net_frame_mod = b.createModule(.{
         .root_source_file = b.path("lib/net/frame.zig"),
         .target = target,

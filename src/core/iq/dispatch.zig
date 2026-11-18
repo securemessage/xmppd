@@ -26,6 +26,8 @@ const connection_mod = @import("../connection.zig");
 const room_registry_mod = @import("room_registry");
 const actor_message = @import("../xworker/envelope.zig");
 const delivery_queue = @import("delivery_queue");
+const Token = delivery_queue.Token;
+const token_kinds = @import("token_kinds");
 
 const log = std.log.scoped(.xmppd);
 
@@ -1447,7 +1449,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
 
         // T173: capture the requester's ABA generation here, where its session
         // is live — the reply's ds.deliver() validates it.
-        const reply_gen: u32 = if (server.session_map) |sm| sm.getGeneration(bound.local, bound.domain, bound.resource) orelse 0 else 0;
+        const reply_gen: u32 = server.sessionToken(session.conn.id).gen;
 
         muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_mam_query = .{
             .room_jid = room_jid,
@@ -2140,7 +2142,7 @@ fn sendPepNotification(
 
         for (self_entries[0..self_count]) |entry| {
             if (entry.worker_id == server.worker_id) {
-                const target = server.sessions[entry.local_session_id] orelse continue;
+                const target = server.sessionForEventToken(entry.token) orelse continue;
                 // XEP-0163 section 4.3: notify ALL subscribed resources including the publisher
 
                 var mfbs = std.io.fixedBufferStream(self_msg_lease.buf);
@@ -2160,7 +2162,7 @@ fn sendPepNotification(
                     noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ bound.local, bound.domain, entry.resource(), self_msg_lease.buf.len });
                     continue;
                 };
-                fanout.deliverToSession(target, notif_xml, entry.local_session_id);
+                fanout.deliverToSession(target, notif_xml, entry.token.index);
             } else {
                 // Cross-thread: build full stanza and deliver via MPSC
                 if (server.delivery_system) |ds| {
@@ -2181,8 +2183,8 @@ fn sendPepNotification(
                         noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ bound.local, bound.domain, entry.resource(), self_msg_lease.buf.len });
                         continue;
                     };
-                    ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, notif_xml) catch |err| {
-                        noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.local_session_id, @errorName(err) });
+                    ds.deliver(entry.worker_id, entry.token, notif_xml) catch |err| {
+                        noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
                     };
                 }
             }
@@ -2234,7 +2236,7 @@ fn sendPepNotification(
         const count = sm.findAvailableByBareJid(sub_local, sub_domain, entries);
         for (entries[0..count]) |entry| {
             if (entry.worker_id == server.worker_id) {
-                const target = server.sessions[entry.local_session_id] orelse continue;
+                const target = server.sessionForEventToken(entry.token) orelse continue;
 
                 var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
                 const mw = mfbs.writer();
@@ -2253,7 +2255,7 @@ fn sendPepNotification(
                     noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ sub_local, sub_domain, entry.resource(), sub_msg_lease.buf.len });
                     continue;
                 };
-                fanout.deliverToSession(target, notif_xml, entry.local_session_id);
+                fanout.deliverToSession(target, notif_xml, entry.token.index);
             } else {
                 if (server.delivery_system) |ds| {
                     var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
@@ -2273,8 +2275,8 @@ fn sendPepNotification(
                         noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ sub_local, sub_domain, entry.resource(), sub_msg_lease.buf.len });
                         continue;
                     };
-                    ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, notif_xml) catch |err| {
-                        noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.local_session_id, @errorName(err) });
+                    ds.deliver(entry.worker_id, entry.token, notif_xml) catch |err| {
+                        noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
                     };
                 }
             }
@@ -2467,7 +2469,7 @@ fn pushBlockPush(
 
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
-            const target = server.sessions[entry.local_session_id] orelse continue;
+            const target = server.sessionForEventToken(entry.token) orelse continue;
             // Skip the originating session (it already got the IQ result)
             if (&target.conn == &sender_session.conn) continue;
 
@@ -2498,7 +2500,7 @@ fn pushBlockPush(
                 continue;
             };
 
-            fanout.deliverToSession(target, push_xml, entry.local_session_id);
+            fanout.deliverToSession(target, push_xml, entry.token.index);
         }
         // Cross-thread push: deferred to post-V1 (T89 pattern)
     }
@@ -2687,12 +2689,12 @@ pub fn pushRosterItem(
         };
 
         if (entry.worker_id == server.worker_id) {
-            const target = server.sessions[entry.local_session_id] orelse continue;
+            const target = server.sessionForEventToken(entry.token) orelse continue;
             if (!target.roster_interested) continue;
-            fanout.deliverToSession(target, full_xml, entry.local_session_id);
+            fanout.deliverToSession(target, full_xml, entry.token.index);
         } else if (server.delivery_system) |ds| {
-            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, full_xml) catch |err| {
-                noteCrossWorkerDrop("roster push to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.local_session_id, @errorName(err) });
+            ds.deliver(entry.worker_id, entry.token, full_xml) catch |err| {
+                noteCrossWorkerDrop("roster push to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
             };
         }
     }
@@ -3015,7 +3017,7 @@ test "F6: MUC MAM 'with' matches the folded archive contact key" {
 
 var f6_with_seen: [512]u8 = undefined;
 var f6_with_len: usize = 0;
-fn f6Drain(_: void, _: u32, _: u32, payload: []const u8) void {
+fn f6Drain(_: void, _: Token, payload: []const u8) void {
     const m = actor_message.decode(payload) orelse return;
     switch (m) {
         .room_mam_query => |q| {
@@ -3097,10 +3099,10 @@ test "R5: a roster push to a full remote queue is counted" {
     server.delivery_system = &delivery_sys;
     server.worker_id = 0;
 
-    _ = try sm.bind(1, 7, "bob", "localhost", "mobile");
+    _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "mobile");
 
     const queue = delivery_sys.getQueue(1);
-    for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(1, 1, "fill");
+    for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(Token.init(1, 1, token_kinds.session), "fill");
 
     const drops_before = delivery_queue.cross_worker_drops.load(.monotonic);
     var scratch: [16]posix.Kevent = undefined;
@@ -3133,7 +3135,7 @@ test "R5: an unbuildable PEP self-notification is counted, never silent" {
 
     // The publisher's other resource lives on worker 1; the cross-worker
     // build is what overflows.
-    _ = try sm.bind(1, 7, "alice", "localhost", "desk");
+    _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "alice", "localhost", "desk");
     sm.setPresenceAvailable("alice", "localhost", "desk", true);
 
     var fds: [2]posix.fd_t = undefined;

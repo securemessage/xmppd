@@ -2566,7 +2566,7 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     // CSI-inactive sessions.
     target.csi_active = true;
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "naplestb", "localhost", "desk");
+    _ = try sm.bind(0, server.sessionToken(5), "naplestb", "localhost", "desk");
     sm.setPresenceAvailable("naplestb", "localhost", "desk", true);
 
     const alice_fds = try makeSocketPair();
@@ -2810,7 +2810,7 @@ pub fn f6WireSetupBound(allocator: std.mem.Allocator, server: *Server, sm: *Sess
     target.stream.bound_jid = .{ .local = bound_local, .domain = "localhost", .resource = "desk" };
     target.csi_active = true;
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, bound_local, "localhost", "desk");
+    _ = try sm.bind(0, server.sessionToken(5), bound_local, "localhost", "desk");
     sm.setPresenceAvailable(bound_local, "localhost", "desk", true);
 
     const alice = try allocator.create(Session);
@@ -3765,7 +3765,7 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     target.sm_unacked = queue;
     server.sessions[5] = target;
 
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     const alice_fds = try makeSocketPair();
@@ -4039,7 +4039,7 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     const bob = try allocator.create(Session);
     bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
     server.sessions[5] = bob;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     // alice sends a message whose body exceeds the accumulation buffer.
