@@ -1,24 +1,24 @@
-//! # xmppd-core — XMPP connection handler daemon
+//! # xmppd-core: XMPP connection handler daemon
 //!
 //! This is the worker process that handles XMPP client connections.
 //! It can be run in two modes:
 //!
-//! - **Supervised**: spawned by the `xmppd` master, receives listening sockets
-//!   via command-line fd numbers.
-//! - **Standalone (dev mode)**: binds its own sockets on high ports. Useful
-//!   for development and testing without root.
+//! - **Supervised**: spawned by the `xmppd` master, receives listening
+//!   sockets and the sealed config blob via inherited fd numbers.
+//! - **Standalone (dev mode)**: binds its own sockets and reads its
+//!   --config file directly. Useful for development and testing.
 //!
 //! ## Usage
 //!
 //! ```sh
-//! # Dev mode — bind high port, no TLS
-//! ./xmppd-core --host localhost --port 15222
+//! # Dev mode: bind the schema defaults with no TLS
+//! ./xmppd-core --host localhost --port 15222 --no-tls
 //!
-//! # Dev mode — with TLS
-//! ./xmppd-core --host localhost --port 15222 --cert server.pem --key server.key
+//! # Dev mode: with TLS and a config file
+//! ./xmppd-core --config /etc/xmppd/xmppd.conf --cert server.pem --key server.key
 //!
 //! # Supervised mode (called by xmppd master)
-//! ./xmppd-core --host example.com --fd 3 --cert /etc/xmppd/server.pem --key /etc/xmppd/server.key
+//! ./xmppd-core --listen-fd 3 --conf-fd 4
 //! ```
 
 const std = @import("std");
@@ -27,7 +27,8 @@ const root_allocator = @import("root_allocator");
 pub const std_options = xmppd_log.std_options;
 
 const Server = @import("worker/worker.zig").Server;
-const config_mod = @import("config");
+const conf = @import("conf");
+const schema = @import("schema");
 const generic_roster = @import("roster_store");
 const GenericRosterStore = generic_roster.RosterStore(OpBackendType);
 const generic_offline = @import("generic_offline_store");
@@ -70,165 +71,57 @@ pub fn main() !void {
     defer root.deinit();
     const allocator = root.allocator();
 
-    // Parse command-line arguments
+    // Configuration: lib/conf applies default < file < forwarded < CLI
+    // with per-field provenance (ADR-9). --conf-fd and --config are
+    // prescanned because the fd must be read and the file loaded before
+    // the CLI applies. Unknown arguments, unknown file keys and bad
+    // values are startup errors with the Diag.
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
+    _ = args.next(); // argv[0]
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    while (args.next()) |arg| try argv.append(allocator, arg);
 
-    var host: []const u8 = "localhost";
-    var address: []const u8 = "127.0.0.1";
-    var port: u16 = 15222;
-    var cert_path: ?[:0]const u8 = null;
-    var key_path: ?[:0]const u8 = null;
-    var auth_socket: ?[]const u8 = null;
-    var s2s_socket: ?[]const u8 = null;
-    var db_path: ?[]const u8 = null;
-    var muc_host_arg: ?[]const u8 = null;
-    var config_path: ?[]const u8 = null;
-    var listen_fd_str: ?[]const u8 = null;
-    var max_sessions: usize = @import("worker/worker.zig").DEFAULT_MAX_SESSIONS;
-    var fan_out_batch_size: u8 = @import("muc/fanout.zig").DEFAULT_BATCH_SIZE;
-    // 0 = SessionMap default (256). T198/Sonya: raise for many-resources-per-account deployments.
-    var max_resources_per_account: usize = 0;
-    var oidc_import_avatar: bool = false;
+    var diag: conf.Diag = .{};
+    var loaded = loadCoreConfig(allocator, argv.items, &diag) catch |err| {
+        log.err("{f}", .{diag});
+        return err;
+    };
+    defer loaded.deinit();
+    const v = &loaded.values;
 
-    // Skip argv[0]
-    _ = args.next();
-
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--host")) {
-            host = args.next() orelse {
-                log.err("--host requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--address") or std.mem.eql(u8, arg, "--bind")) {
-            address = args.next() orelse {
-                log.err("--address requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--port")) {
-            const val = args.next() orelse {
-                log.err("--port requires a value", .{});
-                return error.InvalidArgs;
-            };
-            port = std.fmt.parseInt(u16, val, 10) catch {
-                log.err("invalid port: {s}", .{val});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--cert")) {
-            cert_path = args.next() orelse {
-                log.err("--cert requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--key")) {
-            key_path = args.next() orelse {
-                log.err("--key requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--auth-socket")) {
-            auth_socket = args.next() orelse {
-                log.err("--auth-socket requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--s2s-socket")) {
-            s2s_socket = args.next() orelse {
-                log.err("--s2s-socket requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--listen-fd")) {
-            listen_fd_str = args.next() orelse {
-                log.err("--listen-fd requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--db")) {
-            db_path = args.next() orelse {
-                log.err("--db requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--muc-host")) {
-            muc_host_arg = args.next() orelse {
-                log.err("--muc-host requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
-            config_path = args.next() orelse {
-                log.err("--config requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--no-tls")) {
-            // Skip TLS requirement — offer SASL without STARTTLS (benchmarks/trusted networks)
-            cert_path = null;
-            key_path = null;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            printUsage();
-            return;
-        } else {
-            log.warn("unknown argument: {s}", .{arg});
-        }
+    if (v.meta.help) {
+        try printUsage(allocator);
+        return;
     }
 
-    // Apply config file defaults (CLI flags above take precedence)
-    var cfg: ?config_mod.Config = null;
-    if (config_path) |cp| {
-        cfg = config_mod.parse(allocator, cp) catch |err| {
-            log.err("failed to read config file '{s}': {}", .{ cp, err });
+    const host = v.server.hostname;
+    const address = v.server.bind_address;
+    const port = v.server.c2s_port;
+    const db_path = v.server.db_path;
+    const auth_socket = v.auth.socket;
+    // The s2s socket connects only when federation is enabled.
+    const s2s_socket: ?[]const u8 = if (v.s2s.enabled) v.s2s.socket else null;
+    const max_sessions = v.core.max_sessions;
+    const fan_out_batch_size = v.core.fan_out_batch_size;
+    const max_resources_per_account = v.core.max_resources_per_account;
+    const oidc_import_avatar = v.oidc.import_avatar;
+
+    // cert/key arrive sentinel-terminated for the C TLS API; the file's
+    // [tls] section is honored now (ADR-9).
+    const tls = resolveTls(loaded.arena_state.allocator(), v) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.TlsIncomplete => {
+            log.err("tls.cert and tls.key must be set together", .{});
             return error.InvalidArgs;
-        };
-        const c = &cfg.?;
+        },
+    };
+    const cert_path = tls.cert;
+    const key_path = tls.key;
+    const skip_tls = tls.skip_tls;
 
-        // [server] section
-        if (host.len == 0 or std.mem.eql(u8, host, "localhost")) {
-            if (c.get("server", "hostname")) |v| host = v;
-        }
-        if (std.mem.eql(u8, address, "127.0.0.1")) {
-            if (c.get("server", "bind_address")) |v| address = v;
-        }
-        if (port == 15222) {
-            if (c.get("server", "c2s_port")) |v| {
-                port = std.fmt.parseInt(u16, v, 10) catch 15222;
-            }
-        }
-        if (db_path == null) {
-            if (c.get("server", "db_path")) |v| db_path = v;
-        }
-
-        // [tls] section — cert/key are sentinel-terminated (C API requirement),
-        // config values are not null-terminated. TLS is typically set via CLI or
-        // passed by the master supervisor. Skip config for TLS paths.
-
-        // [auth] section
-        if (auth_socket == null) {
-            if (c.get("auth", "socket")) |v| auth_socket = v;
-        }
-
-        // [s2s] section
-        if (s2s_socket == null) {
-            if (c.get("s2s", "socket")) |v| s2s_socket = v;
-        }
-
-        // [muc] section
-        if (muc_host_arg == null) {
-            if (c.get("muc", "host")) |v| muc_host_arg = v;
-        }
-
-        // [core] section
-        if (c.get("core", "max_sessions")) |v| {
-            max_sessions = std.fmt.parseInt(usize, v, 10) catch @import("worker/worker.zig").DEFAULT_MAX_SESSIONS;
-        }
-        if (c.get("core", "fan_out_batch_size")) |v| {
-            fan_out_batch_size = std.fmt.parseInt(u8, v, 10) catch @import("muc/fanout.zig").DEFAULT_BATCH_SIZE;
-        }
-        if (c.get("core", "max_resources_per_account")) |v| {
-            max_resources_per_account = std.fmt.parseInt(usize, v, 10) catch 0;
-        }
-
-        // [oidc] section (core-side options)
-        if (c.get("oidc", "import_avatar")) |v| {
-            oidc_import_avatar = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "yes");
-        }
-    }
-    defer if (cfg) |*c| c.deinit();
-
-    // Parse listen fd list (comma-separated)
+    // Inherited listener fds (comma list parsed by the loader already).
     const MAX_LISTEN_FDS = 64;
     comptime {
         // One worker per listen fd; a worker id past these bounds would
@@ -240,16 +133,13 @@ pub fn main() !void {
     var listen_fds: [MAX_LISTEN_FDS]std.posix.fd_t = undefined;
     var listen_fd_count: usize = 0;
 
-    if (listen_fd_str) |fd_str| {
-        var iter = std.mem.splitScalar(u8, fd_str, ',');
-        while (iter.next()) |part| {
-            if (listen_fd_count >= MAX_LISTEN_FDS) break;
-            listen_fds[listen_fd_count] = std.fmt.parseInt(std.posix.fd_t, part, 10) catch {
-                log.err("invalid fd number in list: {s}", .{part});
-                return error.InvalidArgs;
-            };
-            listen_fd_count += 1;
-        }
+    for (v.core.listen_fd) |fd_str| {
+        if (listen_fd_count >= MAX_LISTEN_FDS) break;
+        listen_fds[listen_fd_count] = std.fmt.parseInt(std.posix.fd_t, fd_str, 10) catch {
+            log.err("invalid fd number in --listen-fd list: {s}", .{fd_str});
+            return error.InvalidArgs;
+        };
+        listen_fd_count += 1;
     }
 
     // Per-worker session quota
@@ -260,11 +150,9 @@ pub fn main() !void {
         host, address, port, worker_count, per_worker_sessions,
     });
 
-    if (db_path) |db| {
-        if (try @import("backend").migrationPending(db)) {
-            log.err("an interrupted migrate-precis recovery is pending; rerun 'xmppctl migrate-precis --apply' before starting xmppd-core", .{});
-            return error.MigrationPending;
-        }
+    if (try @import("backend").migrationPending(db_path)) {
+        log.err("an interrupted migrate-precis recovery is pending; rerun 'xmppctl migrate-precis --apply' before starting xmppd-core", .{});
+        return error.MigrationPending;
     }
 
     // Open storage backends (shared across workers — backends are thread-safe)
@@ -275,9 +163,9 @@ pub fn main() !void {
     var rs: ?GenericRoomStore = null;
     var block_store_val: ?GenericBlockStore = null;
     var pep_store_val: ?GenericPepStore = null;
-    if (db_path) |db| {
+    {
         var op_path_buf: [1024]u8 = undefined;
-        const op_path = std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db}) catch {
+        const op_path = std.fmt.bufPrint(&op_path_buf, "{s}/op", .{db_path}) catch {
             log.err("db path too long", .{});
             return error.InvalidArgs;
         };
@@ -296,9 +184,9 @@ pub fn main() !void {
 
     var archive_backend: ?ArchiveBackendType = null;
     var archive_store: ?archive_store_mod.ArchiveStore(ArchiveBackendType) = null;
-    if (db_path) |db| {
+    {
         var archive_path_buf: [1024]u8 = undefined;
-        const archive_path = std.fmt.bufPrint(&archive_path_buf, "{s}/archive", .{db}) catch {
+        const archive_path = std.fmt.bufPrint(&archive_path_buf, "{s}/archive", .{db_path}) catch {
             log.err("db path too long", .{});
             return error.InvalidArgs;
         };
@@ -345,7 +233,7 @@ pub fn main() !void {
 
     // MUC host resolution — each worker creates its own RoomRegistry in configureServer
     var muc_host_buf: [256]u8 = undefined;
-    const effective_muc_host: ?[]const u8 = if (muc_host_arg) |h| h else blk: {
+    const effective_muc_host: ?[]const u8 = if (v.muc.host.len != 0) v.muc.host else blk: {
         const muc_default = std.fmt.bufPrint(&muc_host_buf, "conference.{s}", .{host}) catch null;
         break :blk muc_default;
     };
@@ -376,7 +264,7 @@ pub fn main() !void {
         .s2s_socket = s2s_socket,
         .per_worker_sessions = per_worker_sessions,
         .fan_out_batch_size = fan_out_batch_size,
-        .skip_tls = (cert_path == null),
+        .skip_tls = skip_tls,
         .roster = if (roster_store != null) &roster_store.? else null,
         .offline = if (offline_store != null) &offline_store.? else null,
         .archive = if (archive_store != null) &archive_store.? else null,
@@ -446,27 +334,49 @@ pub fn main() !void {
     log.info("shutdown complete ({d} workers)", .{worker_count});
 }
 
-fn printUsage() void {
-    const usage =
-        \\Usage: xmppd-core [OPTIONS]
-        \\
-        \\Options:
-        \\  --host HOST      XMPP server hostname (default: localhost)
-        \\  --address ADDR   Bind address (default: 127.0.0.1)
-        \\  --port PORT      TCP port (default: 15222)
-        \\  --cert PATH      TLS certificate file (PEM)
-        \\  --key PATH       TLS private key file (PEM)
-        \\  --auth-socket PATH  Auth daemon IPC socket
-        \\  --s2s-socket PATH   S2S federation daemon IPC socket
-        \\  --listen-fd N[,N...]  Pre-bound listener fd(s) from master (comma-separated for multi-worker)
-        \\  --db PATH        User database path (roster stored alongside)
-        \\  --muc-host HOST  MUC service hostname (default: conference.{host})
-        \\  --help, -h       Show this help
-        \\
-    ;
-    var buf: [0]u8 = .{};
+/// Loads the core configuration through the shared loader (ADR-9):
+/// the inherited --conf-fd blob is prescanned alongside --config, so a
+/// supervised child gets file < forwarded < CLI and a manual run gets
+/// default < file < CLI.
+fn loadCoreConfig(gpa: std.mem.Allocator, argv: []const []const u8, diag: *conf.Diag) conf.Error!schema.CoreLoader {
+    return schema.CoreLoader.load(gpa, .{
+        .conf_fd = schema.confFdArg(argv),
+        .path = schema.configPathArg(argv),
+        .args = argv,
+    }, diag);
+}
+
+/// Resolved TLS inputs for one worker: cert and key are valid only as a
+/// pair and are sentinel-terminated for the C TLS API; disabled or
+/// certless TLS yields null paths and skip_tls.
+const TlsConfig = struct {
+    cert: ?[:0]const u8,
+    key: ?[:0]const u8,
+    skip_tls: bool,
+};
+
+fn resolveTls(arena: std.mem.Allocator, v: *const schema.Sections) error{ OutOfMemory, TlsIncomplete }!TlsConfig {
+    if ((v.tls.cert.len == 0) != (v.tls.key.len == 0)) return error.TlsIncomplete;
+    const on = v.tls.enabled and v.tls.cert.len != 0;
+    return .{
+        .cert = if (on) try arena.dupeZ(u8, v.tls.cert) else null,
+        .key = if (on) try arena.dupeZ(u8, v.tls.key) else null,
+        .skip_tls = !on,
+    };
+}
+
+/// --help is generated from the schema: every core_cli spelling plus
+/// the shared file keys and their defaults. A fresh loader is used so
+/// the defaults shown come from the schema initializers, not the
+/// resolved values of this run.
+fn printUsage(allocator: std.mem.Allocator) std.Io.Writer.Error!void {
+    var gen = schema.CoreLoader.init(allocator);
+    defer gen.deinit();
+    var buf: [4096]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
-    stdout.interface.writeAll(usage) catch {};
+    try stdout.interface.writeAll("Usage: xmppd-core [OPTIONS]\n\n");
+    try gen.writeHelp(&stdout.interface);
+    try stdout.interface.flush();
 }
 
 /// Worker context struct (defined at file scope for thread function signature).
@@ -598,4 +508,113 @@ fn workerThread(args: *WorkerArgs) void {
     };
 
     log.info("worker {d} stopped", .{args.worker_id});
+}
+
+// ============================================================================
+// lib/conf loading tests (X4 part 2a, ADR-9)
+// ============================================================================
+
+const testing = std.testing;
+
+fn writeTempConfig(dir: *std.fs.Dir, name: []const u8, content: []const u8, buf: []u8) ![]const u8 {
+    const f = try dir.createFile(name, .{});
+    defer f.close();
+    try f.writeAll(content);
+    return try dir.realpath(name, buf);
+}
+
+test "core config: the file's [tls] section reaches the TLS setup" {
+    // Goal: cert and key set in the file configure TLS (the ADR-9 bug
+    // had core skipping [tls] entirely). resolveTls sees the pair,
+    // terminates it for the C API, and clears skip_tls.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "core.ini",
+        \\[server]
+        \\hostname = file.test
+        \\[tls]
+        \\cert = /x/cert.pem
+        \\key = /x/key.pem
+        \\
+    , &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try loadCoreConfig(testing.allocator, &.{ "--config", path }, &diag);
+    defer l.deinit();
+    try testing.expectEqualStrings("/x/cert.pem", l.values.tls.cert);
+    try testing.expectEqualStrings("/x/key.pem", l.values.tls.key);
+    try testing.expect(l.values.tls.enabled);
+    try testing.expectEqual(.file, l.provenanceOf("tls", "cert"));
+
+    const tls = try resolveTls(l.arena_state.allocator(), &l.values);
+    try testing.expect(!tls.skip_tls);
+    try testing.expectEqualStrings("/x/cert.pem", tls.cert.?);
+    try testing.expectEqualStrings("/x/key.pem", tls.key.?);
+}
+
+test "core config: --no-tls wins over a file [tls] pair" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "core.ini",
+        \\[tls]
+        \\cert = /x/cert.pem
+        \\key = /x/key.pem
+        \\
+    , &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try loadCoreConfig(testing.allocator, &.{ "--config", path, "--no-tls" }, &diag);
+    defer l.deinit();
+    try testing.expect(!l.values.tls.enabled);
+
+    const tls = try resolveTls(l.arena_state.allocator(), &l.values);
+    try testing.expect(tls.skip_tls);
+    try testing.expect(tls.cert == null);
+    try testing.expect(tls.key == null);
+}
+
+test "core config: cert without key is a startup error" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "core.ini", "[tls]\ncert = /x/cert.pem\n", &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try loadCoreConfig(testing.allocator, &.{ "--config", path }, &diag);
+    defer l.deinit();
+    try testing.expectError(error.TlsIncomplete, resolveTls(l.arena_state.allocator(), &l.values));
+}
+
+test "core config: a child without --conf-fd loads its --config file" {
+    // Goal: a manual or dev run keeps working exactly like today: the
+    // file supplies values with .file provenance and the defaults
+    // fill the rest.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "core.ini",
+        \\[server]
+        \\hostname = manual.test
+        \\[core]
+        \\max_sessions = 64
+        \\
+    , &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try loadCoreConfig(testing.allocator, &.{ "--config", path }, &diag);
+    defer l.deinit();
+    try testing.expectEqualStrings("manual.test", l.values.server.hostname);
+    try testing.expectEqual(.file, l.provenanceOf("server", "hostname"));
+    try testing.expectEqual(@as(usize, 64), l.values.core.max_sessions);
+    try testing.expectEqual(.file, l.provenanceOf("core", "max_sessions"));
+    try testing.expectEqual(@as(usize, 256), l.values.core.max_resources_per_account);
+    try testing.expectEqual(.default, l.provenanceOf("core", "max_resources_per_account"));
+}
+
+test "core config: an unknown argument is a startup error, not a warning" {
+    var diag: conf.Diag = .{};
+    try testing.expectError(error.UnknownArgument, loadCoreConfig(testing.allocator, &.{"--bogus-arg"}, &diag));
+    try testing.expectEqualStrings("--bogus-arg", diag.key);
 }

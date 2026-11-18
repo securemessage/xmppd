@@ -1709,6 +1709,13 @@ pub fn build(b: *std.Build) void {
     master_tests.root_module.link_libc = true;
     const run_master_tests = b.addRunArtifact(master_tests);
 
+    // xmppd-core tests (same module instance; Zig forbids re-rooting)
+    const core_tests = b.addTest(.{
+        .name = "core-tests",
+        .root_module = core_mod,
+    });
+    const run_core_tests = b.addRunArtifact(core_tests);
+
     // xmppd-auth: the authentication daemon
     const auth_ipc_protocol_mod = b.createModule(.{
         .root_source_file = b.path("src/ipc/protocol.zig"),
@@ -2257,6 +2264,8 @@ pub fn build(b: *std.Build) void {
     const test_master_step = b.step("test-master", "Run only the master supervisor tests");
     test_master_step.dependOn(&run_master_tests.step);
     test_master_step.dependOn(&run_supervisor_tests.step);
+    const test_core_step = b.step("test-core", "Run only the core daemon tests");
+    test_core_step.dependOn(&run_core_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
     // A green test suite must also prove every install artifact compiles.
@@ -2351,6 +2360,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ctl_tests.step);
     test_step.dependOn(&run_supervisor_tests.step);
     test_step.dependOn(&run_master_tests.step);
+    test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_roster_store_tests.step);
     test_step.dependOn(&run_session_map_tests.step);
     test_step.dependOn(&run_delivery_queue_tests.step);
