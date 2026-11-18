@@ -459,7 +459,9 @@ fn recordLastOffline(roster: anytype, bound: anytype) void {
 /// Detached sessions are destroyed; a later resume fails with item-not-found
 /// and the client performs a full bind and MAM catch-up.
 /// Called once per event batch from the worker event loop.
-pub fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
+/// noinline: the teardown chains (destroySession, drainUnackedToOffline)
+/// are cold paths and must stay out of the Server.run frame.
+pub noinline fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
     for (server.sessions, 0..) |slot, i| {
         const session = slot orelse continue;
         if (!session.sm_overflow) continue;

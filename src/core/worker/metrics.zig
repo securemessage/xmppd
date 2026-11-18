@@ -134,7 +134,9 @@ fn read(c: *const Counter) u64 {
 
 /// Log the worker's counters and loop-time histogram. Called from the
 /// worker's own EVFILT_SIGNAL handler, so plain relaxed loads suffice.
-pub fn dump(worker_id: u16, ext: Externals) void {
+/// noinline: the dump path is cold and must stay out of the dispatch
+/// and run frames (ReleaseSafe caps).
+pub noinline fn dump(worker_id: u16, ext: Externals) void {
     if (worker_id >= MAX_WORKERS) return;
     const c = &workers[worker_id].counters;
     log.info("worker {d} counters: stanzas msg={d} pres={d} iq={d} bytes in={d} out={d} wakes={d}", .{
