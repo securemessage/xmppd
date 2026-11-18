@@ -37,9 +37,11 @@ pub const POOL_UDATA: usize = std.math.maxInt(usize) - 1;
 /// Base udata for IPC client connections.
 pub const CLIENT_UDATA_BASE: usize = 0x10000;
 
-/// Backpressure watermarks for IPC client intake. Sized against the SCRAM
-/// frame reality: a challenge+result pair is ~300 bytes, so 256 KiB of
-/// backlog is ~850 in-flight exchanges -- deep but bounded.
+/// Backpressure watermarks for IPC client intake: lane reads pause once the
+/// send backlog passes RX_PAUSE_AT (768 KiB) and resume under RX_RESUME_AT
+/// (256 KiB). Sized against the SCRAM frame reality: a challenge+result pair
+/// is ~300 bytes, so the 256 KiB resume point still holds ~850 in-flight
+/// exchanges -- deep but bounded.
 pub const RX_PAUSE_AT: usize = 768 << 10;
 pub const RX_RESUME_AT: usize = 256 << 10;
 

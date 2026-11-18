@@ -381,10 +381,10 @@ fn resolveOidcRateConfig(cfg: *const config_mod.Config) OidcRateConfig {
         policy.lockout_duration = std.fmt.parseInt(u32, v, 10) catch defaults.lockout_duration;
     }
     if (cfg.get("auth", "lockout_threshold")) |v| {
-        policy.lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch defaults.lockout_threshold);
+        policy.lockout_threshold = std.fmt.parseInt(u16, v, 10) catch defaults.lockout_threshold;
     }
     if (cfg.get("auth", "ip_lockout_threshold")) |v| {
-        policy.ip_lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch defaults.ip_lockout_threshold);
+        policy.ip_lockout_threshold = std.fmt.parseInt(u16, v, 10) catch defaults.ip_lockout_threshold;
     }
     var enabled = true;
     if (cfg.get("auth", "rate_limit")) |v| {
@@ -2756,6 +2756,27 @@ test "rate config reads the shared [auth] keys with the old [oidc] spellings as 
     try std.testing.expectEqual(@as(u32, 42), r2.policy.max_per_account);
     try std.testing.expectEqual(@as(u32, 77), r2.policy.max_per_ip);
     try std.testing.expect(!r2.enabled);
+}
+
+test "rate config treats an out-of-range lockout threshold as a bad value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Both thresholds are u16: 70000 fails to parse, so the defaults apply
+    // like any other bad value instead of tripping a cast check.
+    const path = try writeTmpConfig(
+        allocator,
+        &tmp,
+        "[auth]\nlockout_threshold = 70000\nip_lockout_threshold = 70000\n",
+    );
+    defer allocator.free(path);
+    var cfg = try config_mod.parse(allocator, path);
+    defer cfg.deinit();
+    const r = resolveOidcRateConfig(&cfg);
+    const defaults = RatePolicy{};
+    try std.testing.expectEqual(defaults.lockout_threshold, r.policy.lockout_threshold);
+    try std.testing.expectEqual(defaults.ip_lockout_threshold, r.policy.ip_lockout_threshold);
 }
 
 /// Which IPC lane the fixture's single client occupies.

@@ -128,15 +128,15 @@ pub fn main() !void {
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--lockout-threshold")) {
-            rate_policy.lockout_threshold = @intCast(parseU32Arg(args.next()) orelse {
+            rate_policy.lockout_threshold = parseU16Arg(args.next()) orelse {
                 log.err("--lockout-threshold requires a numeric value", .{});
                 return error.InvalidArgs;
-            });
+            };
         } else if (std.mem.eql(u8, arg, "--ip-lockout-threshold")) {
-            rate_policy.ip_lockout_threshold = @intCast(parseU32Arg(args.next()) orelse {
+            rate_policy.ip_lockout_threshold = parseU16Arg(args.next()) orelse {
                 log.err("--ip-lockout-threshold requires a numeric value", .{});
                 return error.InvalidArgs;
-            });
+            };
         } else if (std.mem.eql(u8, arg, "--no-rate-limit")) {
             rate_limit_enabled = false;
         } else if (std.mem.eql(u8, arg, "--enable-registration")) {
@@ -204,12 +204,12 @@ pub fn main() !void {
         }
         if (rate_policy.lockout_threshold == rate_defaults.lockout_threshold) {
             if (c.get("auth", "lockout_threshold")) |v| {
-                rate_policy.lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch rate_defaults.lockout_threshold);
+                rate_policy.lockout_threshold = std.fmt.parseInt(u16, v, 10) catch rate_defaults.lockout_threshold;
             }
         }
         if (rate_policy.ip_lockout_threshold == rate_defaults.ip_lockout_threshold) {
             if (c.get("auth", "ip_lockout_threshold")) |v| {
-                rate_policy.ip_lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch rate_defaults.ip_lockout_threshold);
+                rate_policy.ip_lockout_threshold = std.fmt.parseInt(u16, v, 10) catch rate_defaults.ip_lockout_threshold;
             }
         }
         if (c.get("auth", "rate_limit")) |v| {
@@ -423,6 +423,11 @@ fn parseU32Arg(arg: ?[]const u8) ?u32 {
     return std.fmt.parseInt(u32, s, 10) catch null;
 }
 
+fn parseU16Arg(arg: ?[]const u8) ?u16 {
+    const s = arg orelse return null;
+    return std.fmt.parseInt(u16, s, 10) catch null;
+}
+
 test "auth startup: users_scan_limit config is parsed and validated" {
     try std.testing.expectEqual(@as(usize, 500), try parseUsersScanLimit("500"));
     try std.testing.expectError(error.InvalidArgs, parseUsersScanLimit("not-a-number"));
@@ -498,6 +503,37 @@ test "auth startup: a pending migrate-precis marker refuses startup" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "migrate-precis recovery is pending") != null);
+}
+
+test "auth startup: --lockout-threshold over u16 max is a bad value, not a panic" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    // The threshold fields are u16: 70000 must be rejected as a bad value
+    // (InvalidArgs) rather than trip the cast check.
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "zig-out/bin/xmppd-auth",
+            "--db",
+            base,
+            "--socket",
+            "/nonexistent-threshold-test/auth.sock",
+            "--lockout-threshold",
+            "70000",
+        },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "--lockout-threshold requires a numeric value") != null);
 }
 
 test "auth startup: an unprepared users key refuses startup" {
