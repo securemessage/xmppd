@@ -1667,7 +1667,6 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("room_mailbox", server_room_mailbox_mod);
     core_mod.addImport("block_store", server_block_store_mod);
     core_mod.addImport("pep_store", server_pep_store_mod);
-    core_mod.addImport("config", config_mod);
     core_mod.addImport("conf", conf_mod);
     core_mod.addImport("schema", schema_mod);
     core_mod.addImport("xmppd_log", xmppd_log_mod);
