@@ -64,6 +64,9 @@ pub const OidcConfig = struct {
     localpart_auto_suffix: bool = false,
     /// Domain to append to bare usernames for ROPC (e.g., "morante.dev" → alice@morante.dev).
     user_domain: ?[]const u8 = null,
+    /// Minimum milliseconds between kid-miss JWKS refetches after a
+    /// failed fetch ([oidc] jwks_min_refresh; 0 disables suppression).
+    jwks_min_refresh_ms: u64 = 60_000,
 };
 
 /// What the IdP decided about one credential.
@@ -346,6 +349,21 @@ pub const OidcStore = struct {
 
     /// Timestamp of last JWKS refresh, Unix seconds (jwks_mutex).
     jwks_last_refresh: i64 = 0,
+
+    /// Timestamp of the last failed JWKS fetch, Unix seconds
+    /// (jwks_mutex). A failed fetch opens the negative window: kid-miss
+    /// refetches are suppressed until jwks_min_refresh has passed, so a
+    /// dead IdP is not hammered by tokens carrying unknown kids.
+    jwks_last_failure: i64 = 0,
+
+    /// Daemon counters (read without the mutex like IdpPool's): failed
+    /// JWKS fetches and kid-miss refetches the negative window ate.
+    jwks_failures: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    jwks_suppressed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    /// Last time a suppression was logged, Unix seconds (jwks_mutex):
+    /// suppression warnings are rate-limited to one per minute.
+    jwks_suppress_log_last: i64 = 0,
 
     /// Set by the daemon only around the replay of a completed exchange:
     /// handleMessage then calls validatePassword/validateToken, which read
@@ -949,7 +967,22 @@ pub const OidcStore = struct {
             return .absent;
         }
 
-        // Kid miss on a fresh cache: the IdP may have rotated keys.
+        // Kid miss on a fresh cache: the IdP may have rotated keys. A
+        // recent fetch failure suppresses the refetch until
+        // jwks_min_refresh has passed; cached keys keep serving and the
+        // suppression is counted and rate-limited at warn.
+        const min_refresh_s: i64 = @intCast(self.config.jwks_min_refresh_ms / 1000);
+        if (now - self.jwks_last_failure < min_refresh_s) {
+            _ = self.jwks_suppressed.fetchAdd(1, .monotonic);
+            if (now - self.jwks_suppress_log_last >= 60) {
+                self.jwks_suppress_log_last = now;
+                log.warn(
+                    "JWKS: kid-miss refetch suppressed ({d}s after fetch failure, min {d}s)",
+                    .{ now - self.jwks_last_failure, min_refresh_s },
+                );
+            }
+            return .absent;
+        }
         self.refreshJwksLocked(options) catch |err| {
             return .{ .failed = switch (err) {
                 error.Timeout => .timed_out,
@@ -1004,6 +1037,19 @@ pub const OidcStore = struct {
     /// jwks_mutex; the HTTP GET is serialized with every other refresh and
     /// bounded by the request deadline.
     fn refreshJwksLocked(self: *OidcStore, options: ExchangeOptions) JwksError!void {
+        // Every failure stamps and counts the negative window for the
+        // kid-miss path; a success clears it so rotation can be
+        // discovered again.
+        var ok = false;
+        defer {
+            if (ok) {
+                self.jwks_last_failure = 0;
+            } else {
+                self.jwks_last_failure = std.time.timestamp();
+                _ = self.jwks_failures.fetchAdd(1, .monotonic);
+            }
+        }
+
         log.info("refreshing JWKS from {s}", .{self.config.jwks_uri});
 
         var response = self.httpClient().get(
@@ -1041,6 +1087,7 @@ pub const OidcStore = struct {
         // Parse keys from JWKS JSON
         self.key_count = 0;
         self.parseJwksKeys();
+        ok = true;
     }
 
     /// Parse JWKS JSON and extract key components (RSA and EdDSA/OKP).
@@ -1997,6 +2044,56 @@ test "OidcStore: concurrent kid misses fetch the JWKS once" {
     t2.join();
     try std.testing.expectEqual(@as(usize, 2), hits.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), fetches.load(.acquire));
+}
+
+test "OidcStore: a failed JWKS fetch suppresses refetch on kid-miss until the interval" {
+    const allocator = std.testing.allocator;
+    // jwks_uri points at a port nothing listens on, so every fetch
+    // attempt fails fast with a transport error. A suppressed lookup
+    // answers .absent while a real attempt answers .failed, which is
+    // the observable the revert check needs.
+    var store = testStore(allocator, .{ .jwks_uri = "https://localhost:1/certs" });
+    defer store.deinit();
+    try store.start();
+
+    // Seed one cached key and mark the cache fresh, so the lookup
+    // exercises the kid-miss path and "cached keys keep serving" is
+    // checkable.
+    store.jwks_body = try allocator.dupe(
+        u8,
+        "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"k1\",\"n\":\"AQAB\",\"e\":\"AQAB\"}]}",
+    );
+    store.jwks_last_refresh = std.time.timestamp();
+    store.parseJwksKeys();
+    try std.testing.expectEqual(@as(usize, 1), store.key_count);
+
+    // First kid miss fetches and fails; the failure is stamped.
+    switch (store.signingKey("k2", testOptions(5000))) {
+        .failed => {},
+        else => return error.ExpectedFailure,
+    }
+    try std.testing.expectEqual(@as(usize, 1), store.jwks_failures.load(.monotonic));
+
+    // Inside the negative window the same miss is answered absent with
+    // no second fetch, and the cached key still serves.
+    switch (store.signingKey("k2", testOptions(5000))) {
+        .absent => {},
+        else => return error.ExpectedAbsent,
+    }
+    try std.testing.expectEqual(@as(usize, 1), store.jwks_suppressed.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), store.jwks_failures.load(.monotonic));
+    switch (store.signingKey("k1", testOptions(5000))) {
+        .key => {},
+        else => return error.ExpectedKey,
+    }
+
+    // Once the interval has passed the next miss fetches again.
+    store.jwks_last_failure = std.time.timestamp() - 61;
+    switch (store.signingKey("k2", testOptions(5000))) {
+        .failed => {},
+        else => return error.ExpectedFailure,
+    }
+    try std.testing.expectEqual(@as(usize, 2), store.jwks_failures.load(.monotonic));
 }
 
 test "OidcStore: replay returns identity, rejection and temporary failure" {
