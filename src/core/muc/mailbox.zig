@@ -158,7 +158,7 @@ test "RoomMailbox: byte budget returns error" {
     var pool = std.heap.MemoryPool(RoomMailbox.Item).init(std.testing.allocator);
     defer pool.deinit();
     var mb = RoomMailbox{};
-    const payload = try std.testing.allocator.alloc(u8, RoomMailbox.BYTE_BUDGET);
+    const payload = try std.testing.allocator.alloc(u8, BYTE_BUDGET);
     defer std.testing.allocator.free(payload);
     @memset(payload, 'x');
     try enqueuePayload(&mb, &pool, payload);

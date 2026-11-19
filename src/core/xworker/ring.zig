@@ -1173,7 +1173,7 @@ test "DeliverySystem: racing producers lose no wakeups" {
                 // that landed are owed a wake.
                 ds.deliverDelivery(0, 1, Token.init(0, 0, token_kinds.session), "race", 0, 0, .normal) catch |err| switch (err) {
                     error.QueueFull => continue,
-                    error.InvalidWorker, error.PayloadTooLarge, error.BlobBudget => unreachable,
+                    error.InvalidWorker, error.PayloadTooLarge, error.BlobBudget, error.OutOfMemory => unreachable,
                 };
                 _ = sent.fetchAdd(1, .release);
             }
@@ -1330,7 +1330,7 @@ test "delivery classes: a full ring counts every class's QueueFull" {
     const handler = struct {
         fn handle(_: usize, _: Token, _: []const u8) void {}
     }.handle;
-    _ = queue.drain(0, handler);
+    _ = queue.drain(@as(usize, 0), handler);
 }
 
 test "actor retry list resends into a drained ring and exhausts with the class fallback" {
@@ -1360,13 +1360,13 @@ test "actor retry list resends into a drained ring and exhausts with the class f
     const handler = struct {
         fn handle(_: usize, _: Token, _: []const u8) void {}
     }.handle;
-    _ = ds.getQueue(1).drain(0, handler);
+    _ = ds.getQueue(1).drain(@as(usize, 0), handler);
     const resends_before = actor_retry_resends.load(.monotonic);
     ds.retry_lists[0].drain(&ds, &exh, Exh.onExhausted);
     try std.testing.expectEqual(@as(u16, 0), ds.retry_lists[0].count);
     try std.testing.expectEqual(resends_before + 1, actor_retry_resends.load(.monotonic));
     try std.testing.expect(ds.getQueue(1).hasPending());
-    _ = ds.getQueue(1).drain(0, handler);
+    _ = ds.getQueue(1).drain(@as(usize, 0), handler);
 
     // Refill, park another envelope, and let it exhaust its attempts.
     const fill2 = try ds.produceBlob(0, "fill");
@@ -1382,5 +1382,5 @@ test "actor retry list resends into a drained ring and exhausts with the class f
     try std.testing.expectEqual(@as(u16, 1), exh.calls);
     try std.testing.expectEqual(DeliveryClass.sm_actor, exh.last_class);
     try std.testing.expectEqual(drops_before + 1, actor_retry_drops.load(.monotonic));
-    _ = ds.getQueue(1).drain(0, handler);
+    _ = ds.getQueue(1).drain(@as(usize, 0), handler);
 }
