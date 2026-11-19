@@ -3658,6 +3658,70 @@ test "S16: mailbox-full bounce targets the sender and fails closed on overflow" 
     try std.testing.expect(bob.sm_overflow);
 }
 
+test "S16: a full room mailbox follows the policy: sender error and counter" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    const reg_mod = @import("room_registry");
+    const mb_mod = @import("room_mailbox");
+    const sm_mod = @import("session_map");
+
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    var sm = sm_mod.SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+    // Registry tears down first: its mailbox items release blobs into the
+    // delivery system's budgets.
+    var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+    server.delivery_system = &delivery_sys;
+    var registry = reg_mod.RoomRegistry.init(allocator);
+    defer registry.deinit();
+    server.room_registry = &registry;
+    server.worker_id = 0;
+
+    var bob_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
+    defer posix.close(bob_fds[1]);
+    const bob = try allocator.create(Session);
+    bob.init(bob_fds[0], 0, server.server_host, false, allocator);
+    server.sessions[0] = bob;
+    _ = try sm.bind(0, server.sessionToken(0), "bob", "localhost", "phone");
+
+    const msg = actor_message.Message{ .room_message = .{
+        .room_jid = "room@conference.localhost",
+        .from_jid = "bob@localhost/phone",
+        .inner_xml = "<body>hi</body>",
+        .stanza_id = "m42",
+    } };
+    var enc_buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
+    const enc_len = actor_message.encode(&enc_buf, msg) orelse unreachable;
+    const blob = try delivery_sys.produceBlob(0, enc_buf[0..enc_len]);
+    defer blob.release();
+
+    // Fill the mailbox to its item cap; the next push must take the
+    // S16 policy rather than growing memory.
+    const room = try registry.createRoom("room@conference.localhost", .{});
+    var i: u16 = 0;
+    while (i < mb_mod.MAX_ITEMS) : (i += 1) {
+        try room.mailbox.enqueue(&registry.item_pool, blob);
+        registry.markPending(room);
+    }
+
+    const drops_before = mb_mod.mailbox_drops.load(.monotonic);
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    muc_actor.handleRoomActorMessage(&server, blob, &changes);
+
+    try std.testing.expectEqual(drops_before + 1, mb_mod.mailbox_drops.load(.monotonic));
+    _ = try bob.conn.flushSend();
+    var buf: [1024]u8 = undefined;
+    const bn = posix.read(bob_fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..bn], "resource-constraint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..bn], "id='m42'") != null);
+}
+
 test "T256: remote-join twin collapses onto the existing occupant" {
     const allocator = std.testing.allocator;
     const reg_mod = @import("room_registry");

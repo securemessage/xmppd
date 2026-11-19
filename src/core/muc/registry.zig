@@ -173,6 +173,10 @@ pub const Room = struct {
     /// Per-room actor message mailbox. Cross-thread messages from MPSC are pushed
     /// here; owning worker round-robins across rooms for fair scheduling.
     mailbox: RoomMailbox = .{},
+    /// Intrusive link on the registry's pending-mail FIFO; set only while
+    /// mailbox_pending is true.
+    pending_next: ?*Room = null,
+    mailbox_pending: bool = false,
     /// Allocator for hash map internals.
     allocator: std.mem.Allocator = undefined,
     /// O(1) nick → slot index lookup.
@@ -366,6 +370,14 @@ pub const RoomRegistry = struct {
     rooms: [MAX_ROOMS]?*Room = [_]?*Room{null} ** MAX_ROOMS,
     count: usize = 0,
     allocator: std.mem.Allocator,
+    /// Bounded pool for room-mailbox deque items; one item per pending
+    /// actor message, so a burst cannot grow allocation unboundedly.
+    item_pool: std.heap.MemoryPool(RoomMailbox.Item),
+    /// Intrusive FIFO of rooms holding pending mail. enqueue links a
+    /// room on the empty-to-nonempty edge; the drain walks this list
+    /// instead of scanning every room each tick (ADR-3).
+    pending_head: ?*Room = null,
+    pending_tail: ?*Room = null,
     /// Room directory — local projection of all public rooms across ALL workers.
     /// Updated via room_directory_update broadcasts. Used by disco#items to return
     /// a complete room list without scatter-gather.
@@ -373,7 +385,56 @@ pub const RoomRegistry = struct {
     directory_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) RoomRegistry {
-        return .{ .allocator = allocator };
+        return .{
+            .allocator = allocator,
+            .item_pool = std.heap.MemoryPool(RoomMailbox.Item).init(allocator),
+        };
+    }
+
+    /// Link a room onto the pending-mail FIFO. Idempotent: a room already
+    /// parked stays in place. Producer side (mailbox enqueue) only.
+    pub fn markPending(self: *RoomRegistry, room: *Room) void {
+        if (room.mailbox_pending) return;
+        room.mailbox_pending = true;
+        room.pending_next = null;
+        if (self.pending_tail) |t| {
+            t.pending_next = room;
+        } else {
+            self.pending_head = room;
+        }
+        self.pending_tail = room;
+    }
+
+    /// Pop the oldest room with pending mail; clears its link so the
+    /// caller may re-mark it when it still holds items (round-robin).
+    pub fn popPending(self: *RoomRegistry) ?*Room {
+        const room = self.pending_head orelse return null;
+        self.pending_head = room.pending_next;
+        if (self.pending_head == null) self.pending_tail = null;
+        room.pending_next = null;
+        room.mailbox_pending = false;
+        return room;
+    }
+
+    /// Remove a room parked on the pending FIFO (room destruction).
+    fn unlinkPending(self: *RoomRegistry, room: *Room) void {
+        if (!room.mailbox_pending) return;
+        if (self.pending_head == room) {
+            self.pending_head = room.pending_next;
+            if (self.pending_tail == room) self.pending_tail = null;
+        } else {
+            var cur = self.pending_head;
+            while (cur) |c| {
+                if (c.pending_next == room) {
+                    c.pending_next = room.pending_next;
+                    if (self.pending_tail == room) self.pending_tail = c;
+                    break;
+                }
+                cur = c.pending_next;
+            }
+        }
+        room.pending_next = null;
+        room.mailbox_pending = false;
     }
 
     /// Find a room by its bare JID.
@@ -416,6 +477,8 @@ pub const RoomRegistry = struct {
         for (&self.rooms) |*slot| {
             if (slot.*) |room| {
                 if (room.active and std.mem.eql(u8, room.getJid(), jid)) {
+                    self.unlinkPending(room);
+                    room.mailbox.deinit(&self.item_pool);
                     room.deinit();
                     self.allocator.destroy(room);
                     slot.* = null;
@@ -514,11 +577,15 @@ pub const RoomRegistry = struct {
     pub fn deinit(self: *RoomRegistry) void {
         for (&self.rooms) |*slot| {
             if (slot.*) |room| {
+                room.mailbox.deinit(&self.item_pool);
                 room.deinit();
                 self.allocator.destroy(room);
                 slot.* = null;
             }
         }
+        self.pending_head = null;
+        self.pending_tail = null;
+        self.item_pool.deinit();
         self.count = 0;
     }
 };

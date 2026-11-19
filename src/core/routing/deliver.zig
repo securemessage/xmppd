@@ -213,7 +213,7 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
                 },
                 // Room actor message: decode and dispatch to local room shard
                 token_kinds.room_actor => {
-                    muc_actor.handleRoomActorMessage(c.server, payload, c.changes);
+                    muc_actor.handleRoomActorMessage(c.server, c.queue.current_slot_blob.?, c.changes);
                     return;
                 },
                 // SM resume handoff actor message (T177)

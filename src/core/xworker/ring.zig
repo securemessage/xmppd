@@ -388,6 +388,11 @@ pub const MpscQueue = struct {
     /// Delivery class of the slot the drain is currently handing to the
     /// handler. Consumer-only, valid for the duration of one handler call.
     current_slot_class: DeliveryClass = .normal,
+
+    /// The blob backing the payload the drain handler is currently
+    /// processing. Consumer-only, valid for the duration of one handler
+    /// call; a consumer that retains it MUST addRef (room mailboxes do).
+    current_slot_blob: ?*Blob = null,
     /// Producer receipt time of that same slot; 0 when untimed.
     current_slot_receipt_ts: u64 = 0,
 
@@ -480,10 +485,12 @@ pub const MpscQueue = struct {
             self.current_slot_token = slot.hold_token;
             self.current_slot_class = slot.class;
             self.current_slot_receipt_ts = slot.receipt_ts;
+            self.current_slot_blob = blob;
             handler(ctx, slot.target, blob.bytes());
             self.current_slot_token = 0;
             self.current_slot_class = .normal;
             self.current_slot_receipt_ts = 0;
+            self.current_slot_blob = null;
             processed += 1;
 
             // Retire the slot, then publish the advanced head. A producer

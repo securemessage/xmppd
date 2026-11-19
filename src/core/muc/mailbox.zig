@@ -1,77 +1,81 @@
-//! # RoomMailbox — Per-room SPSC message buffer
+//! # RoomMailbox — Per-room actor message deque
 //!
-//! A bounded, single-producer-single-consumer ring buffer for per-room actor
-//! messages. The owning worker is the sole consumer. The sole producer is the
-//! MPSC drain handler (cross-thread messages arrive via the per-worker MPSC,
-//! then are pushed into the target room's mailbox).
+//! A bounded FIFO of refcounted blob envelopes (ADR-3). The owning worker is
+//! the sole consumer; the MPSC drain handler is the sole producer (SPSC).
+//! Items come from the room registry's bounded MemoryPool, and each room
+//! carries a byte budget, so a burst of large actor messages is refused by
+//! policy instead of growing memory.
 //!
 //! Same-thread operations bypass the mailbox entirely — they are processed
 //! inline with zero overhead (fast path).
-//!
-//! ## Design
-//!
-//! - Fixed-capacity ring buffer: 16 slots
-//! - SPSC (not MPSC) — owning worker holds both room and mailbox; only one
-//!   write path per tick (MPSC drain → enqueue)
-//! - Backpressure: enqueue returns error.MailboxFull if capacity exhausted
-//! - No atomics needed — single-threaded access by owning worker only
 
 const std = @import("std");
 const delivery_queue = @import("delivery_queue");
-
-/// Number of mailbox slots per room.
-pub const MAILBOX_SLOTS: u8 = 16;
 
 /// Actor messages dropped because a room mailbox was full (S16). The owning
 /// worker increments it; the M1 metrics task exports it later.
 pub var mailbox_drops = std.atomic.Value(u64).init(0);
 
-/// Maximum payload size per message (matches MPSC slot payload).
-/// Interim inline payload cap; item 4 replaces the mailbox with a
-/// heap deque of blob envelopes. Kept at the old 4080 so the interim
-/// per-room footprint does not grow.
-pub const MAX_PAYLOAD_SIZE: u32 = 4080;
+/// Per-room byte budget across all queued items.
+pub const BYTE_BUDGET: u32 = 256 * 1024;
+/// Per-room item cap; one room cannot monopolize the worker's item pool.
+pub const MAX_ITEMS: u16 = 64;
 
 /// Per-room actor message mailbox.
 pub const RoomMailbox = struct {
-    slots: [MAILBOX_SLOTS][MAX_PAYLOAD_SIZE]u8 = undefined,
-    lengths: [MAILBOX_SLOTS]u16 = [_]u16{0} ** MAILBOX_SLOTS,
-    head: u8 = 0,
-    tail: u8 = 0,
-    count: u8 = 0,
+    /// Intrusive deque node; allocated from the registry's MemoryPool.
+    pub const Item = struct {
+        next: ?*Item = null,
+        blob: *delivery_queue.Blob,
+    };
 
-    /// Enqueue a serialized actor message into this room's mailbox.
-    /// Returns error.MailboxFull if the ring buffer is at capacity.
-    pub fn enqueue(self: *RoomMailbox, payload: []const u8) !void {
-        if (self.count >= MAILBOX_SLOTS) return error.MailboxFull;
-        if (payload.len > MAX_PAYLOAD_SIZE or payload.len == 0) return error.InvalidPayload;
+    head: ?*Item = null,
+    tail: ?*Item = null,
+    count: u16 = 0,
+    bytes: u32 = 0,
 
-        const slot = self.tail;
-        const len: u16 = @intCast(payload.len);
-        @memcpy(self.slots[slot][0..len], payload[0..len]);
-        self.lengths[slot] = len;
-        self.tail = (self.tail + 1) % MAILBOX_SLOTS;
+    /// Take one reference on `blob` and link it FIFO. Returns
+    /// error.MailboxFull at the item cap, over the byte budget, or when
+    /// the shared pool is exhausted; the caller runs the S16 policy.
+    pub fn enqueue(self: *RoomMailbox, pool: *std.heap.MemoryPool(Item), blob: *delivery_queue.Blob) !void {
+        if (self.count >= MAX_ITEMS) return error.MailboxFull;
+        if (self.bytes + blob.len > BYTE_BUDGET) return error.MailboxFull;
+        const item = pool.create() catch return error.MailboxFull;
+        blob.addRef();
+        item.* = .{ .blob = blob };
+        if (self.tail) |t| {
+            t.next = item;
+        } else {
+            self.head = item;
+        }
+        self.tail = item;
+        self.bytes += blob.len;
         self.count += 1;
     }
 
-    /// Dequeue one message from this room's mailbox.
-    /// Returns the payload slice (pointing into internal buffer) or null if empty.
-    /// The returned slice is valid until the next enqueue into the same slot
-    /// (i.e., until MAILBOX_SLOTS more messages are enqueued).
-    pub fn dequeue(self: *RoomMailbox) ?[]const u8 {
-        if (self.count == 0) return null;
-
-        const slot = self.head;
-        const len = self.lengths[slot];
-        const payload = self.slots[slot][0..len];
-        self.head = (self.head + 1) % MAILBOX_SLOTS;
+    /// Pop the oldest item's blob. The caller owns the returned reference
+    /// and must release it. Returns null when empty.
+    pub fn dequeue(self: *RoomMailbox, pool: *std.heap.MemoryPool(Item)) ?*delivery_queue.Blob {
+        const item = self.head orelse return null;
+        self.head = item.next;
+        if (self.head == null) self.tail = null;
+        const blob = item.blob;
+        self.bytes -= blob.len;
         self.count -= 1;
-        return payload;
+        pool.destroy(item);
+        return blob;
     }
 
     /// Check if there are pending messages.
     pub fn hasPending(self: *const RoomMailbox) bool {
         return self.count > 0;
+    }
+
+    /// Release every parked item; called when the room is destroyed.
+    pub fn deinit(self: *RoomMailbox, pool: *std.heap.MemoryPool(Item)) void {
+        while (self.dequeue(pool)) |blob| blob.release();
+        self.head = null;
+        self.tail = null;
     }
 };
 
@@ -79,71 +83,91 @@ pub const RoomMailbox = struct {
 // Tests
 // ============================================================================
 
+var test_budget_store: ?delivery_queue.BlobBudget = null;
+fn testBudget() *delivery_queue.BlobBudget {
+    if (test_budget_store == null) {
+        test_budget_store = .{ .allocator = std.testing.allocator, .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT };
+    }
+    return &test_budget_store.?;
+}
+
+fn enqueuePayload(mb: *RoomMailbox, pool: *std.heap.MemoryPool(RoomMailbox.Item), payload: []const u8) !void {
+    const blob = try testBudget().produce(payload);
+    defer blob.release();
+    try mb.enqueue(pool, blob);
+}
+
+fn dequeueString(mb: *RoomMailbox, pool: *std.heap.MemoryPool(RoomMailbox.Item), buf: []u8) ?[]const u8 {
+    const blob = mb.dequeue(pool) orelse return null;
+    defer blob.release();
+    if (blob.bytes().len > buf.len) return null;
+    @memcpy(buf[0..blob.bytes().len], blob.bytes());
+    return buf[0..blob.bytes().len];
+}
+
 test "RoomMailbox: enqueue and dequeue round-trip" {
+    var pool = std.heap.MemoryPool(RoomMailbox.Item).init(std.testing.allocator);
+    defer pool.deinit();
     var mb = RoomMailbox{};
     const payload = "hello room actor";
-    try mb.enqueue(payload);
+    try enqueuePayload(&mb, &pool, payload);
 
     try std.testing.expect(mb.hasPending());
-    try std.testing.expectEqual(@as(u8, 1), mb.count);
+    try std.testing.expectEqual(@as(u16, 1), mb.count);
 
-    const out = mb.dequeue().?;
+    var buf: [128]u8 = undefined;
+    const out = dequeueString(&mb, &pool, &buf).?;
     try std.testing.expectEqualStrings("hello room actor", out);
     try std.testing.expect(!mb.hasPending());
-    try std.testing.expectEqual(@as(u8, 0), mb.count);
+    try std.testing.expectEqual(@as(u16, 0), mb.count);
+    try std.testing.expectEqual(@as(u32, 0), mb.bytes);
 }
 
 test "RoomMailbox: FIFO ordering" {
+    var pool = std.heap.MemoryPool(RoomMailbox.Item).init(std.testing.allocator);
+    defer pool.deinit();
     var mb = RoomMailbox{};
-    try mb.enqueue("first");
-    try mb.enqueue("second");
-    try mb.enqueue("third");
+    try enqueuePayload(&mb, &pool, "first");
+    try enqueuePayload(&mb, &pool, "second");
+    try enqueuePayload(&mb, &pool, "third");
 
-    try std.testing.expectEqual(@as(u8, 3), mb.count);
-    try std.testing.expectEqualStrings("first", mb.dequeue().?);
-    try std.testing.expectEqualStrings("second", mb.dequeue().?);
-    try std.testing.expectEqualStrings("third", mb.dequeue().?);
-    try std.testing.expect(mb.dequeue() == null);
+    try std.testing.expectEqual(@as(u16, 3), mb.count);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("first", dequeueString(&mb, &pool, &buf).?);
+    try std.testing.expectEqualStrings("second", dequeueString(&mb, &pool, &buf).?);
+    try std.testing.expectEqualStrings("third", dequeueString(&mb, &pool, &buf).?);
+    try std.testing.expect(mb.dequeue(&pool) == null);
 }
 
 test "RoomMailbox: full mailbox returns error" {
+    var pool = std.heap.MemoryPool(RoomMailbox.Item).init(std.testing.allocator);
+    defer pool.deinit();
     var mb = RoomMailbox{};
-    var i: u8 = 0;
-    while (i < MAILBOX_SLOTS) : (i += 1) {
-        try mb.enqueue("msg");
+    var i: u16 = 0;
+    while (i < MAX_ITEMS) : (i += 1) {
+        try enqueuePayload(&mb, &pool, "msg");
     }
-    try std.testing.expectEqual(@as(u8, MAILBOX_SLOTS), mb.count);
-    try std.testing.expectError(error.MailboxFull, mb.enqueue("overflow"));
+    try std.testing.expectEqual(@as(u16, MAX_ITEMS), mb.count);
+    try std.testing.expectError(error.MailboxFull, enqueuePayload(&mb, &pool, "overflow"));
+    mb.deinit(&pool);
 }
 
-test "RoomMailbox: wrap-around" {
+test "RoomMailbox: byte budget returns error" {
+    var pool = std.heap.MemoryPool(RoomMailbox.Item).init(std.testing.allocator);
+    defer pool.deinit();
     var mb = RoomMailbox{};
-    // Fill and drain multiple times to exercise wrap-around
-    var i: u8 = 0;
-    while (i < MAILBOX_SLOTS) : (i += 1) {
-        try mb.enqueue("fill");
-    }
-    // Drain all
-    i = 0;
-    while (i < MAILBOX_SLOTS) : (i += 1) {
-        try std.testing.expect(mb.dequeue() != null);
-    }
-    try std.testing.expectEqual(@as(u8, 0), mb.count);
-
-    // Now enqueue again — should wrap around
-    try mb.enqueue("wrapped-1");
-    try mb.enqueue("wrapped-2");
-    try std.testing.expectEqualStrings("wrapped-1", mb.dequeue().?);
-    try std.testing.expectEqualStrings("wrapped-2", mb.dequeue().?);
+    const payload = try std.testing.allocator.alloc(u8, RoomMailbox.BYTE_BUDGET);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'x');
+    try enqueuePayload(&mb, &pool, payload);
+    try std.testing.expectError(error.MailboxFull, enqueuePayload(&mb, &pool, "one more"));
+    mb.deinit(&pool);
 }
 
 test "RoomMailbox: dequeue empty returns null" {
+    var pool = std.heap.MemoryPool(RoomMailbox.Item).init(std.testing.allocator);
+    defer pool.deinit();
     var mb = RoomMailbox{};
-    try std.testing.expect(mb.dequeue() == null);
+    try std.testing.expect(mb.dequeue(&pool) == null);
     try std.testing.expect(!mb.hasPending());
-}
-
-test "RoomMailbox: empty payload rejected" {
-    var mb = RoomMailbox{};
-    try std.testing.expectError(error.InvalidPayload, mb.enqueue(""));
 }
