@@ -6,6 +6,7 @@
 //! both the c2s dispatchStanza and the S2S dispatchS2sResponse entries.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const xml = @import("xml");
 const xmpp = @import("xmpp");
@@ -353,6 +354,59 @@ pub fn deliverMulticastToWorkers(self: *Server, room: *const room_registry_mod.R
         ds.deliverBlob(wid, delivery_queue_mod.MULTICAST_TARGET, blob, 0, 0, .normal) catch |err| {
             log.warn("multicast delivery failed to worker {d}: {}", .{ wid, err });
         };
+    }
+}
+
+test "multicast to N remote workers serializes the payload once" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 4);
+    defer delivery_sys.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    var room = room_registry_mod.Room.init(allocator);
+    defer room.deinit();
+    room.active = true;
+    room.setJid("test@conference.localhost");
+
+    // Occupants on workers 1, 2 and 3 plus a local one on worker 0.
+    _ = try room.addOccupant("local", "local@localhost/r", "local@localhost", server.sessionToken(1), 0, .participant, .none);
+    _ = try room.addOccupant("r1", "r1@localhost/r", "r1@localhost", Token.init(1, 1, token_kinds.session), 1, .participant, .none);
+    _ = try room.addOccupant("r2", "r2@localhost/r", "r2@localhost", Token.init(1, 1, token_kinds.session), 2, .participant, .none);
+    _ = try room.addOccupant("r3", "r3@localhost/r", "r3@localhost", Token.init(1, 1, token_kinds.session), 3, .participant, .none);
+
+    if (builtin.is_test) fanout_mod.encode_count.store(0, .monotonic);
+    deliverMulticastToWorkers(&server, &room, "<message from='test@conference.localhost' to='", "/x'><body>hi</body></message>");
+    try std.testing.expectEqual(@as(u32, 1), fanout_mod.encode_count.load(.monotonic));
+
+    // Each remote worker's ring carries exactly one envelope, all sharing
+    // the same blob; the local worker's ring is empty.
+    const Ctx = struct {
+        targets: u32 = 0,
+        payloads: u32 = 0,
+    };
+    var ctx = Ctx{};
+    const drain_one = struct {
+        fn drain_one(c: *Ctx, target: Token, payload: []const u8) void {
+            if (target.eql(delivery_queue_mod.MULTICAST_TARGET)) c.targets += 1;
+            if (payload.len > 0) c.payloads += 1;
+        }
+    }.drain_one;
+
+    try std.testing.expectEqual(@as(u32, 0), delivery_sys.queues[0].drain(&ctx, drain_one));
+    for (delivery_sys.queues[1..4]) |*q| {
+        ctx = .{};
+        try std.testing.expectEqual(@as(u32, 1), q.drain(&ctx, drain_one));
+        try std.testing.expectEqual(@as(u32, 1), ctx.targets);
+        try std.testing.expectEqual(@as(u32, 1), ctx.payloads);
     }
 }
 
