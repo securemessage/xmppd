@@ -1529,13 +1529,7 @@ pub fn build(b: *std.Build) void {
 
     const run_supervisor_tests = b.addRunArtifact(supervisor_tests);
 
-    // --- Config module (shared by all daemons) ---
-
-    const config_mod = b.createModule(.{
-        .root_source_file = b.path("src/config/parser.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // --- Legacy config parser tests ---
 
     const config_test_mod = b.createModule(.{
         .root_source_file = b.path("src/config/parser.zig"),
@@ -1828,7 +1822,6 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("invite_store", auth_invite_store_mod);
     auth_mod.addImport("op_backend", auth_op_backend_mod);
     auth_mod.addImport("event_loop", auth_event_loop_mod);
-    auth_mod.addImport("config", config_mod);
     auth_mod.addImport("conf", conf_mod);
     auth_mod.addImport("schema", schema_mod);
     auth_mod.addImport("backend", auth_backend_mod);
@@ -1954,7 +1947,6 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("policy", oidc_policy_mod);
     oidc_main_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_main_mod.addImport("event_loop", oidc_event_loop_mod);
-    oidc_main_mod.addImport("config", config_mod);
     oidc_main_mod.addImport("conf", conf_mod);
     oidc_main_mod.addImport("schema", schema_mod);
     oidc_main_mod.addImport("lock_store", auth_lock_store_mod);
@@ -1990,6 +1982,8 @@ pub fn build(b: *std.Build) void {
         .root_module = oidc_main_mod,
     });
     const run_oidc_main_tests = b.addRunArtifact(oidc_main_tests);
+    // Startup tests spawn the installed OIDC binary, never a stale artifact.
+    run_oidc_main_tests.step.dependOn(b.getInstallStep());
 
     // xmppd-s2s: the S2S federation daemon
     const s2s_ipc_protocol_mod = b.createModule(.{
@@ -2269,8 +2263,12 @@ pub fn build(b: *std.Build) void {
     test_master_step.dependOn(&run_supervisor_tests.step);
     const test_core_step = b.step("test-core", "Run only the core daemon tests");
     const test_s2s_step = b.step("test-s2s", "Run only the s2s daemon tests");
+    const test_auth_step = b.step("test-auth", "Run only the auth daemon startup tests");
+    const test_auth_oidc_step = b.step("test-auth-oidc", "Run only the OIDC auth daemon tests");
     test_core_step.dependOn(&run_core_tests.step);
     test_s2s_step.dependOn(&run_s2s_main_tests.step);
+    test_auth_step.dependOn(&run_auth_main_tests.step);
+    test_auth_oidc_step.dependOn(&run_oidc_main_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
     // A green test suite must also prove every install artifact compiles.
