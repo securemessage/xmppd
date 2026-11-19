@@ -166,7 +166,7 @@ fn bounceCrossWorkerUnavailable(
             return;
         }
     } else if (self.delivery_system) |ds| {
-        ds.deliver(entry.worker_id, entry.token, stanza) catch {
+        ds.deliver(self.worker_id, entry.worker_id, entry.token, stanza) catch {
             _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
             log.warn("cross-worker bounce for {s} dropped: delivery queue full", .{sender_full});
             return;
@@ -317,15 +317,25 @@ fn handleMulticastDelivery(self: *Server, payload: []const u8, changes: *ChangeL
 
 /// Encode and enqueue a multicast delivery to each remote worker that has
 /// occupants in the given room. Iterates set bits in worker_mask, excluding self.
+/// The payload is serialized once into one refcounted blob that every
+/// target ring shares (ADR-3).
 pub fn deliverMulticastToWorkers(self: *Server, room: *const room_registry_mod.Room, prefix: []const u8, suffix: []const u8) void {
     const ds = self.delivery_system orelse return;
 
-    var mcast_buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
-    const mcast_len = fanout_mod.encodeMulticastPayload(&mcast_buf, room.getJid(), prefix, suffix) orelse {
+    var mcast_lease = self.leaseByteScratch() orelse {
+        log.err("byte-scratch exhausted; multicast for room {s} dropped", .{room.getJid()});
+        return;
+    };
+    defer mcast_lease.release();
+    const mcast_len = fanout_mod.encodeMulticastPayload(mcast_lease.buf, room.getJid(), prefix, suffix) orelse {
         log.warn("multicast payload too large for room {s}", .{room.getJid()});
         return;
     };
-    const mcast_payload = mcast_buf[0..mcast_len];
+    const blob = ds.produceBlob(self.worker_id, mcast_lease.buf[0..mcast_len]) catch |err| {
+        log.warn("multicast blob for room {s} refused: {}", .{ room.getJid(), err });
+        return;
+    };
+    defer blob.release();
 
     // Iterate set bits in worker_mask, excluding self
     var mask = room.worker_mask;
@@ -333,7 +343,7 @@ pub fn deliverMulticastToWorkers(self: *Server, room: *const room_registry_mod.R
     var mask_it = mask.iterator(.{});
     while (mask_it.next()) |bit| {
         const wid: u16 = @intCast(bit);
-        ds.deliver(wid, delivery_queue_mod.MULTICAST_TARGET, mcast_payload) catch |err| {
+        ds.deliverBlob(wid, delivery_queue_mod.MULTICAST_TARGET, blob, 0, 0, .stanza) catch |err| {
             log.warn("multicast delivery failed to worker {d}: {}", .{ wid, err });
         };
     }
@@ -373,7 +383,7 @@ test "cross-thread delivery: enqueue and drain" {
     try std.testing.expect(route.token.eql(server.sessionToken(5)));
 
     // Build a stanza and enqueue it (as if worker 0 is sending)
-    try delivery_sys.deliver(route.worker_id, route.token, "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>cross-thread!</body></message>");
+    try delivery_sys.deliver(server.worker_id, route.worker_id, route.token, "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>cross-thread!</body></message>");
 
     // Worker 1 drains its queue
     var change_buf: [16]posix.Kevent = undefined;
@@ -430,7 +440,7 @@ test "cross-thread delivery: a token minted for a freed-then-reused slot is drop
     try std.testing.expect(fresh.gen > stale.gen);
 
     // A delivery minted against generation 1 must not reach session B.
-    try delivery_sys.deliver(1, stale, "<message type='chat'><body>stale!</body></message>");
+    try delivery_sys.deliver(0, 1, stale, "<message type='chat'><body>stale!</body></message>");
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
     drainDeliveryQueue(&server, &changes);
@@ -438,7 +448,7 @@ test "cross-thread delivery: a token minted for a freed-then-reused slot is drop
     try std.testing.expectEqual(@as(u64, 1), server.stale_token_skips);
 
     // The generation-2 token still resolves: delivery reaches session B.
-    try delivery_sys.deliver(1, fresh, "<message type='chat'><body>fresh!</body></message>");
+    try delivery_sys.deliver(0, 1, fresh, "<message type='chat'><body>fresh!</body></message>");
     drainDeliveryQueue(&server, &changes);
     try std.testing.expect(session_b.conn.hasPendingWrite());
 }
@@ -482,9 +492,9 @@ test "V13: shadow multicast to a freed-then-reused slot is not delivered (ADR-4)
 
     // A multicast arriving for the stale occupant record must not reach
     // session B; the skip is counted like any other stale token.
-    var mcast_buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
+    var mcast_buf: [256]u8 = undefined;
     const mcast_len = fanout_mod.encodeMulticastPayload(&mcast_buf, room.getJid(), "<message to='", "'/>") orelse unreachable;
-    try delivery_sys.deliver(1, delivery_queue_mod.MULTICAST_TARGET, mcast_buf[0..mcast_len]);
+    try delivery_sys.deliver(0, 1, delivery_queue_mod.MULTICAST_TARGET, mcast_buf[0..mcast_len]);
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
     drainDeliveryQueue(&server, &changes);
@@ -534,7 +544,7 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
 
     // The producer tags the slot with its own receipt time; the hold on the
     // consuming worker must store that time, not the time the drain ran.
-    try delivery_sys.deliverDelivery(1, server.sessionToken(5), "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345, .stanza);
+    try delivery_sys.deliverDelivery(0, 1, server.sessionToken(5), "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345, .stanza);
     drainDeliveryQueue(&server, &changes);
 
     session_lifecycle.drainOfflinePending(&server, session, &changes);
@@ -567,7 +577,7 @@ test "cross-thread delivery: generation mismatch drops stanza" {
     try sm.bind(0, server.sessionToken(3), "alice", "localhost", "mobile");
     _ = sm.unbind("alice", "localhost", "mobile");
     const stale = Token.init(3, server.slot_gen[3] + 1, token_kinds.session);
-    try delivery_sys.deliver(0, stale, "<message>stale</message>");
+    try delivery_sys.deliver(0, 0, stale, "<message>stale</message>");
 
     // Drain — should silently drop (generation mismatch)
     var change_buf: [16]posix.Kevent = undefined;
@@ -812,7 +822,7 @@ test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
     const entry = sm.findByFullJid("bob", "localhost", "desktop") orelse return error.MissingSession;
 
     const payload = "<message from='alice@localhost/mobile' to='bob@localhost' id='q1' type='chat'><body>queued</body></message>";
-    try delivery_sys.deliver(0, entry.token, payload);
+    try delivery_sys.deliver(0, 0, entry.token, payload);
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
     drainDeliveryQueue(&server, &changes);
@@ -998,7 +1008,7 @@ test "Server: H4 a cross-worker message lands behind an existing offline tail" {
     try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
 
     const live = "<message from='alice@localhost/mobile' to='bob@localhost' id='live-1' type='chat'><body>live</body></message>";
-    try delivery_sys.deliver(0, server.sessionToken(5), live);
+    try delivery_sys.deliver(0, 0, server.sessionToken(5), live);
 
     var change_buf: [32]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -1170,7 +1180,7 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
     try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
 
     const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' id='h2-1' type='chat'><body>hi</body></message>";
-    try delivery_sys.deliver(0, server.sessionToken(5), stanza);
+    try delivery_sys.deliver(0, 0, server.sessionToken(5), stanza);
 
     const bounces_before = delivery_queue_mod.offline_hold_bounces.load(.monotonic);
     var change_buf: [32]posix.Kevent = undefined;
@@ -1225,7 +1235,7 @@ test "Server: H2 a cross-worker hold failure bounces across workers" {
     _ = try sm.bind(0, server.sessionToken(9), "alice", "localhost", "mobile");
 
     const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' id='h2-2' type='chat'><body>hi</body></message>";
-    try delivery_sys.deliver(1, server.sessionToken(5), stanza);
+    try delivery_sys.deliver(0, 1, server.sessionToken(5), stanza);
 
     var change_buf: [32]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -1241,20 +1251,22 @@ test "Server: H2 a cross-worker hold failure bounces across workers" {
     const Seen = struct {
         count: usize = 0,
         session_id: u32 = 0,
-        payload: []const u8 = "",
+        unavailable: bool = false,
+        id_echo: bool = false,
 
         fn handle(self: *@This(), target: Token, payload: []const u8) void {
             self.count += 1;
             self.session_id = target.index;
-            self.payload = payload;
+            if (std.mem.indexOf(u8, payload, "service-unavailable") != null) self.unavailable = true;
+            if (std.mem.indexOf(u8, payload, "id='h2-2'") != null) self.id_echo = true;
         }
     };
     var seen = Seen{};
     _ = delivery_sys.getQueue(0).drain(&seen, Seen.handle);
     try std.testing.expectEqual(@as(usize, 1), seen.count);
     try std.testing.expectEqual(@as(u32, 9), seen.session_id);
-    try std.testing.expect(std.mem.indexOf(u8, seen.payload, "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen.payload, "id='h2-2'") != null);
+    try std.testing.expect(seen.unavailable);
+    try std.testing.expect(seen.id_echo);
 }
 
 // H3: a detached session can still have an undrained offline tail. A live
@@ -1306,7 +1318,7 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
 
     const payload = "<message from='alice@localhost/mobile' to='bob@localhost' id='h3-1' type='chat'><body>live</body></message>";
-    try delivery_sys.deliver(0, server.sessionToken(5), payload);
+    try delivery_sys.deliver(0, 0, server.sessionToken(5), payload);
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);

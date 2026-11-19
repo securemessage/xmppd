@@ -899,10 +899,15 @@ fn enqueueCrossThreadStanza(
 
     // The same serializer as the local path: the receiving worker holds this
     // message under the token below, and a byte that differs between the two
-    // forms would split one dispatch into two rows.
-    var buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
+    // forms would split one dispatch into two rows. The blob ring carries no
+    // 4080-byte cap (S14); only the serialization bank bounds the stanza.
+    var stanza_lease = server.leaseByteScratch() orelse {
+        noteCrossWorkerDrop("byte-scratch exhausted; cross-thread stanza to worker {d} session {d} dropped", .{ route.worker_id, route.token.index });
+        return false;
+    };
+    defer stanza_lease.release();
     const payload = buildDeliveryStanza(
-        &buf,
+        stanza_lease.buf,
         tag_name,
         from_str,
         to_str,
@@ -910,20 +915,18 @@ fn enqueueCrossThreadStanza(
         emitTypeFor(kind, type_str),
         id_str,
         inner_xml,
-    ) orelse return dropOversize(inner_xml.len, route);
+    ) orelse {
+        noteCrossWorkerDrop("cross-thread stanza exceeds the {d}-byte serialization bank (inner {d} bytes) to worker {d} session {d}: routed to offline/bounce fallback", .{ stanza_lease.buf.len, inner_xml.len, route.worker_id, route.token.index });
+        return false;
+    };
 
     // Carry the dispatch identity so the receiving worker holds this message
     // under the same token every other holder uses.
-    ds.deliverDelivery(route.worker_id, route.token, payload, hold_token, receipt_ts, .stanza) catch |err| {
+    ds.deliverDelivery(server.worker_id, route.worker_id, route.token, payload, hold_token, receipt_ts, .stanza) catch |err| {
         noteCrossWorkerDrop("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.token.index, err });
         return false;
     };
     return true;
-}
-
-fn dropOversize(inner_len: usize, route: SessionEntry) bool {
-    noteCrossWorkerDrop("cross-thread stanza exceeds {d}-byte delivery slot (inner {d} bytes) to worker {d} session {d}: routed to offline/bounce fallback (S14)", .{ delivery_queue_mod.MAX_PAYLOAD_SIZE, inner_len, route.worker_id, route.token.index });
-    return false;
 }
 
 /// XEP-0280: Send a carbon copy of a message to other resources of a user.
@@ -1094,7 +1097,7 @@ fn sendCarbons(
             // The slot carries the carbon class so the receiving worker can
             // apply carbons_enabled and the live-only rules; this worker
             // cannot see them on the remote Session.
-            ds.deliverDelivery(entry.worker_id, entry.token, carbon_xml, 0, 0, .carbon) catch |err| {
+            ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, carbon_xml, 0, 0, .carbon) catch |err| {
                 noteCrossWorkerDrop("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
             };
         }
@@ -1471,7 +1474,62 @@ test "S14: failed cross-worker resource does not block local delivery" {
     try std.testing.expectEqual(@as(usize, 0), an);
 }
 
-test "S14: oversize cross-worker stanza falls back to the offline store" {
+test "S14: a cross-worker stanza larger than the old slot cap is delivered" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "phone");
+    sm.setPresenceAvailable("bob", "localhost", "phone", true);
+
+    const alice_fds = try makeSocketPair();
+    defer posix.close(alice_fds[1]);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
+    defer alice.deinit();
+    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stanza_kind = .message;
+    alice.stanza_to = "bob@localhost";
+    alice.stanza_type = "chat";
+    alice.stanza_id = "m1";
+    const body = "<body>" ++ ([_]u8{'x'} ** 5000) ++ "</body>";
+    @memcpy(alice.stanza_buf[0..body.len], body);
+    alice.stanza_buf_len = body.len;
+
+    var change_buf: [64]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    dispatchStanza(&server, &alice, &changes);
+
+    // The stanza that used to overflow the 4080-byte slot now crosses
+    // workers in one descriptor; worker 1 receives the full payload.
+    const Seen = struct {
+        count: usize = 0,
+        len: usize = 0,
+        full_body: bool = false,
+        fn handle(self: *@This(), target: Token, payload: []const u8) void {
+            _ = target;
+            self.count += 1;
+            self.len = payload.len;
+            if (std.mem.indexOf(u8, payload, "xxxxxxxx") != null) self.full_body = true;
+        }
+    };
+    var seen = Seen{};
+    try std.testing.expectEqual(@as(u32, 1), delivery_sys.getQueue(1).drain(&seen, Seen.handle));
+    try std.testing.expect(seen.full_body);
+    try std.testing.expect(seen.len > 5000);
+}
+
+test "S14: a refused cross-worker stanza falls back to the offline store" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1494,6 +1552,7 @@ test "S14: oversize cross-worker stanza falls back to the offline store" {
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
+    delivery_sys.budgets[0].limit = 0;
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -1504,9 +1563,9 @@ test "S14: oversize cross-worker stanza falls back to the offline store" {
     server.offline = &offline_store;
     server.archive = &arch_store;
 
-    // bob's only resource lives on worker 1: the direct handoff is the
-    // cross-thread enqueue, and the stanza exceeds the delivery slot, so
-    // the fallback alone decides what happens to it.
+    // bob's only resource lives on worker 1. A refused cross-thread
+    // enqueue (blob budget at zero) leaves the offline store as the only
+    // remaining outcome.
     _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
@@ -1538,13 +1597,14 @@ test "S14: oversize cross-worker stanza falls back to the offline store" {
     try std.testing.expectEqual(@as(usize, 0), an);
 }
 
-test "S14: oversize cross-worker stanza with no offline store bounces" {
+test "S14: a refused cross-worker stanza with no offline store bounces" {
     const allocator = std.testing.allocator;
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
+    delivery_sys.budgets[0].limit = 0;
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);

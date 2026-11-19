@@ -27,7 +27,10 @@ pub const MAILBOX_SLOTS: u8 = 16;
 pub var mailbox_drops = std.atomic.Value(u64).init(0);
 
 /// Maximum payload size per message (matches MPSC slot payload).
-pub const MAX_PAYLOAD_SIZE = delivery_queue.MAX_PAYLOAD_SIZE;
+/// Interim inline payload cap; item 4 replaces the mailbox with a
+/// heap deque of blob envelopes. Kept at the old 4080 so the interim
+/// per-room footprint does not grow.
+pub const MAX_PAYLOAD_SIZE: u32 = 4080;
 
 /// Per-room actor message mailbox.
 pub const RoomMailbox = struct {

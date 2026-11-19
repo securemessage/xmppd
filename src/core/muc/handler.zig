@@ -1787,7 +1787,7 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
 
     if (before.worker_id != server.worker_id) {
         const ds = server.delivery_system orelse return;
-        ds.deliver(before.worker_id, before.token, stanza) catch |err| {
+        ds.deliver(server.worker_id, before.worker_id, before.token, stanza) catch |err| {
             noteCrossWorkerDrop("replaced-resource notice to worker {d} session {d} failed: {s}", .{ before.worker_id, before.token.index, @errorName(err) });
         };
         return;
@@ -1801,7 +1801,7 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
 }
 
 /// Presence error to a joiner on another worker.
-fn sendRemotePresenceError(ds: anytype, ev: actor_message.RoomEvent, condition: []const u8) void {
+fn sendRemotePresenceError(producer_worker: u16, ds: anytype, ev: actor_message.RoomEvent, condition: []const u8) void {
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     const w = fbs.writer();
@@ -1818,7 +1818,7 @@ fn sendRemotePresenceError(ds: anytype, ev: actor_message.RoomEvent, condition: 
         noteJidOverflowCrossWorker("remote presence error to '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
         return;
     };
-    ds.deliver(ev.worker_id, ev.session_token, stanza_xml) catch |err| {
+    ds.deliver(producer_worker, ev.worker_id, ev.session_token, stanza_xml) catch |err| {
         noteCrossWorkerDrop("remote presence error to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_token.index, @errorName(err) });
     };
 }
@@ -2129,7 +2129,7 @@ pub fn processRemoteJoin(
             noteJidOverflowCrossWorker("rejoin presence for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
             return;
         };
-        ds.deliver(ev.worker_id, ev.session_token, rejoin_xml) catch |err| {
+        ds.deliver(server.worker_id, ev.worker_id, ev.session_token, rejoin_xml) catch |err| {
             noteCrossWorkerDrop("rejoin presence to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_token.index, @errorName(err) });
         };
         return;
@@ -2142,14 +2142,14 @@ pub fn processRemoteJoin(
             // Same user, same nick, new resource on another worker: the new
             // resource takes over the occupant record.
             if (!collapseOccupant(server, r, existing_idx, ev.real_jid, ev.worker_id, ev.session_token, changes)) {
-                sendRemotePresenceError(ds, ev, "resource-constraint");
+                sendRemotePresenceError(server.worker_id, ds, ev, "resource-constraint");
                 return;
             }
             finishRemoteJoin(server, r, ev, existing.role, existing.affiliation, false, changes);
             return;
         } else {
             // Send conflict error back via MPSC
-            sendRemotePresenceError(ds, ev, "conflict");
+            sendRemotePresenceError(server.worker_id, ds, ev, "conflict");
             return;
         }
     }
@@ -2170,7 +2170,7 @@ pub fn processRemoteJoin(
             affiliation = store.getAffiliation(ev.room_jid, preparedMemberBare(server, bare_jid, &member_key_buf)) catch .none;
         }
         if (affiliation == .outcast) {
-            sendRemotePresenceError(ds, ev, "forbidden");
+            sendRemotePresenceError(server.worker_id, ds, ev, "forbidden");
             return;
         }
         role = affiliation.defaultRole();
@@ -2181,13 +2181,13 @@ pub fn processRemoteJoin(
 
     // Members-only check
     if (r.config.members_only and affiliation == .none) {
-        sendRemotePresenceError(ds, ev, "registration-required");
+        sendRemotePresenceError(server.worker_id, ds, ev, "registration-required");
         return;
     }
 
     // Add occupant to canonical room on owning worker
     _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_token, ev.worker_id, role, affiliation) catch {
-        sendRemotePresenceError(ds, ev, "service-unavailable");
+        sendRemotePresenceError(server.worker_id, ds, ev, "service-unavailable");
         return;
     };
 
@@ -2245,7 +2245,7 @@ fn finishRemoteJoin(
             noteJidOverflowCrossWorker("occupant presence '{s}/{s}' for joiner '{s}' exceeds {d} bytes; skipped", .{ r.getJid(), occ.getNick(), ev.real_jid, router.JID_STANZA_MAX });
             continue;
         };
-        ds.deliver(ev.worker_id, ev.session_token, occ_xml) catch |err| {
+        ds.deliver(server.worker_id, ev.worker_id, ev.session_token, occ_xml) catch |err| {
             noteCrossWorkerDrop("occupant presence '{s}/{s}' to worker {d} session {d} failed: {s}", .{ r.getJid(), occ.getNick(), ev.worker_id, ev.session_token.index, @errorName(err) });
             continue;
         };
@@ -2278,7 +2278,7 @@ fn finishRemoteJoin(
             noteJidOverflowCrossWorker("self presence '{s}/{s}' for joiner '{s}' exceeds {d} bytes; not sent", .{ r.getJid(), ev.nick, ev.real_jid, router.JID_STANZA_MAX });
             return;
         };
-        ds.deliver(ev.worker_id, ev.session_token, self_xml) catch |err| {
+        ds.deliver(server.worker_id, ev.worker_id, ev.session_token, self_xml) catch |err| {
             noteCrossWorkerDrop("self presence to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_token.index, @errorName(err) });
         };
     }
@@ -2303,7 +2303,7 @@ fn finishRemoteJoin(
             noteJidOverflowCrossWorker("room subject for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, subj_buf.len });
             return;
         };
-        ds.deliver(ev.worker_id, ev.session_token, subj_xml) catch |err| {
+        ds.deliver(server.worker_id, ev.worker_id, ev.session_token, subj_xml) catch |err| {
             noteCrossWorkerDrop("room subject to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_token.index, @errorName(err) });
         };
     }
@@ -2566,7 +2566,7 @@ pub fn processRemoteDiscoInfo(
         noteJidOverflowCrossWorker("remote disco#info reply to '{s}' exceeds {d} bytes; dropped", .{ ev.reply_to_jid, buf.len });
         return;
     };
-    ds.deliver(ev.reply_to_worker, ev.reply_to_token, reply_xml) catch |err| {
+    ds.deliver(server.worker_id, ev.reply_to_worker, ev.reply_to_token, reply_xml) catch |err| {
         noteCrossWorkerDrop("remote disco#info reply to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_token.index, @errorName(err) });
     };
 }
@@ -2749,6 +2749,12 @@ noinline fn sendRoomHistoryRemote(
 
     if (result.messages.len == 0) return;
 
+    var hist_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; history replay for '{s}' skipped", .{room_jid});
+        return;
+    };
+    defer hist_lease.release();
+
     var i: usize = result.messages.len;
     while (i > 0) {
         i -= 1;
@@ -2772,8 +2778,7 @@ noinline fn sendRoomHistoryRemote(
             continue;
         };
 
-        var buf: [delivery_queue.MAX_PAYLOAD_SIZE]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
+        var fbs = std.io.fixedBufferStream(hist_lease.buf);
         const w = fbs.writer();
 
         const hist_xml = out: {
@@ -2790,11 +2795,11 @@ noinline fn sendRoomHistoryRemote(
             w.writeAll(close_tag) catch break :out null;
             break :out fbs.getWritten();
         } orelse {
-            noteJidOverflowCrossWorker("history stanza for '{s}' exceeds {d} bytes; skipped", .{ real_jid, delivery_queue.MAX_PAYLOAD_SIZE });
+            noteJidOverflowCrossWorker("history stanza for '{s}' exceeds {d} bytes; skipped", .{ real_jid, hist_lease.buf.len });
             continue;
         };
 
-        ds.deliver(target_worker, target, hist_xml) catch |err| {
+        ds.deliver(server.worker_id, target_worker, target, hist_xml) catch |err| {
             noteCrossWorkerDrop("history stanza to worker {d} session {d} failed: {s}", .{ target_worker, target.index, @errorName(err) });
             continue;
         };
@@ -3046,7 +3051,7 @@ fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, target: Tok
         }
     } else {
         const ds = server.delivery_system orelse return;
-        ds.deliver(worker, target, stanza) catch |err| {
+        ds.deliver(server.worker_id, worker, target, stanza) catch |err| {
             noteCrossWorkerDrop("MUC delivery to worker {d} session {d} failed: {s}", .{ worker, target.index, @errorName(err) });
         };
     }
@@ -3134,7 +3139,7 @@ pub fn processRemoteAdminAction(
     };
 
     const ds = server.delivery_system orelse return;
-    ds.deliver(ev.reply_to_worker, ev.reply_to_token, result_xml) catch |err| {
+    ds.deliver(server.worker_id, ev.reply_to_worker, ev.reply_to_token, result_xml) catch |err| {
         noteCrossWorkerDrop("admin result to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_token.index, @errorName(err) });
     };
 }
@@ -3195,14 +3200,14 @@ pub fn processRemoteMamQuery(
 
     // Send each result message via MPSC unicast
     for (response.messages) |msg| {
-        ds.deliver(ev.reply_to_worker, ev.reply_to_token, msg.xml) catch |err| {
+        ds.deliver(server.worker_id, ev.reply_to_worker, ev.reply_to_token, msg.xml) catch |err| {
             noteCrossWorkerDrop("MAM result to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_token.index, @errorName(err) });
             continue;
         };
     }
 
     // Send the fin IQ
-    ds.deliver(ev.reply_to_worker, ev.reply_to_token, response.fin_iq) catch |err| {
+    ds.deliver(server.worker_id, ev.reply_to_worker, ev.reply_to_token, response.fin_iq) catch |err| {
         noteCrossWorkerDrop("MAM fin to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_token.index, @errorName(err) });
     };
 }
@@ -3214,21 +3219,25 @@ fn broadcastDirectoryUpdate(server: *Server, room_jid: []const u8, room_name: []
     const wc = muc_actor.getWorkerCount(server);
     if (wc <= 1) return;
 
-    var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
+    var enc_lease = server.leaseByteScratch() orelse {
+        noteDrop("byte-scratch exhausted; directory update for '{s}' not broadcast", .{room_jid});
+        return;
+    };
+    defer enc_lease.release();
     const msg = actor_message.Message{ .room_directory_update = .{
         .room_jid = room_jid,
         .room_name = room_name,
         .active = active,
     } };
-    const len = actor_message.encode(&buf, msg) orelse {
-        noteJidOverflow("directory update for '{s}' exceeds {d} bytes; not broadcast", .{ room_jid, actor_message.MAX_ENCODED_SIZE });
+    const len = actor_message.encode(enc_lease.buf, msg) orelse {
+        noteJidOverflow("directory update for '{s}' exceeds {d} bytes; not broadcast", .{ room_jid, enc_lease.buf.len });
         return;
     };
 
     var w: u16 = 0;
     while (w < wc) : (w += 1) {
         if (w == server.worker_id) continue;
-        ds.deliver(w, delivery_queue.ROOM_ACTOR_TARGET, buf[0..len]) catch |err| {
+        ds.deliver(server.worker_id, w, delivery_queue.ROOM_ACTOR_TARGET, enc_lease.buf[0..len]) catch |err| {
             noteCrossWorkerDrop("directory update for '{s}' to worker {d} failed: {s}", .{ room_jid, w, @errorName(err) });
         };
     }
@@ -3255,7 +3264,7 @@ fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8,
         noteJidOverflowCrossWorker("IQ error '{s}' for '{s}' exceeds {d} bytes; not sent", .{ error_type, room_jid, router.JID_STANZA_MAX });
         return;
     };
-    ds.deliver(target_worker, target, err_xml) catch |err| {
+    ds.deliver(server.worker_id, target_worker, target, err_xml) catch |err| {
         noteCrossWorkerDrop("IQ error '{s}' to worker {d} session {d} failed: {s}", .{ error_type, target_worker, target.index, @errorName(err) });
     };
 }
@@ -3773,7 +3782,7 @@ test "S1: remote presence error escapes the room and target JIDs" {
     var delivery_sys = try dq_mod.DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    sendRemotePresenceError(&delivery_sys, .{
+    sendRemotePresenceError(0, &delivery_sys, .{
         .room_jid = "r'@conference.localhost",
         .real_jid = "eve@localhost/x'y",
         .nick = "eve",
@@ -3823,7 +3832,12 @@ test "T413: replaced-resource delivery drops are counted" {
     defer initial.deinit();
     const queue = delivery_sys.getQueue(1);
     _ = queue.drain(&initial, StanzaCollector.onDelivery);
-    for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(Token.init(1, 1, token_kinds.session), "fill");
+    var fill_budget = delivery_queue.BlobBudget{ .allocator = allocator, .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT };
+    for (0..delivery_queue.QUEUE_SLOTS) |_| {
+        const fb = try fill_budget.produce("fill");
+        try queue.enqueue(Token.init(1, 1, token_kinds.session), fb);
+        fb.release();
+    }
 
     // The takeover joins from worker 2 so only the replaced-resource notice
     // aimed at the full worker-1 queue is counted; the joiner's own replies
@@ -3844,10 +3858,15 @@ test "T413: remote presence error delivery drops are counted" {
     var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
     const queue = delivery_sys.getQueue(1);
-    for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(Token.init(1, 1, token_kinds.session), "fill");
+    var fill_budget = delivery_queue.BlobBudget{ .allocator = allocator, .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT };
+    for (0..delivery_queue.QUEUE_SLOTS) |_| {
+        const fb = try fill_budget.produce("fill");
+        try queue.enqueue(Token.init(1, 1, token_kinds.session), fb);
+        fb.release();
+    }
 
     const drops_before = delivery_queue.cross_worker_drops.load(.monotonic);
-    sendRemotePresenceError(&delivery_sys, .{
+    sendRemotePresenceError(0, &delivery_sys, .{
         .room_jid = "room@conference.localhost",
         .real_jid = "eve@localhost/phone",
         .nick = "eve",
@@ -4342,7 +4361,7 @@ test "S4: an over-long remote presence error JID is counted, never silent" {
 
     // A target JID wider than the stanza bound: the error cannot be built,
     // so the skip must land on the counters instead of vanishing (M2).
-    sendRemotePresenceError(&delivery_sys, .{
+    sendRemotePresenceError(0, &delivery_sys, .{
         .room_jid = "room@conference.localhost",
         .real_jid = "a" ** (router.JID_STANZA_MAX + 64),
         .nick = "eve",

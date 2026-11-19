@@ -177,12 +177,16 @@ fn processRoomMailboxMessage(self: *Server, room: *room_registry_mod.Room, paylo
 /// Used by muc_handler when a MUC operation lands on a non-owning worker.
 pub fn enqueueRoomActorMessage(self: *Server, target_worker: u16, msg: actor_message.Message) void {
     const ds = self.delivery_system orelse return;
-    var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
-    const len = actor_message.encode(&buf, msg) orelse {
+    var enc_lease = self.leaseByteScratch() orelse {
+        log.warn("byte-scratch exhausted; room actor message dropped", .{});
+        return;
+    };
+    defer enc_lease.release();
+    const len = actor_message.encode(enc_lease.buf, msg) orelse {
         log.warn("room actor message encode failed", .{});
         return;
     };
-    ds.deliver(target_worker, delivery_queue_mod.ROOM_ACTOR_TARGET, buf[0..len]) catch |err| {
+    ds.deliver(self.worker_id, target_worker, delivery_queue_mod.ROOM_ACTOR_TARGET, enc_lease.buf[0..len]) catch |err| {
         log.warn("room actor enqueue to worker {d} failed: {}", .{ target_worker, err });
     };
 }
