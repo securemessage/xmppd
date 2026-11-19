@@ -48,7 +48,11 @@ pub fn handleRoomActorMessage(self: *Server, blob: *delivery_queue_mod.Blob, cha
             if (room == null) {
                 if (std.meta.activeTag(msg) == .room_join) {
                     // Create a minimal room so the mailbox exists for enqueue
-                    room = reg.createRoom(room_jid, .{ .persistent = false }) catch return;
+                    room = reg.createRoom(room_jid, .{ .persistent = false }) catch {
+                        _ = room_mailbox_mod.mailbox_drops.fetchAdd(1, .monotonic);
+                        log.warn("room_join for {s} dropped: room table full", .{room_jid});
+                        return;
+                    };
                     // Mark that processRemoteJoin should treat this as new
                     room.?.occupant_count = 0;
                 } else {
