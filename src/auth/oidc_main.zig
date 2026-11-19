@@ -30,7 +30,6 @@ pub const std_options = xmppd_log.std_options;
 
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const IpcServer = @import("ipc_server").IpcServer;
 const IpcConn = @import("ipc_server").IpcConn;
 const MAX_IPC_CLIENTS = @import("ipc_server").MAX_IPC_CLIENTS;
 const handler_mod = @import("handler");
@@ -40,9 +39,7 @@ const OidcConfig = oidc.OidcConfig;
 const IdpPool = oidc.IdpPool;
 const AuthHandler = handler_mod.AuthHandler(OidcStore);
 const protocol = @import("ipc_protocol");
-const event_loop_mod = @import("event_loop");
-const EventLoop = event_loop_mod.EventLoop;
-const ChangeList = event_loop_mod.ChangeList;
+const runner_mod = @import("runner");
 const config_mod = @import("config");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
@@ -67,15 +64,6 @@ comptime {
 }
 
 const log = std.log.scoped(.xmppd_auth_oidc);
-
-/// Sentinel value for the listener fd in kqueue udata.
-const LISTENER_UDATA: usize = std.math.maxInt(usize);
-
-/// Sentinel value for the IdP pool wake pipe in kqueue udata.
-const POOL_UDATA: usize = std.math.maxInt(usize) - 1;
-
-/// Base udata for IPC client connections.
-const CLIENT_UDATA_BASE: usize = 0x10000;
 
 /// In-flight IdP exchange caps: a queued or running exchange spends pool
 /// capacity, so one account or one client IP may only park so many before
@@ -208,29 +196,25 @@ pub fn main() !void {
         return error.TlsInitFailed;
     };
 
-    // Initialize rate limiter
-    var rate_policy = RatePolicy{};
-    if (cfg.get("oidc", "rate_max_per_account")) |v| {
-        rate_policy.max_per_account = std.fmt.parseInt(
-            u32,
-            v,
-            10,
-        ) catch rate_policy.max_per_account;
-    }
-    if (cfg.get("oidc", "rate_max_per_ip")) |v| {
-        rate_policy.max_per_ip = std.fmt.parseInt(u32, v, 10) catch rate_policy.max_per_ip;
-    }
-    var rate_limiter = try RateLimiter.init(allocator, rate_policy);
+    // Initialize rate limiter. This daemon reads the same [auth] keys
+    // xmppd-auth reads; the old [oidc] rate_max_* spellings stay as
+    // aliases (ADR-9).
+    const rate_cfg = resolveOidcRateConfig(&cfg);
+    var rate_limiter = try RateLimiter.init(allocator, rate_cfg.policy);
     defer rate_limiter.deinit();
 
     // Initialize auth handler (generic over OidcStore)
     var handler = AuthHandler.init(allocator, &oidc_store);
-    const rate_limit_disabled = if (cfg.get("oidc", "rate_limit")) |v|
-        std.mem.eql(u8, v, "false")
-    else
-        false;
-    if (!rate_limit_disabled) {
+    if (rate_cfg.enabled) {
         handler.setRateLimiter(&rate_limiter);
+        log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} account / {d} ip failures", .{
+            rate_cfg.policy.max_per_account,
+            rate_cfg.policy.max_per_ip,
+            rate_cfg.policy.window_seconds,
+            rate_cfg.policy.lockout_duration,
+            rate_cfg.policy.lockout_threshold,
+            rate_cfg.policy.ip_lockout_threshold,
+        });
     } else {
         log.warn(
             "auth rate limiting DISABLED -- no brute-force protection (benchmark/testing only)",
@@ -371,6 +355,54 @@ fn parsePoolOptions(cfg: *const config_mod.Config) error{InvalidArgs}!IdpPool.Op
     return options;
 }
 
+/// Resolved rate-limit config: the policy plus the enable flag.
+const OidcRateConfig = struct {
+    policy: RatePolicy,
+    enabled: bool,
+};
+
+/// The OIDC daemon reads the same [auth] rate-limit keys xmppd-auth
+/// reads so one config section sizes both daemons; the old
+/// [oidc] rate_max_* spellings stay as aliases (ADR-9) and [auth] wins
+/// when both are present.
+fn resolveOidcRateConfig(cfg: *const config_mod.Config) OidcRateConfig {
+    const defaults = RatePolicy{};
+    var policy = defaults;
+    if (configRateValue(cfg, "max_per_account", "rate_max_per_account")) |v| {
+        policy.max_per_account = std.fmt.parseInt(u32, v, 10) catch defaults.max_per_account;
+    }
+    if (configRateValue(cfg, "max_per_ip", "rate_max_per_ip")) |v| {
+        policy.max_per_ip = std.fmt.parseInt(u32, v, 10) catch defaults.max_per_ip;
+    }
+    if (cfg.get("auth", "window_seconds")) |v| {
+        policy.window_seconds = std.fmt.parseInt(u32, v, 10) catch defaults.window_seconds;
+    }
+    if (cfg.get("auth", "lockout_duration")) |v| {
+        policy.lockout_duration = std.fmt.parseInt(u32, v, 10) catch defaults.lockout_duration;
+    }
+    if (cfg.get("auth", "lockout_threshold")) |v| {
+        policy.lockout_threshold = std.fmt.parseInt(u16, v, 10) catch defaults.lockout_threshold;
+    }
+    if (cfg.get("auth", "ip_lockout_threshold")) |v| {
+        policy.ip_lockout_threshold = std.fmt.parseInt(u16, v, 10) catch defaults.ip_lockout_threshold;
+    }
+    var enabled = true;
+    if (cfg.get("auth", "rate_limit")) |v| {
+        if (std.mem.eql(u8, v, "false")) enabled = false;
+    }
+    // The old [oidc] spelling is honored too.
+    if (cfg.get("oidc", "rate_limit")) |v| {
+        if (std.mem.eql(u8, v, "false")) enabled = false;
+    }
+    return .{ .policy = policy, .enabled = enabled };
+}
+
+/// The shared [auth] key first, then the old [oidc] alias.
+fn configRateValue(cfg: *const config_mod.Config, auth_key: []const u8, oidc_key: []const u8) ?[]const u8 {
+    if (cfg.get("auth", auth_key)) |v| return v;
+    return cfg.get("oidc", oidc_key);
+}
+
 /// An auth_request parked while its IdP exchange runs on a pool worker.
 /// `owned` is one allocation holding client_ip ++ username ++ payload ++
 /// cb_data; it is wiped before free (the payload carries the password).
@@ -404,47 +436,29 @@ const Pending = struct {
     }
 };
 
-/// The OIDC auth daemon: one event loop on kqueue, one bounded worker pool
-/// for blocking IdP exchanges, and a pending table correlating jobs back to
-/// the request that queued them. Built in place (batch borrows scratch).
+/// The OIDC auth daemon: the shared runner (src/auth/runner.zig) owns the
+/// kqueue loop and the IPC lanes, a bounded worker pool runs the blocking
+/// IdP exchanges, and a pending table correlates jobs back to the request
+/// that queued them. Built in place.
 pub const Daemon = struct {
     allocator: Allocator,
     store: *OidcStore,
     handler: *AuthHandler,
 
-    ipc: *IpcServer,
-    loop: EventLoop,
+    runner: runner_mod.Runner(OidcStore, Daemon),
     pool: IdpPool,
-
-    /// Scratch for batching kqueue changes across one iteration; sized for
-    /// the worst iteration like xmppd-auth (S22).
-    scratch: [2 * MAX_IPC_CLIENTS + 8]posix.Kevent = undefined,
-    batch: ChangeList = undefined,
-
-    /// ABA guard bumped on every accept so a stale completion cannot land
-    /// on a connection that reused the slot.
-    ipc_gens: [MAX_IPC_CLIENTS]u32 = [_]u32{0} ** MAX_IPC_CLIENTS,
-    /// Lanes that gained outbound backlog this iteration; flushed once at
-    /// the end of step().
-    flush_pending: [MAX_IPC_CLIENTS]bool = [_]bool{false} ** MAX_IPC_CLIENTS,
 
     /// Dispatched exchanges awaiting a completion, keyed by job id.
     /// Capacity is ensured at init for the pool bound; it never grows on
     /// the hot path.
     pending: std.AutoHashMapUnmanaged(u64, Pending) = .empty,
 
-    running: bool = true,
+    pub const log = std.log.scoped(.xmppd_auth_oidc);
 
-    /// Everything init() can fail with: the IPC listener socket, the
-    /// kqueue, the pool start and the pending-table capacity.
-    pub const InitError = IdpPool.StartError || posix.SocketError || posix.BindError ||
-        posix.ListenError || posix.KQueueError || error{
-        OutOfMemory,
-        PathTooLong,
-        EventNotFound,
-        ProcessNotFound,
-        SystemResources,
-    };
+    /// Everything init() can fail with: the pool start, the IPC listener
+    /// socket, the kqueue and the pending-table capacity.
+    pub const InitError = IdpPool.StartError || runner_mod.Runner(OidcStore, Daemon).InitError ||
+        error{OutOfMemory};
 
     pub fn init(
         self: *Daemon,
@@ -458,103 +472,25 @@ pub const Daemon = struct {
         self.store = store;
         self.handler = handler;
         self.pending = .empty;
-        self.ipc_gens = [_]u32{0} ** MAX_IPC_CLIENTS;
-        self.flush_pending = [_]bool{false} ** MAX_IPC_CLIENTS;
-        self.running = true;
-        self.batch = ChangeList.init(&self.scratch);
-
-        const ipc = try allocator.create(IpcServer);
-        errdefer allocator.destroy(ipc);
-        ipc.* = IpcServer.init(allocator);
-        try ipc.listen(socket_path);
-        errdefer ipc.deinit();
-        self.ipc = ipc;
-
-        self.loop = try EventLoop.init(allocator, 32);
-        errdefer self.loop.deinit();
 
         self.pool = .{};
         try self.pool.start(allocator, store, pool_options);
         errdefer self.pool.stop();
 
-        try self.pending.ensureTotalCapacity(allocator, pool_options.max_outstanding);
-        errdefer self.pending.deinit(allocator);
+        try self.runner.init(allocator, self, handler, socket_path, &AUTH_MECHS, self.pool.wake_rd);
+        errdefer self.runner.deinit();
 
-        try self.loop.addFd(ipc.listen_fd, .read, LISTENER_UDATA);
-        try self.loop.addFd(self.pool.wake_rd, .read, POOL_UDATA);
-        try self.loop.addSignal(posix.SIG.TERM);
-        try self.loop.addSignal(posix.SIG.INT);
-        try self.loop.addSignal(posix.SIG.HUP);
+        try self.pending.ensureTotalCapacity(allocator, pool_options.max_outstanding);
     }
 
     /// One poll iteration: submit staged changes, dispatch the events, then
     /// flush every lane that gained backlog once.
     pub fn step(self: *Daemon, timeout_ms: ?u32) !void {
-        const events = self.loop.submitAndPoll(self.batch.slice(), timeout_ms) catch |err| {
-            log.err("event loop poll failed: {}", .{err});
-            return err;
-        };
-        self.batch.reset();
-
-        for (events) |ev| {
-            switch (ev) {
-                .signal => |s| {
-                    if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
-                        log.info("received signal {d}, shutting down", .{s.signo});
-                        self.running = false;
-                    } else if (s.signo == posix.SIG.HUP) {
-                        log.info("received SIGHUP (no-op for OIDC backend)", .{});
-                    }
-                },
-                .fd_readable => |e| {
-                    if (e.udata == LISTENER_UDATA) {
-                        self.acceptClient();
-                    } else if (e.udata == POOL_UDATA) {
-                        self.pumpCompletions();
-                    } else if (e.udata >= CLIENT_UDATA_BASE) {
-                        const slot = e.udata - CLIENT_UDATA_BASE;
-                        self.handleIpcClient(slot);
-                    }
-                },
-                .fd_writable => |e| {
-                    if (e.udata >= CLIENT_UDATA_BASE) {
-                        const slot = e.udata - CLIENT_UDATA_BASE;
-                        self.flushIpcClient(slot);
-                    }
-                },
-                else => {},
-            }
-        }
-
-        // Coalesced flush (same shape as xmppd-auth, S22): a lane still
-        // holding backlog gets a one-shot write arm; a staging failure
-        // strands its replies, so close it loudly.
-        for (&self.flush_pending, 0..) |*dirty, slot| {
-            if (!dirty.*) continue;
-            dirty.* = false;
-            const conn = self.ipc.getClient(slot) orelse continue;
-            _ = conn.flush() catch {
-                log.err("IPC client {d} flush error: closing", .{slot});
-                self.closeLane(slot);
-                continue;
-            };
-            if (conn.hasPendingSend()) {
-                self.batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-                    log.err(
-                        "change list full arming write for IPC slot {d}: closing the lane",
-                        .{slot},
-                    );
-                    self.closeLane(slot);
-                    continue;
-                };
-            }
-        }
+        return self.runner.step(timeout_ms);
     }
 
     pub fn run(self: *Daemon) void {
-        while (self.running) {
-            self.step(null) catch break;
-        }
+        self.runner.run();
     }
 
     pub fn deinit(self: *Daemon) void {
@@ -568,90 +504,139 @@ pub const Daemon = struct {
             self.freePending(e.value_ptr.*);
         }
         self.pending.deinit(self.allocator);
-        self.ipc.deinit();
-        self.allocator.destroy(self.ipc);
-        self.loop.deinit();
+        self.runner.deinit();
     }
 
-    fn acceptClient(self: *Daemon) void {
-        const slot = (self.ipc.accept() catch |err| {
-            log.err("IPC accept failed: {s}", .{@errorName(err)});
-            return;
-        }) orelse return;
-        self.ipc_gens[slot] +%= 1;
-        const conn = self.ipc.getClient(slot) orelse return;
-        self.batch.addRead(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-            log.err("change list full accepting IPC slot {d}: closing the lane", .{slot});
-            self.closeLane(slot);
-            return;
-        };
+    // -- runner hooks -----------------------------------------------------
 
-        // Send MechanismList: OAUTHBEARER + PLAIN
-        const ml_msg = protocol.Message{ .mechanism_list = protocol.MechanismList.init(&AUTH_MECHS) };
-        conn.queueSend(ml_msg) catch {
-            self.closeLane(slot);
-            return;
-        };
-        if (conn.hasPendingSend()) {
-            self.flush_pending[slot] = true;
-        }
-    }
-
-    /// Close an IPC client lane: its sessions and staged changes die with
-    /// it, and pending exchanges for it are orphaned (their jobs still
-    /// spend the caps until the completions are consumed).
-    fn closeLane(self: *Daemon, slot: usize) void {
-        self.handler.closeLaneSessions(slot);
-        if (self.ipc.getClient(slot)) |conn| self.batch.purgeFd(conn.fd);
-        self.ipc.closeClient(slot);
-        self.flush_pending[slot] = false;
-        self.dropPending(@intCast(slot), null);
-    }
-
-    fn handleIpcClient(self: *Daemon, slot: usize) void {
-        const conn = self.ipc.getClient(slot) orelse return;
-
-        const rr = conn.recv() catch {
-            self.closeLane(slot);
-            return;
-        };
-        // .would_block is a stale event, not a hangup (T329).
-        if (rr == .eof) {
-            self.closeLane(slot);
-            return;
-        }
-
-        // Process all complete messages
-        while (true) {
-            const msg = conn.nextMessage() catch {
-                self.closeLane(slot);
-                return;
-            };
-            if (msg == null) break;
-            self.dispatch(msg.?, @intCast(slot));
-            // dispatch may have closed the lane on a send failure.
-            if (self.ipc.getClient(slot) == null) return;
-        }
-    }
-
-    /// Route one message: IdP-bound mechanisms go to the pool, aborts drop
-    /// their pending entry, everything else goes straight to the handler.
-    fn dispatch(self: *Daemon, msg: protocol.Message, slot: u16) void {
+    /// Route one message before the runner delivers it to the handler:
+    /// IdP-bound mechanisms go to the pool and aborts drop their pending
+    /// entry (but still reach the handler, which releases the session).
+    pub fn intercept(self: *Daemon, runner: anytype, msg: protocol.Message, slot: u16) bool {
+        _ = runner;
         switch (msg) {
             .auth_request => |req| {
                 switch (req.mechanism) {
-                    .plain, .oauthbearer => {
-                        if (self.tryQueueIdp(req, slot)) return;
-                    },
+                    .plain, .oauthbearer => return self.tryQueueIdp(req, slot),
                     else => {},
                 }
             },
-            .auth_abort => |a| {
-                self.dropPending(slot, a.conn_id);
-            },
+            .auth_abort => |a| self.dropPending(slot, a.conn_id),
             else => {},
         }
-        self.deliver(msg, slot);
+        return false;
+    }
+
+    /// Drain finished exchanges and replay each through the handler with
+    /// its answer parked in store.answer.
+    pub fn onPoolWake(self: *Daemon, runner: anytype) void {
+        self.pool.drainWake();
+        while (self.pool.popCompletion()) |job_in| {
+            var job = job_in;
+            defer IdpPool.releaseJob(&job);
+
+            const kv = self.pending.fetchRemove(job.id) orelse {
+                Daemon.log.debug("stale IdP completion {d} dropped (aborted or lane closed)", .{job.id});
+                continue;
+            };
+            const pend = kv.value;
+            defer self.freePending(pend);
+
+            // An orphaned exchange ran to completion anyway: consume it to
+            // release its cap slot, but never replay or answer it.
+            if (pend.orphaned) continue;
+
+            const slot: usize = pend.slot;
+            if (slot >= MAX_IPC_CLIENTS or runner.ipc_gens[slot] != pend.slot_gen) {
+                Daemon.log.debug("IdP completion {d} dropped: lane recycled", .{job.id});
+                continue;
+            }
+            if (runner.ipc.getClient(slot) == null) continue;
+
+            // Rebuild the request from the owned copy and replay it through
+            // the handler, which is the only place that counts attempts.
+            var off: usize = 0;
+            const client_ip = pend.owned[off..][0..pend.client_ip_len];
+            off += pend.client_ip_len;
+            const username = pend.owned[off..][0..pend.username_len];
+            off += pend.username_len;
+            const payload = pend.owned[off..][0..pend.payload_len];
+            off += pend.payload_len;
+            const cb_data = pend.owned[off..][0..pend.cb_data_len];
+
+            // An IP lock that engaged since admission denies the parked
+            // verdict, exactly as the handler's own lock check would have
+            // for a direct request.
+            if (self.handler.policy.check("", client_ip)) |reason| {
+                self.replyAuthFailure(pend.conn_id, pend.slot, reason);
+                continue;
+            }
+
+            const req = protocol.AuthRequest{
+                .conn_id = pend.conn_id,
+                .mechanism = pend.mechanism,
+                // The attempt was already admitted at dispatch; an empty
+                // IP keeps the replay's admitIp free and its lock checks
+                // account-only, so nothing is counted twice.
+                .client_ip = "",
+                .cb_type = pend.cb_type,
+                .cb_data = cb_data,
+                .username = username,
+                .payload = payload,
+            };
+
+            self.store.answer = &job.answer;
+            const result = self.handler.handleMessage(
+                .{ .auth_request = req },
+                pend.slot,
+                pend.slot_gen,
+            );
+            self.store.answer = null;
+
+            switch (result) {
+                .reply => |response| {
+                    // Mirror the IP-side outcome the handler could not see
+                    // with an empty client_ip: credential verdicts only,
+                    // matching where a direct request records.
+                    switch (response) {
+                        .auth_success => self.handler.policy.recordOutcome("", client_ip, .success),
+                        .auth_failure => |f| {
+                            if (std.mem.eql(u8, f.reason, policy_mod.FailureReason.not_authorized.text())) {
+                                self.handler.policy.recordOutcome("", client_ip, .failure);
+                            }
+                        },
+                        else => {},
+                    }
+                    runner.replyToLane(slot, response);
+                    // Clean up session after the send; a lane the send
+                    // closed already dropped its sessions.
+                    if (runner.ipc.getClient(slot) != null) {
+                        switch (response) {
+                            .auth_success => |s| self.handler.cleanupSession(pend.slot, s.conn_id),
+                            .auth_failure => |f| self.handler.cleanupSession(pend.slot, f.conn_id),
+                            else => {},
+                        }
+                    }
+                },
+                .deferred, .none => {
+                    // Unreachable for a real mechanism, but a replay that
+                    // produced no reply must never leave the client hanging.
+                    Daemon.log.err("IdP replay produced no reply for conn_id {d}", .{pend.conn_id});
+                    self.replyTemporary(pend.conn_id, pend.slot);
+                },
+            }
+        }
+    }
+
+    /// Lane teardown: pending exchanges for the lane are orphaned (their
+    /// jobs still spend the caps until the completions are consumed).
+    pub fn onLaneClose(self: *Daemon, slot: usize) void {
+        self.dropPending(@intCast(slot), null);
+    }
+
+    pub fn onSighup(self: *Daemon) void {
+        _ = self;
+        Daemon.log.info("received SIGHUP (no-op for OIDC backend)", .{});
     }
 
     /// Intercept a PLAIN or OAUTHBEARER auth_request: run the handler's own
@@ -748,7 +733,7 @@ pub const Daemon = struct {
 
         var pend = Pending{
             .slot = slot,
-            .slot_gen = self.ipc_gens[slot],
+            .slot_gen = self.runner.ipc_gens[slot],
             .conn_id = req.conn_id,
             .mechanism = req.mechanism,
             .cb_type = req.cb_type,
@@ -790,15 +775,10 @@ pub const Daemon = struct {
     /// involvement. Pre-gate denials carry the policy's own reason so the
     /// client sees what a direct request would have seen.
     fn replyAuthFailure(self: *Daemon, conn_id: u32, slot: u16, reason: policy_mod.FailureReason) void {
-        const conn = self.ipc.getClient(slot) orelse return;
-        conn.queueSend(.{ .auth_failure = .{
+        self.runner.replyToLane(slot, .{ .auth_failure = .{
             .conn_id = conn_id,
             .reason = reason.text(),
-        } }) catch {
-            self.closeLane(slot);
-            return;
-        };
-        if (conn.hasPendingSend()) self.flush_pending[slot] = true;
+        } });
     }
 
     /// Answer a request temporary-auth-failure without handler involvement:
@@ -806,148 +786,6 @@ pub const Daemon = struct {
     /// failed credential, so nothing is counted or recorded.
     fn replyTemporary(self: *Daemon, conn_id: u32, slot: u16) void {
         self.replyAuthFailure(conn_id, slot, .temporary_auth_failure);
-    }
-
-    /// Deliver a message to the handler and queue its reply.
-    fn deliver(self: *Daemon, msg: protocol.Message, slot: u16) void {
-        const conn = self.ipc.getClient(slot) orelse return;
-        switch (self.handler.handleMessage(msg, slot, self.ipc_gens[slot])) {
-            .reply => |response| {
-                conn.queueSend(response) catch {
-                    self.closeLane(slot);
-                    return;
-                };
-                // Clean up session after sending success/failure
-                // (lane, conn_id) keyed, matching xmppd-auth (T279).
-                switch (response) {
-                    .auth_success => |s| self.handler.cleanupSession(slot, s.conn_id),
-                    .auth_failure => |f| self.handler.cleanupSession(slot, f.conn_id),
-                    else => {},
-                }
-                if (conn.hasPendingSend()) self.flush_pending[slot] = true;
-            },
-            .deferred, .none => {},
-        }
-    }
-
-    /// Drain finished exchanges and replay each through the handler with
-    /// its answer parked in store.answer.
-    fn pumpCompletions(self: *Daemon) void {
-        self.pool.drainWake();
-        while (self.pool.popCompletion()) |job_in| {
-            var job = job_in;
-            defer IdpPool.releaseJob(&job);
-
-            const kv = self.pending.fetchRemove(job.id) orelse {
-                log.debug("stale IdP completion {d} dropped (aborted or lane closed)", .{job.id});
-                continue;
-            };
-            const pend = kv.value;
-            defer self.freePending(pend);
-
-            // An orphaned exchange ran to completion anyway: consume it to
-            // release its cap slot, but never replay or answer it.
-            if (pend.orphaned) continue;
-
-            const slot: usize = pend.slot;
-            if (slot >= MAX_IPC_CLIENTS or self.ipc_gens[slot] != pend.slot_gen) {
-                log.debug("IdP completion {d} dropped: lane recycled", .{job.id});
-                continue;
-            }
-            const conn = self.ipc.getClient(slot) orelse continue;
-
-            // Rebuild the request from the owned copy and replay it through
-            // the handler, which is the only place that counts attempts.
-            var off: usize = 0;
-            const client_ip = pend.owned[off..][0..pend.client_ip_len];
-            off += pend.client_ip_len;
-            const username = pend.owned[off..][0..pend.username_len];
-            off += pend.username_len;
-            const payload = pend.owned[off..][0..pend.payload_len];
-            off += pend.payload_len;
-            const cb_data = pend.owned[off..][0..pend.cb_data_len];
-
-            // An IP lock that engaged since admission denies the parked
-            // verdict, exactly as the handler's own lock check would have
-            // for a direct request.
-            if (self.handler.policy.check("", client_ip)) |reason| {
-                self.replyAuthFailure(pend.conn_id, pend.slot, reason);
-                continue;
-            }
-
-            const req = protocol.AuthRequest{
-                .conn_id = pend.conn_id,
-                .mechanism = pend.mechanism,
-                // The attempt was already admitted at dispatch; an empty
-                // IP keeps the replay's admitIp free and its lock checks
-                // account-only, so nothing is counted twice.
-                .client_ip = "",
-                .cb_type = pend.cb_type,
-                .cb_data = cb_data,
-                .username = username,
-                .payload = payload,
-            };
-
-            self.store.answer = &job.answer;
-            const result = self.handler.handleMessage(
-                .{ .auth_request = req },
-                pend.slot,
-                pend.slot_gen,
-            );
-            self.store.answer = null;
-
-            switch (result) {
-                .reply => |response| {
-                    // Mirror the IP-side outcome the handler could not see
-                    // with an empty client_ip: credential verdicts only,
-                    // matching where a direct request records.
-                    switch (response) {
-                        .auth_success => self.handler.policy.recordOutcome("", client_ip, .success),
-                        .auth_failure => |f| {
-                            if (std.mem.eql(u8, f.reason, policy_mod.FailureReason.not_authorized.text())) {
-                                self.handler.policy.recordOutcome("", client_ip, .failure);
-                            }
-                        },
-                        else => {},
-                    }
-                    conn.queueSend(response) catch {
-                        self.closeLane(slot);
-                        continue;
-                    };
-                    switch (response) {
-                        .auth_success => |s| self.handler.cleanupSession(pend.slot, s.conn_id),
-                        .auth_failure => |f| self.handler.cleanupSession(pend.slot, f.conn_id),
-                        else => {},
-                    }
-                    if (conn.hasPendingSend()) self.flush_pending[slot] = true;
-                },
-                .deferred, .none => {
-                    // Unreachable for a real mechanism, but a replay that
-                    // produced no reply must never leave the client hanging.
-                    log.err("IdP replay produced no reply for conn_id {d}", .{pend.conn_id});
-                    self.replyTemporary(pend.conn_id, pend.slot);
-                },
-            }
-        }
-    }
-
-    fn flushIpcClient(self: *Daemon, slot: usize) void {
-        const conn = self.ipc.getClient(slot) orelse return;
-
-        _ = conn.flush() catch {
-            self.closeLane(slot);
-            return;
-        };
-
-        if (conn.hasPendingSend()) {
-            self.batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-                log.err(
-                    "change list full arming write for IPC slot {d}: closing the lane",
-                    .{slot},
-                );
-                self.closeLane(slot);
-            };
-        }
     }
 
     fn freePending(self: *Daemon, pend: Pending) void {
@@ -1067,8 +905,9 @@ fn printUsage() void {
         \\Optional config [oidc] section:
         \\  ca_file           CA bundle path (default: system)
         \\  socket            Override IPC socket path
-        \\  rate_max_per_account  Rate limit per account (default: 60)
-        \\  rate_max_per_ip       Rate limit per IP (default: 200)
+        \\  rate_max_per_account  Alias for [auth] max_per_account
+        \\  rate_max_per_ip       Alias for [auth] max_per_ip
+        \\  rate_limit            Alias for [auth] rate_limit
         \\  idp_threads           IdP worker threads (default: 8, range 1..32)
         \\  idp_max_outstanding   Max queued+running IdP exchanges (default: 256, range 1..4096)
         \\  idp_connect_timeout_ms  Connect+handshake budget (default: 3000, range 100..60000)
@@ -2875,4 +2714,130 @@ test "a full-pool denial does not count the IP attempt again" {
         try std.testing.expectEqual(@as(u32, @intCast(i)), reply.auth_failure.conn_id);
         try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
     }
+}
+
+test "rate config reads the shared [auth] keys with the old [oidc] spellings as aliases" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Shared [auth] keys win over the [oidc] aliases for the same field.
+    const path = try writeTmpConfig(
+        allocator,
+        &tmp,
+        "rate_max_per_account = 99\nrate_max_per_ip = 88\n" ++
+            "[auth]\n" ++
+            "max_per_account = 7\nmax_per_ip = 9\nwindow_seconds = 30\n" ++
+            "lockout_duration = 120\nlockout_threshold = 4\n" ++
+            "ip_lockout_threshold = 11\nrate_limit = true\n",
+    );
+    defer allocator.free(path);
+    var cfg = try config_mod.parse(allocator, path);
+    defer cfg.deinit();
+    const r = resolveOidcRateConfig(&cfg);
+    try std.testing.expectEqual(@as(u32, 7), r.policy.max_per_account);
+    try std.testing.expectEqual(@as(u32, 9), r.policy.max_per_ip);
+    try std.testing.expectEqual(@as(u32, 30), r.policy.window_seconds);
+    try std.testing.expectEqual(@as(u32, 120), r.policy.lockout_duration);
+    try std.testing.expectEqual(@as(u16, 4), r.policy.lockout_threshold);
+    try std.testing.expectEqual(@as(u16, 11), r.policy.ip_lockout_threshold);
+    try std.testing.expect(r.enabled);
+
+    // Alias-only configs still apply to the maxes and to the kill switch.
+    const path2 = try writeTmpConfig(
+        allocator,
+        &tmp,
+        "rate_max_per_account = 42\nrate_max_per_ip = 77\nrate_limit = false\n",
+    );
+    defer allocator.free(path2);
+    var cfg2 = try config_mod.parse(allocator, path2);
+    defer cfg2.deinit();
+    const r2 = resolveOidcRateConfig(&cfg2);
+    try std.testing.expectEqual(@as(u32, 42), r2.policy.max_per_account);
+    try std.testing.expectEqual(@as(u32, 77), r2.policy.max_per_ip);
+    try std.testing.expect(!r2.enabled);
+}
+
+test "rate config treats an out-of-range lockout threshold as a bad value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Both thresholds are u16: 70000 fails to parse, so the defaults apply
+    // like any other bad value instead of tripping a cast check.
+    const path = try writeTmpConfig(
+        allocator,
+        &tmp,
+        "[auth]\nlockout_threshold = 70000\nip_lockout_threshold = 70000\n",
+    );
+    defer allocator.free(path);
+    var cfg = try config_mod.parse(allocator, path);
+    defer cfg.deinit();
+    const r = resolveOidcRateConfig(&cfg);
+    const defaults = RatePolicy{};
+    try std.testing.expectEqual(defaults.lockout_threshold, r.policy.lockout_threshold);
+    try std.testing.expectEqual(defaults.ip_lockout_threshold, r.policy.ip_lockout_threshold);
+}
+
+/// Which IPC lane the fixture's single client occupies.
+fn clientSlot(fx: *DaemonFixture) ?usize {
+    for (&fx.daemon.runner.ipc.clients, 0..) |*conn, i| {
+        if (conn.active) return i;
+    }
+    return null;
+}
+
+test "the runner pauses lane intake at the high watermark and resumes on drain" {
+    const allocator = std.testing.allocator;
+    var fx: DaemonFixture = undefined;
+    // No IdP traffic is needed: mechanism_not_supported replies are
+    // produced on the loop itself, which is the output path under test.
+    try fx.init(allocator, "http://127.0.0.1:1/token", null, null, null, .{
+        .threads = 1,
+        .max_outstanding = 8,
+        .connect_timeout_ms = 100,
+        .timeout_ms = 500,
+    });
+    defer fx.deinit(allocator);
+
+    var client = try connectClient(allocator, &fx);
+    defer client.close();
+
+    const slot = clientSlot(&fx) orelse return error.ClientDropped;
+
+    // Shrink the window: the assertion is about behavior, not capacity.
+    fx.daemon.runner.rx_pause_at = 4096;
+    fx.daemon.runner.rx_resume_at = 512;
+
+    const req = protocol.Message{ .auth_request = .{
+        .conn_id = 1,
+        .mechanism = .scram_sha_256,
+        .client_ip = "10.0.0.7",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "alice",
+        .payload = "n,,n=alice,r=0123456789abcdef",
+    } };
+
+    // The client never reads, so replies pile onto the lane's send
+    // backlog until intake pauses.
+    var guard: usize = 2048;
+    while (!fx.daemon.runner.read_paused[slot] and guard > 0) : (guard -= 1) {
+        var i: usize = 0;
+        while (i < 16) : (i += 1) client.send(req) catch break;
+        try fx.daemon.step(10);
+    }
+    try std.testing.expect(fx.daemon.runner.read_paused[slot]);
+    try std.testing.expectEqual(slot, clientSlot(&fx).?);
+
+    // Draining the replies lets the backlog fall under the resume mark;
+    // the lane's write handling then re-enables intake.
+    guard = 4096;
+    while (fx.daemon.runner.read_paused[slot] and guard > 0) : (guard -= 1) {
+        _ = client.conn.recv() catch .would_block;
+        while (try client.conn.nextMessage()) |_| {}
+        try fx.daemon.step(10);
+    }
+    try std.testing.expect(!fx.daemon.runner.read_paused[slot]);
+    try std.testing.expectEqual(slot, clientSlot(&fx).?);
 }

@@ -20,9 +20,6 @@ const xmppd_log = @import("xmppd_log");
 const root_allocator = @import("root_allocator");
 pub const std_options = xmppd_log.std_options;
 
-const posix = std.posix;
-const IpcServer = @import("ipc_server").IpcServer;
-const IpcConn = @import("ipc_server").IpcConn;
 const OpBackendType = @import("op_backend").Backend;
 const config_mod = @import("config");
 const backend_mod = @import("backend");
@@ -31,10 +28,7 @@ const UserStore = user_store_mod.UserStore(OpBackendType);
 const handler_mod = @import("handler");
 const AuthHandler = handler_mod.AuthHandler(UserStore);
 const protocol = @import("ipc_protocol");
-const event_loop_mod = @import("event_loop");
-const EventLoop = event_loop_mod.EventLoop;
-const ChangeList = event_loop_mod.ChangeList;
-const Event = event_loop_mod.Event;
+const runner_mod = @import("runner");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
 const crypto_pool_mod = @import("crypto_pool");
@@ -72,15 +66,6 @@ fn resolveUsersScanLimit(default: usize, cli_value: ?[]const u8, config_value: ?
 fn verifyUsersAtStartup(comptime Backend: type, backend: *Backend, max_keys: usize) !void {
     return user_store_mod.verifyPreparedUsers(Backend, backend, max_keys);
 }
-
-/// Sentinel value for the listener fd in kqueue udata.
-const LISTENER_UDATA: usize = std.math.maxInt(usize);
-
-/// Sentinel value for the crypto pool wake pipe in kqueue udata (T121).
-const POOL_UDATA: usize = std.math.maxInt(usize) - 1;
-
-/// Base udata for IPC client connections.
-const CLIENT_UDATA_BASE: usize = 0x10000;
 
 pub fn main() !void {
     var root = root_allocator.Root.init();
@@ -143,15 +128,15 @@ pub fn main() !void {
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, arg, "--lockout-threshold")) {
-            rate_policy.lockout_threshold = @intCast(parseU32Arg(args.next()) orelse {
+            rate_policy.lockout_threshold = parseU16Arg(args.next()) orelse {
                 log.err("--lockout-threshold requires a numeric value", .{});
                 return error.InvalidArgs;
-            });
+            };
         } else if (std.mem.eql(u8, arg, "--ip-lockout-threshold")) {
-            rate_policy.ip_lockout_threshold = @intCast(parseU32Arg(args.next()) orelse {
+            rate_policy.ip_lockout_threshold = parseU16Arg(args.next()) orelse {
                 log.err("--ip-lockout-threshold requires a numeric value", .{});
                 return error.InvalidArgs;
-            });
+            };
         } else if (std.mem.eql(u8, arg, "--no-rate-limit")) {
             rate_limit_enabled = false;
         } else if (std.mem.eql(u8, arg, "--enable-registration")) {
@@ -219,12 +204,12 @@ pub fn main() !void {
         }
         if (rate_policy.lockout_threshold == rate_defaults.lockout_threshold) {
             if (c.get("auth", "lockout_threshold")) |v| {
-                rate_policy.lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch rate_defaults.lockout_threshold);
+                rate_policy.lockout_threshold = std.fmt.parseInt(u16, v, 10) catch rate_defaults.lockout_threshold;
             }
         }
         if (rate_policy.ip_lockout_threshold == rate_defaults.ip_lockout_threshold) {
             if (c.get("auth", "ip_lockout_threshold")) |v| {
-                rate_policy.ip_lockout_threshold = @intCast(std.fmt.parseInt(u32, v, 10) catch rate_defaults.ip_lockout_threshold);
+                rate_policy.ip_lockout_threshold = std.fmt.parseInt(u16, v, 10) catch rate_defaults.ip_lockout_threshold;
             }
         }
         if (c.get("auth", "rate_limit")) |v| {
@@ -339,285 +324,78 @@ pub fn main() !void {
     }
     defer if (pool_started) crypto_pool.stop();
 
-    // Start IPC server (heap-allocated: the struct is ~2 MB since
-    // MAX_IPC_CLIENTS went 16 -> 80, too big for the stack — T161)
-    const ipc = try allocator.create(IpcServer);
-    ipc.* = IpcServer.init(allocator);
-    defer {
-        ipc.deinit();
-        allocator.destroy(ipc);
-    }
-    try ipc.listen(socket_path);
-
-    // Initialize event loop
-    var loop = try EventLoop.init(allocator, 32);
-    defer loop.deinit();
-
-    // Register listener + signals (signal masking is automatic)
-    try loop.addFd(ipc.listen_fd, .read, LISTENER_UDATA);
-    if (pool_started) try loop.addFd(crypto_pool.pipe_rd, .read, POOL_UDATA);
-    try loop.addSignal(posix.SIG.TERM);
-    try loop.addSignal(posix.SIG.INT);
-    try loop.addSignal(posix.SIG.HUP);
-
-    // ABA guard for deferred crypto replies: bumped on every client accept so
-    // a stale completion can't land on a different core connection that
-    // reused the slot.
-    var ipc_gens = [_]u32{0} ** @import("ipc_server").MAX_IPC_CLIENTS;
-
-    // Intake throttle: when a core's response backlog passes the high-water
-    // mark, stop reading NEW requests from that client (EV_DISABLE its read
-    // filter) until the backlog drains. Purely event-driven — no timers.
-    var read_paused = [_]bool{false} ** @import("ipc_server").MAX_IPC_CLIENTS;
-
-    // Scratch buffer for batching changes across iterations. Sized for the
-    // worst iteration: one write arm + one pause-toggle per client lane
-    // plus loop constants (S22).
-    var scratch: [2 * @import("ipc_server").MAX_IPC_CLIENTS + 8]posix.Kevent = undefined;
-    var batch = ChangeList.init(&scratch);
-
-    // Lanes that gained outbound backlog this iteration; flushed once per
-    // iteration at the end of event dispatch (S22): a write sitting
-    // un-staged strands replies until unrelated activity.
-    var flush_pending = [_]bool{false} ** @import("ipc_server").MAX_IPC_CLIENTS;
-
-    // Main event loop
-    var running = true;
-    while (running) {
-        const events = loop.submitAndPoll(batch.slice(), null) catch |err| {
-            log.err("event loop poll failed: {}", .{err});
-            break;
-        };
-        batch.reset();
-
-        for (events) |ev| {
-            switch (ev) {
-                .signal => |s| {
-                    if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
-                        log.info("received signal {d}, shutting down", .{s.signo});
-                        running = false;
-                    } else if (s.signo == posix.SIG.HUP) {
-                        log.info("received SIGHUP (LMDB — no reload needed)", .{});
-                    }
-                },
-                .fd_readable => |e| {
-                    if (e.udata == LISTENER_UDATA) {
-                        // New IPC client connection
-                        if (ipc.accept() catch null) |slot| {
-                            ipc_gens[slot] +%= 1;
-                            read_paused[slot] = false;
-                            const conn = ipc.getClient(slot) orelse continue;
-                            batch.addRead(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-                                log.err("change list full accepting IPC slot {d}: closing the lane", .{slot});
-                                batch.purgeFd(conn.fd);
-                                closeIpcLane(ipc, &handler, slot);
-                                continue;
-                            };
-
-                            // Send MechanismList immediately on connect
-                            const ml_msg = protocol.Message{ .mechanism_list = protocol.MechanismList.init(&AUTH_MECHS) };
-                            conn.queueSend(ml_msg) catch {
-                                batch.purgeFd(conn.fd);
-                                closeIpcLane(ipc, &handler, slot);
-                                continue;
-                            };
-                            if (conn.hasPendingSend()) {
-                                flush_pending[slot] = true;
-                            }
-                        }
-                    } else if (e.udata == POOL_UDATA) {
-                        // T121: crypto completions — render and send replies
-                        crypto_pool.drainPipe();
-                        while (crypto_pool.popCompletion()) |c| {
-                            pumpCryptoReply(ipc, &handler, c, &ipc_gens, &batch, &read_paused, &flush_pending);
-                        }
-                    } else if (e.udata >= CLIENT_UDATA_BASE) {
-                        const slot = e.udata - CLIENT_UDATA_BASE;
-                        // Belts-and-braces: a paused client's read filter is
-                        // disabled, so no event should arrive — but one may
-                        // already be queued from before the disable landed.
-                        if (!read_paused[slot])
-                            handleIpcClient(ipc, &handler, &batch, slot, &ipc_gens, &read_paused, &flush_pending);
-                    }
-                },
-                .fd_writable => |e| {
-                    if (e.udata >= CLIENT_UDATA_BASE) {
-                        const slot = e.udata - CLIENT_UDATA_BASE;
-                        flushIpcClient(ipc, &handler, &batch, slot, &read_paused);
-                    }
-                },
-                else => {},
-            }
-        }
-
-        // Coalesced flush: every lane that gained backlog this iteration
-        // writes once here. A lane still holding backlog afterwards gets its
-        // one-shot write arm. A swallowed staging failure strands the
-        // lane's replies (S22); close such a lane loudly.
-        for (&flush_pending, 0..) |*dirty, slot| {
-            if (!dirty.*) continue;
-            dirty.* = false;
-            const conn = ipc.getClient(slot) orelse continue;
-            _ = conn.flush() catch {
-                log.err("IPC client {d} flush error: closing", .{slot});
-                batch.purgeFd(conn.fd);
-                closeIpcLane(ipc, &handler, slot);
-                read_paused[slot] = false;
-                continue;
-            };
-            if (conn.hasPendingSend()) {
-                batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-                    log.err("change list full arming write for IPC slot {d}: closing the lane", .{slot});
-                    batch.purgeFd(conn.fd);
-                    closeIpcLane(ipc, &handler, slot);
-                    read_paused[slot] = false;
-                    continue;
-                };
-            }
-        }
-    }
+    // Run the shared auth daemon loop (src/auth/runner.zig): it owns the
+    // IPC listener, the kqueue, lane generations, intake backpressure,
+    // flush coalescing, the crypto-pool drain and signals.
+    var hooks = AuthHooks{ .crypto_pool = if (pool_started) &crypto_pool else null };
+    var auth_runner: runner_mod.Runner(UserStore, AuthHooks) = undefined;
+    try auth_runner.init(
+        allocator,
+        &hooks,
+        &handler,
+        socket_path,
+        &AUTH_MECHS,
+        if (pool_started) crypto_pool.pipe_rd else null,
+    );
+    defer auth_runner.deinit();
+    auth_runner.run();
 
     log.info("xmppd-auth shutdown complete", .{});
 }
 
-/// Backpressure watermarks for IPC client intake. Sized against the SCRAM
-/// frame reality: a challenge+result pair is ~300 bytes, so 256 KiB of
-/// backlog is ~850 in-flight exchanges — deep but bounded.
-const RX_PAUSE_AT: usize = 768 << 10;
-const RX_RESUME_AT: usize = 256 << 10;
+/// Per-daemon hooks for the shared runner (src/auth/runner.zig): the
+/// crypto-pool drain and the daemon's SIGHUP text. Message dispatch and
+/// lane bookkeeping stay with the runner, which is the xmppd-auth
+/// reference behavior.
+const AuthHooks = struct {
+    crypto_pool: ?*crypto_pool_mod.CryptoPool,
 
-/// Close an IPC client lane: its in-flight SCRAM sessions die with it
-/// (T279) instead of waiting for the 60 s stale probe.
-fn closeIpcLane(ipc: *IpcServer, handler: *AuthHandler, slot: usize) void {
-    handler.closeLaneSessions(slot);
-    ipc.closeClient(slot);
-}
+    pub const log = std.log.scoped(.xmppd_auth);
 
-fn updateReadBackpressure(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, slot: usize, read_paused: []bool) void {
-    const conn = ipc.getClient(slot) orelse return;
-    if (conn.fd < 0) return;
-    const pend = conn.pendingSendBytes();
-    if (!read_paused[slot] and pend > RX_PAUSE_AT) {
-        read_paused[slot] = true;
-        batch.disableRead(conn.fd) catch {
-            // Can't enforce the throttle: a missed EV_DISABLE would spin the
-            // loop on a drowned lane (S22). Close rather than lie.
-            log.err("change list full pausing IPC slot {d}: closing the lane", .{slot});
-            batch.purgeFd(conn.fd);
-            closeIpcLane(ipc, handler, slot);
-            read_paused[slot] = false;
-            return;
-        };
-        log.warn("IPC client {d}: {d}B outbound backlog > {d}B — pausing intake until drained", .{ slot, pend, RX_PAUSE_AT });
-    } else if (read_paused[slot] and pend < RX_RESUME_AT) {
-        read_paused[slot] = false;
-        batch.enableRead(conn.fd) catch {
-            log.err("change list full resuming IPC slot {d}: closing the lane", .{slot});
-            batch.purgeFd(conn.fd);
-            closeIpcLane(ipc, handler, slot);
-            return;
-        };
-        log.info("IPC client {d}: backlog drained to {d}B — resuming intake", .{ slot, pend });
-    }
-}
-
-fn handleIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, slot: usize, ipc_gens: []const u32, read_paused: []bool, flush_pending: []bool) void {
-    defer updateReadBackpressure(ipc, handler, batch, slot, read_paused);
-    const conn = ipc.getClient(slot) orelse return;
-
-    const rr = conn.recv() catch |err| {
-        log.err("IPC client {d} recv error: {} — closing", .{ slot, err });
-        batch.purgeFd(conn.fd);
-        closeIpcLane(ipc, handler, slot);
-        read_paused[slot] = false;
-        return;
-    };
-
-    // .would_block is a stale event, not a hangup (T329): fall through
-    // and still parse whatever the buffer already holds.
-    if (rr == .eof) {
-        batch.purgeFd(conn.fd);
-        closeIpcLane(ipc, handler, slot);
-        return;
+    /// xmppd-auth hands every message to the handler; nothing is consumed
+    /// before it.
+    pub fn intercept(self: *AuthHooks, runner: anytype, msg: protocol.Message, slot: u16) bool {
+        _ = self;
+        _ = runner;
+        _ = msg;
+        _ = slot;
+        return false;
     }
 
-    // Process all complete messages
-    while (true) {
-        const msg = conn.nextMessage() catch {
-            batch.purgeFd(conn.fd);
-            closeIpcLane(ipc, handler, slot);
-            return;
-        };
-
-        if (msg == null) break;
-
-        switch (handler.handleMessage(msg.?, @intCast(slot), ipc_gens[slot])) {
-            .reply => |response| {
-                conn.queueSend(response) catch {
-                    batch.purgeFd(conn.fd);
-                    closeIpcLane(ipc, handler, slot);
-                    return;
-                };
-
-                // Clean up SCRAM session after sending success/failure
-                // (lane, conn_id) keyed: lanes share conn_id numbers (T279).
-                switch (response) {
-                    .auth_success => |s| handler.cleanupSession(@intCast(slot), s.conn_id),
-                    .auth_failure => |f| handler.cleanupSession(@intCast(slot), f.conn_id),
-                    else => {},
-                }
-
-                // Deferred flush: the lane writes once at end of iteration (S22)
-                if (conn.hasPendingSend()) flush_pending[slot] = true;
-            },
-            // Crypto pool answers via the completion pipe (T121).
-            .deferred, .none => {},
+    /// T121: crypto completions -- render and send replies.
+    pub fn onPoolWake(self: *AuthHooks, runner: anytype) void {
+        const pool = self.crypto_pool orelse return;
+        pool.drainPipe();
+        while (pool.popCompletion()) |completion| {
+            self.pumpCryptoReply(runner, completion);
         }
     }
-}
 
-/// T121: send a finished crypto job's reply to its IPC client. The slot
-/// generation both validates the client is still the connection that asked
-/// and prevents a stale reply reaching an unrelated (reused) slot.
-fn pumpCryptoReply(ipc: *IpcServer, handler: *AuthHandler, c: crypto_pool_mod.Completion, ipc_gens: []const u32, batch: *ChangeList, read_paused: []bool, flush_pending: []bool) void {
-    var reply = handler.takeCryptoReply(c) orelse return;
-    defer reply.deinit(handler.allocator);
-
-    const slot: usize = reply.slot;
-    if (slot >= ipc_gens.len or ipc_gens[slot] != reply.slot_gen) return;
-
-    const conn = ipc.getClient(slot) orelse return;
-    conn.queueSend(reply.msg) catch {
-        batch.purgeFd(conn.fd);
-        closeIpcLane(ipc, handler, slot);
-        read_paused[slot] = false;
-        return;
-    };
-    if (conn.hasPendingSend()) flush_pending[slot] = true;
-    updateReadBackpressure(ipc, handler, batch, slot, read_paused);
-}
-
-fn flushIpcClient(ipc: *IpcServer, handler: *AuthHandler, batch: *ChangeList, slot: usize, read_paused: []bool) void {
-    const conn = ipc.getClient(slot) orelse return;
-
-    _ = conn.flush() catch {
-        batch.purgeFd(conn.fd);
-        closeIpcLane(ipc, handler, slot);
-        read_paused[slot] = false;
-        return;
-    };
-
-    // Re-arm write if more data pending
-    if (conn.hasPendingSend()) {
-        batch.addWriteOnce(conn.fd, CLIENT_UDATA_BASE + slot) catch {
-            log.err("change list full arming write in flushIpcClient for slot {d}: closing the lane", .{slot});
-            batch.purgeFd(conn.fd);
-            closeIpcLane(ipc, handler, slot);
-            read_paused[slot] = false;
-        };
+    pub fn onLaneClose(self: *AuthHooks, slot: usize) void {
+        _ = self;
+        _ = slot;
     }
-    updateReadBackpressure(ipc, handler, batch, slot, read_paused);
-}
+
+    pub fn onSighup(self: *AuthHooks) void {
+        _ = self;
+        AuthHooks.log.info("received SIGHUP (LMDB -- no reload needed)", .{});
+    }
+
+    /// T121: send a finished crypto job's reply to its IPC client. The
+    /// slot generation both validates the client is still the connection
+    /// that asked and prevents a stale reply reaching an unrelated
+    /// (reused) slot.
+    fn pumpCryptoReply(self: *AuthHooks, runner: anytype, c: crypto_pool_mod.Completion) void {
+        _ = self;
+        var reply = runner.handler.takeCryptoReply(c) orelse return;
+        defer reply.deinit(runner.handler.allocator);
+
+        const slot: usize = reply.slot;
+        if (slot >= runner.ipc_gens.len or runner.ipc_gens[slot] != reply.slot_gen) return;
+
+        runner.replyToLane(slot, reply.msg);
+    }
+};
 
 /// Context for the invite validator callback.
 const InviteValidatorCtx = struct {
@@ -643,6 +421,11 @@ fn makeInviteValidator(ctx: *InviteValidatorCtx) InviteValidator {
 fn parseU32Arg(arg: ?[]const u8) ?u32 {
     const s = arg orelse return null;
     return std.fmt.parseInt(u32, s, 10) catch null;
+}
+
+fn parseU16Arg(arg: ?[]const u8) ?u16 {
+    const s = arg orelse return null;
+    return std.fmt.parseInt(u16, s, 10) catch null;
 }
 
 test "auth startup: users_scan_limit config is parsed and validated" {
@@ -720,6 +503,37 @@ test "auth startup: a pending migrate-precis marker refuses startup" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "migrate-precis recovery is pending") != null);
+}
+
+test "auth startup: --lockout-threshold over u16 max is a bad value, not a panic" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    // The threshold fields are u16: 70000 must be rejected as a bad value
+    // (InvalidArgs) rather than trip the cast check.
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "zig-out/bin/xmppd-auth",
+            "--db",
+            base,
+            "--socket",
+            "/nonexistent-threshold-test/auth.sock",
+            "--lockout-threshold",
+            "70000",
+        },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "--lockout-threshold requires a numeric value") != null);
 }
 
 test "auth startup: an unprepared users key refuses startup" {
