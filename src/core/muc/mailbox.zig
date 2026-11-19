@@ -158,11 +158,14 @@ test "RoomMailbox: byte budget returns error" {
     var pool = std.heap.MemoryPool(RoomMailbox.Item).init(std.testing.allocator);
     defer pool.deinit();
     var mb = RoomMailbox{};
-    const payload = try std.testing.allocator.alloc(u8, BYTE_BUDGET);
+    // Blobs cap at MAX_BLOB_SIZE, so the budget is filled with two
+    // cap-sized payloads; the third must take the MailboxFull path.
+    const payload = try std.testing.allocator.alloc(u8, delivery_queue.MAX_BLOB_SIZE);
     defer std.testing.allocator.free(payload);
     @memset(payload, 'x');
     try enqueuePayload(&mb, &pool, payload);
-    try std.testing.expectError(error.MailboxFull, enqueuePayload(&mb, &pool, "one more"));
+    try enqueuePayload(&mb, &pool, payload);
+    try std.testing.expectError(error.MailboxFull, enqueuePayload(&mb, &pool, payload));
     mb.deinit(&pool);
 }
 

@@ -328,6 +328,7 @@ pub const ActorRetryList = struct {
                 e.attempts += 1;
                 if (e.attempts >= ATTEMPTS) {
                     self.unlink(e);
+                    _ = actor_retry_drops.fetchAdd(1, .monotonic);
                     on_exhausted(ctx, e);
                     e.blob.release();
                     self.allocator.destroy(e);
@@ -886,20 +887,25 @@ test "MpscQueue: basic enqueue and drain" {
 
     var received_id: u32 = 0;
     var received_gen: u24 = 0;
-    var received_payload: []const u8 = "";
+    var received_buf: [64]u8 = undefined;
+    var received_len: usize = 0;
 
     const Ctx = struct {
         id: *u32,
         gen: *u24,
-        pl: *[]const u8,
+        buf: *[64]u8,
+        len: *usize,
     };
-    const ctx = Ctx{ .id = &received_id, .gen = &received_gen, .pl = &received_payload };
+    const ctx = Ctx{ .id = &received_id, .gen = &received_gen, .buf = &received_buf, .len = &received_len };
 
     const handler = struct {
         fn handle(c: Ctx, target: Token, pl: []const u8) void {
             c.id.* = target.index;
             c.gen.* = target.gen;
-            c.pl.* = pl;
+            // The payload slice dies with the slot's blob reference when
+            // the handler returns; copy while it is valid.
+            @memcpy(c.buf[0..pl.len], pl);
+            c.len.* = pl.len;
         }
     }.handle;
 
@@ -907,7 +913,7 @@ test "MpscQueue: basic enqueue and drain" {
     try std.testing.expectEqual(@as(u32, 1), processed);
     try std.testing.expectEqual(@as(u32, 42), received_id);
     try std.testing.expectEqual(@as(u24, 7), received_gen);
-    try std.testing.expectEqualStrings("hello world", received_payload);
+    try std.testing.expectEqualStrings("hello world", received_buf[0..received_len]);
 }
 
 test "MpscQueue: receipt timestamp reaches the drain handler" {
@@ -1054,10 +1060,16 @@ test "MpscQueue: hasPending" {
 
     try enqueuePayload(&queue, Token.init(1, 1, token_kinds.session), "test");
     try std.testing.expect(queue.hasPending());
+
+    const handler = struct {
+        fn handle(_: usize, _: Token, _: []const u8) void {}
+    }.handle;
+    _ = queue.drain(@as(usize, 0), handler);
+    try std.testing.expect(!queue.hasPending());
 }
 
 test "Blob: a slot's reference outlives the producer's" {
-    var budget = testBudget();
+    var budget = BlobBudget{ .allocator = std.testing.allocator, .limit = BlobBudget.DEFAULT_LIMIT };
     var queue = MpscQueue{};
 
     const blob = try budget.produce("shared");
