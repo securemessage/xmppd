@@ -769,7 +769,7 @@ test "master config: precedence default < file < CLI with provenance" {
     try std.testing.expectEqualStrings("file.test", l.values.server.hostname);
     try std.testing.expectEqual(.file, l.provenanceOf("server", "hostname"));
     try std.testing.expectEqual(@as(u32, 2), l.lineOf("server", "hostname"));
-    try std.testing.expectEqualStrings("/var/db/xmppd/users.db", l.values.server.db_path);
+    try std.testing.expectEqualStrings("/var/db/xmppd", l.values.server.db_path);
     try std.testing.expectEqual(.default, l.provenanceOf("server", "db_path"));
 }
 

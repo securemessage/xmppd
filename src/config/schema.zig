@@ -42,7 +42,7 @@ pub const Sections = struct {
         hostname: []const u8 = "localhost",
         bind_address: []const u8 = "0.0.0.0",
         c2s_port: u16 = 5222,
-        db_path: []const u8 = "/var/db/xmppd/users.db",
+        db_path: []const u8 = "/var/db/xmppd",
         lmdb_map_size_mb: usize = 8192,
         user: []const u8 = "",
         log_file: []const u8 = "/var/log/xmppd/xmppd.log",
@@ -63,7 +63,7 @@ pub const Sections = struct {
         ip_lockout_threshold: u16 = 20,
         users_scan_limit: usize = 100_000,
         rate_limit: bool = true,
-        crypto_threads: u32 = 0,
+        crypto_threads: u32 = 4,
         registration: bool = false,
         require_invite: bool = true,
     } = .{},
@@ -97,7 +97,8 @@ pub const Sections = struct {
         ca_file: []const u8 = "",
         introspection_endpoint: []const u8 = "",
         user_domain: []const u8 = "",
-        socket: []const u8 = "/var/run/xmppd/oidc.sock",
+        /// Empty follows auth.socket so both auth backends share the IPC endpoint.
+        socket: []const u8 = "",
         max_per_account: u32 = 60,
         max_per_ip: u32 = 200,
         rate_limit: bool = true,
@@ -269,6 +270,37 @@ pub const s2s_cli = [_]conf.CliSpec{
     .{ .name = "help", .target = "meta.help", .flag = true, .aliases = &.{"h"}, .help = "show this help" },
 };
 
+/// Every CLI spelling xmppd-auth accepts. The forwarded blob supplies
+/// supervised values; the CLI table still wins for manual overrides.
+pub const auth_cli = [_]conf.CliSpec{
+    .{ .name = "config", .target = "meta.config_path", .aliases = &.{"c"}, .help = "config file path" },
+    .{ .name = "db", .target = "server.db_path", .help = "storage base directory" },
+    .{ .name = "socket", .target = "auth.socket", .help = "auth IPC socket path" },
+    .{ .name = "max-auth-per-account", .target = "auth.max_per_account", .help = "attempts per account per window" },
+    .{ .name = "max-auth-per-ip", .target = "auth.max_per_ip", .help = "attempts per IP per window" },
+    .{ .name = "auth-window", .target = "auth.window_seconds", .help = "rate window in seconds" },
+    .{ .name = "lockout-duration", .target = "auth.lockout_duration", .help = "temporary lockout in seconds" },
+    .{ .name = "lockout-threshold", .target = "auth.lockout_threshold", .help = "account failures before lockout" },
+    .{ .name = "ip-lockout-threshold", .target = "auth.ip_lockout_threshold", .help = "IP failures before lockout" },
+    .{ .name = "no-rate-limit", .target = "auth.rate_limit", .flag = false, .help = "disable auth rate limiting" },
+    .{ .name = "enable-registration", .target = "auth.registration", .flag = true, .help = "enable in-band registration" },
+    .{ .name = "no-require-invite", .target = "auth.require_invite", .flag = false, .help = "allow registration without an invite" },
+    .{ .name = "users-scan-limit", .target = "auth.users_scan_limit", .help = "startup users scan bound" },
+    .{ .name = "conf-fd", .target = "meta.conf_fd", .help = "inherited sealed config fd" },
+    .{ .name = "help", .target = "meta.help", .flag = true, .aliases = &.{"h"}, .help = "show this help" },
+};
+
+/// Every CLI spelling xmppd-auth-oidc accepts. An explicit --socket wins
+/// over both the file and forwarded values; otherwise oidc.socket inherits
+/// auth.socket when empty.
+pub const oidc_cli = [_]conf.CliSpec{
+    .{ .name = "config", .target = "meta.config_path", .aliases = &.{"c"}, .help = "config file path" },
+    .{ .name = "db", .target = "server.db_path", .help = "storage base directory" },
+    .{ .name = "socket", .target = "oidc.socket", .help = "auth IPC socket path" },
+    .{ .name = "conf-fd", .target = "meta.conf_fd", .help = "inherited sealed config fd" },
+    .{ .name = "help", .target = "meta.help", .flag = true, .aliases = &.{"h"}, .help = "show this help" },
+};
+
 /// Every CLI spelling xmppctl accepts. Subcommand positionals are
 /// collected through the loader (positional_cap); --rename and the
 /// repeatable --hosted-domain are pre-scanned by ctl itself because they
@@ -289,6 +321,8 @@ pub const ctl_cli = [_]conf.CliSpec{
 
 pub const CoreLoader = conf.Loader(Sections, &file_spec, &core_cli, .{});
 pub const S2sLoader = conf.Loader(Sections, &file_spec, &s2s_cli, .{});
+pub const AuthLoader = conf.Loader(Sections, &file_spec, &auth_cli, .{});
+pub const OidcLoader = conf.Loader(Sections, &file_spec, &oidc_cli, .{});
 /// ctl collects its subcommand and arguments as positionals.
 pub const CtlLoader = conf.Loader(Sections, &file_spec, &ctl_cli, .{ .positional_cap = 16 });
 
@@ -340,6 +374,87 @@ pub fn confFdArg(argv: []const []const u8) ?i32 {
         return std.fmt.parseInt(i32, v, 10) catch null;
     }
     return null;
+}
+
+/// The socket xmppd-auth-oidc listens on. An unset OIDC-specific socket
+/// inherits the shared auth endpoint; an explicit file, forwarded or CLI
+/// value wins in that order through the loader.
+pub fn oidcSocket(values: *const Sections) []const u8 {
+    return if (values.oidc.socket.len != 0) values.oidc.socket else values.auth.socket;
+}
+
+/// Records a semantic field error at the same file location the loader
+/// would use for a parse error. `path` is the file loaded by the caller;
+/// forwarded and CLI-only failures may have no path or line.
+pub fn failField(
+    loader: anytype,
+    path: ?[]const u8,
+    diag: *conf.Diag,
+    comptime section: []const u8,
+    comptime field: []const u8,
+    detail: []const u8,
+) error{BadValue} {
+    const from_file = loader.provenanceOf(section, field) == .file;
+    diag.set(.{
+        .path = if (from_file) path orelse "" else "",
+        .line = if (from_file) loader.lineOf(section, field) else 0,
+        .section = section,
+        .key = field,
+        .detail = detail,
+    });
+    return error.BadValue;
+}
+
+fn validateRateMax(loader: anytype, path: ?[]const u8, diag: *conf.Diag, comptime section: []const u8, comptime field: []const u8) error{BadValue}!void {
+    if (@field(@field(loader.values, section), field) > std.math.maxInt(u16)) {
+        return failField(loader, path, diag, section, field, "rate maximum exceeds 65535");
+    }
+}
+
+/// Validates values RateLimiter would otherwise clamp and returns the
+/// lockout in its native whole-second unit.
+pub fn validateAuthRate(loader: anytype, path: ?[]const u8, diag: *conf.Diag) error{BadValue}!u32 {
+    try validateRateMax(loader, path, diag, "auth", "max_per_account");
+    try validateRateMax(loader, path, diag, "auth", "max_per_ip");
+    if (loader.values.auth.window_seconds == 0) {
+        return failField(loader, path, diag, "auth", "window_seconds", "rate window must be at least one second");
+    }
+    const ms = loader.values.auth.lockout_duration.ms;
+    if (ms % 1000 != 0) {
+        return failField(loader, path, diag, "auth", "lockout_duration", "lockout must use whole seconds");
+    }
+    const seconds = ms / 1000;
+    if (seconds > std.math.maxInt(u32)) {
+        return failField(loader, path, diag, "auth", "lockout_duration", "lockout exceeds the u32 second range");
+    }
+    return @intCast(seconds);
+}
+
+/// OIDC shares the auth policy and additionally validates its legacy maxima.
+pub fn validateOidcRate(loader: anytype, path: ?[]const u8, diag: *conf.Diag) error{BadValue}!u32 {
+    const seconds = try validateAuthRate(loader, path, diag);
+    try validateRateMax(loader, path, diag, "oidc", "max_per_account");
+    try validateRateMax(loader, path, diag, "oidc", "max_per_ip");
+    return seconds;
+}
+
+/// Converts the LMDB map size without allowing a configured overflow.
+pub fn mapSizeBytes(loader: anytype, path: ?[]const u8, diag: *conf.Diag) error{BadValue}!usize {
+    return std.math.mul(usize, loader.values.server.lmdb_map_size_mb, 1024 * 1024) catch {
+        return failField(loader, path, diag, "server", "lmdb_map_size_mb", "map size overflows addressable bytes");
+    };
+}
+
+/// The master forwards every field, including defaults. Preserve the OIDC
+/// rule that explicitly configured shared auth maxima beat the OIDC aliases
+/// by resolving them into the OIDC view before the blob is sealed.
+pub fn normalizeForwardedOidcRates(loader: anytype) void {
+    if (loader.provenanceOf("auth", "max_per_account") != .default) {
+        loader.values.oidc.max_per_account = loader.values.auth.max_per_account;
+    }
+    if (loader.provenanceOf("auth", "max_per_ip") != .default) {
+        loader.values.oidc.max_per_ip = loader.values.auth.max_per_ip;
+    }
 }
 
 // ============================================================================
@@ -487,4 +602,137 @@ test "ctl rejects an unknown argument instead of silently dropping it" {
     var l = CtlLoader.init(testing.allocator);
     defer l.deinit();
     try testing.expectError(error.UnknownArgument, l.applyArgs(&.{"--bogus"}, &diag));
+}
+
+test "auth defaults and every CLI spelling match the daemon contract" {
+    var diag: conf.Diag = .{};
+    var l = try AuthLoader.load(testing.allocator, .{ .args = &.{
+        "--config",               "a.ini",                 "--db",                "/cli/db",            "--socket",               "/cli/auth.sock",
+        "--max-auth-per-account", "9",                     "--max-auth-per-ip",   "30",                 "--auth-window",          "90",
+        "--lockout-duration",     "900",                   "--lockout-threshold", "3",                  "--ip-lockout-threshold", "4",
+        "--no-rate-limit",        "--enable-registration", "--no-require-invite", "--users-scan-limit", "500",                    "--conf-fd",
+        "7",                      "--help",
+    } }, &diag);
+    defer l.deinit();
+
+    try testing.expectEqualStrings("/cli/db", l.values.server.db_path);
+    try testing.expectEqualStrings("/cli/auth.sock", l.values.auth.socket);
+    try testing.expectEqual(@as(u32, 9), l.values.auth.max_per_account);
+    try testing.expectEqual(@as(u32, 30), l.values.auth.max_per_ip);
+    try testing.expectEqual(@as(u32, 90), l.values.auth.window_seconds);
+    try testing.expectEqual(@as(u64, 900_000), l.values.auth.lockout_duration.ms);
+    try testing.expectEqual(@as(u16, 3), l.values.auth.lockout_threshold);
+    try testing.expectEqual(@as(u16, 4), l.values.auth.ip_lockout_threshold);
+    try testing.expectEqual(@as(usize, 500), l.values.auth.users_scan_limit);
+    try testing.expect(!l.values.auth.rate_limit);
+    try testing.expect(l.values.auth.registration);
+    try testing.expect(!l.values.auth.require_invite);
+    try testing.expectEqual(@as(i32, 7), l.values.meta.conf_fd);
+    try testing.expect(l.values.meta.help);
+    try testing.expectEqual(@as(u32, 900), try validateAuthRate(&l, null, &diag));
+
+    var defaults = AuthLoader.init(testing.allocator);
+    defer defaults.deinit();
+    try testing.expectEqualStrings("/var/db/xmppd", defaults.values.server.db_path);
+    try testing.expectEqual(@as(u32, 4), defaults.values.auth.crypto_threads);
+    try testing.expectEqualStrings("/var/run/xmppd/auth.sock", oidcSocket(&defaults.values));
+}
+
+fn expectHelpCoversCli(comptime specs: []const conf.CliSpec, loader: anytype) !void {
+    var help_buf: [32768]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&help_buf);
+    try loader.writeHelp(&w);
+    const help = w.buffered();
+    inline for (specs) |spec| {
+        var name_buf: [128]u8 = undefined;
+        const long = try std.fmt.bufPrint(&name_buf, "--{s}", .{spec.name});
+        try testing.expect(std.mem.indexOf(u8, help, long) != null);
+        for (spec.aliases) |alias| {
+            const short = try std.fmt.bufPrint(&name_buf, "-{s}", .{alias});
+            try testing.expect(std.mem.indexOf(u8, help, short) != null);
+        }
+    }
+}
+
+test "generated auth help covers every schema CLI spelling" {
+    var auth = AuthLoader.init(testing.allocator);
+    defer auth.deinit();
+    try expectHelpCoversCli(&auth_cli, &auth);
+
+    var oidc = OidcLoader.init(testing.allocator);
+    defer oidc.deinit();
+    try expectHelpCoversCli(&oidc_cli, &oidc);
+}
+
+test "auth forwarded values beat the file and lose to CLI flags" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "auth.ini", "[server]\ndb_path = /file/db\n[auth]\nmax_per_account = 10\n", &path_buf);
+    const blob = "--server.db_path=/fwd/db\n--auth.max_per_account=20\n";
+
+    var diag: conf.Diag = .{};
+    var forwarded = try AuthLoader.load(testing.allocator, .{
+        .path = path,
+        .conf_fd = (try conf.ConfFd.create(blob)).fd,
+    }, &diag);
+    defer forwarded.deinit();
+    try testing.expectEqualStrings("/fwd/db", forwarded.values.server.db_path);
+    try testing.expectEqual(@as(u32, 20), forwarded.values.auth.max_per_account);
+
+    var cli = try AuthLoader.load(testing.allocator, .{
+        .path = path,
+        .conf_fd = (try conf.ConfFd.create(blob)).fd,
+        .args = &.{ "--db", "/cli/db", "--max-auth-per-account", "30" },
+    }, &diag);
+    defer cli.deinit();
+    try testing.expectEqualStrings("/cli/db", cli.values.server.db_path);
+    try testing.expectEqual(@as(u32, 30), cli.values.auth.max_per_account);
+    try testing.expectEqual(.cli, cli.provenanceOf("auth", "max_per_account"));
+}
+
+test "OIDC aliases load and shared auth maxima normalize into the forwarded view" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "oidc.ini", "[oidc]\nrate_max_per_account = 42\nrate_max_per_ip = 77\nsocket = /run/oidc.sock\n", &path_buf);
+
+    var diag: conf.Diag = .{};
+    var aliases = try OidcLoader.load(testing.allocator, .{ .path = path }, &diag);
+    defer aliases.deinit();
+    try testing.expectEqual(@as(u32, 42), aliases.values.oidc.max_per_account);
+    try testing.expectEqual(@as(u32, 77), aliases.values.oidc.max_per_ip);
+    try testing.expectEqualStrings("/run/oidc.sock", oidcSocket(&aliases.values));
+
+    var parent = try MasterLoader.load(testing.allocator, .{ .path = path, .args = &.{"--auth.max_per_account=7"} }, &diag);
+    defer parent.deinit();
+    normalizeForwardedOidcRates(&parent);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const blob = try parent.forwardBlob(arena.allocator(), &diag);
+    var child = try OidcLoader.load(testing.allocator, .{ .conf_fd = (try conf.ConfFd.create(blob)).fd }, &diag);
+    defer child.deinit();
+    try testing.expectEqual(@as(u32, 7), child.values.oidc.max_per_account);
+    try testing.expectEqual(@as(u32, 77), child.values.oidc.max_per_ip);
+}
+
+test "semantic rate and map-size errors keep their file location" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "bad-rate.ini", "[auth]\nwindow_seconds = 0\n", &path_buf);
+    var diag: conf.Diag = .{};
+    var l = try AuthLoader.load(testing.allocator, .{ .path = path }, &diag);
+    defer l.deinit();
+    try testing.expectError(error.BadValue, validateAuthRate(&l, path, &diag));
+    try testing.expectEqual(@as(u32, 2), diag.line);
+    try testing.expectEqualStrings("window_seconds", diag.key);
+
+    const huge = try std.fmt.allocPrint(testing.allocator, "[server]\nlmdb_map_size_mb = {d}\n", .{std.math.maxInt(usize)});
+    defer testing.allocator.free(huge);
+    const map_path = try writeTempConfig(&tmp.dir, "bad-map.ini", huge, &path_buf);
+    var map = try AuthLoader.load(testing.allocator, .{ .path = map_path }, &diag);
+    defer map.deinit();
+    try testing.expectError(error.BadValue, mapSizeBytes(&map, map_path, &diag));
+    try testing.expectEqual(@as(u32, 2), diag.line);
 }

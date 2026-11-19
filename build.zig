@@ -1829,6 +1829,8 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("op_backend", auth_op_backend_mod);
     auth_mod.addImport("event_loop", auth_event_loop_mod);
     auth_mod.addImport("config", config_mod);
+    auth_mod.addImport("conf", conf_mod);
+    auth_mod.addImport("schema", schema_mod);
     auth_mod.addImport("backend", auth_backend_mod);
     auth_mod.addImport("runner", auth_runner_mod);
     auth_mod.addImport("xmppd_log", xmppd_log_mod);
@@ -1953,6 +1955,8 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_main_mod.addImport("event_loop", oidc_event_loop_mod);
     oidc_main_mod.addImport("config", config_mod);
+    oidc_main_mod.addImport("conf", conf_mod);
+    oidc_main_mod.addImport("schema", schema_mod);
     oidc_main_mod.addImport("lock_store", auth_lock_store_mod);
     oidc_main_mod.addImport("op_backend", auth_op_backend_mod);
     oidc_main_mod.addImport("archive_backend", auth_archive_backend_mod);
