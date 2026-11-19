@@ -21,7 +21,8 @@ const root_allocator = @import("root_allocator");
 pub const std_options = xmppd_log.std_options;
 
 const OpBackendType = @import("op_backend").Backend;
-const config_mod = @import("config");
+const conf = @import("conf");
+const schema = @import("schema");
 const backend_mod = @import("backend");
 const user_store_mod = @import("user_store");
 const UserStore = user_store_mod.UserStore(OpBackendType);
@@ -50,19 +51,20 @@ comptime {
 
 const log = std.log.scoped(.xmppd_auth);
 
+/// Loads into caller-owned storage so the parser does not remain in main's
+/// long-lived stack frame. Values borrow the loader arena until deinit.
+noinline fn loadAuthConfig(loaded: *schema.AuthLoader, gpa: std.mem.Allocator, argv: []const []const u8, diag: *conf.Diag) conf.Error!void {
+    loaded.* = schema.AuthLoader.init(gpa);
+    errdefer loaded.deinit();
+    try loaded.loadInto(.{
+        .conf_fd = schema.confFdArg(argv),
+        .path = schema.configPathArg(argv),
+        .args = argv,
+    }, diag);
+}
+
 /// Certify the users namespace before any request is served. There is
 /// deliberately no raw-name read fallback.
-fn parseUsersScanLimit(text: []const u8) !usize {
-    return std.fmt.parseInt(usize, text, 10) catch error.InvalidArgs;
-}
-
-/// CLI wins over config, which wins over the built-in default.
-fn resolveUsersScanLimit(default: usize, cli_value: ?[]const u8, config_value: ?[]const u8) !usize {
-    if (cli_value) |v| return parseUsersScanLimit(v);
-    if (config_value) |v| return parseUsersScanLimit(v);
-    return default;
-}
-
 fn verifyUsersAtStartup(comptime Backend: type, backend: *Backend, max_keys: usize) !void {
     return user_store_mod.verifyPreparedUsers(Backend, backend, max_keys);
 }
@@ -72,174 +74,61 @@ pub fn main() !void {
     defer root.deinit();
     const allocator = root.allocator();
 
-    // Parse arguments
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
+    _ = args.next();
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    while (args.next()) |arg| try argv.append(allocator, arg);
 
-    var db_path: []const u8 = "/var/db/xmppd";
-    var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
-    var map_size_mb: usize = 8192; // OpenOptions.map_size default (S9)
-    var rate_policy = RatePolicy{};
-    var rate_limit_enabled = true;
-    var reg_config = RegistrationConfig{};
-    var users_scan_limit_arg: ?[]const u8 = null;
-    var config_users_scan_limit: ?[]const u8 = null;
-    // T121: crypto pool size. 0 disables (inline derive in the event loop).
-    var crypto_threads: u32 = 4;
-
-    var config_path: ?[]const u8 = null;
-
-    _ = args.next(); // Skip argv[0]
-
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
-            config_path = args.next() orelse {
-                log.err("--config requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--db")) {
-            db_path = args.next() orelse {
-                log.err("--db requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--socket")) {
-            socket_path = args.next() orelse {
-                log.err("--socket requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--max-auth-per-account")) {
-            rate_policy.max_per_account = parseU32Arg(args.next()) orelse {
-                log.err("--max-auth-per-account requires a numeric value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--max-auth-per-ip")) {
-            rate_policy.max_per_ip = parseU32Arg(args.next()) orelse {
-                log.err("--max-auth-per-ip requires a numeric value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--auth-window")) {
-            rate_policy.window_seconds = parseU32Arg(args.next()) orelse {
-                log.err("--auth-window requires a numeric value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--lockout-duration")) {
-            rate_policy.lockout_duration = parseU32Arg(args.next()) orelse {
-                log.err("--lockout-duration requires a numeric value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--lockout-threshold")) {
-            rate_policy.lockout_threshold = parseU16Arg(args.next()) orelse {
-                log.err("--lockout-threshold requires a numeric value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--ip-lockout-threshold")) {
-            rate_policy.ip_lockout_threshold = parseU16Arg(args.next()) orelse {
-                log.err("--ip-lockout-threshold requires a numeric value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--no-rate-limit")) {
-            rate_limit_enabled = false;
-        } else if (std.mem.eql(u8, arg, "--enable-registration")) {
-            reg_config.enabled = true;
-        } else if (std.mem.eql(u8, arg, "--no-require-invite")) {
-            reg_config.require_invite = false;
-        } else if (std.mem.eql(u8, arg, "--users-scan-limit")) {
-            users_scan_limit_arg = args.next() orelse {
-                log.err("--users-scan-limit requires a numeric value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            printUsage();
-            return;
-        } else {
-            log.warn("unknown argument: {s}", .{arg});
-        }
-    }
-
-    // Apply config file defaults (CLI flags take precedence)
-    var cfg: ?config_mod.Config = null;
-    if (config_path) |cp| {
-        cfg = config_mod.parse(allocator, cp) catch |err| {
-            log.err("failed to read config file '{s}': {}", .{ cp, err });
-            return error.InvalidArgs;
-        };
-        const c = &cfg.?;
-
-        // [server] section
-        if (std.mem.eql(u8, db_path, "/var/db/xmppd")) {
-            if (c.get("server", "db_path")) |v| db_path = v;
-        }
-        // LMDB map size: fixed at open, never resized at runtime (S9).
-        if (c.get("server", "lmdb_map_size_mb")) |v| {
-            map_size_mb = std.fmt.parseInt(usize, v, 10) catch map_size_mb;
-        }
-
-        // [auth] section
-        if (std.mem.eql(u8, socket_path, "/var/run/xmppd/auth.sock")) {
-            if (c.get("auth", "socket")) |v| socket_path = v;
-        }
-        // CLI args outrank config; config applies only at the untouched
-        // default. Compare against the struct default, not a copy-pasted
-        // literal (T196: literals bit-rotted when defaults moved).
-        const rate_defaults = RatePolicy{};
-        if (rate_policy.max_per_account == rate_defaults.max_per_account) {
-            if (c.get("auth", "max_per_account")) |v| {
-                rate_policy.max_per_account = std.fmt.parseInt(u32, v, 10) catch rate_defaults.max_per_account;
-            }
-        }
-        if (rate_policy.max_per_ip == rate_defaults.max_per_ip) {
-            if (c.get("auth", "max_per_ip")) |v| {
-                rate_policy.max_per_ip = std.fmt.parseInt(u32, v, 10) catch rate_defaults.max_per_ip;
-            }
-        }
-        if (rate_policy.window_seconds == rate_defaults.window_seconds) {
-            if (c.get("auth", "window_seconds")) |v| {
-                rate_policy.window_seconds = std.fmt.parseInt(u32, v, 10) catch rate_defaults.window_seconds;
-            }
-        }
-        if (rate_policy.lockout_duration == rate_defaults.lockout_duration) {
-            if (c.get("auth", "lockout_duration")) |v| {
-                rate_policy.lockout_duration = std.fmt.parseInt(u32, v, 10) catch rate_defaults.lockout_duration;
-            }
-        }
-        if (rate_policy.lockout_threshold == rate_defaults.lockout_threshold) {
-            if (c.get("auth", "lockout_threshold")) |v| {
-                rate_policy.lockout_threshold = std.fmt.parseInt(u16, v, 10) catch rate_defaults.lockout_threshold;
-            }
-        }
-        if (rate_policy.ip_lockout_threshold == rate_defaults.ip_lockout_threshold) {
-            if (c.get("auth", "ip_lockout_threshold")) |v| {
-                rate_policy.ip_lockout_threshold = std.fmt.parseInt(u16, v, 10) catch rate_defaults.ip_lockout_threshold;
-            }
-        }
-        if (c.get("auth", "rate_limit")) |v| {
-            if (std.mem.eql(u8, v, "false")) rate_limit_enabled = false;
-        }
-        if (c.get("auth", "crypto_threads")) |v| {
-            crypto_threads = std.fmt.parseInt(u32, v, 10) catch 4;
-        }
-        if (c.get("auth", "registration")) |v| {
-            if (std.mem.eql(u8, v, "true")) reg_config.enabled = true;
-        }
-        if (c.get("auth", "require_invite")) |v| {
-            if (std.mem.eql(u8, v, "false")) reg_config.require_invite = false;
-        }
-        if (c.get("auth", "users_scan_limit")) |v| {
-            config_users_scan_limit = v;
-        }
-
-        log.info("config file: {s}", .{cp});
-    }
-    defer if (cfg) |*c| c.deinit();
-
-    const users_scan_limit = resolveUsersScanLimit(
-        user_store_mod.max_startup_scan_keys,
-        users_scan_limit_arg,
-        config_users_scan_limit,
-    ) catch |err| {
-        log.err("invalid users_scan_limit value", .{});
+    const Cfg = struct {
+        diag: conf.Diag,
+        loader: schema.AuthLoader,
+    };
+    const cfg = try allocator.create(Cfg);
+    cfg.diag = .{};
+    loadAuthConfig(&cfg.loader, allocator, argv.items, &cfg.diag) catch |err| {
+        log.err("{f}", .{&cfg.diag});
+        allocator.destroy(cfg);
         return err;
     };
+    defer {
+        cfg.loader.deinit();
+        allocator.destroy(cfg);
+    }
+    const v = &cfg.loader.values;
+    if (v.meta.help) {
+        try printUsage(allocator);
+        return;
+    }
+
+    const config_path = schema.configPathArg(argv.items);
+    const lockout_duration = schema.validateAuthRate(&cfg.loader, config_path, &cfg.diag) catch |err| {
+        log.err("{f}", .{&cfg.diag});
+        return err;
+    };
+    const map_size_bytes = schema.mapSizeBytes(&cfg.loader, config_path, &cfg.diag) catch |err| {
+        log.err("{f}", .{&cfg.diag});
+        return err;
+    };
+    const db_path = v.server.db_path;
+    const socket_path = v.auth.socket;
+    const users_scan_limit = v.auth.users_scan_limit;
+    const crypto_threads = v.auth.crypto_threads;
+    const rate_limit_enabled = v.auth.rate_limit;
+    const rate_policy = RatePolicy{
+        .max_per_account = v.auth.max_per_account,
+        .max_per_ip = v.auth.max_per_ip,
+        .window_seconds = v.auth.window_seconds,
+        .lockout_duration = lockout_duration,
+        .lockout_threshold = v.auth.lockout_threshold,
+        .ip_lockout_threshold = v.auth.ip_lockout_threshold,
+    };
+    const reg_config = RegistrationConfig{
+        .enabled = v.auth.registration,
+        .require_invite = v.auth.require_invite,
+    };
+    if (config_path) |cp| log.info("config file: {s}", .{cp});
 
     // Build auth-specific sub-path: {db_path}/auth
     var auth_path_buf: [1024]u8 = undefined;
@@ -255,7 +144,7 @@ pub fn main() !void {
     }
 
     // Open storage backend
-    var backend = try OpBackendType.open(auth_path, .{ .map_size = map_size_mb * 1024 * 1024 });
+    var backend = try OpBackendType.open(auth_path, .{ .map_size = map_size_bytes });
     defer backend.close();
     var store = UserStore.init(&backend);
     verifyUsersAtStartup(OpBackendType, &backend, users_scan_limit) catch |err| {
@@ -418,25 +307,6 @@ fn makeInviteValidator(ctx: *InviteValidatorCtx) InviteValidator {
     };
 }
 
-fn parseU32Arg(arg: ?[]const u8) ?u32 {
-    const s = arg orelse return null;
-    return std.fmt.parseInt(u32, s, 10) catch null;
-}
-
-fn parseU16Arg(arg: ?[]const u8) ?u16 {
-    const s = arg orelse return null;
-    return std.fmt.parseInt(u16, s, 10) catch null;
-}
-
-test "auth startup: users_scan_limit config is parsed and validated" {
-    try std.testing.expectEqual(@as(usize, 500), try parseUsersScanLimit("500"));
-    try std.testing.expectError(error.InvalidArgs, parseUsersScanLimit("not-a-number"));
-    try std.testing.expectEqual(@as(usize, 100), try resolveUsersScanLimit(100000, "100", "200"));
-    try std.testing.expectEqual(@as(usize, 200), try resolveUsersScanLimit(100000, null, "200"));
-    try std.testing.expectEqual(@as(usize, 100000), try resolveUsersScanLimit(100000, null, null));
-    try std.testing.expectError(error.InvalidArgs, resolveUsersScanLimit(100000, null, "typo"));
-}
-
 test "auth startup: main applies --users-scan-limit" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -533,7 +403,8 @@ test "auth startup: --lockout-threshold over u16 max is a bad value, not a panic
         .Exited => |code| try std.testing.expect(code != 0),
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "--lockout-threshold requires a numeric value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "--lockout-threshold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "invalid value") != null);
 }
 
 test "auth startup: an unprepared users key refuses startup" {
@@ -549,27 +420,72 @@ test "auth startup: an unprepared users key refuses startup" {
     try verifyUsersAtStartup(backend_mod.MemoryBackend, &db, 1);
 }
 
-fn printUsage() void {
-    const usage =
-        \\Usage: xmppd-auth [OPTIONS]
-        \\
-        \\Options:
-        \\  --db PATH                  Storage directory (default: /var/db/xmppd)
-        \\  --socket PATH              IPC socket path (default: /var/run/xmppd/auth.sock)
-        \\  --max-auth-per-account N   Max attempts per account per window (default: 60)
-        \\  --max-auth-per-ip N        Max attempts per IP per window (default: 200)
-        \\  --auth-window N            Rate window in seconds (default: 120)
-        \\  --lockout-duration N       Temp lockout duration in seconds (default: 300)
-        \\  --lockout-threshold N      Consecutive account failures before lockout (default: 10)
-        \\  --ip-lockout-threshold N   Consecutive IP failures before lockout (default: 20)
-        \\  --no-rate-limit            Disable auth rate limiting entirely (testing/benchmarks only)
-        \\  --enable-registration      Enable in-band registration (XEP-0077)
-        \\  --no-require-invite        Allow registration without invitation code
-        \\  --users-scan-limit N       Max users keys certified at startup (default: 100000)
-        \\  --help, -h                 Show this help
-        \\
-    ;
-    var buf: [0]u8 = .{};
+fn printUsage(allocator: std.mem.Allocator) std.Io.Writer.Error!void {
+    var gen = schema.AuthLoader.init(allocator);
+    defer gen.deinit();
+    var buf: [4096]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
-    stdout.interface.writeAll(usage) catch {};
+    try stdout.interface.writeAll("Usage: xmppd-auth [OPTIONS]\n\n");
+    try gen.writeHelp(&stdout.interface);
+    try stdout.interface.flush();
+}
+
+test "auth startup: bad file rate values fail with file and line" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{
+        "max_per_account = nope",
+        "lockout_threshold = 70000",
+        "max_per_ip = 65536",
+    }) |setting| {
+        const file = try tmp.dir.createFile("bad.ini", .{ .truncate = true });
+        try file.writeAll("[auth]\n");
+        try file.writeAll(setting);
+        try file.writeAll("\n");
+        file.close();
+        const path = try tmp.dir.realpathAlloc(allocator, "bad.ini");
+        defer allocator.free(path);
+
+        const result = try std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "zig-out/bin/xmppd-auth", "--config", path },
+            .max_output_bytes = 64 * 1024,
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .Exited => |code| try std.testing.expect(code != 0),
+            else => return error.TestUnexpectedResult,
+        }
+        const location = try std.fmt.allocPrint(allocator, "{s}:2:", .{path});
+        defer allocator.free(location);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, location) != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "invalid value") != null or
+            std.mem.indexOf(u8, result.stderr, "exceeds 65535") != null);
+    }
+}
+
+test "auth startup: generated help lists every schema CLI spelling" {
+    const allocator = std.testing.allocator;
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "zig-out/bin/xmppd-auth", "--help" },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestUnexpectedResult,
+    }
+    inline for (schema.auth_cli) |spec| {
+        var buf: [128]u8 = undefined;
+        const option = try std.fmt.bufPrint(&buf, "--{s}", .{spec.name});
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, option) != null);
+        for (spec.aliases) |alias| {
+            const short = try std.fmt.bufPrint(&buf, "-{s}", .{alias});
+            try std.testing.expect(std.mem.indexOf(u8, result.stdout, short) != null);
+        }
+    }
 }
