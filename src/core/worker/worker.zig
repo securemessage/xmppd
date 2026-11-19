@@ -843,7 +843,10 @@ pub const Server = struct {
     /// before the free. A slot whose generation would wrap is retired
     /// rather than reissued under a generation an ancient token could hold.
     pub fn releaseSessionSlot(self: *Server, id: usize) void {
-        if (self.slot_gen[id] == std.math.maxInt(u24)) return;
+        if (self.slot_gen[id] == std.math.maxInt(u24)) {
+            if (metrics.get()) |c| metrics.bump(&c.slots_retired, 1);
+            return;
+        }
         self.slot_gen[id] += 1;
         self.free_ids[self.free_count] = id;
         self.free_count += 1;
@@ -5557,4 +5560,37 @@ test "ADR-4: a stale token for a reused slot is dropped and counted" {
     // The replacement's teardown is owned by the defers above, not the
     // server table sweep.
     server.sessions[1] = null;
+}
+
+// A slot released at the u24 generation ceiling is retired rather than
+// reissued under a generation an ancient token could hold. Retiring loses
+// capacity permanently, so the M1 block counts it for the SIGUSR1 dump.
+test "ADR-4: a slot at the u24 generation ceiling retires and is counted" {
+    const allocator = std.testing.allocator;
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    metrics.bind(0);
+    defer metrics.current = null;
+    const c = metrics.get().?;
+    const base = c.slots_retired.load(.monotonic);
+
+    // Claim slot 1 (tail of the reverse-filled free list) and drive it to
+    // the last generation that still reissues.
+    server.free_count -= 1;
+    const free_at_claim = server.free_count;
+    server.slot_gen[1] = std.math.maxInt(u24) - 1;
+    server.releaseSessionSlot(1);
+    try std.testing.expectEqual(std.math.maxInt(u24), server.slot_gen[1]);
+    try std.testing.expectEqual(free_at_claim + 1, server.free_count);
+    try std.testing.expectEqual(base, c.slots_retired.load(.monotonic));
+
+    // Reissued under the max generation, the next release retires the slot:
+    // no free_ids push, no generation wrap, and the counter moves.
+    server.free_count -= 1;
+    server.releaseSessionSlot(1);
+    try std.testing.expectEqual(std.math.maxInt(u24), server.slot_gen[1]);
+    try std.testing.expectEqual(free_at_claim, server.free_count);
+    try std.testing.expectEqual(base + 1, c.slots_retired.load(.monotonic));
 }
