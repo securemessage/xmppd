@@ -3810,7 +3810,7 @@ test "Server: H3 a resume carries the stalled offline tail" {
 
     c2s_sm.handleSmResumeReply(&server, .{
         .previd = previd,
-        .req_session = 1,
+        .req_token = server.sessionToken(1),
         .req_epoch = 7,
         .status = "ok",
     }, &changes);
@@ -3956,7 +3956,7 @@ test "Re-review 6.3: a cross-worker resume carries the recorded sequence" {
 
     c2s_sm.handleSmResumeReply(&server, .{
         .previd = previd,
-        .req_session = 1,
+        .req_token = server.sessionToken(1),
         .req_epoch = 3,
         .status = "ok",
     }, &changes);

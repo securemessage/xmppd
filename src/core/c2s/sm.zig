@@ -33,6 +33,7 @@ const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
 const Token = delivery_queue_mod.Token;
+const token_kinds = @import("token_kinds");
 const offline_store_mod = @import("generic_offline_store");
 const GenericOfflineStore = offline_store_mod.GenericOfflineStore;
 const OfflinePointer = offline_store_mod.OfflinePointer;
@@ -265,7 +266,7 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
             if (!room.active) continue;
             for (&room.occupants) |*occ_slot| {
                 const occ = occ_slot.* orelse continue;
-                if (occ.worker_id == self.worker_id and occ.session_id == detached_id) {
+                if (occ.worker_id == self.worker_id and occ.token.index == detached_id) {
                     if (move_room_count >= move_rooms_buf.len) {
                         log.warn("SM resume: session occupies more than {d} rooms — remaining occupancies will not migrate", .{sm_handoff.MAX_BUNDLE_ROOMS});
                         break;
@@ -428,7 +429,7 @@ pub fn startCrossWorkerResume(self: *Server, session: *Session, previd: []const 
         .previd = previd,
         .h = h_value,
         .req_worker = self.worker_id,
-        .req_session = @intCast(session.conn.id),
+        .req_token = self.sessionToken(session.conn.id),
         .req_epoch = session.sm_resume_epoch,
         .auth_local = auth_jid.local,
         .auth_domain = auth_jid.domain,
@@ -452,7 +453,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
             log.info("cross-worker SM resume handoff for {s} rejected: {s}", .{ r.previd, why });
             enqueueSmActor(server, r.req_worker, .{ .sm_resume_reply = .{
                 .previd = r.previd,
-                .req_session = r.req_session,
+                .req_token = r.req_token,
                 .req_epoch = r.req_epoch,
                 .status = status,
             } }) catch {};
@@ -570,7 +571,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
         sm_handoff.allocator.destroy(bundle);
         enqueueSmActor(self, req.req_worker, .{ .sm_resume_reply = .{
             .previd = req.previd,
-            .req_session = req.req_session,
+            .req_token = req.req_token,
             .req_epoch = req.req_epoch,
             .status = "item-not-found",
         } }) catch {};
@@ -605,7 +606,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
 
     enqueueSmActor(self, req.req_worker, .{ .sm_resume_reply = .{
         .previd = req.previd,
-        .req_session = req.req_session,
+        .req_token = req.req_token,
         .req_epoch = req.req_epoch,
         .status = "ok",
     } }) catch |err| {
@@ -617,7 +618,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
 /// parked session, re-bind it in the session map, send <resumed/> and
 /// replay. The epoch check makes stale replies to a reused slot harmless.
 pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, changes: *ChangeList) void {
-    const session = self.sessions[rep.req_session] orelse {
+    const session = self.sessionForEventToken(rep.req_token) orelse {
         // Requesting connection is gone — drop any parked bundle.
         if (sm_handoff.take(rep.previd)) |orphan| sm_handoff.release(orphan);
         return;
@@ -804,7 +805,7 @@ pub fn startSessionKick(self: *Server, session: *Session, local: []const u8, dom
         .domain = domain,
         .resource = resource,
         .req_worker = self.worker_id,
-        .req_session = @intCast(session.conn.id),
+        .req_token = self.sessionToken(session.conn.id),
         .req_epoch = session.bind_kick_epoch,
     } }) catch |err| {
         log.warn("session_kick to worker {d} failed to enqueue: {}", .{ owner, err });
@@ -841,7 +842,7 @@ pub fn handleSessionKickRequest(self: *Server, req: actor_message.SessionKickReq
     }
 
     enqueueSmActor(self, req.req_worker, .{ .session_kick_reply = .{
-        .req_session = req.req_session,
+        .req_token = req.req_token,
         .req_epoch = req.req_epoch,
     } }) catch |err| {
         log.warn("session_kick reply to worker {d} failed: {}", .{ req.req_worker, err });
@@ -850,10 +851,10 @@ pub fn handleSessionKickRequest(self: *Server, req: actor_message.SessionKickReq
 
 /// T154 step 3 — requesting worker. Epoch-guarded, then retry the bind.
 pub fn handleSessionKickReply(self: *Server, rep: actor_message.SessionKickReply, changes: *ChangeList) void {
-    const session = self.sessions[rep.req_session] orelse return;
+    const session = self.sessionForEventToken(rep.req_token) orelse return;
 
     if (!session.bind_kick_pending or session.bind_kick_epoch != rep.req_epoch) {
-        log.warn("stale session_kick reply for conn {d} ignored", .{rep.req_session});
+        log.warn("stale session_kick reply for conn {d} ignored", .{rep.req_token.index});
         return;
     }
     session.bind_kick_pending = false;
@@ -886,7 +887,7 @@ pub fn gatherSessionRooms(self: *Server, worker_id: u16, session_id: usize, bund
         if (!room.active) continue;
         for (&room.occupants) |*occ_slot| {
             const occ = occ_slot.* orelse continue;
-            if (occ.worker_id != worker_id or occ.session_id != session_id) continue;
+            if (occ.worker_id != worker_id or occ.token.index != session_id) continue;
             if (bundle.rooms.items.len >= sm_handoff.MAX_BUNDLE_ROOMS) return false;
             const copy = sm_handoff.allocator.dupe(u8, room.getJid()) catch return false;
             bundle.rooms.append(sm_handoff.allocator, copy) catch {
@@ -927,8 +928,7 @@ pub fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const 
             .real_jid = real_jid,
             .old_worker_id = old_worker,
             .new_worker_id = self.worker_id,
-            .new_session_id = token.index,
-            .new_generation = token.gen,
+            .new_token = token,
         };
         const owner = room_registry_mod.roomOwner(room_jid, muc_actor.getWorkerCount(self));
         if (owner == self.worker_id) {
@@ -1086,6 +1086,11 @@ pub fn handleSmRequest(self: *Server, session: *Session, changes: *ChangeList) v
     _ = session.conn.flushSend() catch {};
 }
 
+/// Session-kind token for event fields in tests.
+fn st(index: u32, gen: u24) Token {
+    return .{ .index = index, .gen = gen, .kind = token_kinds.session };
+}
+
 test "S17: SM-ID map holds more than 64 detached sessions" {
     const allocator = std.testing.allocator;
     var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
@@ -1170,16 +1175,14 @@ test "Server: replaced-resource notice fits worst-case XML escaping" {
         .real_jid = &first_jid,
         .nick = &nick,
         .worker_id = 1,
-        .session_id = 7,
-        .generation = 1,
+        .session_token = st(7, 1),
     }, &changes);
     muc_handler.processRemoteJoin(&server, .{
         .room_jid = &room_jid,
         .real_jid = &second_jid,
         .nick = &nick,
         .worker_id = 1,
-        .session_id = 9,
-        .generation = 2,
+        .session_token = st(9, 2),
     }, &changes);
 
     const NoticeCheck = struct {
@@ -1494,7 +1497,7 @@ test "Server: S24 cross-worker handoff carries last_h" {
 
     handleSmResumeReply(&server, .{
         .previd = &previd,
-        .req_session = 1,
+        .req_token = server.sessionToken(1),
         .req_epoch = 7,
         .status = "ok",
     }, &changes);
@@ -1596,7 +1599,7 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
         .previd = previd,
         .h = 3,
         .req_worker = 1,
-        .req_session = 1,
+        .req_token = st(1, 1),
         .req_epoch = 0,
         .auth_local = "alice",
         .auth_domain = "localhost",
@@ -1616,7 +1619,7 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
         .previd = previd,
         .h = 100,
         .req_worker = 1,
-        .req_session = 1,
+        .req_token = st(1, 1),
         .req_epoch = 0,
         .auth_local = "alice",
         .auth_domain = "localhost",
@@ -1634,7 +1637,7 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
         .previd = previd,
         .h = 5,
         .req_worker = 1,
-        .req_session = 1,
+        .req_token = st(1, 1),
         .req_epoch = 0,
         .auth_local = "alice",
         .auth_domain = "localhost",
@@ -1671,7 +1674,7 @@ test "Re-review 7.4: the resume request carries the drain sequence into the bund
         .previd = previd,
         .h = 5,
         .req_worker = 1,
-        .req_session = 1,
+        .req_token = st(1, 1),
         .req_epoch = 0,
         .auth_local = "alice",
         .auth_domain = "localhost",
@@ -1710,7 +1713,7 @@ test "Server: S24 cross-worker resume rejects a wrapped h above the sent count" 
         .previd = previd,
         .h = 3,
         .req_worker = 1,
-        .req_session = 1,
+        .req_token = st(1, 1),
         .req_epoch = 0,
         .auth_local = "alice",
         .auth_domain = "localhost",

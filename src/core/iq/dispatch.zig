@@ -1449,7 +1449,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
 
         // T173: capture the requester's ABA generation here, where its session
         // is live — the reply's ds.deliver() validates it.
-        const reply_gen: u32 = server.sessionToken(session.conn.id).gen;
+        const reply_token = server.sessionToken(session.conn.id);
 
         muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_mam_query = .{
             .room_jid = room_jid,
@@ -1462,8 +1462,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
             .after_id = session.mam_after,
             .before_id = session.mam_before,
             .reply_to_worker = server.worker_id,
-            .reply_to_session = @intCast(session.conn.id),
-            .reply_to_generation = reply_gen,
+            .reply_to_token = reply_token,
             .reply_to_jid = requester_jid,
         } });
         return;

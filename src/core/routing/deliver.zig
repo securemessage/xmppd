@@ -308,10 +308,10 @@ fn handleMulticastDelivery(self: *Server, payload: []const u8, changes: *ChangeL
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
         if (occ.worker_id != self.worker_id) continue;
-        if (occ.session_id == room_registry_mod.REMOTE_OCCUPANT) continue;
+        if (occ.isRemote()) continue;
 
-        const target_session = self.sessions[occ.session_id] orelse continue;
-        fanout_mod.deliverPrebuiltToSession(target_session, deliver_lease.buf, decoded.prefix, occ.getRealJid(), decoded.suffix, occ.session_id);
+        const target_session = self.sessionForEventToken(occ.token) orelse continue;
+        fanout_mod.deliverPrebuiltToSession(target_session, deliver_lease.buf, decoded.prefix, occ.getRealJid(), decoded.suffix, occ.token.index);
     }
 }
 
@@ -439,6 +439,54 @@ test "cross-thread delivery: a token minted for a freed-then-reused slot is drop
     try delivery_sys.deliver(1, fresh, "<message type='chat'><body>fresh!</body></message>");
     drainDeliveryQueue(&server, &changes);
     try std.testing.expect(session_b.conn.hasPendingWrite());
+}
+
+test "V13: shadow multicast to a freed-then-reused slot is not delivered (ADR-4)" {
+    const allocator = std.testing.allocator;
+
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 1;
+    server.delivery_system = &delivery_sys;
+
+    // The shadow room on this worker records an occupant addressed at
+    // session A in slot 5, generation 1.
+    var reg = room_registry_mod.RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    const room = try reg.createRoom("hall@conference.localhost", .{ .persistent = false });
+    const fds_a = try makeSocketPair();
+    defer posix.close(fds_a[1]);
+    const session_a = try allocator.create(Session);
+    session_a.* = Session.init(fds_a[0], 5, "localhost", false, allocator);
+    server.sessions[5] = session_a;
+    const stale = server.sessionToken(5);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", stale, 1, .participant, .none);
+
+    // The slot is freed (generation bumps) and a new session reuses it.
+    server.sessions[5] = null;
+    server.releaseSessionSlot(5);
+    session_a.deinit();
+    allocator.destroy(session_a);
+    const fds_b = try makeSocketPair();
+    defer posix.close(fds_b[1]);
+    const session_b = try allocator.create(Session);
+    session_b.* = Session.init(fds_b[0], 5, "localhost", false, allocator);
+    server.sessions[5] = session_b;
+
+    // A multicast arriving for the stale occupant record must not reach
+    // session B; the skip is counted like any other stale token.
+    var mcast_buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
+    const mcast_len = fanout_mod.encodeMulticastPayload(&mcast_buf, room.getJid(), "<message to='", "'/>") orelse unreachable;
+    try delivery_sys.deliver(1, delivery_queue_mod.MULTICAST_TARGET, mcast_buf[0..mcast_len]);
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(!session_b.conn.hasPendingWrite());
+    try std.testing.expectEqual(@as(u64, 1), server.stale_token_skips);
 }
 
 test "S35: the cross-worker hold stamps the producer receipt time" {

@@ -124,7 +124,7 @@ pub fn handleMucPresence(
         const bound = session.stream.bound_jid orelse return;
         var real_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
         const real_jid = buildFullJid(&real_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
-        const join_gen: u32 = server.sessionToken(session.conn.id).gen;
+        const join_token = server.sessionToken(session.conn.id);
 
         if (std.mem.eql(u8, type_str, "unavailable")) {
             muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_part = .{
@@ -132,8 +132,7 @@ pub fn handleMucPresence(
                 .real_jid = real_jid,
                 .nick = to_resource,
                 .worker_id = server.worker_id,
-                .session_id = @intCast(session.conn.id),
-                .generation = join_gen,
+                .session_token = join_token,
             } });
         } else if (type_str.len == 0) {
             muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_join = .{
@@ -141,8 +140,7 @@ pub fn handleMucPresence(
                 .real_jid = real_jid,
                 .nick = to_resource,
                 .worker_id = server.worker_id,
-                .session_id = @intCast(session.conn.id),
-                .generation = join_gen,
+                .session_token = join_token,
             } });
         }
         return;
@@ -276,12 +274,11 @@ pub fn handleMucGroupchat(
 
     for (&room.occupants, 0..) |*slot, idx| {
         const occ = slot.* orelse continue;
-        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.isRemote()) continue;
         if (occ.worker_id != server.worker_id) continue;
 
-        const local_sid = occ.session_id;
-        const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid);
+        const target_session = server.sessionForEventToken(occ.token) orelse continue;
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.token.index);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -391,12 +388,11 @@ pub fn drainPendingFanout(
     var i: usize = pf.next_slot;
     while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
         const occ = room.occupants[i] orelse continue;
-        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.isRemote()) continue;
         if (occ.worker_id != server.worker_id) continue;
 
-        const local_sid = occ.session_id;
-        const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid);
+        const target_session = server.sessionForEventToken(occ.token) orelse continue;
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.token.index);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -433,12 +429,11 @@ fn deliverRemainingSync(
     var i: usize = start_slot;
     while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
         const occ = room.occupants[i] orelse continue;
-        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.isRemote()) continue;
         if (occ.worker_id != server.worker_id) continue;
 
-        const local_sid = occ.session_id;
-        const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, buf, prefix, occ.getRealJid(), suffix, local_sid);
+        const target_session = server.sessionForEventToken(occ.token) orelse continue;
+        fanout.deliverPrebuiltToSession(target_session, buf, prefix, occ.getRealJid(), suffix, occ.token.index);
     }
 }
 
@@ -624,13 +619,12 @@ pub fn handleRoomDiscoInfo(
         const reply_jid = buildFullJid(&reply_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
         // T173: capture the requester's ABA generation here, where its session
         // is live — the reply's ds.deliver() validates it.
-        const reply_gen: u32 = server.sessionToken(session.conn.id).gen;
+        const reply_token = server.sessionToken(session.conn.id);
         muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_disco_info = .{
             .room_jid = room_jid,
             .iq_id = iq_id,
             .reply_to_worker = server.worker_id,
-            .reply_to_session = @intCast(session.conn.id),
-            .reply_to_generation = reply_gen,
+            .reply_to_token = reply_token,
             .reply_to_jid = reply_jid,
         } });
         return;
@@ -732,7 +726,7 @@ pub fn handleMucAdminIq(
 
         // T173: capture the requester's ABA generation here, where its session
         // is live — the reply's ds.deliver() validates it.
-        const reply_gen: u32 = server.sessionToken(session.conn.id).gen;
+        const reply_token = server.sessionToken(session.conn.id);
 
         muc_actor.enqueueRoomActorMessage(server, owner, .{ .room_admin = .{
             .room_jid = room_jid,
@@ -741,8 +735,7 @@ pub fn handleMucAdminIq(
             .new_role = new_role_str,
             .iq_id = iq_id,
             .reply_to_worker = server.worker_id,
-            .reply_to_session = @intCast(session.conn.id),
-            .reply_to_generation = reply_gen,
+            .reply_to_token = reply_token,
         } });
         return;
     }
@@ -802,8 +795,7 @@ pub fn handleMucAdminIq(
                 .real_jid = removed.getRealJid(),
                 .nick = removed.getNick(),
                 .worker_id = removed.worker_id,
-                .session_id = @intCast(removed.session_id),
-                .generation = 0,
+                .session_token = removed.token,
             } });
         }
 
@@ -1139,7 +1131,7 @@ fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
         if (occ.worker_id != server.worker_id) continue;
-        const target = server.sessions[occ.session_id] orelse continue;
+        const target = server.sessionForEventToken(occ.token) orelse continue;
         var buf: [router.JID_STANZA_MAX]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
         const w = fbs.writer();
@@ -1151,7 +1143,7 @@ fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u
             w.writeAll("' type='groupchat'><x xmlns='http://jabber.org/protocol/muc#user'><status code='104'/></x></message>") catch break :stanza null;
             break :stanza fbs.getWritten();
         } orelse {
-            noteJidOverflow("config-change notice for '{s}' exceeds {d} bytes; not sent to session {d}", .{ room.getJid(), router.JID_STANZA_MAX, occ.session_id });
+            noteJidOverflow("config-change notice for '{s}' exceeds {d} bytes; not sent to session {d}", .{ room.getJid(), router.JID_STANZA_MAX, occ.token.index });
             continue;
         };
         fanout.deliverToSession(target, notice_xml, target.conn.id);
@@ -1216,8 +1208,8 @@ fn handleJoin(
         // Same user, same nick, different resource: the new resource takes
         // over the occupant record.
         const local_sid: usize = session.conn.id;
-        const join_gen: u32 = server.sessionToken(session.conn.id).gen;
-        if (!collapseOccupant(server, r, existing_idx, real_jid, server.worker_id, local_sid, join_gen, changes)) {
+        const join_token = server.sessionToken(session.conn.id);
+        if (!collapseOccupant(server, r, existing_idx, real_jid, server.worker_id, join_token, changes)) {
             sendPresenceError(server, session, room_local, muc_host, "resource-constraint", changes);
             return;
         }
@@ -1225,7 +1217,7 @@ fn handleJoin(
         // broadcast: the nick did not change, so other occupants see nothing.
         for (&r.occupants) |*slot| {
             const occ = slot.* orelse continue;
-            if (occ.session_id == local_sid and occ.worker_id == server.worker_id) continue; // skip self
+            if (occ.token.index == local_sid and occ.worker_id == server.worker_id) continue; // skip self
             sendOccupantPresence(server, session, r, &occ, muc_host, null, changes);
         }
         sendSelfPresence(server, session, r, &r.occupants[existing_idx].?, muc_host, changes);
@@ -1303,8 +1295,8 @@ fn handleJoin(
     // Add occupant — store local session ID directly (no global mapping).
     const local_sid: usize = session.conn.id;
     // Look up generation from session map for ABA-safe cross-thread delivery.
-    const join_gen: u32 = server.sessionToken(session.conn.id).gen;
-    _ = r.addOccupant(nick, real_jid, bare_jid, local_sid, server.worker_id, join_gen, role, affiliation) catch {
+    const join_token = server.sessionToken(session.conn.id);
+    _ = r.addOccupant(nick, real_jid, bare_jid, join_token, server.worker_id, role, affiliation) catch {
         sendPresenceError(server, session, room_local, muc_host, "service-unavailable", changes);
         return;
     };
@@ -1314,12 +1306,12 @@ fn handleJoin(
     // 1. Send existing occupants' presence to the new joiner
     for (&r.occupants) |*slot| {
         const occ = slot.* orelse continue;
-        if (occ.session_id == local_sid) continue; // skip self
+        if (occ.token.index == local_sid) continue; // skip self
         sendOccupantPresence(server, session, r, &occ, muc_host, null, changes);
     }
 
     // 2. Broadcast the new occupant's presence to ALL (including self with status 110)
-    broadcastOccupantJoin(server, r, nick, real_jid, role, affiliation, muc_host, session.conn.id, changes);
+    broadcastOccupantJoin(server, r, nick, real_jid, role, affiliation, muc_host, server.sessionToken(session.conn.id), changes);
 
     // 3. Replay room history (XEP-0045 §7.2.14, before subject)
     sendRoomHistory(server, session, r, muc_host, changes);
@@ -1376,7 +1368,7 @@ pub fn handleSessionClose(server: *Server, real_jid: []const u8, changes: *Chang
                 .domain = domain,
                 .resource = resource,
                 .worker_id = server.worker_id,
-                .session_id = 0,
+                .session_token = .none,
             } });
         }
     }
@@ -1530,7 +1522,7 @@ fn broadcastOccupantJoin(
     role: Role,
     affiliation: Affiliation,
     muc_host: []const u8,
-    new_session_id: usize,
+    new_token: Token,
     changes: *ChangeList,
 ) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
@@ -1608,12 +1600,12 @@ fn broadcastOccupantJoin(
 
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
-        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.isRemote()) continue;
         if (occ.worker_id != server.worker_id) continue;
-        const target = server.sessions[occ.session_id] orelse continue;
+        const target = server.sessionForEventToken(occ.token) orelse continue;
 
-        const use_suffix = if (occ.session_id == new_session_id) suffix_110 else suffix;
-        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), use_suffix, occ.session_id);
+        const use_suffix = if (occ.token.eql(new_token)) suffix_110 else suffix;
+        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), use_suffix, occ.token.index);
     }
 }
 
@@ -1681,17 +1673,17 @@ fn broadcastOccupantLeave(
     // Local fan-out to remaining occupants on this worker
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
-        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.isRemote()) continue;
         if (occ.worker_id != server.worker_id) continue;
-        const target = server.sessions[occ.session_id] orelse continue;
+        const target = server.sessionForEventToken(occ.token) orelse continue;
 
-        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.session_id);
+        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.token.index);
     }
 
     // Send unavailable presence to the removed occupant themselves (with status 110)
     // The removed occupant is always on the current worker (they initiated part/were kicked locally)
-    if (removed.session_id != room_registry.REMOTE_OCCUPANT and removed.worker_id == server.worker_id) {
-        const self_target = server.sessions[removed.session_id] orelse return;
+    if (!removed.isRemote() and removed.worker_id == server.worker_id) {
+        const self_target = server.sessionForEventToken(removed.token) orelse return;
 
         // Build suffix with status 110. The broadcast above already went
         // out, so a build failure only costs the self-echo; it is logged (R5).
@@ -1714,7 +1706,7 @@ fn broadcastOccupantLeave(
             return;
         };
 
-        fanout.deliverPrebuiltToSession(self_target, deliver_lease.buf, prefix, removed.getRealJid(), suffix_110, removed.session_id);
+        fanout.deliverPrebuiltToSession(self_target, deliver_lease.buf, prefix, removed.getRealJid(), suffix_110, removed.token.index);
     }
 }
 
@@ -1729,17 +1721,16 @@ fn collapseOccupant(
     idx: usize,
     new_real_jid: []const u8,
     new_worker: u16,
-    new_session: usize,
-    new_generation: u32,
+    new_token: Token,
     changes: *ChangeList,
 ) bool {
     // By-value copy: the JID buffers are inline, so `before` keeps the
     // previous resource after the record is retargeted.
     const before = r.occupants[idx].?;
-    r.retargetOccupant(idx, new_real_jid, new_session, new_worker, new_generation) catch return false;
+    r.retargetOccupant(idx, new_real_jid, new_token, new_worker) catch return false;
     log.info("{s} took over occupant '{s}' in {s} from {s}", .{ new_real_jid, before.getNick(), r.getJid(), before.getRealJid() });
 
-    if (before.session_id == room_registry.REMOTE_OCCUPANT) return true;
+    if (before.isRemote()) return true;
     notifyReplacedResource(server, r, &before, changes);
     if (before.worker_id != server.worker_id) {
         muc_actor.enqueueRoomActorMessage(server, before.worker_id, .{ .shadow_part = .{
@@ -1747,8 +1738,7 @@ fn collapseOccupant(
             .real_jid = before.getRealJid(),
             .nick = before.getNick(),
             .worker_id = before.worker_id,
-            .session_id = @intCast(before.session_id),
-            .generation = before.generation,
+            .session_token = before.token,
         } });
     }
     return true;
@@ -1797,17 +1787,17 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
 
     if (before.worker_id != server.worker_id) {
         const ds = server.delivery_system orelse return;
-        ds.deliver(before.worker_id, Token.init(before.session_id, @intCast(before.generation), token_kinds.session), stanza) catch |err| {
-            noteCrossWorkerDrop("replaced-resource notice to worker {d} session {d} failed: {s}", .{ before.worker_id, before.session_id, @errorName(err) });
+        ds.deliver(before.worker_id, before.token, stanza) catch |err| {
+            noteCrossWorkerDrop("replaced-resource notice to worker {d} session {d} failed: {s}", .{ before.worker_id, before.token.index, @errorName(err) });
         };
         return;
     }
-    const target = server.sessions[before.session_id] orelse return;
+    const target = server.sessionForEventToken(before.token) orelse return;
     const bound = target.stream.bound_jid orelse return;
     var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
     const target_jid = buildFullJid(&jid_buf, bound.local, bound.domain, bound.resource) orelse return;
     if (!std.mem.eql(u8, target_jid, before.getRealJid())) return;
-    fanout.deliverToSession(target, stanza, before.session_id);
+    fanout.deliverToSession(target, stanza, before.token.index);
 }
 
 /// Presence error to a joiner on another worker.
@@ -1828,8 +1818,8 @@ fn sendRemotePresenceError(ds: anytype, ev: actor_message.RoomEvent, condition: 
         noteJidOverflowCrossWorker("remote presence error to '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
         return;
     };
-    ds.deliver(ev.worker_id, Token.init(ev.session_id, @intCast(ev.generation), token_kinds.session), stanza_xml) catch |err| {
-        noteCrossWorkerDrop("remote presence error to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
+    ds.deliver(ev.worker_id, ev.session_token, stanza_xml) catch |err| {
+        noteCrossWorkerDrop("remote presence error to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_token.index, @errorName(err) });
     };
 }
 
@@ -2139,8 +2129,8 @@ pub fn processRemoteJoin(
             noteJidOverflowCrossWorker("rejoin presence for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
             return;
         };
-        ds.deliver(ev.worker_id, Token.init(ev.session_id, @intCast(ev.generation), token_kinds.session), rejoin_xml) catch |err| {
-            noteCrossWorkerDrop("rejoin presence to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
+        ds.deliver(ev.worker_id, ev.session_token, rejoin_xml) catch |err| {
+            noteCrossWorkerDrop("rejoin presence to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_token.index, @errorName(err) });
         };
         return;
     }
@@ -2151,7 +2141,7 @@ pub fn processRemoteJoin(
         if (std.mem.eql(u8, existing.getBareJid(), bare_jid)) {
             // Same user, same nick, new resource on another worker: the new
             // resource takes over the occupant record.
-            if (!collapseOccupant(server, r, existing_idx, ev.real_jid, ev.worker_id, ev.session_id, ev.generation, changes)) {
+            if (!collapseOccupant(server, r, existing_idx, ev.real_jid, ev.worker_id, ev.session_token, changes)) {
                 sendRemotePresenceError(ds, ev, "resource-constraint");
                 return;
             }
@@ -2196,7 +2186,7 @@ pub fn processRemoteJoin(
     }
 
     // Add occupant to canonical room on owning worker
-    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, ev.generation, role, affiliation) catch {
+    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_token, ev.worker_id, role, affiliation) catch {
         sendRemotePresenceError(ds, ev, "service-unavailable");
         return;
     };
@@ -2228,8 +2218,7 @@ fn finishRemoteJoin(
         .real_jid = ev.real_jid,
         .nick = ev.nick,
         .worker_id = ev.worker_id,
-        .session_id = ev.session_id,
-        .generation = ev.generation,
+        .session_token = ev.session_token,
     } });
 
     // Send existing occupants' presence to the joiner (via MPSC unicast)
@@ -2256,15 +2245,15 @@ fn finishRemoteJoin(
             noteJidOverflowCrossWorker("occupant presence '{s}/{s}' for joiner '{s}' exceeds {d} bytes; skipped", .{ r.getJid(), occ.getNick(), ev.real_jid, router.JID_STANZA_MAX });
             continue;
         };
-        ds.deliver(ev.worker_id, Token.init(ev.session_id, @intCast(ev.generation), token_kinds.session), occ_xml) catch |err| {
-            noteCrossWorkerDrop("occupant presence '{s}/{s}' to worker {d} session {d} failed: {s}", .{ r.getJid(), occ.getNick(), ev.worker_id, ev.session_id, @errorName(err) });
+        ds.deliver(ev.worker_id, ev.session_token, occ_xml) catch |err| {
+            noteCrossWorkerDrop("occupant presence '{s}/{s}' to worker {d} session {d} failed: {s}", .{ r.getJid(), occ.getNick(), ev.worker_id, ev.session_token.index, @errorName(err) });
             continue;
         };
     }
 
     // Broadcast new occupant's presence to ALL occupants (multicast + local)
     if (broadcast) {
-        broadcastOccupantJoin(server, r, ev.nick, ev.real_jid, role, affiliation, muc_host, ev.session_id, changes);
+        broadcastOccupantJoin(server, r, ev.nick, ev.real_jid, role, affiliation, muc_host, ev.session_token, changes);
     }
 
     // Send self-presence with status 110 to the joiner
@@ -2289,13 +2278,13 @@ fn finishRemoteJoin(
             noteJidOverflowCrossWorker("self presence '{s}/{s}' for joiner '{s}' exceeds {d} bytes; not sent", .{ r.getJid(), ev.nick, ev.real_jid, router.JID_STANZA_MAX });
             return;
         };
-        ds.deliver(ev.worker_id, Token.init(ev.session_id, @intCast(ev.generation), token_kinds.session), self_xml) catch |err| {
-            noteCrossWorkerDrop("self presence to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
+        ds.deliver(ev.worker_id, ev.session_token, self_xml) catch |err| {
+            noteCrossWorkerDrop("self presence to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_token.index, @errorName(err) });
         };
     }
 
     // Room history + subject sent via MPSC unicast
-    sendRoomHistoryRemote(server, ev.real_jid, ev.worker_id, ev.session_id, ev.generation, r);
+    sendRoomHistoryRemote(server, ev.real_jid, ev.worker_id, ev.session_token, r);
     {
         const subject = r.config.getSubject();
         var subj_buf: [2048]u8 = undefined;
@@ -2314,8 +2303,8 @@ fn finishRemoteJoin(
             noteJidOverflowCrossWorker("room subject for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, subj_buf.len });
             return;
         };
-        ds.deliver(ev.worker_id, Token.init(ev.session_id, @intCast(ev.generation), token_kinds.session), subj_xml) catch |err| {
-            noteCrossWorkerDrop("room subject to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_id, @errorName(err) });
+        ds.deliver(ev.worker_id, ev.session_token, subj_xml) catch |err| {
+            noteCrossWorkerDrop("room subject to worker {d} session {d} failed: {s}", .{ ev.worker_id, ev.session_token.index, @errorName(err) });
         };
     }
 }
@@ -2340,8 +2329,7 @@ pub fn processRemotePart(
         .real_jid = ev.real_jid,
         .nick = ev.nick,
         .worker_id = ev.worker_id,
-        .session_id = ev.session_id,
-        .generation = ev.generation,
+        .session_token = ev.session_token,
     } });
 
     broadcastOccupantLeave(server, room, &removed, muc_host, null, changes);
@@ -2427,12 +2415,11 @@ pub fn processRemoteGroupchat(
 
     for (&room.occupants, 0..) |*slot, idx| {
         const occ = slot.* orelse continue;
-        if (occ.session_id == room_registry.REMOTE_OCCUPANT) continue;
+        if (occ.isRemote()) continue;
         if (occ.worker_id != server.worker_id) continue;
 
-        const local_sid = occ.session_id;
-        const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid);
+        const target_session = server.sessionForEventToken(occ.token) orelse continue;
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.token.index);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -2579,8 +2566,8 @@ pub fn processRemoteDiscoInfo(
         noteJidOverflowCrossWorker("remote disco#info reply to '{s}' exceeds {d} bytes; dropped", .{ ev.reply_to_jid, buf.len });
         return;
     };
-    ds.deliver(ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), reply_xml) catch |err| {
-        noteCrossWorkerDrop("remote disco#info reply to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_session, @errorName(err) });
+    ds.deliver(ev.reply_to_worker, ev.reply_to_token, reply_xml) catch |err| {
+        noteCrossWorkerDrop("remote disco#info reply to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_token.index, @errorName(err) });
     };
 }
 
@@ -2623,8 +2610,7 @@ pub fn handleShadowJoin(server: *Server, ev: actor_message.RoomEvent) void {
     if (r.findByRealJid(ev.real_jid)) |idx| {
         const occ = &r.occupants[idx].?;
         occ.worker_id = ev.worker_id;
-        occ.session_id = ev.session_id;
-        occ.generation = ev.generation;
+        occ.token = ev.session_token;
         return;
     }
 
@@ -2634,7 +2620,7 @@ pub fn handleShadowJoin(server: *Server, ev: actor_message.RoomEvent) void {
 
     // Add occupant to shadow. The shadow copy is best-effort fan-out state,
     // so a failure is only logged (R5); the canonical room keeps working.
-    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_id, ev.worker_id, ev.generation, .participant, .none) catch |err| {
+    _ = r.addOccupant(ev.nick, ev.real_jid, bare_jid, ev.session_token, ev.worker_id, .participant, .none) catch |err| {
         noteDrop("shadow occupant '{s}' in '{s}' not added: {s}", .{ ev.real_jid, ev.room_jid, @errorName(err) });
     };
 }
@@ -2676,8 +2662,7 @@ pub fn handleOccupantMove(server: *Server, ev: actor_message.RoomOccupantMove) v
     const old_worker = room.updateOccupantMove(
         ev.real_jid,
         ev.new_worker_id,
-        ev.new_session_id,
-        ev.new_generation,
+        ev.new_token,
     ) orelse {
         // Occupant ended concurrently with the resume (kick/ban, expiry) —
         // do not resurrect it; still sweep the old worker's stale shadow.
@@ -2686,7 +2671,7 @@ pub fn handleOccupantMove(server: *Server, ev: actor_message.RoomOccupantMove) v
     };
 
     log.info("occupant {s} in {s} moved: worker {d} -> {d} (session {d}, gen {d})", .{
-        ev.real_jid, ev.room_jid, old_worker, ev.new_worker_id, ev.new_session_id, ev.new_generation,
+        ev.real_jid, ev.room_jid, old_worker, ev.new_worker_id, ev.new_token.index, ev.new_token.gen,
     });
 
     // Cross-worker move: the old worker's shadow copy is stale — remove it.
@@ -2696,8 +2681,7 @@ pub fn handleOccupantMove(server: *Server, ev: actor_message.RoomOccupantMove) v
             .real_jid = ev.real_jid,
             .nick = "",
             .worker_id = old_worker,
-            .session_id = 0,
-            .generation = 0,
+            .session_token = .none,
         } });
     }
 
@@ -2714,8 +2698,7 @@ pub fn handleOccupantMove(server: *Server, ev: actor_message.RoomOccupantMove) v
             .real_jid = ev.real_jid,
             .nick = occ.getNick(),
             .worker_id = ev.new_worker_id,
-            .session_id = ev.new_session_id,
-            .generation = ev.new_generation,
+            .session_token = ev.new_token,
         } });
     }
 }
@@ -2729,8 +2712,7 @@ fn shadowCleanOldWorker(server: *Server, ev: actor_message.RoomOccupantMove) voi
         .real_jid = ev.real_jid,
         .nick = "",
         .worker_id = ev.old_worker_id,
-        .session_id = 0,
-        .generation = 0,
+        .session_token = .none,
     } });
 }
 
@@ -2741,8 +2723,7 @@ noinline fn sendRoomHistoryRemote(
     server: *Server,
     real_jid: []const u8,
     target_worker: u16,
-    target_session: u32,
-    target_generation: u32,
+    target: Token,
     room: *const Room,
 ) void {
     const archive = server.archive orelse return;
@@ -2813,8 +2794,8 @@ noinline fn sendRoomHistoryRemote(
             continue;
         };
 
-        ds.deliver(target_worker, Token.init(target_session, @intCast(target_generation), token_kinds.session), hist_xml) catch |err| {
-            noteCrossWorkerDrop("history stanza to worker {d} session {d} failed: {s}", .{ target_worker, target_session, @errorName(err) });
+        ds.deliver(target_worker, target, hist_xml) catch |err| {
+            noteCrossWorkerDrop("history stanza to worker {d} session {d} failed: {s}", .{ target_worker, target.index, @errorName(err) });
             continue;
         };
     }
@@ -3018,16 +2999,16 @@ pub fn bounceRoomMailboxFull(server: *Server, msg: actor_message.Message, room_j
                 noteJidOverflow("mailbox-full bounce for '{s}' exceeds {d} bytes; not sent", .{ ev.real_jid, router.JID_STANZA_MAX });
                 return;
             };
-            deliverToTriple(server, bounce_xml, ev.worker_id, Token.init(ev.session_id, @intCast(ev.generation), token_kinds.session), changes);
+            deliverToTriple(server, bounce_xml, ev.worker_id, ev.session_token, changes);
         },
         .room_disco_info, .room_disco_items => |ev| {
-            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), changes);
+            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, changes);
         },
         .room_admin => |ev| {
-            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), changes);
+            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, changes);
         },
         .room_mam_query => |ev| {
-            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), changes);
+            sendIqWaitError(server, room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, changes);
         },
         else => {},
     }
@@ -3081,33 +3062,33 @@ pub fn processRemoteAdminAction(
     const muc_host = server.muc_host orelse return;
     const room = reg.findByJid(ev.room_jid) orelse {
         // Room doesn't exist — send error back
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), "item-not-found");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "item-not-found");
         return;
     };
 
     // Verify requester is in the room
     const requester_idx = room.findByRealJid(ev.actor_jid) orelse {
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), "not-allowed");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "not-allowed");
         return;
     };
     const requester = room.occupants[requester_idx].?;
 
     // Moderator for kick, admin/owner for ban
     if (requester.role != .moderator and requester.affiliation != .admin and requester.affiliation != .owner) {
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), "forbidden");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "forbidden");
         return;
     }
 
     // Find target by nick
     const target_idx = room.findByNick(ev.target_nick) orelse {
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), "item-not-found");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "item-not-found");
         return;
     };
 
     if (std.mem.eql(u8, ev.new_role, "none")) {
         // Kick
         if (target_idx == requester_idx) {
-            sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), "not-allowed");
+            sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "not-allowed");
             return;
         }
         const removed = room.removeOccupant(target_idx) orelse return;
@@ -3120,8 +3101,7 @@ pub fn processRemoteAdminAction(
                 .real_jid = removed.getRealJid(),
                 .nick = removed.getNick(),
                 .worker_id = removed.worker_id,
-                .session_id = @intCast(removed.session_id),
-                .generation = 0,
+                .session_token = removed.token,
             } });
         }
         // Do NOT destroy the room here: ev.room_jid/ev.iq_id borrow this
@@ -3154,8 +3134,8 @@ pub fn processRemoteAdminAction(
     };
 
     const ds = server.delivery_system orelse return;
-    ds.deliver(ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), result_xml) catch |err| {
-        noteCrossWorkerDrop("admin result to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_session, @errorName(err) });
+    ds.deliver(ev.reply_to_worker, ev.reply_to_token, result_xml) catch |err| {
+        noteCrossWorkerDrop("admin result to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_token.index, @errorName(err) });
     };
 }
 
@@ -3170,7 +3150,7 @@ pub fn processRemoteMamQuery(
     _ = changes;
     const reg = server.room_registry orelse return;
     if (reg.findByJid(ev.room_jid) == null) {
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), "item-not-found");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "item-not-found");
         return;
     }
 
@@ -3178,7 +3158,7 @@ pub fn processRemoteMamQuery(
     const archive = server.archive orelse {
         // No archive configured — same answer the local path gives
         // (routing must be invisible to the client).
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), "item-not-found");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "item-not-found");
         return;
     };
 
@@ -3208,22 +3188,22 @@ pub fn processRemoteMamQuery(
 
     const ArchBackend = @import("archive_backend").Backend;
     var response = mam_handler.handleMamQuery(ArchBackend, archive, query, server.allocator) catch {
-        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), "internal-server-error");
+        sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "internal-server-error");
         return;
     };
     defer response.deinit();
 
     // Send each result message via MPSC unicast
     for (response.messages) |msg| {
-        ds.deliver(ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), msg.xml) catch |err| {
-            noteCrossWorkerDrop("MAM result to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_session, @errorName(err) });
+        ds.deliver(ev.reply_to_worker, ev.reply_to_token, msg.xml) catch |err| {
+            noteCrossWorkerDrop("MAM result to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_token.index, @errorName(err) });
             continue;
         };
     }
 
     // Send the fin IQ
-    ds.deliver(ev.reply_to_worker, Token.init(ev.reply_to_session, @intCast(ev.reply_to_generation), token_kinds.session), response.fin_iq) catch |err| {
-        noteCrossWorkerDrop("MAM fin to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_session, @errorName(err) });
+    ds.deliver(ev.reply_to_worker, ev.reply_to_token, response.fin_iq) catch |err| {
+        noteCrossWorkerDrop("MAM fin to worker {d} session {d} failed: {s}", .{ ev.reply_to_worker, ev.reply_to_token.index, @errorName(err) });
     };
 }
 
@@ -3283,6 +3263,11 @@ fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8,
 /// Scratch for pendingOutboxCopy peeks in tests.
 var outbox_peek_buf: [connection_mod.WRITE_BUF_SIZE]u8 = undefined;
 
+/// Session-kind token for event fields and occupant records in tests.
+fn st(index: u32, gen: u24) Token {
+    return .{ .index = index, .gen = gen, .kind = token_kinds.session };
+}
+
 test "S6: self-kick is rejected and the room survives actor processing" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
@@ -3292,7 +3277,7 @@ test "S6: self-kick is rejected and the room survives actor processing" {
     server.muc_host = "conference.localhost";
 
     const room = try reg.createRoom("room@conference.localhost", .{ .persistent = false });
-    _ = try room.addOccupant("solo", "solo@localhost/x", "solo@localhost", 0, 0, 1, .moderator, .owner);
+    _ = try room.addOccupant("solo", "solo@localhost/x", "solo@localhost", st(0, 1), 0, .moderator, .owner);
 
     var scratch: [16]std.posix.Kevent = undefined;
     var changes = ChangeList.init(&scratch);
@@ -3305,15 +3290,14 @@ test "S6: self-kick is rejected and the room survives actor processing" {
         .new_role = "none",
         .iq_id = "kick1",
         .reply_to_worker = 0,
-        .reply_to_session = 0,
-        .reply_to_generation = 1,
+        .reply_to_token = st(0, 1),
     }, &changes);
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
     try std.testing.expect(reg.findByJid("room@conference.localhost") != null);
 
     // A kick of another occupant must not destroy the room mid-processing
     // either: cleanupEmptyRooms is the only destroy site.
-    _ = try room.addOccupant("vic", "vic@localhost/y", "vic@localhost", 1, 0, 1, .participant, .none);
+    _ = try room.addOccupant("vic", "vic@localhost/y", "vic@localhost", st(1, 1), 0, .participant, .none);
     processRemoteAdminAction(&server, .{
         .room_jid = "room@conference.localhost",
         .actor_jid = "solo@localhost/x",
@@ -3321,8 +3305,7 @@ test "S6: self-kick is rejected and the room survives actor processing" {
         .new_role = "none",
         .iq_id = "kick2",
         .reply_to_worker = 0,
-        .reply_to_session = 0,
-        .reply_to_generation = 1,
+        .reply_to_token = st(0, 1),
     }, &changes);
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
     try std.testing.expect(reg.findByJid("room@conference.localhost") != null);
@@ -3450,7 +3433,7 @@ test "S1: room config form values are stored decoded, escaped once on output" {
     session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
     session.stream.bound_jid = .{ .local = "owner", .domain = "localhost", .resource = "desk" };
     server.sessions[0] = session; // owned by server.deinit from here on
-    _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", 0, 0, 1, .moderator, .owner);
+    _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", st(0, 1), 0, .moderator, .owner);
 
     // stanza_buf holds the re-serialized (escaped) form submission.
     const form = "<query xmlns='http://jabber.org/protocol/muc#owner'>" ++
@@ -3523,7 +3506,7 @@ test "G1: an overflowing room secret rejects the whole config form" {
     session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
     session.stream.bound_jid = .{ .local = "owner", .domain = "localhost", .resource = "desk" };
     server.sessions[0] = session;
-    _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", 0, 0, 1, .moderator, .owner);
+    _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", st(0, 1), 0, .moderator, .owner);
 
     // passwordprotectedroom=1 with a secret too wide for the form buffer:
     // the whole form must be rejected, not applied with an empty secret.
@@ -3671,8 +3654,7 @@ test "T256: remote-join twin collapses onto the existing occupant" {
         .real_jid = "alice@localhost/phone",
         .nick = "ally",
         .worker_id = 1,
-        .session_id = 7,
-        .generation = 1,
+        .session_token = st(7, 1),
     }, &changes);
 
     const room = registry.findByJid("room@conference.localhost").?;
@@ -3684,15 +3666,14 @@ test "T256: remote-join twin collapses onto the existing occupant" {
         .real_jid = "alice@localhost/laptop",
         .nick = "ally",
         .worker_id = 1,
-        .session_id = 9,
-        .generation = 2,
+        .session_token = st(9, 2),
     }, &changes);
 
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
     const idx = room.findByNick("ally").?;
     const occ = room.occupants[idx].?;
     try std.testing.expectEqualStrings("alice@localhost/laptop", occ.getRealJid());
-    try std.testing.expectEqual(@as(usize, 9), occ.session_id);
+    try std.testing.expectEqual(@as(u32, 9), occ.token.index);
     try std.testing.expectEqual(idx, room.findByRealJid("alice@localhost/laptop").?);
     // The old resource is gone from the index.
     try std.testing.expect(room.findByRealJid("alice@localhost/phone") == null);
@@ -3746,8 +3727,7 @@ test "S1: takeover notice escapes the replaced resource's nick and JID" {
         .real_jid = "eve@localhost/phone",
         .nick = "e'><evil a='",
         .worker_id = 1,
-        .session_id = 7,
-        .generation = 1,
+        .session_token = st(7, 1),
     }, &changes);
 
     var collector = StanzaCollector{ .allocator = allocator };
@@ -3760,8 +3740,7 @@ test "S1: takeover notice escapes the replaced resource's nick and JID" {
         .real_jid = "eve@localhost/laptop",
         .nick = "e'><evil a='",
         .worker_id = 1,
-        .session_id = 9,
-        .generation = 2,
+        .session_token = st(9, 2),
     }, &changes);
 
     _ = delivery_sys.getQueue(1).drain(&collector, StanzaCollector.onDelivery);
@@ -3790,8 +3769,7 @@ test "S1: remote presence error escapes the room and target JIDs" {
         .real_jid = "eve@localhost/x'y",
         .nick = "eve",
         .worker_id = 1,
-        .session_id = 5,
-        .generation = 1,
+        .session_token = st(5, 1),
     }, "resource-constraint");
 
     var collector = StanzaCollector{ .allocator = allocator };
@@ -3828,8 +3806,7 @@ test "T413: replaced-resource delivery drops are counted" {
         .real_jid = "eve@localhost/phone",
         .nick = "eve",
         .worker_id = 1,
-        .session_id = 7,
-        .generation = 1,
+        .session_token = st(7, 1),
     }, &changes);
 
     var initial = StanzaCollector{ .allocator = allocator };
@@ -3847,8 +3824,7 @@ test "T413: replaced-resource delivery drops are counted" {
         .real_jid = "eve@localhost/laptop",
         .nick = "eve",
         .worker_id = 2,
-        .session_id = 9,
-        .generation = 2,
+        .session_token = st(9, 2),
     }, &changes);
     try std.testing.expectEqual(drops_before + 1, delivery_queue.cross_worker_drops.load(.monotonic));
 }
@@ -3866,8 +3842,7 @@ test "T413: remote presence error delivery drops are counted" {
         .real_jid = "eve@localhost/phone",
         .nick = "eve",
         .worker_id = 1,
-        .session_id = 7,
-        .generation = 1,
+        .session_token = st(7, 1),
     }, "resource-constraint");
     try std.testing.expectEqual(drops_before + 1, delivery_queue.cross_worker_drops.load(.monotonic));
 }
@@ -3884,7 +3859,7 @@ test "S16: local replaced-resource notice overflow fails the session" {
     server.worker_id = 0;
 
     const room = try registry.createRoom("room@conference.localhost", .{});
-    _ = try room.addOccupant("eve", "eve@localhost/phone", "eve@localhost", 0, 0, 1, .moderator, .owner);
+    _ = try room.addOccupant("eve", "eve@localhost/phone", "eve@localhost", st(0, 1), 0, .moderator, .owner);
     const before = room.occupants[0].?;
 
     var fds: [2]posix.fd_t = undefined;
@@ -3921,7 +3896,7 @@ test "S16: a maximum-length escape-heavy replaced-resource notice is built in a 
     // to a six-character entity, which is what sized the old stack buffer.
     const room = try registry.createRoom("'" ** 512, .{});
     const real_jid = "'" ** 511 ++ "@" ++ "'" ** 500 ++ "/" ++ "'" ** 11;
-    _ = try room.addOccupant("'" ** 64, real_jid, "'" ** 512, 0, 0, 1, .participant, .member);
+    _ = try room.addOccupant("'" ** 64, real_jid, "'" ** 512, st(0, 1), 0, .participant, .member);
     const before = room.occupants[0].?;
 
     var fds: [2]posix.fd_t = undefined;
@@ -4021,7 +3996,7 @@ test "H5: the first fan-out after a genuine buffer-full loss still reaches the r
         server.sessions[idx] = session;
         var jid_buf: [128]u8 = undefined;
         const real_jid = try std.fmt.bufPrint(&jid_buf, "{s}@localhost/desk", .{name});
-        _ = try room.addOccupant(name, real_jid, name, idx, 0, 1, .participant, .member);
+        _ = try room.addOccupant(name, real_jid, name, st(@intCast(idx), 1), 0, .participant, .member);
     }
     defer for (peer_fds) |fd| posix.close(fd);
 
@@ -4095,7 +4070,7 @@ test "H5: the first fan-out after a rejected oversized groupchat reaches every o
         server.sessions[idx] = session;
         var jid_buf: [256]u8 = undefined;
         const real_jid = try std.fmt.bufPrint(&jid_buf, "{s}@localhost/{s}", .{ name, res });
-        _ = try room.addOccupant(name, real_jid, name, idx, 0, 1, .participant, .member);
+        _ = try room.addOccupant(name, real_jid, name, st(@intCast(idx), 1), 0, .participant, .member);
     }
 
     var scratch: [16]posix.Kevent = undefined;
@@ -4161,8 +4136,8 @@ test "H5: an oversized groupchat body is rejected with a bounce, not a room tear
     bob.stream.authenticated = true;
     server.sessions[1] = bob;
 
-    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", 0, 0, 1, .participant, .member);
-    _ = try room.addOccupant("bob", "bob@localhost/phone", "bob@localhost", 1, 0, 1, .participant, .member);
+    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", st(0, 1), 0, .participant, .member);
+    _ = try room.addOccupant("bob", "bob@localhost/phone", "bob@localhost", st(1, 1), 0, .participant, .member);
 
     var scratch: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&scratch);
@@ -4230,7 +4205,7 @@ test "S32: id-less groupchat messages archive under minted stanza ids" {
     alice.stream.state = .active;
     alice.stream.authenticated = true;
     server.sessions[0] = alice;
-    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", 0, 0, 1, .participant, .member);
+    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", st(0, 1), 0, .participant, .member);
 
     var scratch: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&scratch);
@@ -4282,7 +4257,7 @@ test "H5: ingress sizing accounts for an occupant JID that escapes wider" {
     alice.stream.state = .active;
     alice.stream.authenticated = true;
     server.sessions[0] = alice;
-    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", 0, 0, 1, .participant, .member);
+    _ = try room.addOccupant("alice", "alice@localhost/desk", "alice@localhost", st(0, 1), 0, .participant, .member);
 
     // Two characters that each grow from 1 to 4 bytes under escaping, so the
     // emitted recipient JID is 6 bytes wider than the one the room stores.
@@ -4295,7 +4270,7 @@ test "H5: ingress sizing accounts for an occupant JID that escapes wider" {
     wide_w.writeByte('<') catch unreachable;
     wide_w.writeAll(&([_]u8{'b'} ** 120)) catch unreachable;
     const wide = wide_fbs.getWritten();
-    _ = try room.addOccupant("wide", wide, "wide@localhost", 1, 0, 1, .participant, .member);
+    _ = try room.addOccupant("wide", wide, "wide@localhost", st(1, 1), 0, .participant, .member);
 
     try std.testing.expectEqual(wide.len + 6, fanout.escapedLen(wide));
 
@@ -4354,8 +4329,7 @@ test "S4: an over-long remote presence error JID is counted, never silent" {
         .real_jid = "a" ** (router.JID_STANZA_MAX + 64),
         .nick = "eve",
         .worker_id = 1,
-        .session_id = 7,
-        .generation = 1,
+        .session_token = st(7, 1),
     }, "resource-constraint");
 
     try std.testing.expectEqual(drops_before + 1, router.jid_overflow_drops.load(.monotonic));
@@ -4390,8 +4364,7 @@ test "R5: an over-long remote disco#info requester JID is counted, never silent"
         .room_jid = "room@conference.localhost",
         .iq_id = "d1",
         .reply_to_worker = 1,
-        .reply_to_session = 7,
-        .reply_to_generation = 1,
+        .reply_to_token = st(7, 1),
         .reply_to_jid = "a" ** (4096 + 64),
     }, &changes);
 
@@ -4425,8 +4398,7 @@ test "S4: a near-maximum remote join conflict error is delivered whole" {
         .real_jid = "eve@localhost/phone",
         .nick = "ally",
         .worker_id = 1,
-        .session_id = 7,
-        .generation = 1,
+        .session_token = st(7, 1),
     }, &changes);
 
     var initial = StanzaCollector{ .allocator = allocator };
@@ -4443,8 +4415,7 @@ test "S4: a near-maximum remote join conflict error is delivered whole" {
         .real_jid = real_jid,
         .nick = "ally",
         .worker_id = 1,
-        .session_id = 9,
-        .generation = 2,
+        .session_token = st(9, 2),
     }, &changes);
 
     var collector = StanzaCollector{ .allocator = allocator };
@@ -4495,8 +4466,8 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     // case: with two occupants the owner check cannot fall back to the
     // new-room creator rule.
     try store.setAffiliation("room@conference.localhost", "naplestb@localhost", .owner);
-    _ = try room.addOccupant("naples", "NaplesTB@localhost/desk", "NaplesTB@localhost", 0, 0, 1, .moderator, .owner);
-    _ = try room.addOccupant("other", "other@localhost/x", "other@localhost", 1, 0, 1, .participant, .none);
+    _ = try room.addOccupant("naples", "NaplesTB@localhost/desk", "NaplesTB@localhost", st(0, 1), 0, .moderator, .owner);
+    _ = try room.addOccupant("other", "other@localhost/x", "other@localhost", st(1, 1), 0, .participant, .none);
 
     var fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
@@ -4553,8 +4524,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
         .real_jid = "DaveX@localhost/wind",
         .nick = "davex",
         .worker_id = 1,
-        .session_id = 7,
-        .generation = 1,
+        .session_token = st(7, 1),
     }, &changes);
     try std.testing.expectEqual(occupants_before, room.occupant_count);
 }
