@@ -1525,6 +1525,9 @@ pub const IdpPool = struct {
     }
 
     fn workerMain(self: *IdpPool) void {
+        // The keep-alive pool is threadlocal to this worker; release its
+        // parked fds so they do not outlive the thread.
+        defer http.drainIdlePool();
         while (true) {
             const entry = blk: {
                 self.job_mutex.lock();
@@ -2826,6 +2829,212 @@ test "IdpPool: popping a completion releases the outstanding slot" {
     _ = try pool.put(cred);
     _ = try pool.put(cred);
     try std.testing.expectError(error.QueueFull, pool.put(cred));
+}
+
+/// One-shot TLS IdP that answers its first request with a keep-alive
+/// response (Content-Length, no Connection: close), then holds the conn
+/// and watches for peer EOF: peer_closed flips when the client's fd is
+/// closed, which proves a parked conn was released.
+fn serveKeepAliveWatchClose(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    body: []const u8,
+    port_out: *std.atomic.Value(u16),
+    peer_closed: *std.atomic.Value(bool),
+    stop: *std.atomic.Value(bool),
+) void {
+    serveKeepAliveWatchCloseInner(
+        cert_path,
+        key_path,
+        body,
+        port_out,
+        peer_closed,
+        stop,
+    ) catch |err| {
+        log.warn("keep-alive-watch fixture failed: {s}", .{@errorName(err)});
+    };
+}
+
+fn serveKeepAliveWatchCloseInner(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    body: []const u8,
+    port_out: *std.atomic.Value(u16),
+    peer_closed: *std.atomic.Value(bool),
+    stop: *std.atomic.Value(bool),
+) !void {
+    var ctx = try ssl.SslContext.initServer(cert_path, key_path);
+    defer ctx.deinit();
+    ctx.disableKtls();
+
+    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in));
+    try posix.listen(listen_fd, 4);
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try posix.getsockname(listen_fd, @ptrCast(&addr), &alen);
+    port_out.store(std.mem.bigToNative(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + 15000;
+    var conn_fd: posix.fd_t = -1;
+    defer if (conn_fd >= 0) posix.close(conn_fd);
+    var conn: ?ssl.SslConn = null;
+    defer if (conn) |*c2| {
+        c2.shutdown();
+        c2.deinit();
+    };
+
+    while (!stop.load(.acquire) and std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if ((posix.poll(&fds, 250) catch break) <= 0) continue;
+        conn_fd = posix.accept(listen_fd, null, null, 0) catch {
+            continue;
+        };
+        conn = ssl.SslConn.init(ctx, conn_fd) catch {
+            posix.close(conn_fd);
+            conn_fd = -1;
+            continue;
+        };
+        var hs_done = false;
+        while (!hs_done and std.time.milliTimestamp() < deadline) {
+            const hs = conn.?.doHandshake() catch break;
+            hs_done = hs == .complete;
+        }
+        if (!hs_done) {
+            conn.?.shutdown();
+            conn.?.deinit();
+            conn = null;
+            posix.close(conn_fd);
+            conn_fd = -1;
+            continue;
+        }
+
+        // Consume the request head, then reply without Connection: close.
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len and std.time.milliTimestamp() < deadline) {
+            const rr = conn.?.read(buf[total..]) catch break;
+            switch (rr) {
+                .ok => |n| {
+                    if (n == 0) break;
+                    total += n;
+                    if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+                },
+                .want_read, .want_write => {},
+            }
+        }
+        var resp: [8192]u8 = undefined;
+        const out = try std.fmt.bufPrint(
+            &resp,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\n\r\n{s}",
+            .{ body.len, body },
+        );
+        var sent: usize = 0;
+        while (sent < out.len and std.time.milliTimestamp() < deadline) {
+            const wr = conn.?.write(out[sent..]) catch break;
+            switch (wr) {
+                .ok => |n| sent += n,
+                .want_read, .want_write => {},
+            }
+        }
+
+        // Hold the conn: EOF means the client closed its parked fd.
+        while (!stop.load(.acquire) and std.time.milliTimestamp() < deadline) {
+            var fds2 = [_]posix.pollfd{.{ .fd = conn_fd, .events = posix.POLL.IN, .revents = 0 }};
+            if ((posix.poll(&fds2, 250) catch break) <= 0) continue;
+            const rr = conn.?.read(buf[0..]) catch {
+                peer_closed.store(true, .release);
+                return;
+            };
+            switch (rr) {
+                .ok => |n| {
+                    if (n == 0) {
+                        peer_closed.store(true, .release);
+                        return;
+                    }
+                },
+                .want_read, .want_write => {},
+            }
+        }
+        return;
+    }
+}
+
+test "IdpPool: worker exit closes the conns it parked" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try makeIdpTlsPaths(allocator, &tmp);
+    defer allocator.free(paths.cert);
+    defer allocator.free(paths.key);
+
+    var port = std.atomic.Value(u16).init(0);
+    var peer_closed = std.atomic.Value(bool).init(false);
+    var stop = std.atomic.Value(bool).init(false);
+    const th = try std.Thread.spawn(
+        .{},
+        serveKeepAliveWatchClose,
+        .{ paths.cert.ptr, paths.key.ptr, "{\"error\":\"invalid_grant\"}", &port, &peer_closed, &stop },
+    );
+    defer {
+        stop.store(true, .release);
+        th.join();
+    }
+    const dl = std.time.milliTimestamp() + 5000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(port.load(.acquire) != 0);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://localhost:{d}/token",
+        .{port.load(.acquire)},
+    );
+    var store = testStore(allocator, .{ .token_endpoint = url, .ca_file = paths.cert });
+    defer store.deinit();
+    try store.start();
+
+    var pool = IdpPool{ .allocator = undefined, .store = undefined, .options = undefined };
+    try pool.start(allocator, &store, .{
+        .threads = 1,
+        .max_outstanding = 4,
+        .connect_timeout_ms = 1000,
+        .timeout_ms = 5000,
+    });
+    defer pool.stop();
+
+    const cred = Credential{ .password = .{ .username = "alice", .password = "pw" } };
+    _ = try pool.put(cred);
+    var done = false;
+    while (!done and std.time.milliTimestamp() < dl) {
+        pool.drainWake();
+        if (pool.popCompletion()) |job_in| {
+            var job = job_in;
+            IdpPool.releaseJob(&job);
+            done = true;
+        } else {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expect(done);
+
+    // The exchange parked the conn on the worker's threadlocal pool;
+    // exiting the worker must close it.
+    pool.stop();
+
+    const dl2 = std.time.milliTimestamp() + 3000;
+    while (!peer_closed.load(.acquire) and std.time.milliTimestamp() < dl2) {
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(peer_closed.load(.acquire));
 }
 
 test "IdpPool: put rejects at max_outstanding" {
