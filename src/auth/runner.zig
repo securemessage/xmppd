@@ -28,6 +28,7 @@ const event_loop_mod = @import("event_loop");
 const EventLoop = event_loop_mod.EventLoop;
 const ChangeList = event_loop_mod.ChangeList;
 const handler_mod = @import("handler");
+const metrics = @import("auth_metrics");
 
 /// Sentinel value for the listener fd in kqueue udata.
 pub const LISTENER_UDATA: usize = std.math.maxInt(usize);
@@ -293,6 +294,7 @@ pub fn Runner(comptime Store: type, comptime Hooks: type) type {
                     self.closeLane(slot);
                     return;
                 };
+                metrics.ipcPaused();
                 Hooks.log.warn("IPC client {d}: {d}B outbound backlog > {d}B -- pausing intake until drained", .{ slot, pend, self.rx_pause_at });
             } else if (self.read_paused[slot] and pend < self.rx_resume_at) {
                 self.read_paused[slot] = false;

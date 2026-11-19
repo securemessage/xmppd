@@ -24,8 +24,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const sasl = @import("sasl");
+const metrics = @import("auth_metrics");
 
 const log = std.log.scoped(.crypto_pool);
+
+/// CLOCK_MONOTONIC in nanoseconds (the lib/net/loop.zig pattern).
+fn monotonicNs() u64 {
+    const ts = posix.clock_gettime(.MONOTONIC) catch unreachable;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
 
 /// Maximum jobs outstanding at once: queued, in flight, or completed but
 /// not yet popped. Full = the event loop answers temporary-auth-failure
@@ -57,16 +64,21 @@ pub const Job = struct {
     /// was copied into `password` and the worker completes ok = false
     /// without deriving.
     over_bound: bool,
+    /// CLOCK_MONOTONIC stamp at put(): the worker turns it into the
+    /// queue-to-done latency the loop counts in metrics.poolJobDone.
+    queued_ns: u64,
     salt: [32]u8,
     iteration_count: u32,
     expected_stored_key: [32]u8,
     password: [PASSWORD_LEN_MAX]u8,
 };
 
-/// Result of a derivation: did the derived key match the stored one.
+/// Result of a derivation: did the derived key match the stored one, and
+/// how long the job sat between put() and completion.
 pub const Completion = struct {
     id: u64,
     ok: bool,
+    latency_us: u64,
 };
 
 /// Fixed-size pool. put() is called from the event loop; completions are
@@ -149,6 +161,7 @@ pub const CryptoPool = struct {
             .id = id,
             .password_len = if (over) 0 else @intCast(password.len),
             .over_bound = over,
+            .queued_ns = monotonicNs(),
             .salt = salt,
             .iteration_count = iteration_count,
             .expected_stored_key = expected_stored_key,
@@ -156,6 +169,7 @@ pub const CryptoPool = struct {
         };
         if (!over) @memcpy(slot.password[0..password.len], password);
         self.job_tail += 1;
+        metrics.poolQueued(self.job_tail - self.job_head);
         self.job_cond.signal();
         return id;
     }
@@ -308,12 +322,12 @@ pub const CryptoPool = struct {
     /// jobs by the ring capacity, so the publish cannot fail. The wake
     /// byte goes out only on the wake_pending false->true edge; the flag
     /// is the source of truth and the byte a hint.
-    fn finish(self: *CryptoPool, id: u64, ok: bool) void {
+    fn finish(self: *CryptoPool, id: u64, ok: bool, latency_us: u64) void {
         {
             self.completion_mutex.lock();
             defer self.completion_mutex.unlock();
             std.debug.assert(self.completion_tail - self.completion_head < MAX_JOBS);
-            self.completions[self.completion_tail % MAX_JOBS] = .{ .id = id, .ok = ok };
+            self.completions[self.completion_tail % MAX_JOBS] = .{ .id = id, .ok = ok, .latency_us = latency_us };
             self.completion_tail += 1;
         }
 
@@ -348,6 +362,7 @@ pub const CryptoPool = struct {
                 job.id = slot.id;
                 job.password_len = slot.password_len;
                 job.over_bound = slot.over_bound;
+                job.queued_ns = slot.queued_ns;
                 job.salt = slot.salt;
                 job.iteration_count = slot.iteration_count;
                 job.expected_stored_key = slot.expected_stored_key;
@@ -368,19 +383,19 @@ pub const CryptoPool = struct {
             // An over-bound job holds no password bytes; it fails like a
             // wrong password without paying for a derive.
             if (job.over_bound) {
-                self.finish(job.id, false);
+                self.finish(job.id, false, (monotonicNs() -| job.queued_ns) / 1000);
                 continue;
             }
             // Prep failure means the presented password can never match a
             // prepped stored credential: report as a mismatch.
             const test_creds = sasl.StoredCredentials.derive(job.password[0..job.password_len], job.salt, job.iteration_count) catch {
-                self.finish(job.id, false);
+                self.finish(job.id, false, (monotonicNs() -| job.queued_ns) / 1000);
                 continue;
             };
             // T211 follow-up: constant-time compare for StoredKey (the
             // reference in scram.zig uses the same pattern).
             const ok = std.crypto.timing_safe.eql([32]u8, test_creds.stored_key, job.expected_stored_key);
-            self.finish(job.id, ok);
+            self.finish(job.id, ok, (monotonicNs() -| job.queued_ns) / 1000);
         }
     }
 };
