@@ -1,18 +1,19 @@
 //! # Auth Handler — SASL authentication request processor
 //!
-//! Handles IPC auth requests from xmppd-core. Maintains per-connection
-//! SCRAM state for multi-step exchanges.
+//! Handles IPC auth requests from xmppd-core. Protocol v2: SCRAM is a
+//! stateless one-round-trip verify (ADR-6), so the only per-mechanism state
+//! left is the bounded server-nonce replay cache.
 //!
 //! ## Flow
 //!
 //! **PLAIN:** AuthRequest → lookup → AuthSuccess/AuthFailure (one step)
 //!
-//! **SCRAM-SHA-256:** AuthRequest → ScramServer.handleClientFirst → AuthChallenge
-//!                    SaslResponse → ScramServer.handleClientFinal → AuthSuccess/AuthFailure
+//! **SCRAM-SHA-256:** ScramParamsRequest → ScramParams (cache-miss lookup)
+//!                    ScramVerify → verify vs StoredKey → AuthSuccess/AuthFailure
 //!
 //! ## Layout
 //!
-//! The handler owns the shared state (SCRAM session table, credential
+//! The handler owns the shared state (replay cache, credential
 //! cache, deferred PLAIN jobs) and dispatches each request to the module
 //! that owns the concern: mech/plain.zig, mech/scram.zig,
 //! mech/oauthbearer.zig and account.zig. Admission policy lives in
@@ -180,8 +181,13 @@ pub fn AuthHandler(comptime Store: type) type {
     return struct {
         store: *Store,
         allocator: std.mem.Allocator,
-        /// Active SCRAM sessions indexed by slot.
-        scram_sessions: [scram_mech.MAX_SCRAM_SESSIONS]scram_mech.ScramSession = undefined,
+        /// Per-boot secret for the deterministic fake credentials and the
+        /// keyed replay-cache tags (ADR-6); drawn at init, never leaves.
+        scram_secret: [32]u8 = undefined,
+        /// Server-nonce replay cache, fixed capacity (mech/scram.zig owns
+        /// the probe rules). The only SCRAM state the daemon holds.
+        replay_entries: [scram_mech.REPLAY_CAPACITY]scram_mech.ReplayEntry =
+            [_]scram_mech.ReplayEntry{.{}} ** scram_mech.REPLAY_CAPACITY,
         /// Admission policy: permanent locks and the rate limiter.
         policy: policy_mod.Policy = .{},
         /// Registration configuration.
@@ -212,11 +218,10 @@ pub fn AuthHandler(comptime Store: type) type {
             var handler = Self{
                 .store = store,
                 .allocator = allocator,
-                .scram_sessions = undefined,
+                .scram_secret = undefined,
+                .replay_entries = [_]scram_mech.ReplayEntry{.{}} ** scram_mech.REPLAY_CAPACITY,
             };
-            for (&handler.scram_sessions) |*s| {
-                s.active = false;
-            }
+            std.crypto.random.bytes(&handler.scram_secret);
             return handler;
         }
 
@@ -262,9 +267,6 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            for (&self.scram_sessions) |*s| {
-                scram_mech.releaseSession(s);
-            }
             var pend_it = self.pending_plain.iterator();
             while (pend_it.next()) |kv| {
                 self.allocator.free(kv.value_ptr.username);
@@ -299,8 +301,10 @@ pub fn AuthHandler(comptime Store: type) type {
         pub fn handleMessage(self: *Self, msg: protocol.Message, slot: u32, slot_gen: u32) HandleResult {
             return switch (msg) {
                 .auth_request => |req| self.handleAuthRequest(req, slot, slot_gen),
-                .sasl_response => |resp| blk: {
-                    const reply = scram_mech.handleSaslResponse(Store, self, @intCast(slot), resp);
+                .scram_params_request => |req| .{ .reply = scram_mech.handleScramParams(Store, self, req) },
+                .scram_verify => |req| blk: {
+                    metrics.exchangeStarted(@intFromEnum(protocol.MechanismId.scram_sha_256));
+                    const reply = scram_mech.handleScramVerify(Store, self, req);
                     switch (reply) {
                         .auth_success => metrics.exchangeCompleted(@intFromEnum(protocol.MechanismId.scram_sha_256), true),
                         .auth_failure => metrics.exchangeCompleted(@intFromEnum(protocol.MechanismId.scram_sha_256), false),
@@ -308,13 +312,7 @@ pub fn AuthHandler(comptime Store: type) type {
                     }
                     break :blk .{ .reply = reply };
                 },
-                .auth_abort => |a| blk: {
-                    // The XMPP connection vanished mid-exchange; release its
-                    // SCRAM slot immediately instead of waiting for the stale
-                    // sweep — the core may already be reusing the conn.id.
-                    scram_mech.cleanupSession(Store, self, @intCast(slot), a.conn_id);
-                    break :blk .none;
-                },
+                .auth_abort => .none,
                 .password_change_request => |req| .{ .reply = account_mod.handlePasswordChange(Store, self, req) },
                 .account_delete_request => |req| .{ .reply = account_mod.handleAccountDelete(Store, self, req) },
                 .register_request => |req| .{ .reply = account_mod.handleRegisterRequest(Store, self, req) },
@@ -329,7 +327,7 @@ pub fn AuthHandler(comptime Store: type) type {
                 .auth_success => metrics.exchangeCompleted(@intFromEnum(req.mechanism), true),
                 .auth_failure => metrics.exchangeCompleted(@intFromEnum(req.mechanism), false),
                 // A challenge leaves the exchange open; it completes at the
-                // sasl_response or dies abandoned.
+                // scram_verify or dies abandoned.
                 else => {},
             };
             return result;
@@ -340,10 +338,7 @@ pub fn AuthHandler(comptime Store: type) type {
             // once the identity is known, so every key is counted once.
             return switch (req.mechanism) {
                 .plain => plain_mech.handlePlainAuth(Store, self, req, slot, slot_gen),
-                .scram_sha_256 => if (comptime caps.lookup)
-                    .{ .reply = scram_mech.handleScramInit(Store, self, req, slot) }
-                else
-                    .{ .reply = authFailure(req.conn_id, .mechanism_not_supported) },
+                .scram_sha_256 => .{ .reply = authFailure(req.conn_id, .mechanism_not_supported) },
                 .oauthbearer => if (comptime caps.validate_token)
                     .{ .reply = oauthbearer_mech.handleOAuthBearerAuth(Store, self, req) }
                 else
@@ -355,31 +350,6 @@ pub fn AuthHandler(comptime Store: type) type {
         /// Counts in-flight crypto-pool work against the lockout threshold.
         pub fn pendingFor(self: *Self, username: []const u8) usize {
             return plain_mech.pendingFor(Store, self, username);
-        }
-
-        /// Find or create a session slot for (lane, conn_id); null when the
-        /// table is genuinely full (mech/scram.zig owns the probe rules).
-        pub fn findOrCreateScramSlot(self: *Self, lane: u16, conn_id: u32) ?usize {
-            return scram_mech.findOrCreateScramSlot(Store, self, lane, conn_id);
-        }
-
-        /// Find the live session slot for (lane, conn_id), or null.
-        pub fn findScramSlot(self: *Self, lane: u16, conn_id: u32) ?usize {
-            return scram_mech.findScramSlot(Store, self, lane, conn_id);
-        }
-
-        /// Clean up a SCRAM session after the response has been sent.
-        /// Lookup is keyed on (lane, conn_id): conn_id alone collides
-        /// across core worker lanes each numbering from 1 (T279).
-        pub fn cleanupSession(self: *Self, lane: u16, conn_id: u32) void {
-            scram_mech.cleanupSession(Store, self, lane, conn_id);
-        }
-
-        /// Deinit every in-flight SCRAM session the given IPC lane owns;
-        /// called before closing that IPC client so dead lanes cannot wedge
-        /// sessions into the 60 s stale probe (T279).
-        pub fn closeLaneSessions(self: *Self, lane: usize) void {
-            scram_mech.closeLaneSessions(Store, self, lane);
         }
     };
 }
@@ -465,7 +435,7 @@ test "AuthMetrics: PLAIN moves the started, completed and outcome counters" {
     try std.testing.expectEqual(@as(u64, 1), counterValue(&c.outcomes[@intFromEnum(FailureReason.invalid_encoding)]));
 }
 
-test "AuthMetrics: SCRAM starts at client-first and completes only at client-final" {
+test "AuthMetrics: SCRAM v2 counts one exchange per verify" {
     const allocator = std.testing.allocator;
     metrics.reset();
     defer metrics.reset();
@@ -482,54 +452,21 @@ test "AuthMetrics: SCRAM starts at client-first and completes only at client-fin
 
     var client = sasl.ScramClient.init(allocator, "alice", "secret123");
     defer client.deinit();
-    const challenge_msg = handleSync(&handler, .{ .auth_request = .{
-        .conn_id = 5,
-        .mechanism = .scram_sha_256,
-        .client_ip = "10.0.0.5",
-        .cb_type = 0,
-        .cb_data = "",
-        .username = "alice",
-        .payload = try client.clientFirst(),
-    } }) orelse return error.NoResponse;
-    try std.testing.expect(challenge_msg == .auth_challenge);
-
-    // The exchange is open: started, not completed, one live session.
+    var sf1: [512]u8 = undefined;
+    const ok = try testkit.scramV2Exchange(&handler, &client, 5, "10.0.0.5", "secret123", "srvnonceAAA=", &sf1);
+    try std.testing.expect(ok.verify_msg.? == .auth_success);
     try std.testing.expectEqual(@as(u64, 1), counterValue(&c.exchanges_started[scram]));
-    try std.testing.expectEqual(@as(u64, 0), counterValue(&c.exchanges_completed[scram]));
-    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.scram_active));
-    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.scram_high_water));
-
-    const success_msg = handleSync(&handler, .{ .sasl_response = .{
-        .conn_id = 5,
-        .payload = try client.handleServerFirst(challenge_msg.auth_challenge.challenge),
-    } }) orelse return error.NoResponse;
-    try std.testing.expect(success_msg == .auth_success);
     try std.testing.expectEqual(@as(u64, 1), counterValue(&c.exchanges_completed[scram]));
     try std.testing.expectEqual(@as(u64, 1), counterValue(&c.auth_success));
-
-    // Releasing the session drops occupancy but keeps the high-water mark.
-    handler.cleanupSession(0, 5);
-    try std.testing.expectEqual(@as(u64, 0), counterValue(&c.scram_active));
-    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.scram_high_water));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.replay_occupied));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.replay_high_water));
 
     // A failed exchange completes the same counters, minus auth_success.
     var bad = sasl.ScramClient.init(allocator, "alice", "wrong-pass");
     defer bad.deinit();
-    const chal2 = handleSync(&handler, .{ .auth_request = .{
-        .conn_id = 6,
-        .mechanism = .scram_sha_256,
-        .client_ip = "10.0.0.6",
-        .cb_type = 0,
-        .cb_data = "",
-        .username = "alice",
-        .payload = try bad.clientFirst(),
-    } }) orelse return error.NoResponse;
-    try std.testing.expect(chal2 == .auth_challenge);
-    const fail_msg = handleSync(&handler, .{ .sasl_response = .{
-        .conn_id = 6,
-        .payload = try bad.handleServerFirst(chal2.auth_challenge.challenge),
-    } }) orelse return error.NoResponse;
-    try std.testing.expect(fail_msg == .auth_failure);
+    var sf2: [512]u8 = undefined;
+    const ko = try testkit.scramV2Exchange(&handler, &bad, 6, "10.0.0.6", "wrong-pass", "srvnonceBBB=", &sf2);
+    try std.testing.expect(ko.verify_msg.? == .auth_failure);
     try std.testing.expectEqual(@as(u64, 2), counterValue(&c.exchanges_started[scram]));
     try std.testing.expectEqual(@as(u64, 2), counterValue(&c.exchanges_completed[scram]));
     try std.testing.expectEqual(@as(u64, 1), counterValue(&c.auth_success));
@@ -619,7 +556,7 @@ test "AuthMetrics: limiter admits, refusals and lockouts move under driven excha
     try std.testing.expectEqual(@as(u64, 1), counterValue(&c.outcomes[@intFromEnum(FailureReason.account_disabled)]));
 }
 
-test "AuthMetrics: a lock checked at client-final counts only the lockout" {
+test "AuthMetrics: a locked account's verify counts the refusal and lockout" {
     const allocator = std.testing.allocator;
     metrics.reset();
     defer metrics.reset();
@@ -642,34 +579,19 @@ test "AuthMetrics: a lock checked at client-final counts only the lockout" {
     defer handler.deinit();
 
     const c = &metrics.counters;
-    const refusals_before = counterValue(&c.account_refusals);
+
+    // The account locks before the verify; admission denies as locked and
+    // counts the account refusal plus its lockout split.
+    limiter.recordOutcome("alice", "10.0.0.60", false);
 
     var client = sasl.ScramClient.init(allocator, "alice", "secret123");
     defer client.deinit();
-    const challenge_msg = handleSync(&handler, .{ .auth_request = .{
-        .conn_id = 60,
-        .mechanism = .scram_sha_256,
-        .client_ip = "10.0.0.60",
-        .cb_type = 0,
-        .cb_data = "",
-        .username = "",
-        .payload = try client.clientFirst(),
-    } }) orelse return error.NoResponse;
-    try std.testing.expect(challenge_msg == .auth_challenge);
-
-    // The account locks while the exchange is in flight; the final
-    // re-check denies without counting an admission.
-    limiter.recordOutcome("alice", "10.0.0.60", false);
-
-    const reply = handleSync(&handler, .{ .sasl_response = .{
-        .conn_id = 60,
-        .payload = try client.handleServerFirst(challenge_msg.auth_challenge.challenge),
-    } }) orelse return error.NoResponse;
-    try std.testing.expect(reply == .auth_failure);
-    try std.testing.expectEqualStrings("account-disabled", reply.auth_failure.reason);
+    var sf: [512]u8 = undefined;
+    const ex = try testkit.scramV2Exchange(&handler, &client, 60, "10.0.0.60", "secret123", "srvnonceCCC=", &sf);
+    try std.testing.expect(ex.verify_msg.? == .auth_failure);
+    try std.testing.expectEqualStrings("account-disabled", ex.verify_msg.?.auth_failure.reason);
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.account_refusals));
     try std.testing.expectEqual(@as(u64, 1), counterValue(&c.lockout_refusals));
-    // A re-check is not an admission: account_refusals stays put.
-    try std.testing.expectEqual(refusals_before, counterValue(&c.account_refusals));
 }
 
 test "AuthMetrics: an IP window denial and IP lockout move their counters" {

@@ -244,10 +244,14 @@ comptime {
 pub const AuthState = enum {
     /// No auth exchange in progress.
     none,
-    /// Sent AuthRequest to auth daemon, awaiting AuthChallenge or AuthSuccess/Failure.
-    awaiting_challenge,
-    /// Sent SaslResponse to auth daemon, awaiting AuthSuccess/Failure.
+    /// Sent AuthRequest (PLAIN/OAUTHBEARER) or ScramVerify to the auth
+    /// daemon, awaiting AuthSuccess/AuthFailure.
     awaiting_result,
+    /// Sent ScramParamsRequest on a params-cache miss (ADR-6), awaiting
+    /// ScramParams.
+    awaiting_params,
+    /// Sent the core-built server-first <challenge>, awaiting <response>.
+    awaiting_client_final,
 };
 
 /// Which SASL element's text content we're currently accumulating.
@@ -295,6 +299,27 @@ pub const Session = struct {
     /// Stable copy of authenticated username (IPC message data is transient).
     auth_username_buf: [precis.max_username_octets]u8 = undefined,
     auth_username_len: usize = 0,
+    /// Protocol v2 SCRAM (ADR-6): the exchange pieces parked between
+    /// client-first and client-final so the core can build server-first and
+    /// then verify in one round trip.
+    scram_gs2_flag: u8 = 0,
+    /// The escaped n= name: params-request username and params-cache key.
+    scram_user_buf: [256]u8 = undefined,
+    scram_user_len: usize = 0,
+    /// client-first-message-bare verbatim.
+    scram_bare_buf: [1024]u8 = undefined,
+    scram_bare_len: usize = 0,
+    /// The r= client nonce, prefix of the combined nonce in server-first.
+    scram_cnonce_buf: [256]u8 = undefined,
+    scram_cnonce_len: usize = 0,
+    /// The server-first-message this core issued (sent to the daemon for
+    /// verification verbatim; it is part of the AuthMessage).
+    scram_sfirst_buf: [512]u8 = undefined,
+    scram_sfirst_len: usize = 0,
+    /// Channel binding captured at exchange start.
+    scram_cb_type: u8 = 0,
+    scram_cb_buf: [32]u8 = undefined,
+    scram_cb_len: usize = 0,
     /// Which SASL element we're collecting text content for.
     sasl_collecting: SaslCollecting = .none,
     /// Buffer for accumulating SASL text content (base64 from XML).
@@ -563,6 +588,13 @@ pub const Session = struct {
         self.sasl_buf_len = 0;
         self.sasl_mechanism = "";
         self.auth_state = .none;
+        self.scram_gs2_flag = 0;
+        self.scram_user_len = 0;
+        self.scram_bare_len = 0;
+        self.scram_cnonce_len = 0;
+        self.scram_sfirst_len = 0;
+        self.scram_cb_type = 0;
+        self.scram_cb_len = 0;
     }
 
     /// Encode session slot + auth generation into IPC conn_id.
@@ -1721,7 +1753,13 @@ pub fn processSaslAuthComplete(self: *Server, session: *Session, changes: *Chang
     // Increment generation before encoding — the response must carry this gen
     session.auth_ipc_gen +%= 1;
 
-    // Send AuthRequest to auth daemon
+    if (mech_id == .scram_sha_256) {
+        processScramAuthComplete(self, session, decoded, cb, changes);
+        return;
+    }
+
+    // Send AuthRequest to auth daemon (PLAIN and OAUTHBEARER are unchanged
+    // one-round-trip auth_request exchanges).
     self.ipc.send(.{
         .auth_request = .{
             .conn_id = session.ipcConnId(),
@@ -1739,14 +1777,126 @@ pub fn processSaslAuthComplete(self: *Server, session: *Session, changes: *Chang
         return;
     };
 
-    session.auth_state = .awaiting_challenge;
+    session.auth_state = .awaiting_result;
 
     // Write interest: reconcileIpcWriteInterest (S10).
 }
 
-/// Called when </response> is reached — we have the full SCRAM response.
+/// SCRAM client-first under protocol v2 (ADR-6): park the exchange pieces,
+/// consult the params cache, and either issue the challenge inline or take
+/// one params round trip to the auth daemon.
+fn processScramAuthComplete(self: *Server, session: *Session, client_first: []const u8, cb: anytype, changes: *ChangeList) void {
+    const parsed = sasl.scram.parseClientFirst(client_first) catch {
+        log.warn("connection {d} malformed SCRAM client-first", .{session.conn.id});
+        const fail_action = session.stream.saslFailure("not-authorized");
+        executeAction(self, session, fail_action, changes);
+        return;
+    };
+
+    if (parsed.bare.len > session.scram_bare_buf.len or
+        parsed.raw_name.len > session.scram_user_buf.len or
+        parsed.client_nonce.len > session.scram_cnonce_buf.len or
+        cb.data.len > session.scram_cb_buf.len)
+    {
+        const fail_action = session.stream.saslFailure("not-authorized");
+        executeAction(self, session, fail_action, changes);
+        return;
+    }
+    session.scram_gs2_flag = parsed.gs2_flag;
+    @memcpy(session.scram_bare_buf[0..parsed.bare.len], parsed.bare);
+    session.scram_bare_len = parsed.bare.len;
+    @memcpy(session.scram_user_buf[0..parsed.raw_name.len], parsed.raw_name);
+    session.scram_user_len = parsed.raw_name.len;
+    @memcpy(session.scram_cnonce_buf[0..parsed.client_nonce.len], parsed.client_nonce);
+    session.scram_cnonce_len = parsed.client_nonce.len;
+    session.scram_cb_type = cb.cb_type;
+    @memcpy(session.scram_cb_buf[0..cb.data.len], cb.data);
+    session.scram_cb_len = cb.data.len;
+
+    if (self.scramParamsLookup(session.scram_user_buf[0..session.scram_user_len])) |params| {
+        if (!sendScramChallenge(self, session, params.salt[0..], params.iterations, changes)) return;
+        session.auth_state = .awaiting_client_final;
+        return;
+    }
+
+    // Cache miss: one lookup round trip. The raw n= name is enough — the
+    // daemon prepares it and answers a deterministic fake for unknown users.
+    self.ipc.send(.{ .scram_params_request = .{
+        .conn_id = session.ipcConnId(),
+        .username = session.scram_user_buf[0..session.scram_user_len],
+        .client_ip = session.conn.peerAddr(),
+    } }) catch {
+        log.err("connection {d} failed to send scram params request via IPC", .{session.conn.id});
+        const fail_action = session.stream.saslFailure("temporary-auth-failure");
+        executeAction(self, session, fail_action, changes);
+        return;
+    };
+    session.auth_state = .awaiting_params;
+}
+
+/// Build server-first ("r=cnonce+snonce,s=b64(salt),i=iters") from the
+/// parked client nonce plus (cached or replied) params, and send it as the
+/// SASL <challenge>. False when the send could not be staged.
+pub fn sendScramChallenge(self: *Server, session: *Session, salt: []const u8, iterations: u32, changes: *ChangeList) bool {
+    const cnonce = session.scram_cnonce_buf[0..session.scram_cnonce_len];
+
+    // 24 raw bytes of server nonce encode to 32 base64 chars.
+    var snonce_raw: [24]u8 = undefined;
+    std.crypto.random.bytes(&snonce_raw);
+    const encoder = std.base64.standard.Encoder;
+    var snonce_b64: [32]u8 = undefined;
+    _ = encoder.encode(&snonce_b64, &snonce_raw);
+
+    var salt_b64: [44]u8 = undefined;
+    const enc_len = encoder.calcSize(salt.len);
+    if (enc_len > salt_b64.len) {
+        const fail_action = session.stream.saslFailure("temporary-auth-failure");
+        executeAction(self, session, fail_action, changes);
+        return false;
+    }
+    const salt_enc = encoder.encode(salt_b64[0..enc_len], salt);
+
+    var fbs = std.io.fixedBufferStream(&session.scram_sfirst_buf);
+    fbs.writer().print("r={s}{s},s={s},i={d}", .{ cnonce, snonce_b64, salt_enc, iterations }) catch {
+        const fail_action = session.stream.saslFailure("temporary-auth-failure");
+        executeAction(self, session, fail_action, changes);
+        return false;
+    };
+    session.scram_sfirst_len = fbs.pos;
+
+    // <challenge> carries the server-first base64'd, matching the old
+    // daemon-built path byte for byte.
+    var xml_fbs = std.io.fixedBufferStream(&session.write_scratch);
+    const w = xml_fbs.writer();
+    const challenge_xml = stanza: {
+        w.writeAll("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch break :stanza null;
+        stanza_writer.b64EncodeWrite(w, session.scram_sfirst_buf[0..session.scram_sfirst_len]) catch break :stanza null;
+        w.writeAll("</challenge>") catch break :stanza null;
+        break :stanza xml_fbs.getWritten();
+    } orelse {
+        noteDrop("SCRAM challenge to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
+        return false;
+    };
+    if (session.nonza(challenge_xml) == .failed_closed) {
+        noteSendDrop(session, challenge_xml, "SCRAM challenge");
+        return false;
+    }
+    return true;
+}
+
+/// Called when </response> is reached — the client-final for a parked v2
+/// SCRAM exchange goes to the auth daemon in one scram_verify.
 pub fn processSaslResponseComplete(self: *Server, session: *Session, changes: *ChangeList) void {
     session.sasl_collecting = .none;
+
+    // A <response> is only meaningful after this core issued a challenge;
+    // there is no other multi-step SASL element left under protocol v2.
+    if (session.auth_state != .awaiting_client_final) {
+        log.warn("connection {d} SASL response with no SCRAM challenge in flight", .{session.conn.id});
+        const fail_action = session.stream.saslFailure("not-authorized");
+        executeAction(self, session, fail_action, changes);
+        return;
+    }
 
     if (!self.ipc.connected) {
         const fail_action = session.stream.saslFailure("temporary-auth-failure");
@@ -1764,12 +1914,17 @@ pub fn processSaslResponseComplete(self: *Server, session: *Session, changes: *C
         return;
     };
 
-    // Send SaslResponse to auth daemon
-    self.ipc.send(.{ .sasl_response = .{
+    self.ipc.send(.{ .scram_verify = .{
         .conn_id = session.ipcConnId(),
-        .payload = decoded,
+        .client_ip = session.conn.peerAddr(),
+        .cb_type = session.scram_cb_type,
+        .cb_data = session.scram_cb_buf[0..session.scram_cb_len],
+        .gs2_flag = session.scram_gs2_flag,
+        .client_first_bare = session.scram_bare_buf[0..session.scram_bare_len],
+        .server_first = session.scram_sfirst_buf[0..session.scram_sfirst_len],
+        .client_final = decoded,
     } }) catch {
-        log.err("connection {d} failed to send SASL response via IPC", .{session.conn.id});
+        log.err("connection {d} failed to send SCRAM verify via IPC", .{session.conn.id});
         const fail_action = session.stream.saslFailure("temporary-auth-failure");
         executeAction(self, session, fail_action, changes);
         return;

@@ -581,15 +581,6 @@ pub const Daemon = struct {
                         else => {},
                     }
                     runner.replyToLane(slot, response);
-                    // Clean up session after the send; a lane the send
-                    // closed already dropped its sessions.
-                    if (runner.ipc.getClient(slot) != null) {
-                        switch (response) {
-                            .auth_success => |s| self.handler.cleanupSession(pend.slot, s.conn_id),
-                            .auth_failure => |f| self.handler.cleanupSession(pend.slot, f.conn_id),
-                            else => {},
-                        }
-                    }
                 },
                 .deferred, .none => {
                     // Unreachable for a real mechanism, but a replay that

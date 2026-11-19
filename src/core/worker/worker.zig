@@ -203,6 +203,26 @@ const IPC_RECONCILE_RESERVED = 8;
 const DIRTY_FLUSH_POPS_MAX: u32 = 256;
 
 /// The XMPP core server.
+/// Public SCRAM parameters (salt, iterations) cached per raw n= username
+/// (ADR-6). The values are public — the auth daemon returns deterministic
+/// fakes for unknown users, which cache identically — so an eviction only
+/// costs one params round trip. Fixed direct-mapped table per worker; the
+/// TTL is checked at use, never swept.
+pub const SCRAM_PARAM_CACHE_SIZE = 1024;
+pub const SCRAM_PARAM_TTL_SECONDS: i64 = 300;
+pub const SCRAM_PARAM_USER_MAX = 256;
+
+pub const ScramParamEntry = struct {
+    user_hash: u64 = 0,
+    user_len: usize = 0,
+    user: [SCRAM_PARAM_USER_MAX]u8 = undefined,
+    salt: [32]u8 = undefined,
+    salt_len: usize = 0,
+    iterations: u32 = 0,
+    fetched_at: i64 = 0,
+    occupied: bool = false,
+};
+
 pub const Server = struct {
     loop: EventLoop,
     listener: Listener,
@@ -413,6 +433,11 @@ pub const Server = struct {
     auth_mechanism_count: u8 = 0,
     /// Backing storage for mechanism name strings.
     auth_mechanism_name_buf: [256]u8 = undefined,
+
+    /// Per-worker cache of public SCRAM params by raw n= username (ADR-6).
+    /// Heap-allocated with the other large tables so Server stays off the
+    /// stack; an empty slice means "no cache" (tests) and always misses.
+    scram_param_cache: []ScramParamEntry = &.{},
 
     /// Wire the backlog allocators once the Server exists (allocator field
     /// is set during init{,FromFd}).
@@ -790,6 +815,7 @@ pub const Server = struct {
         self.allocator.free(self.sessions);
         if (self.free_ids.len > 0) self.allocator.free(self.free_ids);
         if (self.slot_gen.len > 0) self.allocator.free(self.slot_gen);
+        if (self.scram_param_cache.len > 0) self.allocator.free(self.scram_param_cache);
         if (self.scratch_entries_a.len > 0) self.allocator.free(self.scratch_entries_a);
         if (self.scratch_entries_b.len > 0) self.allocator.free(self.scratch_entries_b);
         if (self.scratch_entries_c.len > 0) self.allocator.free(self.scratch_entries_c);
@@ -1035,6 +1061,20 @@ pub const Server = struct {
         };
     }
 
+    /// One-time params-table allocation at run() start. Kept out of
+    /// init{,WithMaxSessions,FromFdOpts}: a `try` there reserves a full
+    /// !Server slot in the Debug frame (stack_frames caps), and an alloc
+    /// failure degrades to every-miss lookups instead of failing startup.
+    fn growScramParamCache(self: *Server) void {
+        if (self.scram_param_cache.len > 0) return;
+        self.scram_param_cache = self.allocator.alloc(ScramParamEntry, SCRAM_PARAM_CACHE_SIZE) catch {
+            log.err("scram params cache alloc of {d} entries failed; every lookup misses", .{SCRAM_PARAM_CACHE_SIZE});
+            self.scram_param_cache = &.{};
+            return;
+        };
+        for (self.scram_param_cache) |*e| e.* = .{};
+    }
+
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
     pub fn run(self: *Server) !void {
         var change_buf: [CHANGE_BUF_SIZE]posix.Kevent = undefined;
@@ -1042,6 +1082,7 @@ pub const Server = struct {
 
         // M1: per-worker counters live on this thread; SIGUSR1 dumps them.
         metrics.bind(self.worker_id);
+        self.growScramParamCache();
         try self.loop.addSignal(posix.SIG.USR1);
 
         // Initial registration: listener for read
@@ -1550,6 +1591,40 @@ pub const Server = struct {
         return f;
     }
 
+    /// Cache lookup by raw n= username; null on miss, name mismatch or a
+    /// stale entry past the TTL (checked at use, not swept).
+    pub fn scramParamsLookup(self: *Server, username: []const u8) ?*const ScramParamEntry {
+        if (username.len == 0 or username.len > SCRAM_PARAM_USER_MAX) return null;
+        if (self.scram_param_cache.len == 0) return null;
+        const hash = std.hash.Wyhash.hash(0, username);
+        const entry = &self.scram_param_cache[hash % SCRAM_PARAM_CACHE_SIZE];
+        if (!entry.occupied or entry.user_hash != hash) return null;
+        if (!std.mem.eql(u8, entry.user[0..entry.user_len], username)) return null;
+        if (std.time.timestamp() - entry.fetched_at > SCRAM_PARAM_TTL_SECONDS) {
+            entry.occupied = false;
+            return null;
+        }
+        return entry;
+    }
+
+    /// Cache insert keyed by the same raw n= username the request carried.
+    /// Direct-mapped overwrite: a collision only costs a re-fetch.
+    fn scramParamsStore(self: *Server, username: []const u8, salt: []const u8, iterations: u32) void {
+        if (username.len == 0 or username.len > SCRAM_PARAM_USER_MAX) return;
+        if (self.scram_param_cache.len == 0) return;
+        if (salt.len == 0 or salt.len > 32 or iterations == 0) return;
+        const hash = std.hash.Wyhash.hash(0, username);
+        const entry = &self.scram_param_cache[hash % SCRAM_PARAM_CACHE_SIZE];
+        @memcpy(entry.user[0..username.len], username);
+        entry.user_hash = hash;
+        entry.user_len = username.len;
+        @memcpy(entry.salt[0..salt.len], salt);
+        entry.salt_len = salt.len;
+        entry.iterations = iterations;
+        entry.fetched_at = std.time.timestamp();
+        entry.occupied = true;
+    }
+
     fn dispatchAuthResponse(self: *Server, msg: ipc_protocol.Message, changes: *ChangeList) void {
         // Handle MechanismList separately (not per-connection)
         switch (msg) {
@@ -1571,7 +1646,7 @@ pub const Server = struct {
         }
 
         const raw_id: u32 = switch (msg) {
-            .auth_challenge => |m| m.conn_id,
+            .scram_params => |m| m.conn_id,
             .auth_success => |m| m.conn_id,
             .auth_failure => |m| m.conn_id,
             .register_result => |m| m.conn_id,
@@ -1596,24 +1671,20 @@ pub const Server = struct {
         }
 
         switch (msg) {
-            .auth_challenge => |m| {
-                // Base64-encode the challenge and send as <challenge>
-                var fbs = std.io.fixedBufferStream(&session.write_scratch);
-                const w = fbs.writer();
-                const challenge_xml = stanza: {
-                    w.writeAll("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch break :stanza null;
-                    stanza_writer.b64EncodeWrite(w, m.challenge) catch break :stanza null;
-                    w.writeAll("</challenge>") catch break :stanza null;
-                    break :stanza fbs.getWritten();
-                } orelse {
-                    noteDrop("SASL challenge to connection {d} exceeds {d} bytes; dropped", .{ conn_id, session.write_scratch.len });
-                    return;
-                };
-                if (session.nonza(challenge_xml) == .failed_closed) {
-                    c2s_session.noteSendDrop(session, challenge_xml, "SASL challenge");
+            .scram_params => |m| {
+                // Params-cache miss reply (ADR-6): cache the public pair,
+                // then build server-first and issue the challenge inline.
+                if (session.auth_state != .awaiting_params) {
+                    log.warn("scram_params for connection {d} in unexpected auth state", .{conn_id});
                     return;
                 }
-                session.auth_state = .none;
+                self.scramParamsStore(
+                    session.scram_user_buf[0..session.scram_user_len],
+                    m.salt,
+                    m.iteration_count,
+                );
+                if (!c2s_session.sendScramChallenge(self, session, m.salt, m.iteration_count, changes)) return;
+                session.auth_state = .awaiting_client_final;
             },
             .auth_success => |m| {
                 // Base64-encode server_final for the <success> element

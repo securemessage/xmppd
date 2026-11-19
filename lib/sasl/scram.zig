@@ -412,32 +412,50 @@ pub const ScramServer = struct {
     /// Validate the channel binding data from the client-final c= field.
     /// Per RFC 5802: c= is base64(gs2-header [+ channel-binding-data])
     fn validateChannelBinding(self: *ScramServer, cb_b64: []const u8) !void {
-        // Decode the c= field
-        var decoded_buf: [256]u8 = undefined;
-        const decoder = std.base64.standard.Decoder;
-        const decoded_len = decoder.calcSizeUpperBound(cb_b64.len) catch return error.InvalidMessage;
-        if (decoded_len > decoded_buf.len) return error.InvalidMessage;
-        const actual_len = decoder.calcSizeForSlice(cb_b64) catch return error.InvalidMessage;
-        decoder.decode(decoded_buf[0..actual_len], cb_b64) catch return error.InvalidMessage;
-        const decoded = decoded_buf[0..actual_len];
+        return checkChannelBinding(self.gs2_cb_flag, cb_b64, self.cb_type, self.cb_data);
+    }
 
-        if (self.gs2_cb_flag == 'n') {
+    pub fn isComplete(self: *const ScramServer) bool {
+        return self.state == .completed;
+    }
+
+    pub fn hasFailed(self: *const ScramServer) bool {
+        return self.state == .failed;
+    }
+};
+
+/// Shared channel-binding check for the stateful (ScramServer) and
+/// stateless (verifyExchange) server paths. Per RFC 5802: c= is
+/// base64(gs2-header [+ channel-binding-data]).
+fn checkChannelBinding(gs2_flag: u8, cb_b64: []const u8, cb_type: u8, cb_data: []const u8) !void {
+
+    // Decode the c= field
+    var decoded_buf: [256]u8 = undefined;
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeUpperBound(cb_b64.len) catch return error.InvalidMessage;
+    if (decoded_len > decoded_buf.len) return error.InvalidMessage;
+    const actual_len = decoder.calcSizeForSlice(cb_b64) catch return error.InvalidMessage;
+    decoder.decode(decoded_buf[0..actual_len], cb_b64) catch return error.InvalidMessage;
+    const decoded = decoded_buf[0..actual_len];
+
+    {
+        if (gs2_flag == 'n') {
             // Client said no channel binding: c= must be base64("n,,")
-            // "n,," = { 0x6e, 0x2c, 0x2c } → base64 "biws"
+            // "n,," = { 0x6e, 0x2c, 0x2c } -> base64 "biws"
             if (!std.mem.eql(u8, cb_b64, "biws")) {
                 return error.ChannelBindingMismatch;
             }
-        } else if (self.gs2_cb_flag == 'y') {
+        } else if (gs2_flag == 'y') {
             // Client supports CB but server doesn't advertise it (or SCRAM without -PLUS)
             // c= must be base64("y,,")
             const expected = "y,,";
             if (!std.mem.eql(u8, decoded[0..@min(decoded.len, expected.len)], expected)) {
                 return error.ChannelBindingMismatch;
             }
-        } else if (self.gs2_cb_flag == 'p') {
+        } else if (gs2_flag == 'p') {
             // Client wants channel binding: c= is base64(gs2-header + cb-data)
-            // gs2-header is "p=<cb-name>,," — we need to verify the cb-data portion
-            if (self.cb_type == 0 or self.cb_data.len == 0) {
+            // gs2-header is "p=<cb-name>,," so verify the cb-data portion
+            if (cb_type == 0 or cb_data.len == 0) {
                 // Server has no binding data but client demands it
                 return error.ChannelBindingMismatch;
             }
@@ -455,24 +473,199 @@ pub const ScramServer = struct {
             }
             // The rest is the channel binding data
             const client_cb = decoded[hdr_end..];
-            if (!std.mem.eql(u8, client_cb, self.cb_data)) {
+            if (!std.mem.eql(u8, client_cb, cb_data)) {
                 return error.ChannelBindingMismatch;
             }
         } else {
-            // Belt and braces: handleClientFirst already rejects unknown
+            // handleClientFirst and verifyExchange both reject unknown
             // flags; never let a fresh code path skip CB verification.
             return error.ChannelBindingMismatch;
         }
     }
+}
 
-    pub fn isComplete(self: *const ScramServer) bool {
-        return self.state == .completed;
-    }
+// ============================================================================
+// Stateless server-side verify (auth protocol v2, ADR-6)
+// ============================================================================
 
-    pub fn hasFailed(self: *const ScramServer) bool {
-        return self.state == .failed;
-    }
+/// A parsed client-first-message. All slices borrow the input.
+pub const ClientFirst = struct {
+    /// gs2 channel binding flag: 'n', 'y' or 'p'.
+    gs2_flag: u8,
+    /// client-first-message-bare (everything after the gs2 header).
+    bare: []const u8,
+    /// The escaped n= name (RFC 5802 wire form; unescape before use).
+    raw_name: []const u8,
+    /// The r= client nonce, including any trailing extension text, exactly
+    /// as the stateful path treats it.
+    client_nonce: []const u8,
 };
+
+/// Split a full client-first-message into gs2 flag, bare, name and nonce.
+/// Shared by the core's server-first builder and by tests; the daemon parses
+/// the bare alone through parseClientFirstBare.
+pub fn parseClientFirst(message: []const u8) error{ InvalidMessage, ChannelBindingMismatch }!ClientFirst {
+    if (message.len == 0) return error.InvalidMessage;
+    const flag: u8 = switch (message[0]) {
+        'n', 'y', 'p' => message[0],
+        else => return error.ChannelBindingMismatch,
+    };
+    const bare_start = findClientFirstBare(message) orelse return error.InvalidMessage;
+    const parsed = try parseClientFirstBare(message[bare_start..]);
+    return .{
+        .gs2_flag = flag,
+        .bare = message[bare_start..],
+        .raw_name = parsed.raw_name,
+        .client_nonce = parsed.client_nonce,
+    };
+}
+
+/// Parse client-first-message-bare alone: "n=<raw>,r=<cnonce>[,extensions]".
+/// The r= value runs to the end of the message, matching ScramServer.
+pub fn parseClientFirstBare(bare: []const u8) error{InvalidMessage}!struct {
+    raw_name: []const u8,
+    client_nonce: []const u8,
+} {
+    if (!std.mem.startsWith(u8, bare, "n=")) return error.InvalidMessage;
+    const after_n = bare[2..];
+    const comma_pos = std.mem.indexOfScalar(u8, after_n, ',') orelse return error.InvalidMessage;
+    const raw_name = after_n[0..comma_pos];
+    const after_comma = after_n[comma_pos + 1 ..];
+    if (!std.mem.startsWith(u8, after_comma, "r=")) return error.InvalidMessage;
+    return .{ .raw_name = raw_name, .client_nonce = after_comma[2..] };
+}
+
+/// Upper bound for the server-nonce portion of the combined nonce (base64
+/// text). 24 raw bytes encode to 32 chars; anything past 64 is malformed.
+pub const server_nonce_max_len = 64;
+
+pub const ExchangeError = error{
+    InvalidMessage,
+    ChannelBindingMismatch,
+    NonceMismatch,
+    /// server-first salt or iteration count does not match the credentials.
+    ParameterMismatch,
+    NoSpaceLeft,
+};
+
+/// Parsed and checked SCRAM exchange pieces; slices borrow the inputs.
+pub const ParsedExchange = struct {
+    /// b64 server nonce (the combined nonce minus the client nonce prefix).
+    server_nonce: []const u8,
+    /// ClientProof, decoded.
+    client_proof: [32]u8,
+    /// AuthMessage, assembled into the caller's buffer.
+    auth_message: []const u8,
+};
+
+/// Parse server-first and client-final, check the gs2 flag, channel binding,
+/// nonce chain and (salt, iterations) against creds, and assemble
+/// AuthMessage into auth_message_buf. No allocation, no proof check: the
+/// caller consumes the nonce into its replay cache first, then runs
+/// verifyProof.
+pub fn parseExchange(
+    gs2_flag: u8,
+    cb_type: u8,
+    cb_data: []const u8,
+    client_first_bare: []const u8,
+    server_first: []const u8,
+    client_final: []const u8,
+    creds: *const StoredCredentials,
+    auth_message_buf: []u8,
+) ExchangeError!ParsedExchange {
+    switch (gs2_flag) {
+        'n', 'y', 'p' => {},
+        else => return error.ChannelBindingMismatch,
+    }
+    const first = try parseClientFirstBare(client_first_bare);
+
+    // server-first-message: "r=<combined>,s=<salt-b64>,i=<iterations>"
+    if (!std.mem.startsWith(u8, server_first, "r=")) return error.InvalidMessage;
+    const sf_r = server_first[2..];
+    const c1 = std.mem.indexOfScalar(u8, sf_r, ',') orelse return error.InvalidMessage;
+    const combined = sf_r[0..c1];
+    const sf_s = sf_r[c1 + 1 ..];
+    if (!std.mem.startsWith(u8, sf_s, "s=")) return error.InvalidMessage;
+    const c2 = std.mem.indexOfScalar(u8, sf_s, ',') orelse return error.InvalidMessage;
+    const salt_b64 = sf_s[2..c2];
+    const sf_i = sf_s[c2 + 1 ..];
+    if (!std.mem.startsWith(u8, sf_i, "i=")) return error.InvalidMessage;
+    const iters = std.fmt.parseUnsigned(u32, sf_i[2..], 10) catch return error.InvalidMessage;
+
+    // The combined nonce must be client_nonce + server nonce; the tail is
+    // the server nonce the replay cache consumes.
+    if (!std.mem.startsWith(u8, combined, first.client_nonce)) return error.NonceMismatch;
+    const server_nonce = combined[first.client_nonce.len..];
+    if (server_nonce.len == 0 or server_nonce.len > server_nonce_max_len) return error.InvalidMessage;
+
+    // The parameters core signed must be the credential's, or a stale or
+    // forged server-first could be completed here.
+    var salt_buf: [64]u8 = undefined;
+    const dec = std.base64.standard.Decoder;
+    const salt_len = dec.calcSizeForSlice(salt_b64) catch return error.InvalidMessage;
+    if (salt_len != creds.salt.len) return error.ParameterMismatch;
+    base64Decode(salt_b64, salt_buf[0..salt_len]) catch return error.InvalidMessage;
+    if (!std.mem.eql(u8, salt_buf[0..salt_len], &creds.salt)) return error.ParameterMismatch;
+    if (iters != creds.iteration_count) return error.ParameterMismatch;
+
+    // client-final-message: "c=<b64>,r=<combined>,p=<proof-b64>"
+    if (!std.mem.startsWith(u8, client_final, "c=")) return error.InvalidMessage;
+    const cf_c = client_final[2..];
+    const f1 = std.mem.indexOfScalar(u8, cf_c, ',') orelse return error.InvalidMessage;
+    const cb_b64 = cf_c[0..f1];
+    try checkChannelBinding(gs2_flag, cb_b64, cb_type, cb_data);
+    const cf_r = cf_c[f1 + 1 ..];
+    if (!std.mem.startsWith(u8, cf_r, "r=")) return error.InvalidMessage;
+    const f2 = std.mem.indexOfScalar(u8, cf_r, ',') orelse return error.InvalidMessage;
+    if (!std.mem.eql(u8, cf_r[2..f2], combined)) return error.NonceMismatch;
+    const cf_p = cf_r[f2 + 1 ..];
+    if (!std.mem.startsWith(u8, cf_p, "p=")) return error.InvalidMessage;
+    var proof: [32]u8 = undefined;
+    base64Decode(cf_p[2..], &proof) catch return error.InvalidMessage;
+
+    // client-final-message-without-proof: everything before ",p=".
+    const without_proof = client_final[0 .. client_final.len - cf_p.len - 1];
+
+    // AuthMessage = bare + "," + server-first + "," + without-proof
+    var fbs = std.io.fixedBufferStream(auth_message_buf);
+    fbs.writer().print("{s},{s},{s}", .{ client_first_bare, server_first, without_proof }) catch
+        return error.NoSpaceLeft;
+
+    return .{
+        .server_nonce = server_nonce,
+        .client_proof = proof,
+        .auth_message = fbs.getWritten(),
+    };
+}
+
+/// Verify a decoded ClientProof against creds over auth_message and return
+/// the ServerSignature. Constant-time on the stored-key compare, exactly as
+/// the stateful path (T211).
+pub fn verifyProof(creds: *const StoredCredentials, auth_message: []const u8, client_proof: *const [32]u8) error{AuthenticationFailed}![32]u8 {
+    // ClientSignature := HMAC(StoredKey, AuthMessage)
+    var client_signature: [32]u8 = undefined;
+    HmacSha256.create(&client_signature, auth_message, &creds.stored_key);
+
+    // Recover ClientKey := ClientProof XOR ClientSignature
+    var recovered_client_key: [32]u8 = undefined;
+    for (&recovered_client_key, client_proof.*, client_signature) |*r, p, s| {
+        r.* = p ^ s;
+    }
+
+    var recovered_stored_key: [32]u8 = undefined;
+    Sha256.hash(&recovered_client_key, &recovered_stored_key, .{});
+    if (!std.crypto.timing_safe.eql([32]u8, recovered_stored_key, creds.stored_key)) {
+        return error.AuthenticationFailed;
+    }
+
+    // ServerSignature := HMAC(ServerKey, AuthMessage)
+    var server_signature: [32]u8 = undefined;
+    HmacSha256.create(&server_signature, auth_message, &creds.server_key);
+    std.crypto.secureZero(u8, &client_signature);
+    std.crypto.secureZero(u8, &recovered_client_key);
+    std.crypto.secureZero(u8, &recovered_stored_key);
+    return server_signature;
+}
 
 /// SCRAM client-side implementation, comptime-parameterized over the hash
 /// family (SCRAM-SHA-256 per RFC 7677, SCRAM-SHA-1 per RFC 5802).
