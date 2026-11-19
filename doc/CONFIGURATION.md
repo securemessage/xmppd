@@ -19,7 +19,7 @@ list.
 | `hostname` | `localhost` | XMPP domain (e.g., `example.com`) |
 | `bind_address` | `0.0.0.0` | Listen address literal (C2S; also S2S unless `s2s.bind_address` is set) |
 | `c2s_port` | `5222` | Client-to-server port |
-| `db_path` | `/var/db/xmppd/users.db` | User database path; the master also creates `auth/`, `op/`, `archive/` subdirectories under it |
+| `db_path` | `/var/db/xmppd` | Storage base directory; the master also creates `auth/`, `op/`, `archive/` subdirectories under it |
 | `lmdb_map_size_mb` | `8192` | LMDB map size in MiB |
 | `user` | (none) | Unprivileged user the master's children run as (required when the master runs as root) |
 | `log_file` | `/var/log/xmppd/xmppd.log` | Log file path (used with `--background`) |
@@ -56,7 +56,7 @@ list.
 | `lockout_threshold` | `10` | Consecutive account failures before temporary lockout |
 | `ip_lockout_threshold` | `20` | Consecutive IP failures before that address is temporarily locked |
 | `users_scan_limit` | `100000` | Startup users scan bound |
-| `crypto_threads` | `0` | Password hash threads |
+| `crypto_threads` | `4` | Password hash threads (`0` disables the pool and derives inline) |
 | `registration` | `false` | In-band registration (XEP-0077) |
 | `require_invite` | `true` | Require invitation code for registration |
 
@@ -98,7 +98,7 @@ is an unknown-key error.
 | `introspection_endpoint` | no | RFC 7662 introspection (for opaque tokens) |
 | `ca_file` | no | CA bundle path for IdP TLS verification |
 | `user_domain` | no | Domain appended to bare usernames for ROPC (e.g., `morante.dev`) |
-| `socket` | no | IPC socket path (default `/var/run/xmppd/oidc.sock`) |
+| `socket` | no | OIDC-specific IPC socket override; when unset, inherits `[auth] socket` (default `/var/run/xmppd/auth.sock`) |
 | `max_per_account` | no | Max requests per account (default `60`, alias `rate_max_per_account`) |
 | `max_per_ip` | no | Max requests per IP (default `200`, alias `rate_max_per_ip`) |
 | `rate_limit` | no | Rate limiting switch (default `true`) |
@@ -215,23 +215,52 @@ from the schema, so it cannot drift from what the parser accepts:
   --help, -h              show this help
 ```
 
+### Auth daemon options
+
+`xmppd-auth --help` and `xmppd-auth-oidc --help` are also generated from
+the schema. `xmppd-auth` accepts:
+
+- `-c`, `--config PATH`
+- `--db PATH`
+- `--socket PATH`
+- `--max-auth-per-account N`
+- `--max-auth-per-ip N`
+- `--auth-window SECONDS`
+- `--lockout-duration DURATION` (a bare number is seconds)
+- `--lockout-threshold N`
+- `--ip-lockout-threshold N`
+- `--no-rate-limit`
+- `--enable-registration`
+- `--no-require-invite`
+- `--users-scan-limit N`
+- `--conf-fd N` (the master's inherited sealed config slot)
+- `-h`, `--help`
+
+`xmppd-auth-oidc` accepts `-c`/`--config PATH`, `--db PATH`,
+`--socket PATH`, `--conf-fd N`, and `-h`/`--help`. Without `--config`
+or `--conf-fd`, it reads `/usr/local/etc/xmppd/xmppd.conf`.
+
+Unknown arguments, unknown file keys, malformed lines, non-numeric values,
+and values outside the consuming daemon's bounds are startup errors with a
+`file:line` diagnostic when they came from a file. Rate maxima above 65535,
+a zero rate window, and a lockout that is not a whole number of seconds are
+errors rather than values to clamp or replace with defaults.
+
 ## Config forwarding
 
-The master forwards the *resolved* values to its children. After loading
+The master forwards the *resolved* values to every child. After loading
 the file and its own CLI it serializes the effective fields once into a
-sealed in-memory fd that `xmppd-core` and `xmppd-s2s` inherit through
-the supervisor's `pass_fds` remap, named on their argv as `--conf-fd N`.
-Their precedence is therefore default < file < forwarded < CLI: a file
-key or a master CLI flag (`xmppd -c xmppd.conf --host x.test`) reaches
-every child exactly once, and a child-side CLI flag still wins for a
-manual run. The child argv carries only what the file grammar cannot
-express: the inherited listen-fd remap slots (`--listen-fd`) and the
-conf-fd slot itself. `xmppd-auth` still receives its resolved values on
-argv until it moves to the same loader. A core or s2s started by hand
-without `--conf-fd` reads `--config` directly. On SIGHUP the master
-rebuilds the fd from the reloaded configuration before forwarding the
-signal, so a respawned child sees the new values; no child re-reads the
-file.
+sealed in-memory fd that `xmppd-auth` (either backend), `xmppd-core`, and
+`xmppd-s2s` inherit through the supervisor's `pass_fds` remap, named on
+their argv as `--conf-fd N`. Their precedence is therefore
+default < file < forwarded < CLI: a file key or a master CLI flag
+(`xmppd -c xmppd.conf --host x.test`) reaches every child exactly once,
+and a child-side CLI flag still wins for a manual run. Child argv carries
+only fd remap slots (`--listen-fd` where applicable and `--conf-fd`). A
+child started by hand without `--conf-fd` reads `--config` directly. On
+SIGHUP the master rebuilds the fd from the reloaded configuration before
+forwarding the signal, so a respawned child sees the new values; no
+supervised child re-reads the file.
 
 `xmppctl` accepts:
 - `-c`, `--config PATH` - read the shared config file

@@ -112,6 +112,28 @@ Behavior changes that ride along:
   `--expires` are ordinary options accepted in any position instead of
   only after `invite create`, unknown arguments to `invite create` are
   errors instead of being ignored, and `--help` prints usage and exits
-  0. Without `--db` or a config file, the storage directory default
-  follows the shared `[server] db_path` default
-  `/var/db/xmppd/users.db` (was `/var/db/xmppd`).
+  0. Without `--db` or a config file, the storage directory default is the
+  shared `[server] db_path` default `/var/db/xmppd`.
+
+## 0.9.0 -> 0.9.1: strict auth daemon configuration
+
+`xmppd-auth` and `xmppd-auth-oidc` now use the shared typed loader and
+receive the master's sealed configuration fd as `--conf-fd N`. The master
+no longer passes resolved database, socket or other file values on their
+argv. Precedence is default < file < forwarded < CLI for both daemons.
+Standalone runs still accept `--config`; standalone OIDC retains its
+default `/usr/local/etc/xmppd/xmppd.conf` path.
+
+**Bad auth values are now startup errors.** Non-numeric values, integers
+outside their target type, rate maxima above 65535, a zero rate window,
+invalid IdP pool bounds, and lockouts that are not whole seconds refuse
+startup instead of silently falling back to a default or being clamped.
+File errors include `file:line` and the key. Unknown arguments and unknown
+file keys are errors too. Existing `[oidc] rate_max_per_account` and
+`rate_max_per_ip` spellings remain accepted as aliases.
+
+Both `--help` outputs are generated from the schema and include every
+accepted CLI spelling and the actual defaults. The shared storage default
+stays `/var/db/xmppd`, and `auth.crypto_threads` defaults to `4` (`0`
+disables the pool). An unset `[oidc] socket` inherits `[auth] socket`;
+an explicit OIDC socket or child `--socket` overrides it.
