@@ -178,6 +178,13 @@ pub const AtomicCounters = struct {
         }
     }
 
+    /// Publish an owner's latest cumulative snapshot for lock-free readers.
+    pub fn store(self: *AtomicCounters, current: Counters) void {
+        inline for (std.meta.fields(Counters), 0..) |field, i| {
+            self.values[i].store(@field(current, field.name), .monotonic);
+        }
+    }
+
     pub fn snapshot(self: *const AtomicCounters) Counters {
         var out: Counters = .{};
         inline for (std.meta.fields(Counters), 0..) |field, i| {
