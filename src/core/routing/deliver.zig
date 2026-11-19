@@ -186,6 +186,7 @@ pub fn handleDeliveryWake(self: *Server, changes: *ChangeList) void {
     ds.drainPipe(self.worker_id);
     drainDeliveryQueue(self, changes);
     _ = muc_actor.drainRoomMailboxes(self, changes);
+    muc_actor.drainActorRetries(self);
 }
 
 /// Drain all pending deliveries from this worker's MPSC queue.

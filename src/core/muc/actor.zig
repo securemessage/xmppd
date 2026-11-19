@@ -186,9 +186,17 @@ pub fn enqueueRoomActorMessage(self: *Server, target_worker: u16, msg: actor_mes
         log.warn("room actor message encode failed", .{});
         return;
     };
-    ds.deliverDelivery(self.worker_id, target_worker, delivery_queue_mod.ROOM_ACTOR_TARGET, enc_lease.buf[0..len], 0, 0, .room_actor) catch |err| {
+    ds.deliverActor(self.worker_id, target_worker, delivery_queue_mod.ROOM_ACTOR_TARGET, enc_lease.buf[0..len], 0, 0, .room_actor) catch |err| {
+        _ = delivery_queue_mod.actor_retry_drops.fetchAdd(1, .monotonic);
         log.warn("room actor enqueue to worker {d} failed: {}", .{ target_worker, err });
     };
+}
+
+/// Re-attempt actor envelopes this worker produced whose target ring was
+/// full; exhausted entries take their class fallback and are counted.
+pub fn drainActorRetries(self: *Server) void {
+    const ds = self.delivery_system orelse return;
+    ds.retry_lists[self.worker_id].drain(ds, self, muc_handler.noteActorRetryExhausted);
 }
 
 /// Get the number of workers (for room ownership computation).

@@ -70,6 +70,18 @@ pub var ring_drops_payload = std.atomic.Value(u64).init(0);
 /// already committed to in-flight payloads (ADR-3 fail-closed bound).
 pub var blob_budget_denials = std.atomic.Value(u64).init(0);
 
+/// Per-class full-ring outcomes (ADR-3 QueueFull table). Indexed by
+/// @intFromEnum(DeliveryClass); ring_drops_full keeps the total.
+pub var class_queue_full: [@typeInfo(DeliveryClass).@"enum".fields.len]std.atomic.Value(u64) =
+    .{std.atomic.Value(u64).init(0)} ** @typeInfo(DeliveryClass).@"enum".fields.len;
+
+/// Actor messages dropped after the bounded retry list filled or an
+/// entry exhausted its attempts. Includes produce-time refusals of
+/// actor-class deliveries.
+pub var actor_retry_drops = std.atomic.Value(u64).init(0);
+/// Actor messages that crossed the ring on a retry tick.
+pub var actor_retry_resends = std.atomic.Value(u64).init(0);
+
 /// Pseudo-targets: they address a broadcast or actor channel, never a
 /// session slot. The drain dispatches on token kind before any session
 /// validation; index and gen are always zero.
@@ -230,6 +242,138 @@ comptime {
 }
 
 /// Per-worker MPSC delivery queue (bounded ring buffer).
+/// Actor-class envelope parked on a producer's bounded retry list after
+/// its target ring refused it. The blob ref pins the payload for the
+/// whole retry window; nothing is copied.
+pub const ActorRetry = struct {
+    next: ?*ActorRetry = null,
+    target_worker: u16,
+    target: Token,
+    blob: *Blob,
+    hold_token: u64,
+    receipt_ts: u64,
+    attempts: u8 = 0,
+    class: DeliveryClass,
+};
+
+/// Per-producer bounded FIFO of refused actor envelopes. Producer-only:
+/// the owning worker appends and drains from its own thread, so no
+/// atomics beyond the ring's own.
+pub const ActorRetryList = struct {
+    pub const MAX: u16 = 64;
+    pub const ATTEMPTS: u8 = 8;
+    /// Re-enqueue attempts per drain tick.
+    pub const DRAIN_MAX: u16 = 32;
+
+    head: ?*ActorRetry = null,
+    tail: ?*ActorRetry = null,
+    count: u16 = 0,
+    allocator: std.mem.Allocator,
+
+    /// Take a reference on `blob` and append it for retry. Fails closed
+    /// with RetryListFull at MAX entries; the caller keeps its ref.
+    pub fn push(
+        self: *ActorRetryList,
+        target_worker: u16,
+        target: Token,
+        blob: *Blob,
+        hold_token: u64,
+        receipt_ts: u64,
+        class: DeliveryClass,
+    ) !void {
+        if (self.count >= MAX) {
+            _ = actor_retry_drops.fetchAdd(1, .monotonic);
+            return error.RetryListFull;
+        }
+        const e = self.allocator.create(ActorRetry) catch return error.OutOfMemory;
+        blob.addRef();
+        e.* = .{
+            .target_worker = target_worker,
+            .target = target,
+            .blob = blob,
+            .hold_token = hold_token,
+            .receipt_ts = receipt_ts,
+            .class = class,
+        };
+        if (self.tail) |t| t.next = e else self.head = e;
+        self.tail = e;
+        self.count += 1;
+    }
+
+    /// Re-attempt each pending entry once per tick. Entries that still
+    /// fail age one attempt; at ATTEMPTS the entry is removed, the class
+    /// fallback runs through `on_exhausted`, and the refs are released.
+    /// Single-threaded: called from the producing worker's drain tick.
+    pub fn drain(
+        self: *ActorRetryList,
+        ds: *DeliverySystem,
+        ctx: anytype,
+        on_exhausted: fn (@TypeOf(ctx), *const ActorRetry) void,
+    ) void {
+        var processed: u16 = 0;
+        var cur = self.head;
+        while (cur != null and processed < DRAIN_MAX) {
+            const e = cur.?;
+            cur = e.next;
+            if (e.target_worker >= ds.worker_count) {
+                self.unlink(e);
+                on_exhausted(ctx, e);
+                e.blob.release();
+                self.allocator.destroy(e);
+                continue;
+            }
+            ds.queues[e.target_worker].enqueueEnvelope(e.target, e.blob, e.hold_token, e.receipt_ts, e.class) catch {
+                e.attempts += 1;
+                if (e.attempts >= ATTEMPTS) {
+                    self.unlink(e);
+                    on_exhausted(ctx, e);
+                    e.blob.release();
+                    self.allocator.destroy(e);
+                }
+                processed += 1;
+                continue;
+            };
+            ds.wakeWorker(e.target_worker);
+            _ = actor_retry_resends.fetchAdd(1, .monotonic);
+            self.unlink(e);
+            e.blob.release();
+            self.allocator.destroy(e);
+            processed += 1;
+        }
+    }
+
+    fn unlink(self: *ActorRetryList, e: *ActorRetry) void {
+        if (self.head == e) self.head = e.next;
+        if (self.tail == e) self.tail = null;
+        // Interior unlink: the list is drained in order so a non-head
+        // removal only happens on exhaustion; walk from head (count <= 64).
+        if (self.head != e) {
+            var cur = self.head;
+            while (cur) |c| {
+                if (c.next == e) {
+                    c.next = e.next;
+                    if (self.tail == e) self.tail = c;
+                    break;
+                }
+                cur = c.next;
+            }
+        }
+        e.next = null;
+        self.count -= 1;
+    }
+
+    /// Release every parked entry; called at DeliverySystem teardown.
+    pub fn deinit(self: *ActorRetryList) void {
+        var cur = self.head;
+        while (cur) |e| {
+            cur = e.next;
+            e.blob.release();
+            self.allocator.destroy(e);
+        }
+        self.* = undefined;
+    }
+};
+
 pub const MpscQueue = struct {
     slots: [QUEUE_SLOTS]Envelope = [_]Envelope{.{}} ** QUEUE_SLOTS,
     /// Next write position — advanced by producers via CAS.
@@ -280,6 +424,7 @@ pub const MpscQueue = struct {
             // Check if queue is full
             if (current_tail -% current_head >= QUEUE_SLOTS) {
                 _ = ring_drops_full.fetchAdd(1, .monotonic);
+                _ = class_queue_full[@intFromEnum(class)].fetchAdd(1, .monotonic);
                 return error.QueueFull;
             }
 
@@ -445,6 +590,10 @@ pub const DeliverySystem = struct {
     /// payload bytes worker `w` has in flight across every target ring,
     /// room mailbox and replay queue (ADR-3).
     budgets: []BlobBudget,
+
+    /// Per-producer bounded retry lists for actor-class envelopes
+    /// refused by a full target ring (ADR-3 QueueFull policy).
+    retry_lists: []ActorRetryList,
     worker_count: u16,
     allocator: std.mem.Allocator,
     /// Optional hook invoked once per accepted envelope (M1). The server
@@ -481,11 +630,17 @@ pub const DeliverySystem = struct {
             b.* = .{ .allocator = allocator, .limit = BlobBudget.DEFAULT_LIMIT };
         }
 
+        const retry_lists = try allocator.alloc(ActorRetryList, n);
+        for (retry_lists) |*r| {
+            r.* = .{ .allocator = allocator };
+        }
+
         return .{
             .queues = queues,
             .pipes = pipes,
             .states = states,
             .budgets = budgets,
+            .retry_lists = retry_lists,
             .worker_count = worker_count,
             .allocator = allocator,
         };
@@ -506,10 +661,14 @@ pub const DeliverySystem = struct {
         for (self.pipes) |*p| {
             p.deinit();
         }
+        for (self.retry_lists) |*r| {
+            r.deinit();
+        }
         self.allocator.free(self.queues);
         self.allocator.free(self.pipes);
         self.allocator.free(self.states);
         self.allocator.free(self.budgets);
+        self.allocator.free(self.retry_lists);
         self.* = undefined;
     }
 
@@ -614,6 +773,28 @@ pub const DeliverySystem = struct {
     ) !void {
         try self.enqueueBlob(target_worker, target, blob, hold_token, receipt_ts, class);
         self.wakeWorker(target_worker);
+    }
+
+    /// Actor-class delivery with the ADR-3 QueueFull policy: a refused
+    /// enqueue parks on the producer's bounded retry list and is
+    /// re-attempted on the worker's drain tick. The policy counter
+    /// covers every refusal; nothing drops silently.
+    pub fn deliverActor(
+        self: *DeliverySystem,
+        producer_worker: u16,
+        target_worker: u16,
+        target: Token,
+        payload: []const u8,
+        hold_token: u64,
+        receipt_ts: u64,
+        class: DeliveryClass,
+    ) !void {
+        const blob = try self.produceBlob(producer_worker, payload);
+        defer blob.release();
+        self.deliverBlob(target_worker, target, blob, hold_token, receipt_ts, class) catch |err| switch (err) {
+            error.QueueFull => try self.retry_lists[producer_worker].push(target_worker, target, blob, hold_token, receipt_ts, class),
+            else => return err,
+        };
     }
 
     /// Wake a worker after one or more enqueue() calls (T130). Coalesced
@@ -1119,4 +1300,78 @@ test "DeliverySystem: coalesced signaling skips wake when active" {
     }.handle;
     _ = sys.getQueue(1).drain(ctx, handler);
     try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "delivery classes: a full ring counts every class's QueueFull" {
+    var queue = MpscQueue{};
+    const fill = try testBudget().produce("fill");
+    for (0..QUEUE_SLOTS) |_| try queue.enqueue(Token.init(1, 1, token_kinds.session), fill);
+    fill.release();
+
+    const blob = try testBudget().produce("x");
+    defer blob.release();
+    inline for (@typeInfo(DeliveryClass).@"enum".fields) |f| {
+        const class: DeliveryClass = @enumFromInt(f.value);
+        const before = class_queue_full[f.value].load(.monotonic);
+        try std.testing.expectError(error.QueueFull, queue.enqueueEnvelope(Token.init(1, 1, token_kinds.session), blob, 0, 0, class));
+        try std.testing.expectEqual(before + 1, class_queue_full[f.value].load(.monotonic));
+    }
+
+    // Release the slot refs the fills took.
+    const handler = struct {
+        fn handle(_: usize, _: Token, _: []const u8) void {}
+    }.handle;
+    _ = queue.drain(0, handler);
+}
+
+test "actor retry list resends into a drained ring and exhausts with the class fallback" {
+    const allocator = std.testing.allocator;
+    var ds = try DeliverySystem.init(allocator, 2);
+    defer ds.deinit();
+
+    // Fill worker 1's ring so the actor delivery parks on the retry list.
+    const fill = try ds.produceBlob(0, "fill");
+    for (0..QUEUE_SLOTS) |_| try ds.getQueue(1).enqueue(Token.init(1, 1, token_kinds.session), fill);
+    fill.release();
+
+    try ds.deliverActor(0, 1, ROOM_ACTOR_TARGET, "actor-msg", 7, 99, .room_actor);
+    try std.testing.expectEqual(@as(u16, 1), ds.retry_lists[0].count);
+
+    const Exh = struct {
+        calls: u16 = 0,
+        last_class: DeliveryClass = .normal,
+        fn onExhausted(self: *@This(), e: *const ActorRetry) void {
+            self.calls += 1;
+            self.last_class = e.class;
+        }
+    };
+    var exh = Exh{};
+
+    // Free the ring, then one retry tick lands the parked envelope.
+    const handler = struct {
+        fn handle(_: usize, _: Token, _: []const u8) void {}
+    }.handle;
+    _ = ds.getQueue(1).drain(0, handler);
+    const resends_before = actor_retry_resends.load(.monotonic);
+    ds.retry_lists[0].drain(&ds, &exh, Exh.onExhausted);
+    try std.testing.expectEqual(@as(u16, 0), ds.retry_lists[0].count);
+    try std.testing.expectEqual(resends_before + 1, actor_retry_resends.load(.monotonic));
+    try std.testing.expect(ds.getQueue(1).hasPending());
+    _ = ds.getQueue(1).drain(0, handler);
+
+    // Refill, park another envelope, and let it exhaust its attempts.
+    const fill2 = try ds.produceBlob(0, "fill");
+    for (0..QUEUE_SLOTS) |_| try ds.getQueue(1).enqueue(Token.init(1, 1, token_kinds.session), fill2);
+    fill2.release();
+    try ds.deliverActor(0, 1, SM_ACTOR_TARGET, "sm-msg", 0, 0, .sm_actor);
+    const drops_before = actor_retry_drops.load(.monotonic);
+    var i: u8 = 0;
+    while (i < ActorRetryList.ATTEMPTS) : (i += 1) {
+        ds.retry_lists[0].drain(&ds, &exh, Exh.onExhausted);
+    }
+    try std.testing.expectEqual(@as(u16, 0), ds.retry_lists[0].count);
+    try std.testing.expectEqual(@as(u16, 1), exh.calls);
+    try std.testing.expectEqual(DeliveryClass.sm_actor, exh.last_class);
+    try std.testing.expectEqual(drops_before + 1, actor_retry_drops.load(.monotonic));
+    _ = ds.getQueue(1).drain(0, handler);
 }

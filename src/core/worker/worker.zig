@@ -1132,6 +1132,7 @@ pub const Server = struct {
                 if (ds.getQueue(self.worker_id).hasPending()) {
                     routing_deliver.drainDeliveryQueue(self, &changes);
                     _ = muc_actor.drainRoomMailboxes(self, &changes);
+                    muc_actor.drainActorRetries(self);
                     // Self-wake only for MPSC queue CAS race (producer reserved
                     // slot but hasn't stored ready=true yet). Room mailboxes
                     // don't need self-wake — they only grow from MPSC deliveries
@@ -1142,6 +1143,7 @@ pub const Server = struct {
                 } else {
                     // No MPSC pending, but drain room mailboxes opportunistically
                     _ = muc_actor.drainRoomMailboxes(self, &changes);
+                    muc_actor.drainActorRetries(self);
                 }
             }
 

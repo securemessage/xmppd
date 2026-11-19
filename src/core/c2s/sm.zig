@@ -869,7 +869,7 @@ pub fn enqueueSmActor(self: *Server, target_worker: u16, msg: actor_message.Mess
     var enc_lease = self.leaseByteScratch() orelse return error.OutOfMemory;
     defer enc_lease.release();
     const len = actor_message.encode(enc_lease.buf, msg) orelse return error.EncodeFailed;
-    try ds.deliverDelivery(self.worker_id, target_worker, delivery_queue_mod.SM_ACTOR_TARGET, enc_lease.buf[0..len], 0, 0, .sm_actor);
+    try ds.deliverActor(self.worker_id, target_worker, delivery_queue_mod.SM_ACTOR_TARGET, enc_lease.buf[0..len], 0, 0, .sm_actor);
 }
 
 /// Append the JIDs of every MUC room the given session occupies into the

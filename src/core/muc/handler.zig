@@ -3237,9 +3237,22 @@ fn broadcastDirectoryUpdate(server: *Server, room_jid: []const u8, room_name: []
     var w: u16 = 0;
     while (w < wc) : (w += 1) {
         if (w == server.worker_id) continue;
-        ds.deliverDelivery(server.worker_id, w, delivery_queue.ROOM_ACTOR_TARGET, enc_lease.buf[0..len], 0, 0, .room_actor) catch |err| {
+        ds.deliverActor(server.worker_id, w, delivery_queue.ROOM_ACTOR_TARGET, enc_lease.buf[0..len], 0, 0, .room_actor) catch |err| {
             noteCrossWorkerDrop("directory update for '{s}' to worker {d} failed: {s}", .{ room_jid, w, @errorName(err) });
         };
+    }
+}
+
+/// Class fallback for an actor message that never reached its target
+/// ring (retry list exhausted): requests carrying a reply target get an
+/// IQ error; the rest are already counted at the retry layer.
+pub fn noteActorRetryExhausted(server: *Server, e: *const delivery_queue.ActorRetry) void {
+    const msg = actor_message.decode(e.blob.bytes()) orelse return;
+    switch (msg) {
+        .room_disco_info, .room_disco_items => |ev| sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "internal-server-error"),
+        .room_admin => |ev| sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "internal-server-error"),
+        .room_mam_query => |ev| sendIqErrorToRemote(server, ev.room_jid, ev.iq_id, ev.reply_to_worker, ev.reply_to_token, "internal-server-error"),
+        else => {},
     }
 }
 
