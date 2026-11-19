@@ -17,6 +17,7 @@
 //! - `onLaneClose(self, slot)` -- extra per-lane teardown after the runner
 //!   has dropped the lane's SCRAM sessions
 //! - `onSighup(self)` -- the daemon's own SIGHUP handling
+//! - `onSigusr1(self)` -- dump per-daemon observability counters
 
 const std = @import("std");
 const posix = std.posix;
@@ -113,7 +114,9 @@ pub fn Runner(comptime Store: type, comptime Hooks: type) type {
             comptime {
                 if (!@hasDecl(Hooks, "log"))
                     @compileError("auth runner hooks must declare 'pub const log' (std.log.scoped)");
-                for (.{ "intercept", "onPoolWake", "onLaneClose", "onSighup" }) |name| {
+                for (.{
+                    "intercept", "onPoolWake", "onLaneClose", "onSighup", "onSigusr1",
+                }) |name| {
                     if (!std.meta.hasFn(Hooks, name))
                         @compileError("auth runner hooks must provide fn " ++ name);
                 }
@@ -146,6 +149,7 @@ pub fn Runner(comptime Store: type, comptime Hooks: type) type {
             try self.loop.addSignal(posix.SIG.TERM);
             try self.loop.addSignal(posix.SIG.INT);
             try self.loop.addSignal(posix.SIG.HUP);
+            try self.loop.addSignal(posix.SIG.USR1);
         }
 
         pub fn deinit(self: *Self) void {
@@ -171,6 +175,8 @@ pub fn Runner(comptime Store: type, comptime Hooks: type) type {
                             self.running = false;
                         } else if (s.signo == posix.SIG.HUP) {
                             self.hooks.onSighup();
+                        } else if (s.signo == posix.SIG.USR1) {
+                            self.hooks.onSigusr1();
                         }
                     },
                     .fd_readable => |e| {

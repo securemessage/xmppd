@@ -7,12 +7,13 @@
 //! ## Threading
 //!
 //! A `Client` is safe to share across threads: after `init` its `SSL_CTX`s
-//! are only read, never mutated; the verification-path log table is the
-//! only shared mutable state and sits behind its own mutex. Each request
-//! owns its socket, `SSL`, resolver and kqueue for its whole lifetime;
-//! nothing else is shared between in-flight requests. The idle pool is
-//! threadlocal: each worker thread parks its own connections, so the
-//! request path takes no lock for reuse.
+//! are only read, never mutated. The verification-path log table sits
+//! behind its own mutex, and request-local resolver totals fold into one
+//! per-daemon atomic snapshot at request end. Each request owns its socket,
+//! `SSL`, resolver and kqueue for its whole lifetime; nothing else is shared
+//! between in-flight requests. The idle pool is threadlocal: each worker
+//! thread parks its own connections, so the request path takes no lock for
+//! reuse.
 //!
 //! ## Features
 //!
@@ -142,6 +143,9 @@ const MAX_HEAD_SIZE: usize = 4096;
 /// Signature of Client.test_info_hook.
 const InfoHook = fn (host: []const u8, port: u16, path: []const u8) void;
 
+/// Signature of Client.test_resolver_hook.
+const ResolverHook = fn (resolver: *dns_async.Resolver) void;
+
 /// Bounded table of the last verification path logged at info per
 /// (host, port): the Client is shared across IdP worker threads, so
 /// entries sit behind a mutex. An endpoint repeats its info line only
@@ -206,12 +210,17 @@ pub const Client = struct {
     /// RRset can never be satisfied by a PKIX anchor (fail closed).
     dane_ctx: ssl.SslContext,
     /// Which (host, port) last logged which verification path at info;
-    /// the only Client state mutated after init, under its own mutex.
+    /// mutated under its own mutex.
     path_log: PathLog,
+    /// Sum of every request-local resolver's counters, folded at request end.
+    resolver_counters: dns_async.AtomicCounters = .{},
     /// Test seam: requests resolve through this nameserver instead of
     /// the host's resolver configuration, the same seam
     /// lib/dns/async.zig's own fixtures use.
     test_nameserver: if (builtin.is_test) ?std.net.Address else void = if (builtin.is_test) null else {},
+    /// Test seam: seed a request-local resolver before its lookup starts.
+    test_resolver_hook: if (builtin.is_test) ?*const ResolverHook else void =
+        if (builtin.is_test) null else {},
     /// Test seam: invoked exactly where the per-endpoint info line is
     /// emitted, so tests count emissions instead of scraping stderr.
     test_info_hook: if (builtin.is_test) ?*const InfoHook else void = if (builtin.is_test) null else {},
@@ -229,6 +238,19 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         c.SSL_CTX_free(self.ssl_ctx);
         self.dane_ctx.deinit();
+    }
+
+    fn noteResolverCounters(self: *Client, resolver: *const dns_async.Resolver) void {
+        self.resolver_counters.add(resolver.counters());
+    }
+
+    pub fn resolverCounterDump(self: *const Client) dns_async.CounterDump {
+        return self.resolver_counters.counterDump("oidc");
+    }
+
+    /// Cold observability path called by the OIDC daemon's SIGUSR1 hook.
+    pub noinline fn dumpResolverCounters(self: *const Client) void {
+        log.info("{f}", .{self.resolverCounterDump()});
     }
 
     /// Perform an HTTPS GET request. Caller owns the returned Response.
@@ -571,7 +593,7 @@ const ResolveOutcome = struct {
 /// on `resolver.kqFd()` through waitIo under the connect deadline, then
 /// pumping `step(0)` -- never a sleep, never a blocking call.
 fn resolveTargets(
-    client: *const Client,
+    client: *Client,
     allocator: Allocator,
     kq: posix.fd_t,
     parsed: ParsedUrl,
@@ -579,9 +601,13 @@ fn resolveTargets(
     options: RequestOptions,
 ) HttpError!dns_async.Resolution {
     var resolver = dns_async.Resolver.init(allocator);
-    defer resolver.deinit();
+    defer {
+        client.noteResolverCounters(&resolver);
+        resolver.deinit();
+    }
     if (builtin.is_test) {
         if (client.test_nameserver) |ns| resolver.setServer(ns);
+        if (client.test_resolver_hook) |hook| hook(&resolver);
     }
     var outcome: ResolveOutcome = .{};
     resolver.setCallback(.{ .ctx = &outcome, .fun = ResolveOutcome.complete });
@@ -1580,6 +1606,50 @@ test "parseStatusLine: strict RFC 9112 4 shape" {
     );
     // A bare CR inside the reason phrase is a CTL, not a phrase byte.
     try std.testing.expect(parseStatusLine("HTTP/1.1 200 bad\rph\r\n") == null);
+}
+
+fn seedResolverCounters(resolver: *dns_async.Resolver) void {
+    resolver.stale_serves = 1;
+    resolver.evict_scans = 2;
+    resolver.too_many_jobs = 3;
+    resolver.malformed_replies = 4;
+    resolver.unmatched_replies = 5;
+    resolver.stale_icmp = 6;
+    resolver.kevent_errors = 7;
+    resolver.udp_errors = 8;
+}
+
+test "OIDC request-local resolver counters reach the daemon dump" {
+    // Goal: a finished request folds every local resolver counter into the
+    // per-daemon dump. Method: run the real resolveTargets defer with a
+    // literal address and seeded local counters, then format its snapshot.
+    var client = try Client.init(null);
+    defer client.deinit();
+    client.test_resolver_hook = seedResolverCounters;
+
+    const kq = try posix.kqueue();
+    defer posix.close(kq);
+    const parsed = parseUrl("https://127.0.0.1:443/").?;
+    const options = testOptions(1000, 1000);
+    var res = try resolveTargets(
+        &client,
+        std.testing.allocator,
+        kq,
+        parsed,
+        options.deadline_ns,
+        options,
+    );
+    defer res.deinitOn(std.testing.allocator);
+
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writer.print("{f}", .{client.resolverCounterDump()});
+    try std.testing.expectEqualStrings(
+        "oidc dns counters: stale_serves=1 evict_scans=2 too_many_jobs=3 " ++
+            "malformed_replies=4 unmatched_replies=5 stale_icmp=6 " ++
+            "kevent_errors=7 udp_errors=8",
+        writer.buffered(),
+    );
 }
 
 /// Loopback TCP listener that accepts connections into a hold array and

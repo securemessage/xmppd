@@ -344,8 +344,8 @@ pub const OidcStore = struct {
 
     /// One shared HTTPS client for the daemon (T357/S8): the SSL_CTX and its
     /// parsed CA bundle cost is paid once, not per token/introspection/JWKS
-    /// request. Created by start() before the workers spawn; read-only
-    /// afterwards, so workers share it safely.
+    /// request. Created by start() before the workers spawn; its TLS
+    /// contexts stay read-only and its DNS totals use atomics.
     http_client: ?http.Client = null,
 
     /// Guards the JWKS cache below (keys, key_count, jwks_body,
@@ -412,11 +412,14 @@ pub const OidcStore = struct {
         self.key_count = 0;
     }
 
-    /// Create the shared HTTPS client. Called once before the IdP workers
-    /// start; afterwards http_client is only read.
+    /// Create the shared HTTPS client before the IdP workers start.
     pub fn start(self: *OidcStore) error{TlsInitFailed}!void {
         std.debug.assert(self.http_client == null);
         self.http_client = http.Client.init(self.config.ca_file) catch return error.TlsInitFailed;
+    }
+
+    pub fn dumpResolverCounters(self: *OidcStore) void {
+        if (self.http_client) |*client| client.dumpResolverCounters();
     }
 
     fn httpClient(self: *OidcStore) *http.Client {
