@@ -16,7 +16,7 @@
 //!   └── xmppd-core (worker, handles connections)
 //! ```
 //!
-//! The master forwards the resolved configuration to core and s2s over
+//! The master forwards the resolved configuration to every child over
 //! a sealed config fd (ADR-9); their argv carries only the CLI-only
 //! fields a blob cannot express, like the inherited listen-fd slots.
 //! xmppd-auth must be ready before xmppd-core starts (core connects to
@@ -289,16 +289,13 @@ pub fn main() !void {
     const c2s_fd_str = c2s_fd_str_buf[0..c2s_fd_str_len];
     const s2s_fd_str = "3"; // the single remapped s2s listener slot
 
-    // The resolved config is serialized once into the sealed blob core
-    // and s2s inherit through their pass_fds remap slot (ADR-9); SIGHUP
-    // rebuilds it so a respawned child reads fresh values. Child argv
-    // then carries only CLI-only fields: the listen-fd remap slots and
-    // the conf-fd slot itself. auth keeps resolved values on argv until
-    // part 2b.
+    // Every child inherits the same sealed resolved config through its
+    // pass_fds remap slot (ADR-9); SIGHUP rebuilds it so a respawn reads
+    // fresh values. Child argv carries only CLI-only fd remap slots.
     var conf_arena = std.heap.ArenaAllocator.init(allocator);
     defer conf_arena.deinit();
     var fwd_diag: conf.Diag = .{};
-    const conf_blob = loaded.forwardBlob(conf_arena.allocator(), &fwd_diag) catch |err| {
+    const conf_blob = buildForwardedBlob(&loaded, conf_arena.allocator(), &fwd_diag) catch |err| {
         log.err("cannot serialize the forwarded config: {f}", .{&fwd_diag});
         return err;
     };
@@ -315,10 +312,11 @@ pub fn main() !void {
 
     var argv_arena = std.heap.ArenaAllocator.init(allocator);
     defer argv_arena.deinit();
-    const child_argv = try buildChildArgv(argv_arena.allocator(), v, .{
+    const child_argv = try buildChildArgv(argv_arena.allocator(), .{
         .s2s_listen = s2s_listen_fd >= 0,
         .c2s_fd_str = c2s_fd_str,
         .s2s_fd_str = s2s_fd_str,
+        .auth_conf_fd = "3",
         .core_conf_fd = core_conf_slot,
         .s2s_conf_fd = "4",
     });
@@ -328,9 +326,11 @@ pub fn main() !void {
     var s2s_sup = try initSupervisor(s2s_path, child_argv.s2s, child_uid, child_gid, euid);
     var core_sup = try initSupervisor(core_path, child_argv.core, child_uid, child_gid, euid);
 
-    // Per-child fd contract (S7): core gets the C2S listeners then the
-    // conf fd on the next slot, s2s its listener then the conf fd, auth
-    // nothing; everything else in the master's table closes.
+    // Per-child fd contract (S7): auth gets only the conf fd on slot 3,
+    // core gets its listeners then the conf fd, and s2s gets its listener
+    // then the conf fd. Everything else in the master's table closes.
+    var auth_pass_fds: [1]posix.fd_t = .{conf_fd.fd};
+    auth_sup.pass_fds = auth_pass_fds[0..];
     var core_pass_fds: [MAX_WORKERS + 1]posix.fd_t = undefined;
     @memcpy(core_pass_fds[0..c2s_fd_count], c2s_listen_fds[0..c2s_fd_count]);
     core_pass_fds[c2s_fd_count] = conf_fd.fd;
@@ -371,10 +371,12 @@ pub fn main() !void {
     defer rt.deinit();
 
     // SIGHUP rebuilds the forwarded blob before the runtime forwards
-    // the signal; the pass_fds tail slots move to the new fd so the
-    // next spawned core or s2s reads the reloaded values.
-    var conf_tails_buf: [2]*posix.fd_t = undefined;
+    // the signal; every pass_fds conf slot moves to the new fd so the
+    // next spawned child reads the reloaded values.
+    var conf_tails_buf: [3]*posix.fd_t = undefined;
     var conf_tails_len: usize = 0;
+    conf_tails_buf[conf_tails_len] = &auth_pass_fds[0];
+    conf_tails_len += 1;
     conf_tails_buf[conf_tails_len] = &core_pass_fds[c2s_fd_count];
     conf_tails_len += 1;
     if (s2s_listen_fd >= 0) {
@@ -492,27 +494,22 @@ const ChildArgv = struct {
     core: []const []const u8,
 };
 
-fn buildChildArgv(arena: Allocator, v: *const schema.Sections, rt: struct {
+fn buildChildArgv(arena: Allocator, rt: struct {
     /// s2s gets its fd pair only when the master bound its listener.
     s2s_listen: bool,
     /// Remapped fd slots for the C2S listeners, comma-separated.
     c2s_fd_str: []const u8,
     /// The single remapped s2s listener slot.
     s2s_fd_str: []const u8,
+    /// Remap slot of auth's sealed config fd.
+    auth_conf_fd: []const u8,
     /// Remap slot of core's sealed config fd (after its listeners).
     core_conf_fd: []const u8,
     /// Remap slot of s2s' sealed config fd (after its listener).
     s2s_conf_fd: []const u8,
 }) error{OutOfMemory}!ChildArgv {
-    const config_path: ?[]const u8 =
-        if (v.meta.config_path.len != 0) v.meta.config_path else null;
-
     var auth = std.ArrayList([]const u8).empty;
-    if (config_path) |cp| try auth.appendSlice(arena, &.{ "--config", cp });
-    // All auth backends get --db: xmppd-auth uses it for credentials AND
-    // locks; xmppd-auth-oidc reads only the shared lock table (S3:
-    // without it the OIDC daemon opened a fresh store and found nothing).
-    try auth.appendSlice(arena, &.{ "--db", v.server.db_path, "--socket", v.auth.socket });
+    try auth.appendSlice(arena, &.{ "--conf-fd", rt.auth_conf_fd });
 
     // core and s2s read the resolved values from the sealed conf fd;
     // their argv carries only the CLI-only fields a blob cannot
@@ -532,8 +529,15 @@ fn buildChildArgv(arena: Allocator, v: *const schema.Sections, rt: struct {
     };
 }
 
+/// Serializes one resolved configuration for every child, including the
+/// OIDC view of any explicitly configured shared auth rate maxima.
+fn buildForwardedBlob(loaded: *MasterLoader, arena: Allocator, diag: *conf.Diag) conf.Error![]u8 {
+    schema.normalizeForwardedOidcRates(loaded);
+    return loaded.forwardBlob(arena, diag);
+}
+
 /// Reloads the shared config on SIGHUP and reseals the forwarded blob,
-/// so the next spawned core or s2s inherits the new values. A failed
+/// so the next spawned child inherits the new values. A failed
 /// reload keeps the previous blob; the pass_fds tail slots move to the
 /// new fd only after the rebuild succeeds.
 const ConfReloader = struct {
@@ -563,7 +567,7 @@ const ConfReloader = struct {
             return;
         };
         defer rel.deinit();
-        const blob = rel.forwardBlob(arena.allocator(), &diag) catch {
+        const blob = buildForwardedBlob(&rel, arena.allocator(), &diag) catch {
             self.last_ok = false;
             log.warn("config reload failed; keeping the previous forwarded config: {f}", .{&diag});
             return;
@@ -896,15 +900,6 @@ test "conf fd slot is scanned from argv in every spelling" {
     try std.testing.expect(schema.confFdArg(&.{ "--host", "h.test" }) == null);
 }
 
-/// The value argv carries for a two-token option; null when absent.
-fn argvValue(argv: []const []const u8, opt: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i + 1 < argv.len) : (i += 1) {
-        if (std.mem.eql(u8, argv[i], opt)) return argv[i + 1];
-    }
-    return null;
-}
-
 /// Asserts the blob carries a canonical "--key=value\n" line.
 fn expectBlobLine(blob: []const u8, key: []const u8, value: []const u8) !void {
     var buf: [4096]u8 = undefined;
@@ -920,29 +915,27 @@ test "master child argv: core and s2s carry only CLI-only keys; resolved values 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [4096]u8 = undefined;
-    const path = try writeTempConfig(&tmp.dir, "conf.ini", "[server]\nhostname = file-host.test\ndb_path = /file/db\n", &path_buf);
+    const path = try writeTempConfig(&tmp.dir, "conf.ini", "[server]\nhostname = file-host.test\ndb_path = /file/db\n[oidc]\nrate_max_per_account = 42\n", &path_buf);
 
     var diag: conf.Diag = .{};
     var l = try MasterLoader.load(std.testing.allocator, .{
         .path = path,
-        .args = &.{ "--host", "cli-host.test", "--db", "/cli/db", "--config", "conf.ini" },
+        .args = &.{ "--host", "cli-host.test", "--db", "/cli/db", "--config", "conf.ini", "--auth.max_per_account=7" },
     }, &diag);
     defer l.deinit();
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const argv = try buildChildArgv(arena.allocator(), &l.values, .{
+    const argv = try buildChildArgv(arena.allocator(), .{
         .s2s_listen = true,
         .c2s_fd_str = "3,4",
         .s2s_fd_str = "3",
+        .auth_conf_fd = "3",
         .core_conf_fd = "5",
         .s2s_conf_fd = "4",
     });
 
-    // auth keeps resolved values on argv until part 2b.
-    try std.testing.expectEqualStrings("/cli/db", argvValue(argv.auth, "--db").?);
-    try std.testing.expectEqualStrings("conf.ini", argvValue(argv.auth, "--config").?);
-    try std.testing.expectEqualStrings("/var/run/xmppd/auth.sock", argvValue(argv.auth, "--socket").?);
+    try std.testing.expectEqualDeep(&[_][]const u8{ "--conf-fd", "3" }, argv.auth);
 
     // core and s2s argv is exactly the CLI-only pair.
     try std.testing.expectEqualDeep(&[_][]const u8{ "--listen-fd", "3,4", "--conf-fd", "5" }, argv.core);
@@ -950,9 +943,11 @@ test "master child argv: core and s2s carry only CLI-only keys; resolved values 
 
     // The resolved values the argv used to carry are in the blob:
     // the CLI hostname and db override the file's for every consumer.
-    const blob = try l.forwardBlob(arena.allocator(), &diag);
+    const blob = try buildForwardedBlob(&l, arena.allocator(), &diag);
     try expectBlobLine(blob, "server.hostname", "cli-host.test");
     try expectBlobLine(blob, "server.db_path", "/cli/db");
+    try expectBlobLine(blob, "auth.max_per_account", "7");
+    try expectBlobLine(blob, "oidc.max_per_account", "7");
     // An unset MUC host forwards empty; the child resolves
     // conference.<hostname> itself.
     try expectBlobLine(blob, "muc.host", "");
@@ -975,21 +970,22 @@ test "master child argv: file values reach the blob; s2s without a listener gets
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const argv = try buildChildArgv(arena.allocator(), &l.values, .{
+    const argv = try buildChildArgv(arena.allocator(), .{
         .s2s_listen = false,
         .c2s_fd_str = "3",
         .s2s_fd_str = "3",
+        .auth_conf_fd = "3",
         .core_conf_fd = "4",
         .s2s_conf_fd = "4",
     });
 
-    try std.testing.expectEqualStrings("/file/db", argvValue(argv.auth, "--db").?);
+    try std.testing.expectEqualDeep(&[_][]const u8{ "--conf-fd", "3" }, argv.auth);
     // No listener bound: the s2s child is never spawned and its argv
     // carries no fd slots at all.
     try std.testing.expectEqual(@as(usize, 0), argv.s2s.len);
     try std.testing.expectEqualDeep(&[_][]const u8{ "--listen-fd", "3", "--conf-fd", "4" }, argv.core);
 
-    const blob = try l.forwardBlob(arena.allocator(), &diag);
+    const blob = try buildForwardedBlob(&l, arena.allocator(), &diag);
     try expectBlobLine(blob, "server.hostname", "file-host.test");
     try expectBlobLine(blob, "s2s.port", "5270");
     try expectBlobLine(blob, "s2s.socket", "/run/s2s.sock");
@@ -1005,7 +1001,7 @@ test "master child argv: --no-s2s forwards s2s.enabled=false in the blob" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const blob = try l.forwardBlob(arena.allocator(), &diag);
+    const blob = try buildForwardedBlob(&l, arena.allocator(), &diag);
     try expectBlobLine(blob, "s2s.enabled", "false");
     try expectBlobLine(blob, "server.hostname", "localhost");
 }
@@ -1028,7 +1024,7 @@ test "master conf reloader: a rebuild changes what the next spawned child reads"
     defer l.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const blob = try l.forwardBlob(arena.allocator(), &diag);
+    const blob = try buildForwardedBlob(&l, arena.allocator(), &diag);
     var cfd = try conf.ConfFd.create(blob);
     defer cfd.deinit();
     const orig_fd = cfd.fd;
@@ -1085,7 +1081,7 @@ test "master conf reloader: a failed reload keeps the previous blob" {
     defer l.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const blob = try l.forwardBlob(arena.allocator(), &diag);
+    const blob = try buildForwardedBlob(&l, arena.allocator(), &diag);
     var cfd = try conf.ConfFd.create(blob);
     defer cfd.deinit();
     const orig_fd = cfd.fd;
