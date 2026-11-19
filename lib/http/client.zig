@@ -30,9 +30,10 @@
 //!   (timeout, SERVFAIL) skips the target and never falls back.
 //! - Keep-alive per endpoint: one idle connection per (host, port) parked
 //!   per worker thread. Reuse skips DNS, TCP and the TLS handshake; the
-//!   parked conn must be under 5 s idle and pass a zero-timeout
-//!   EVFILT_READ probe (no pending bytes, no EOF) or it is closed and a
-//!   fresh connect runs. HTTP/1.0 responses, `Connection: close` replies
+//!   parked conn must be under 5 s idle, hold no unread bytes inside its
+//!   SSL object and pass a zero-timeout EVFILT_READ probe (no pending
+//!   bytes, no EOF) or it is closed and a fresh connect runs.
+//!   HTTP/1.0 responses, `Connection: close` replies
 //!   and EOF-framed bodies are never parked. A GET that dies on a reused
 //!   conn before the first response byte retries once on a fresh conn;
 //!   POST never retries. Peer verification stays at connect time only.
@@ -365,9 +366,16 @@ const IdlePool = struct {
 
     /// Park `conn` under (host, port). A parked conn for the endpoint is
     /// displaced by the one that just completed; a full table drops the
-    /// newcomer. Both keep the table bounded.
+    /// newcomer. Both keep the table bounded. A conn still holding unread
+    /// bytes in its SSL object is never parked: they would parse as the
+    /// next response.
     fn put(self: *IdlePool, host: []const u8, port: u16, conn: Conn) void {
         std.debug.assert(host.len <= 255);
+        if (!sslDrained(conn)) {
+            if (builtin.is_test) pending_drops += 1;
+            closeConn(conn);
+            return;
+        }
         var free: ?*Entry = null;
         for (&self.entries) |*e| {
             if (!e.used) {
@@ -407,7 +415,7 @@ const IdlePool = struct {
             const conn = connOf(e);
             e.used = false;
             if (monotonicNs() - e.idle_since_ns >= max_idle_ns or
-                !connLive(kq, conn.fd))
+                !connLive(kq, conn))
             {
                 if (builtin.is_test) stale_detects += 1;
                 closeConn(conn);
@@ -429,16 +437,34 @@ threadlocal var idle_pool: IdlePool = .{};
 /// Test seam: counts parked connections the take-time probe discarded.
 var stale_detects: usize = 0;
 
-/// Zero-timeout liveness probe for a parked connection: any pending
-/// byte, an EOF or an error event means the peer already closed or is
-/// speaking out of turn, and the conn is not safe to reuse.
-fn connLive(kq: posix.fd_t, fd: posix.fd_t) bool {
+/// Test seam: counts conns refused at park time for holding unread SSL
+/// bytes.
+var pending_drops: usize = 0;
+
+/// Bytes OpenSSL already read from the socket but the parser has not
+/// consumed sit in the SSL object, invisible to kevent: plaintext left
+/// by a record larger than the read buffer (SSL_pending) or a buffered
+/// record not yet processed (SSL_has_pending). Either means the peer
+/// wrote past the response end, so the conn is not safe to park or
+/// reuse.
+fn sslDrained(conn: Conn) bool {
+    return c.SSL_pending(conn.ssl_ptr) == 0 and
+        c.SSL_has_pending(conn.ssl_ptr) == 0;
+}
+
+/// Zero-timeout liveness probe for a parked connection: unread bytes
+/// inside the SSL object, any pending byte, an EOF or an error event
+/// means the peer already closed or is speaking out of turn, and the
+/// conn is not safe to reuse.
+fn connLive(kq: posix.fd_t, conn: Conn) bool {
+    if (!sslDrained(conn)) return false;
     const changes = [_]posix.Kevent{
-        makeKev(@intCast(fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ONESHOT),
+        makeKev(@intCast(conn.fd), std.c.EVFILT.READ, std.c.EV.ADD | std.c.EV.ONESHOT),
     };
     var events: [1]posix.Kevent = undefined;
     const zero: posix.timespec = .{ .sec = 0, .nsec = 0 };
     const n = posix.kevent(kq, &changes, &events, &zero) catch return false;
+    // A live conn's ONESHOT knote stays on kq; kq closes with the request.
     return n == 0;
 }
 
@@ -1973,6 +1999,12 @@ const KaState = struct {
     /// the FIN is queued before the flag, so a client probing afterwards
     /// sees the EOF deterministically.
     closed_after: std.atomic.Value(usize) = .init(0),
+    /// After replying to this request also write a junk record (0 =
+    /// never): a peer speaking past the response end.
+    extra_after: std.atomic.Value(usize) = .init(0),
+    /// On this accept (1-based) write a junk record right after the
+    /// handshake, before any request (0 = never).
+    junk_on_accept: std.atomic.Value(usize) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
 };
 
@@ -1980,6 +2012,8 @@ const KaConn = struct {
     ctx: *c.SSL_CTX,
     fd: posix.fd_t,
     st: *KaState,
+    /// 1-based accept number, for the accept-scripted fields.
+    accept_no: usize,
 };
 
 /// One accepted connection: TLS, then a read-head/reply loop honoring
@@ -1992,6 +2026,10 @@ fn kaConn(a: KaConn) void {
     defer c.SSL_free(ssl_ptr);
     _ = c.SSL_set_fd(ssl_ptr, a.fd);
     if (c.SSL_accept(ssl_ptr) != 1) return;
+    if (a.accept_no == a.st.junk_on_accept.load(.acquire)) {
+        const junk = "JUNK-NOT-A-RESPONSE";
+        _ = c.SSL_write(ssl_ptr, junk.ptr, junk.len);
+    }
     const deadline = std.time.milliTimestamp() + 10000;
     var buf: [8192]u8 = undefined;
     var total: usize = 0;
@@ -2007,6 +2045,10 @@ fn kaConn(a: KaConn) void {
         if (n == a.st.close_on.load(.acquire)) return; // silent close
         const resp = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nok\r\n";
         _ = c.SSL_write(ssl_ptr, resp.ptr, resp.len);
+        if (n == a.st.extra_after.load(.acquire)) {
+            const junk = "JUNK-NOT-A-RESPONSE";
+            _ = c.SSL_write(ssl_ptr, junk.ptr, junk.len);
+        }
         total = 0;
         if (n == a.st.close_after.load(.acquire)) {
             // close_notify, then the socket: the flag is set only after
@@ -2050,12 +2092,17 @@ fn serveKeepAlive(cert_path: [*:0]const u8, key_path: [*:0]const u8, st: *KaStat
         const pn = posix.poll(&fds, 250) catch break;
         if (pn <= 0) continue;
         const conn = posix.accept(listen_fd, null, null, 0) catch continue;
-        _ = st.accepts.fetchAdd(1, .acq_rel);
+        const accept_no = st.accepts.fetchAdd(1, .acq_rel) + 1;
         if (n_handlers >= handlers.len) {
             posix.close(conn);
             continue;
         }
-        const h = std.Thread.spawn(.{}, kaConn, .{KaConn{ .ctx = ctx, .fd = conn, .st = st }}) catch {
+        const h = std.Thread.spawn(.{}, kaConn, .{KaConn{
+            .ctx = ctx,
+            .fd = conn,
+            .st = st,
+            .accept_no = accept_no,
+        }}) catch {
             posix.close(conn);
             continue;
         };
@@ -2251,6 +2298,179 @@ test "TLS: keep-alive discards a parked conn the server already closed" {
     // retried on a third accept.
     try std.testing.expectEqual(@as(usize, 1), stale_detects);
     try std.testing.expectEqual(@as(usize, 2), st.accepts.load(.acquire));
+}
+
+/// The parked entry for (host, port), or null when none is parked.
+fn parkedEntry(host: []const u8, port: u16) ?*IdlePool.Entry {
+    for (&idle_pool.entries) |*e| {
+        if (e.used and e.port == port and e.host_len == host.len and
+            std.mem.eql(u8, e.host[0..e.host_len], host)) return e;
+    }
+    return null;
+}
+
+/// SSL_peek on `ssl_ptr` until one byte arrives or the deadline passes.
+/// Pulls the peer's next record into the SSL object, so the kernel
+/// socket reports quiet and only the SSL checks can see it.
+fn peekUntil(ssl_ptr: *c.SSL, deadline_ms: i64) c_int {
+    var buf: [8]u8 = undefined;
+    while (std.time.milliTimestamp() < deadline_ms) {
+        const r = c.SSL_peek(ssl_ptr, @ptrCast(&buf), @intCast(buf.len));
+        if (r > 0) return r;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    return 0;
+}
+
+test "TLS: keep-alive discards a parked conn holding unread bytes in OpenSSL" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var st = KaState{};
+    // The server writes a junk record right after response 1: bytes the
+    // next request must never parse as its own response.
+    st.extra_after.store(1, .release);
+    const th = try std.Thread.spawn(.{}, serveKeepAlive, .{ cert_path.ptr, key_path.ptr, &st });
+    defer {
+        st.stop.store(true, .release);
+        th.join();
+    }
+    const dl = std.time.milliTimestamp() + 3000;
+    while (st.port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = st.port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    const dns_srv = try startFakeDns(.{});
+    defer stopFakeDns(dns_srv);
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    defer drainIdlePool();
+    useFakeDns(&client, dns_srv);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/jwks", .{p});
+    stale_detects = 0;
+    var resp1 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp1.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp1.status);
+
+    // Response 1 parked the conn. Pull the junk record into the parked
+    // conn's SSL object: the kernel socket then reports quiet, so a
+    // kevent-only probe would call it live.
+    const entry = parkedEntry("localhost", @intCast(p)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(peekUntil(entry.ssl_ptr.?, dl) > 0);
+    try std.testing.expect(c.SSL_pending(entry.ssl_ptr.?) > 0);
+
+    const kq = try posix.kqueue();
+    defer posix.close(kq);
+    try std.testing.expect(idle_pool.take(kq, "localhost", @intCast(p)) == null);
+    try std.testing.expectEqual(@as(usize, 1), stale_detects);
+
+    // The next GET runs on a fresh conn and gets its own response.
+    var resp2 = try client.get(std.testing.allocator, url, testOptions(5000, 2000));
+    defer resp2.deinit();
+    try std.testing.expectEqual(@as(u16, 200), resp2.status);
+    try std.testing.expectEqual(@as(usize, 2), st.accepts.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), st.requests.load(.acquire));
+}
+
+test "TLS: keep-alive never parks a conn with unread bytes in OpenSSL" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    genTestCert(tmp.dir) catch return error.SkipZigTest;
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cert_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/cert.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/key.pem",
+        .{base},
+        0,
+    );
+    defer std.testing.allocator.free(key_path);
+
+    var st = KaState{};
+    // Accept 1 gets a junk record right after the handshake, before any
+    // request.
+    st.junk_on_accept.store(1, .release);
+    const th = try std.Thread.spawn(.{}, serveKeepAlive, .{ cert_path.ptr, key_path.ptr, &st });
+    defer {
+        st.stop.store(true, .release);
+        th.join();
+    }
+    const dl = std.time.milliTimestamp() + 3000;
+    while (st.port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const p = st.port.load(.acquire);
+    try std.testing.expect(p != 0);
+
+    const dns_srv = try startFakeDns(.{});
+    defer stopFakeDns(dns_srv);
+    var client = try Client.init(cert_path);
+    defer client.deinit();
+    defer drainIdlePool();
+    useFakeDns(&client, dns_srv);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/jwks", .{p});
+    const parsed = parseUrl(url).?;
+    var host_buf: [256]u8 = undefined;
+    @memcpy(host_buf[0..parsed.host.len], parsed.host);
+    host_buf[parsed.host.len] = 0;
+    const host_z: [*:0]const u8 = @ptrCast(&host_buf);
+
+    const kq = try posix.kqueue();
+    defer posix.close(kq);
+    const options = testOptions(5000, 2000);
+    const conn = try connectAndHandshake(
+        &client,
+        std.testing.allocator,
+        kq,
+        host_z,
+        parsed,
+        monotonicNs() + @as(u64, options.connect_timeout_ms) * std.time.ns_per_ms,
+        options,
+    );
+    var owned = true;
+    defer if (owned) closeConn(conn);
+
+    // Pull the junk record into the conn's SSL object so the kernel
+    // socket reports quiet.
+    try std.testing.expect(peekUntil(conn.ssl_ptr, dl) > 0);
+    try std.testing.expect(c.SSL_pending(conn.ssl_ptr) > 0);
+
+    pending_drops = 0;
+    idle_pool.put("localhost", @intCast(p), conn);
+    owned = false;
+    try std.testing.expectEqual(@as(usize, 1), pending_drops);
+    try std.testing.expect(idle_pool.take(kq, "localhost", @intCast(p)) == null);
 }
 
 test "TLS: keep-alive never retries a POST" {
