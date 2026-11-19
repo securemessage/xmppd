@@ -2182,7 +2182,7 @@ fn sendPepNotification(
                         noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ bound.local, bound.domain, entry.resource(), self_msg_lease.buf.len });
                         continue;
                     };
-                    ds.deliver(server.worker_id, entry.worker_id, entry.token, notif_xml) catch |err| {
+                    ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, notif_xml, 0, 0, .pep) catch |err| {
                         noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
                     };
                 }
@@ -2274,7 +2274,7 @@ fn sendPepNotification(
                         noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ sub_local, sub_domain, entry.resource(), sub_msg_lease.buf.len });
                         continue;
                     };
-                    ds.deliver(server.worker_id, entry.worker_id, entry.token, notif_xml) catch |err| {
+                    ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, notif_xml, 0, 0, .pep) catch |err| {
                         noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
                     };
                 }
@@ -2692,7 +2692,7 @@ pub fn pushRosterItem(
             if (!target.roster_interested) continue;
             fanout.deliverToSession(target, full_xml, entry.token.index);
         } else if (server.delivery_system) |ds| {
-            ds.deliver(server.worker_id, entry.worker_id, entry.token, full_xml) catch |err| {
+            ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, full_xml, 0, 0, .roster_push) catch |err| {
                 noteCrossWorkerDrop("roster push to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
             };
         }

@@ -920,9 +920,14 @@ fn enqueueCrossThreadStanza(
         return false;
     };
 
+    // A bodyless message is a typing-only chat state; the receiving
+    // worker applies the CSI filter to the remote target (V14).
+    const class: delivery_queue_mod.DeliveryClass = if (kind == .message and
+        std.mem.indexOf(u8, inner_xml, "<body") == null) .chatstate else .normal;
+
     // Carry the dispatch identity so the receiving worker holds this message
     // under the same token every other holder uses.
-    ds.deliverDelivery(server.worker_id, route.worker_id, route.token, payload, hold_token, receipt_ts, .stanza) catch |err| {
+    ds.deliverDelivery(server.worker_id, route.worker_id, route.token, payload, hold_token, receipt_ts, class) catch |err| {
         noteCrossWorkerDrop("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.token.index, err });
         return false;
     };

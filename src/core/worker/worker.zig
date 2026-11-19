@@ -2004,7 +2004,7 @@ pub const Server = struct {
                         // Carry this dispatch's token: the receiving worker holds
                         // under the same identity, so the store writes one row
                         // whichever worker reaches it first.
-                        ds.deliverDelivery(self.worker_id, entry.worker_id, entry.token, m.stanza_xml, s2s_hold_token, s2s_archive_ts, .stanza) catch {
+                        ds.deliverDelivery(self.worker_id, entry.worker_id, entry.token, m.stanza_xml, s2s_hold_token, s2s_archive_ts, .normal) catch {
                             _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
                         };
                     }

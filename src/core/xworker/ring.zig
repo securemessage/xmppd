@@ -94,14 +94,27 @@ pub const QUEUE_SLOTS: u32 = 256;
 /// worker applies the class's per-session policy to a remote target exactly
 /// as the local path applies it, because session flags like carbons_enabled
 /// live on the consumer's Session and the producer cannot see them.
-pub const DeliveryKind = enum(u8) {
+pub const DeliveryClass = enum(u8) {
     /// A stanza under RFC 6121 delivery rules: it may be held behind a
     /// draining offline tail and it may be replayed on SM resume.
-    stanza = 0,
+    normal = 0,
     /// A XEP-0280 carbon copy: only a Carbons-enabled session receives it,
     /// and only live. A carbon is never held behind an offline tail, never
     /// stored and never bounced.
     carbon = 1,
+    /// A roster set push: only a resource that asked for roster pushes
+    /// receives it.
+    roster_push = 2,
+    /// A bodyless typing-only message: an inactive-CSI session skips it.
+    chatstate = 3,
+    /// A XEP-0163 PEP notification.
+    pep = 4,
+    /// A room-actor wire message under the ROOM_ACTOR_TARGET sentinel.
+    room_actor = 5,
+    /// An SM-resume actor wire message under the SM_ACTOR_TARGET sentinel.
+    sm_actor = 6,
+    /// A store-completion actor message; reserved for the C11 store path.
+    store_done = 7,
 };
 
 /// A refcounted payload shared between ring slots, room mailboxes, SM
@@ -206,7 +219,7 @@ pub const Envelope = struct {
     /// consumer need not touch blob cache lines to read it).
     len: u32 = 0,
     /// Delivery class the consumer applies to this slot.
-    kind: DeliveryKind = .stanza,
+    class: DeliveryClass = .normal,
     /// Set to true by producer AFTER the descriptor is written.
     /// Consumer MUST check this before reading the slot.
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -230,7 +243,7 @@ pub const MpscQueue = struct {
     current_slot_token: u64 = 0,
     /// Delivery class of the slot the drain is currently handing to the
     /// handler. Consumer-only, valid for the duration of one handler call.
-    current_slot_kind: DeliveryKind = .stanza,
+    current_slot_class: DeliveryClass = .normal,
     /// Producer receipt time of that same slot; 0 when untimed.
     current_slot_receipt_ts: u64 = 0,
 
@@ -243,7 +256,7 @@ pub const MpscQueue = struct {
         target: Token,
         blob: *Blob,
     ) !void {
-        return self.enqueueEnvelope(target, blob, 0, 0, .stanza);
+        return self.enqueueEnvelope(target, blob, 0, 0, .normal);
     }
 
     /// Enqueue a delivery with its dispatch identity, producer receipt time
@@ -257,7 +270,7 @@ pub const MpscQueue = struct {
         blob: *Blob,
         hold_token: u64,
         receipt_ts: u64,
-        kind: DeliveryKind,
+        class: DeliveryClass,
     ) !void {
         // CAS loop to reserve a slot
         while (true) {
@@ -288,7 +301,7 @@ pub const MpscQueue = struct {
             slot.hold_token = hold_token;
             slot.receipt_ts = receipt_ts;
             slot.len = blob.len;
-            slot.kind = kind;
+            slot.class = class;
 
             // Publish: signal to consumer that this slot is fully written
             slot.ready.store(true, .release);
@@ -320,11 +333,11 @@ pub const MpscQueue = struct {
             // time without widening the handler signature.
             const blob = slot.blob.?;
             self.current_slot_token = slot.hold_token;
-            self.current_slot_kind = slot.kind;
+            self.current_slot_class = slot.class;
             self.current_slot_receipt_ts = slot.receipt_ts;
             handler(ctx, slot.target, blob.bytes());
             self.current_slot_token = 0;
-            self.current_slot_kind = .stanza;
+            self.current_slot_class = .normal;
             self.current_slot_receipt_ts = 0;
             processed += 1;
 
@@ -516,7 +529,7 @@ pub const DeliverySystem = struct {
         target: Token,
         payload: []const u8,
     ) !void {
-        return self.deliverDelivery(producer_worker, target_worker, target, payload, 0, 0, .stanza);
+        return self.deliverDelivery(producer_worker, target_worker, target, payload, 0, 0, .normal);
     }
 
     /// Deliver a stanza with its dispatch identity, producer receipt time
@@ -529,9 +542,9 @@ pub const DeliverySystem = struct {
         payload: []const u8,
         hold_token: u64,
         receipt_ts: u64,
-        kind: DeliveryKind,
+        class: DeliveryClass,
     ) !void {
-        try self.enqueueDelivery(producer_worker, target_worker, target, payload, hold_token, receipt_ts, kind);
+        try self.enqueueDelivery(producer_worker, target_worker, target, payload, hold_token, receipt_ts, class);
 
         self.wakeWorker(target_worker);
     }
@@ -547,7 +560,7 @@ pub const DeliverySystem = struct {
         target: Token,
         payload: []const u8,
     ) !void {
-        return self.enqueueDelivery(producer_worker, target_worker, target, payload, 0, 0, .stanza);
+        return self.enqueueDelivery(producer_worker, target_worker, target, payload, 0, 0, .normal);
     }
 
     /// Enqueue a delivery with its dispatch identity, producer receipt time
@@ -563,12 +576,12 @@ pub const DeliverySystem = struct {
         payload: []const u8,
         hold_token: u64,
         receipt_ts: u64,
-        kind: DeliveryKind,
+        class: DeliveryClass,
     ) !void {
         if (target_worker >= self.worker_count) return error.InvalidWorker;
         const blob = try self.produceBlob(producer_worker, payload);
         defer blob.release();
-        try self.enqueueBlob(target_worker, target, blob, hold_token, receipt_ts, kind);
+        try self.enqueueBlob(target_worker, target, blob, hold_token, receipt_ts, class);
     }
 
     /// Enqueue an already-produced blob into a target worker's ring
@@ -582,10 +595,10 @@ pub const DeliverySystem = struct {
         blob: *Blob,
         hold_token: u64,
         receipt_ts: u64,
-        kind: DeliveryKind,
+        class: DeliveryClass,
     ) !void {
         if (target_worker >= self.worker_count) return error.InvalidWorker;
-        try self.queues[target_worker].enqueueEnvelope(target, blob, hold_token, receipt_ts, kind);
+        try self.queues[target_worker].enqueueEnvelope(target, blob, hold_token, receipt_ts, class);
         if (self.envelope_hook) |h| h();
     }
 
@@ -597,9 +610,9 @@ pub const DeliverySystem = struct {
         blob: *Blob,
         hold_token: u64,
         receipt_ts: u64,
-        kind: DeliveryKind,
+        class: DeliveryClass,
     ) !void {
-        try self.enqueueBlob(target_worker, target, blob, hold_token, receipt_ts, kind);
+        try self.enqueueBlob(target_worker, target, blob, hold_token, receipt_ts, class);
         self.wakeWorker(target_worker);
     }
 
@@ -713,7 +726,7 @@ test "MpscQueue: receipt timestamp reaches the drain handler" {
     {
         const blob = try testBudget().produce("timed");
         defer blob.release();
-        try queue.enqueueEnvelope(Token.init(42, 7, token_kinds.session), blob, 0xdeadbeef, 12345, .stanza);
+        try queue.enqueueEnvelope(Token.init(42, 7, token_kinds.session), blob, 0xdeadbeef, 12345, .normal);
     }
     try enqueuePayload(&queue, Token.init(43, 8, token_kinds.session), "untimed");
 
@@ -748,7 +761,7 @@ test "MpscQueue: hold token survives the round trip and is cleared after each sl
     {
         const blob = try testBudget().produce("tagged");
         defer blob.release();
-        try queue.enqueueEnvelope(Token.init(42, 7, token_kinds.session), blob, 0xdeadbeef, 0, .stanza);
+        try queue.enqueueEnvelope(Token.init(42, 7, token_kinds.session), blob, 0xdeadbeef, 0, .normal);
     }
     try enqueuePayload(&queue, Token.init(43, 8, token_kinds.session), "untagged");
 
@@ -792,26 +805,26 @@ test "MpscQueue: delivery kind survives the round trip and is cleared after each
 
     const Ctx = struct {
         queue: *MpscQueue,
-        kinds: *[2]DeliveryKind,
+        kinds: *[2]DeliveryClass,
         seen: *usize,
     };
-    var kinds = [_]DeliveryKind{ .stanza, .stanza };
+    var kinds = [_]DeliveryClass{ .normal, .normal };
     var seen: usize = 0;
     const ctx = Ctx{ .queue = &queue, .kinds = &kinds, .seen = &seen };
 
     const handler = struct {
         fn handle(c: Ctx, _: Token, pl: []const u8) void {
             _ = pl;
-            c.kinds.*[c.seen.*] = c.queue.current_slot_kind;
+            c.kinds.*[c.seen.*] = c.queue.current_slot_class;
             c.seen.* += 1;
         }
     }.handle;
 
     const processed = queue.drain(ctx, handler);
     try std.testing.expectEqual(@as(u32, 2), processed);
-    try std.testing.expectEqual(DeliveryKind.carbon, kinds[0]);
-    try std.testing.expectEqual(DeliveryKind.stanza, kinds[1]);
-    try std.testing.expectEqual(DeliveryKind.stanza, queue.current_slot_kind);
+    try std.testing.expectEqual(DeliveryClass.carbon, kinds[0]);
+    try std.testing.expectEqual(DeliveryClass.normal, kinds[1]);
+    try std.testing.expectEqual(DeliveryClass.normal, queue.current_slot_class);
 }
 
 test "MpscQueue: queue full" {
@@ -968,7 +981,7 @@ test "DeliverySystem: racing producers lose no wakeups" {
             while (i < n) : (i += 1) {
                 // QueueFull drops are legitimate backpressure; only slots
                 // that landed are owed a wake.
-                ds.deliverDelivery(0, 1, Token.init(0, 0, token_kinds.session), "race", 0, 0, .stanza) catch |err| switch (err) {
+                ds.deliverDelivery(0, 1, Token.init(0, 0, token_kinds.session), "race", 0, 0, .normal) catch |err| switch (err) {
                     error.QueueFull => continue,
                     error.InvalidWorker, error.PayloadTooLarge, error.BlobBudget => unreachable,
                 };

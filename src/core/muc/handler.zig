@@ -3237,7 +3237,7 @@ fn broadcastDirectoryUpdate(server: *Server, room_jid: []const u8, room_name: []
     var w: u16 = 0;
     while (w < wc) : (w += 1) {
         if (w == server.worker_id) continue;
-        ds.deliver(server.worker_id, w, delivery_queue.ROOM_ACTOR_TARGET, enc_lease.buf[0..len]) catch |err| {
+        ds.deliverDelivery(server.worker_id, w, delivery_queue.ROOM_ACTOR_TARGET, enc_lease.buf[0..len], 0, 0, .room_actor) catch |err| {
             noteCrossWorkerDrop("directory update for '{s}' to worker {d} failed: {s}", .{ room_jid, w, @errorName(err) });
         };
     }

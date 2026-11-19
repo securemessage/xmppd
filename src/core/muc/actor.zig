@@ -186,7 +186,7 @@ pub fn enqueueRoomActorMessage(self: *Server, target_worker: u16, msg: actor_mes
         log.warn("room actor message encode failed", .{});
         return;
     };
-    ds.deliver(self.worker_id, target_worker, delivery_queue_mod.ROOM_ACTOR_TARGET, enc_lease.buf[0..len]) catch |err| {
+    ds.deliverDelivery(self.worker_id, target_worker, delivery_queue_mod.ROOM_ACTOR_TARGET, enc_lease.buf[0..len], 0, 0, .room_actor) catch |err| {
         log.warn("room actor enqueue to worker {d} failed: {}", .{ target_worker, err });
     };
 }

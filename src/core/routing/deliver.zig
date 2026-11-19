@@ -239,8 +239,14 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
             // which never holds) applies to a remote target: it is
             // never held behind a draining offline tail, never stored
             // and never bounced.
-            const is_carbon = c.queue.current_slot_kind == .carbon;
+            const class = c.queue.current_slot_class;
+            const is_carbon = class == .carbon;
             if (is_carbon and !target_session.carbons_enabled) return;
+            // The same per-session gates the local path applies (V14):
+            // typing-only messages skip inactive-CSI sessions and roster
+            // pushes skip resources that never asked for roster pushes.
+            if (class == .chatstate and !target_session.csi_active) return;
+            if (class == .roster_push and !target_session.roster_interested) return;
             // The hold check comes before the SM-detach check: a detached
             // session may still have an undrained offline tail, and a
             // message pushed into its replay queue would be replayed
@@ -343,7 +349,7 @@ pub fn deliverMulticastToWorkers(self: *Server, room: *const room_registry_mod.R
     var mask_it = mask.iterator(.{});
     while (mask_it.next()) |bit| {
         const wid: u16 = @intCast(bit);
-        ds.deliverBlob(wid, delivery_queue_mod.MULTICAST_TARGET, blob, 0, 0, .stanza) catch |err| {
+        ds.deliverBlob(wid, delivery_queue_mod.MULTICAST_TARGET, blob, 0, 0, .normal) catch |err| {
             log.warn("multicast delivery failed to worker {d}: {}", .{ wid, err });
         };
     }
@@ -403,6 +409,58 @@ test "cross-thread delivery: enqueue and drain" {
     try std.testing.expect(std.mem.indexOf(u8, received, "cross-thread!") != null);
     try std.testing.expect(std.mem.indexOf(u8, received, "alice@localhost/mobile") != null);
     try std.testing.expect(std.mem.indexOf(u8, received, "bob@localhost") != null);
+}
+
+test "V14: per-session filters apply to a remote target" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    // The consuming worker; its Session carries the flags the filter reads.
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 1;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.init(fds[0], 5, "localhost", false, allocator);
+    server.sessions[5] = session;
+    try sm.bind(1, server.sessionToken(5), "bob", "localhost", "desktop");
+
+    const route = sm.findByFullJid("bob", "localhost", "desktop").?;
+    const chatstate = "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><composing xmlns='http://jabber.org/protocol/chatstates'/></message>";
+    const roster_push = "<iq type='set' to='bob@localhost/desktop' id='r1'><query xmlns='jabber:iq:roster'/></iq>";
+
+    var change_buf: [16]posix.Kevent = undefined;
+
+    // Inactive CSI suppresses a remote typing indicator, exactly as the
+    // local dispatch skips the session.
+    session.csi_active = false;
+    try delivery_sys.deliverDelivery(0, 1, route.token, chatstate, 0, 0, .chatstate);
+    var changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(!session.conn.hasPendingWrite());
+
+    // A resource that never asked for roster pushes does not get a remote
+    // one either.
+    try delivery_sys.deliverDelivery(0, 1, route.token, roster_push, 0, 0, .roster_push);
+    changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(!session.conn.hasPendingWrite());
+
+    // Positive control: the same envelope classes land when the flags allow.
+    session.csi_active = true;
+    try delivery_sys.deliverDelivery(0, 1, route.token, chatstate, 0, 0, .chatstate);
+    changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(session.conn.hasPendingWrite());
 }
 
 test "cross-thread delivery: a token minted for a freed-then-reused slot is dropped (ADR-4)" {
@@ -544,7 +602,7 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
 
     // The producer tags the slot with its own receipt time; the hold on the
     // consuming worker must store that time, not the time the drain ran.
-    try delivery_sys.deliverDelivery(0, 1, server.sessionToken(5), "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345, .stanza);
+    try delivery_sys.deliverDelivery(0, 1, server.sessionToken(5), "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345, .normal);
     drainDeliveryQueue(&server, &changes);
 
     session_lifecycle.drainOfflinePending(&server, session, &changes);
