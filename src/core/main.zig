@@ -83,13 +83,26 @@ pub fn main() !void {
     defer argv.deinit(allocator);
     while (args.next()) |arg| try argv.append(allocator, arg);
 
-    var diag: conf.Diag = .{};
-    var loaded = loadCoreConfig(allocator, argv.items, &diag) catch |err| {
-        log.err("{f}", .{diag});
+    // The resolved loader and its diagnostics are heap-owned: the loader's
+    // Sections plus provenance and the Diag's copy buffers each exceed the
+    // 4 KB in-place rule, and main's frame persists for the worker loop's
+    // whole life.
+    const Cfg = struct {
+        diag: conf.Diag,
+        loader: schema.CoreLoader,
+    };
+    const cfg = try allocator.create(Cfg);
+    cfg.diag = .{};
+    loadCoreConfig(&cfg.loader, allocator, argv.items, &cfg.diag) catch |err| {
+        log.err("{f}", .{&cfg.diag});
+        allocator.destroy(cfg);
         return err;
     };
-    defer loaded.deinit();
-    const v = &loaded.values;
+    defer {
+        cfg.loader.deinit();
+        allocator.destroy(cfg);
+    }
+    const v = &cfg.loader.values;
 
     if (v.meta.help) {
         try printUsage(allocator);
@@ -110,7 +123,7 @@ pub fn main() !void {
 
     // cert/key arrive sentinel-terminated for the C TLS API; the file's
     // [tls] section is honored now (ADR-9).
-    const tls = resolveTls(loaded.arena_state.allocator(), v) catch |err| switch (err) {
+    const tls = resolveTls(cfg.loader.arena_state.allocator(), v) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.TlsIncomplete => {
             log.err("tls.cert and tls.key must be set together", .{});
@@ -337,9 +350,13 @@ pub fn main() !void {
 /// Loads the core configuration through the shared loader (ADR-9):
 /// the inherited --conf-fd blob is prescanned alongside --config, so a
 /// supervised child gets file < forwarded < CLI and a manual run gets
-/// default < file < CLI.
-fn loadCoreConfig(gpa: std.mem.Allocator, argv: []const []const u8, diag: *conf.Diag) conf.Error!schema.CoreLoader {
-    return schema.CoreLoader.load(gpa, .{
+/// default < file < CLI. The caller owns `loaded`; on error it is
+/// already deinitialized. noinline keeps the parser's locals out of
+/// main's long-lived frame in optimized builds.
+noinline fn loadCoreConfig(loaded: *schema.CoreLoader, gpa: std.mem.Allocator, argv: []const []const u8, diag: *conf.Diag) conf.Error!void {
+    loaded.* = schema.CoreLoader.init(gpa);
+    errdefer loaded.deinit();
+    try loaded.loadInto(.{
         .conf_fd = schema.confFdArg(argv),
         .path = schema.configPathArg(argv),
         .args = argv,
@@ -540,7 +557,8 @@ test "core config: the file's [tls] section reaches the TLS setup" {
     , &path_buf);
 
     var diag: conf.Diag = .{};
-    var l = try loadCoreConfig(testing.allocator, &.{ "--config", path }, &diag);
+    var l: schema.CoreLoader = undefined;
+    try loadCoreConfig(&l, testing.allocator, &.{ "--config", path }, &diag);
     defer l.deinit();
     try testing.expectEqualStrings("/x/cert.pem", l.values.tls.cert);
     try testing.expectEqualStrings("/x/key.pem", l.values.tls.key);
@@ -565,7 +583,8 @@ test "core config: --no-tls wins over a file [tls] pair" {
     , &path_buf);
 
     var diag: conf.Diag = .{};
-    var l = try loadCoreConfig(testing.allocator, &.{ "--config", path, "--no-tls" }, &diag);
+    var l: schema.CoreLoader = undefined;
+    try loadCoreConfig(&l, testing.allocator, &.{ "--config", path, "--no-tls" }, &diag);
     defer l.deinit();
     try testing.expect(!l.values.tls.enabled);
 
@@ -582,7 +601,8 @@ test "core config: cert without key is a startup error" {
     const path = try writeTempConfig(&tmp.dir, "core.ini", "[tls]\ncert = /x/cert.pem\n", &path_buf);
 
     var diag: conf.Diag = .{};
-    var l = try loadCoreConfig(testing.allocator, &.{ "--config", path }, &diag);
+    var l: schema.CoreLoader = undefined;
+    try loadCoreConfig(&l, testing.allocator, &.{ "--config", path }, &diag);
     defer l.deinit();
     try testing.expectError(error.TlsIncomplete, resolveTls(l.arena_state.allocator(), &l.values));
 }
@@ -603,7 +623,8 @@ test "core config: a child without --conf-fd loads its --config file" {
     , &path_buf);
 
     var diag: conf.Diag = .{};
-    var l = try loadCoreConfig(testing.allocator, &.{ "--config", path }, &diag);
+    var l: schema.CoreLoader = undefined;
+    try loadCoreConfig(&l, testing.allocator, &.{ "--config", path }, &diag);
     defer l.deinit();
     try testing.expectEqualStrings("manual.test", l.values.server.hostname);
     try testing.expectEqual(.file, l.provenanceOf("server", "hostname"));
@@ -615,6 +636,7 @@ test "core config: a child without --conf-fd loads its --config file" {
 
 test "core config: an unknown argument is a startup error, not a warning" {
     var diag: conf.Diag = .{};
-    try testing.expectError(error.UnknownArgument, loadCoreConfig(testing.allocator, &.{"--bogus-arg"}, &diag));
+    var l: schema.CoreLoader = undefined;
+    try testing.expectError(error.UnknownArgument, loadCoreConfig(&l, testing.allocator, &.{"--bogus-arg"}, &diag));
     try testing.expectEqualStrings("--bogus-arg", diag.key);
 }
