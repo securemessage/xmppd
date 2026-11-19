@@ -64,6 +64,15 @@ pub fn UserStore(comptime Backend: type) type {
 
         const Self = @This();
 
+        /// Auth store capabilities (handler.Capabilities): local credential
+        /// lookup plus the account-management operations.
+        pub const capabilities = .{
+            .lookup = true,
+            .add_user = true,
+            .change_password = true,
+            .remove_user = true,
+        };
+
         pub fn init(b: *Backend) Self {
             return .{ .backend = b };
         }

@@ -22,6 +22,28 @@ const log = std.log.scoped(.auth_policy);
 
 pub const Outcome = enum { success, failure };
 
+/// SASL auth-failure reason, one tag per wire string. `text` is the value
+/// placed on the wire and in logs; the mapping is one-to-one.
+pub const FailureReason = enum {
+    invalid_encoding,
+    not_authorized,
+    mechanism_not_supported,
+    temporary_auth_failure,
+    account_disabled,
+    policy_violation,
+
+    pub fn text(self: FailureReason) []const u8 {
+        return switch (self) {
+            .invalid_encoding => "invalid-encoding",
+            .not_authorized => "not-authorized",
+            .mechanism_not_supported => "mechanism-not-supported",
+            .temporary_auth_failure => "temporary-auth-failure",
+            .account_disabled => "account-disabled",
+            .policy_violation => "policy-violation",
+        };
+    }
+};
+
 /// Three-state lock verdict (T352/S3): a store error must NOT be mapped to
 /// "unlocked": that is fail-open on exactly the path that protects
 /// permanently locked accounts.
@@ -47,17 +69,25 @@ pub const LockChecker = struct {
 };
 
 /// Standard LockChecker adapter over a LockStore (shared by xmppd-auth and
-/// xmppd-auth-oidc so both enforce the same permanent locks).
-pub fn makeLockChecker(comptime Backend: type, ls: *lock_store_mod.LockStore(Backend), alloc: std.mem.Allocator) LockChecker {
-    const S = struct {
-        const Ctx = struct {
-            lock_store: *lock_store_mod.LockStore(Backend),
-            allocator: std.mem.Allocator,
-        };
-        var ctx: Ctx = undefined;
+/// xmppd-auth-oidc so both enforce the same permanent locks). The context
+/// is stored inline and the checker points at the adapter itself, so it
+/// must be initialized in place and kept alive for the checker's lifetime.
+pub fn LockStoreChecker(comptime Backend: type) type {
+    return struct {
+        lock_store: *lock_store_mod.LockStore(Backend),
+        allocator: std.mem.Allocator,
+        checker: LockChecker = undefined,
 
-        fn check(_: *anyopaque, username: []const u8) LockCheckResult {
-            const result = ctx.lock_store.isLocked(ctx.allocator, username) catch |err| switch (err) {
+        const Self = @This();
+
+        pub fn init(self: *Self, ls: *lock_store_mod.LockStore(Backend), alloc: std.mem.Allocator) void {
+            self.* = .{ .lock_store = ls, .allocator = alloc };
+            self.checker = .{ .ctx = @ptrCast(self), .checkFn = &checkLock };
+        }
+
+        fn checkLock(raw_ctx: *anyopaque, username: []const u8) LockCheckResult {
+            const self: *Self = @ptrCast(@alignCast(raw_ctx));
+            const result = self.lock_store.isLocked(self.allocator, username) catch |err| switch (err) {
                 // An unpreparable name cannot have a lock row; that is not a
                 // storage fault and must not become a temporary-auth oracle.
                 error.InvalidAccountName => return .unlocked,
@@ -65,11 +95,6 @@ pub fn makeLockChecker(comptime Backend: type, ls: *lock_store_mod.LockStore(Bac
             };
             return if (result != null) .locked else .unlocked;
         }
-    };
-    S.ctx = .{ .lock_store = ls, .allocator = alloc };
-    return .{
-        .ctx = @ptrCast(&S.ctx),
-        .checkFn = &S.check,
     };
 }
 
@@ -88,15 +113,15 @@ pub fn accountKey(identity: []const u8, buf: *[account_key_max]u8) []const u8 {
     };
 }
 
-fn permanentLockReason(checker: LockChecker, username: []const u8) ?[]const u8 {
+fn permanentLockReason(checker: LockChecker, username: []const u8) ?FailureReason {
     switch (checker.check(localpartOf(username))) {
         .locked => {
             log.info("auth rejected: account '{s}' is permanently locked", .{username});
-            return "account-disabled";
+            return .account_disabled;
         },
         .store_error => {
             log.warn("lock store error checking '{s}': failing closed", .{username});
-            return "temporary-auth-failure";
+            return .temporary_auth_failure;
         },
         .unlocked => return null,
     }
@@ -109,24 +134,24 @@ pub const Policy = struct {
     /// Count one IP attempt and check the IP lock and window. Runs before
     /// the identity is known, so in-flight work is bounded. Returns null
     /// when admitted.
-    pub fn admitIp(self: Policy, client_ip: []const u8) ?[]const u8 {
+    pub fn admitIp(self: Policy, client_ip: []const u8) ?FailureReason {
         const limiter = self.limiter orelse return null;
         return switch (limiter.admitIp(client_ip)) {
             .allowed => null,
             .locked, .rate_limited => blk: {
                 log.info("auth rejected: IP '{s}' is rate limited", .{client_ip});
-                break :blk "policy-violation";
+                break :blk .policy_violation;
             },
             .unavailable => blk: {
                 log.warn("rate state cannot track the request: failing closed", .{});
-                break :blk "temporary-auth-failure";
+                break :blk .temporary_auth_failure;
             },
         };
     }
 
     /// Count one account attempt, then check the permanent lock and the
     /// account lock and window. Returns null when admitted.
-    pub fn admitAccount(self: Policy, username: []const u8) ?[]const u8 {
+    pub fn admitAccount(self: Policy, username: []const u8) ?FailureReason {
         if (username.len == 0) return null;
         if (self.lock_checker) |checker| {
             if (permanentLockReason(checker, username)) |reason| return reason;
@@ -139,15 +164,15 @@ pub const Policy = struct {
             .allowed => null,
             .locked => blk: {
                 log.info("auth rejected: account '{s}' is locked", .{username});
-                break :blk "account-disabled";
+                break :blk .account_disabled;
             },
             .rate_limited => blk: {
                 log.info("auth rejected: account '{s}' is rate limited", .{username});
-                break :blk "policy-violation";
+                break :blk .policy_violation;
             },
             .unavailable => blk: {
                 log.warn("rate state cannot track the request: failing closed", .{});
-                break :blk "temporary-auth-failure";
+                break :blk .temporary_auth_failure;
             },
         };
     }
@@ -155,7 +180,7 @@ pub const Policy = struct {
     /// Count one account attempt and enforce the lock and window, with
     /// in-flight crypto-pool jobs counted as possible failures. Denies when
     /// failures plus pending already reach the lockout threshold.
-    pub fn admitAccountPending(self: Policy, username: []const u8, pending: usize) ?[]const u8 {
+    pub fn admitAccountPending(self: Policy, username: []const u8, pending: usize) ?FailureReason {
         if (username.len == 0) return null;
         if (self.lock_checker) |checker| {
             if (permanentLockReason(checker, username)) |reason| return reason;
@@ -168,22 +193,22 @@ pub const Policy = struct {
             .allowed => null,
             .locked => blk: {
                 log.info("auth rejected: account '{s}' is locked", .{username});
-                break :blk "account-disabled";
+                break :blk .account_disabled;
             },
             .rate_limited => blk: {
                 log.info("auth rejected: account '{s}' is rate limited", .{username});
-                break :blk "policy-violation";
+                break :blk .policy_violation;
             },
             .unavailable => blk: {
                 log.warn("rate state cannot track the request: failing closed", .{});
-                break :blk "temporary-auth-failure";
+                break :blk .temporary_auth_failure;
             },
         };
     }
 
     /// Count one attempt for both keys. One-shot callers only; mechanisms
     /// call admitIp and then admitAccount so each key is counted once.
-    pub fn admit(self: Policy, username: []const u8, client_ip: []const u8) ?[]const u8 {
+    pub fn admit(self: Policy, username: []const u8, client_ip: []const u8) ?FailureReason {
         if (self.admitIp(client_ip)) |reason| return reason;
         return self.admitAccount(username);
     }
@@ -193,7 +218,7 @@ pub const Policy = struct {
     /// verification and before IdP password validation, so a locked account
     /// gets the same reply whether or not the password is right and an
     /// in-flight attempt is not denied by a filled window.
-    pub fn check(self: Policy, username: []const u8, client_ip: []const u8) ?[]const u8 {
+    pub fn check(self: Policy, username: []const u8, client_ip: []const u8) ?FailureReason {
         if (username.len > 0) {
             if (self.lock_checker) |checker| {
                 if (permanentLockReason(checker, username)) |reason| return reason;
@@ -207,11 +232,11 @@ pub const Policy = struct {
             .allowed => null,
             .account_locked => blk: {
                 log.info("auth rejected: account '{s}' is locked", .{username});
-                break :blk "account-disabled";
+                break :blk .account_disabled;
             },
             .ip_locked => blk: {
                 log.info("auth rejected: IP '{s}' is locked", .{client_ip});
-                break :blk "policy-violation";
+                break :blk .policy_violation;
             },
         };
     }
@@ -245,10 +270,10 @@ test "Policy: a locked account is denied and a store error fails closed" {
     try std.testing.expect(policy.admit("alice", "") == null);
 
     S.result = .locked;
-    try std.testing.expectEqualStrings("account-disabled", policy.admit("alice", "").?);
+    try std.testing.expectEqual(.account_disabled, policy.admit("alice", "").?);
 
     S.result = .store_error;
-    try std.testing.expectEqualStrings("temporary-auth-failure", policy.admit("alice", "").?);
+    try std.testing.expectEqual(.temporary_auth_failure, policy.admit("alice", "").?);
 }
 
 test "Policy: the lock is keyed by the identity localpart" {
@@ -278,7 +303,7 @@ test "Policy: admission counts the account and IP keys once" {
     const policy = Policy{ .limiter = &limiter };
 
     try std.testing.expect(policy.admit("alice", "10.0.0.1") == null);
-    try std.testing.expectEqualStrings("policy-violation", policy.admit("alice", "10.0.0.1") orelse return error.ExpectedDenial);
+    try std.testing.expectEqual(.policy_violation, policy.admit("alice", "10.0.0.1") orelse return error.ExpectedDenial);
     try std.testing.expect(policy.admit("bob", "10.0.0.1") == null);
 
     var other = try rate_limiter.RateLimiter.init(std.testing.allocator, .{
@@ -292,7 +317,7 @@ test "Policy: admission counts the account and IP keys once" {
     defer other.deinit();
     const ip_policy = Policy{ .limiter = &other };
     try std.testing.expect(ip_policy.admitIp("10.0.0.9") == null);
-    try std.testing.expectEqualStrings("policy-violation", ip_policy.admitIp("10.0.0.9").?);
+    try std.testing.expectEqual(.policy_violation, ip_policy.admitIp("10.0.0.9").?);
 }
 
 test "Policy: a re-check does not count a second account attempt" {
@@ -309,7 +334,7 @@ test "Policy: a re-check does not count a second account attempt" {
 
     try std.testing.expect(policy.admitAccount("alice") == null);
     try std.testing.expect(policy.check("alice", "") == null);
-    try std.testing.expectEqualStrings("policy-violation", policy.admitAccount("alice") orelse return error.ExpectedDenial);
+    try std.testing.expectEqual(.policy_violation, policy.admitAccount("alice") orelse return error.ExpectedDenial);
 }
 
 test "Policy: Kelvin sign variants share the account budget" {
@@ -328,7 +353,7 @@ test "Policy: Kelvin sign variants share the account budget" {
     policy.recordOutcome("k", "10.0.0.2", .failure);
 
     // Both names fold to k, so the second failure locks the one budget.
-    try std.testing.expectEqualStrings("account-disabled", policy.admit("k", "10.0.0.3") orelse return error.ExpectedDenial);
+    try std.testing.expectEqual(.account_disabled, policy.admit("k", "10.0.0.3") orelse return error.ExpectedDenial);
 }
 
 test "Policy: check folds case against a temporary lock" {
@@ -346,7 +371,7 @@ test "Policy: check folds case against a temporary lock" {
     policy.recordOutcome("alice", "10.0.0.1", .failure);
 
     // The folded ALICE@x must hit the same temporary lock as alice.
-    try std.testing.expectEqualStrings("account-disabled", policy.check("ALICE@x", "10.0.0.2") orelse return error.ExpectedDenial);
+    try std.testing.expectEqual(.account_disabled, policy.check("ALICE@x", "10.0.0.2") orelse return error.ExpectedDenial);
 }
 
 test "Policy: RFC 7622 variants share the account budget" {
@@ -365,7 +390,7 @@ test "Policy: RFC 7622 variants share the account budget" {
     policy.recordOutcome("\u{03BF}\u{03B4}\u{03BF}\u{03C3}@us.example", "10.0.0.2", .failure);
 
     // Greek capitals and the domain form prepare to the same localpart.
-    try std.testing.expectEqualStrings("account-disabled", policy.admit("\u{03BF}\u{03B4}\u{03BF}\u{03C3}", "10.0.0.3") orelse return error.ExpectedDenial);
+    try std.testing.expectEqual(.account_disabled, policy.admit("\u{03BF}\u{03B4}\u{03BF}\u{03C3}", "10.0.0.3") orelse return error.ExpectedDenial);
 }
 
 test "Policy: invalid names get no account key but charge the IP" {
@@ -385,7 +410,7 @@ test "Policy: invalid names get no account key but charge the IP" {
     // No account key was created, so the account side admits; the failed
     // attempt still charged and locked the IP key.
     try std.testing.expect(policy.admitAccount("bad name") == null);
-    try std.testing.expectEqualStrings("policy-violation", policy.admitIp("10.0.0.9") orelse return error.ExpectedDenial);
+    try std.testing.expectEqual(.policy_violation, policy.admitIp("10.0.0.9") orelse return error.ExpectedDenial);
 }
 
 test "Policy: an untrackable prepared key fails closed" {
@@ -402,7 +427,7 @@ test "Policy: an untrackable prepared key fails closed" {
 
     var big: [account_key_max + 1]u8 = undefined;
     @memset(&big, 'a');
-    try std.testing.expectEqualStrings("temporary-auth-failure", policy.admitAccount(&big) orelse return error.ExpectedDenial);
+    try std.testing.expectEqual(.temporary_auth_failure, policy.admitAccount(&big) orelse return error.ExpectedDenial);
 }
 
 test "Policy: an unpreparable name is unlocked, not a store error" {
@@ -410,8 +435,9 @@ test "Policy: an unpreparable name is unlocked, not a store error" {
     var db = try backend_mod.MemoryBackend.open("", .{});
     defer db.close();
     var locks = lock_store_mod.LockStore(backend_mod.MemoryBackend).init(&db);
-    const checker = makeLockChecker(backend_mod.MemoryBackend, &locks, allocator);
-    const policy = Policy{ .lock_checker = checker };
+    var checker: LockStoreChecker(backend_mod.MemoryBackend) = undefined;
+    checker.init(&locks, allocator);
+    const policy = Policy{ .lock_checker = checker.checker };
 
     // A raw invalid name cannot own a lock row, so policy.check must not
     // surface temporary-auth-failure.
@@ -434,5 +460,5 @@ test "Policy: account keys fold case and domain to one localpart" {
     policy.recordOutcome("ALICE", "10.0.0.2", .failure);
 
     // Both failures keyed the same folded localpart: alice is locked.
-    try std.testing.expectEqualStrings("account-disabled", policy.admit("alice", "10.0.0.3") orelse return error.ExpectedDenial);
+    try std.testing.expectEqual(.account_disabled, policy.admit("alice", "10.0.0.3") orelse return error.ExpectedDenial);
 }

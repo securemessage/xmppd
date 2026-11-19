@@ -58,6 +58,14 @@ const BindingResolver = oidc_ids.Resolver(OpBackendType, ArchiveBackendType);
 const MemBindingStore = oidc_ids.Store(backend_mod.MemoryBackend);
 const MemBindingResolver = oidc_ids.Resolver(backend_mod.MemoryBackend, backend_mod.MemoryBackend);
 
+/// Mechanisms this daemon advertises on connect; each must have a store
+/// capability behind it (checked at compile time).
+const AUTH_MECHS = [_]protocol.MechanismId{ .oauthbearer, .plain };
+
+comptime {
+    handler_mod.assertMechanisms(OidcStore, &AUTH_MECHS);
+}
+
 const log = std.log.scoped(.xmppd_auth_oidc);
 
 /// Sentinel value for the listener fd in kqueue udata.
@@ -255,7 +263,9 @@ pub fn main() !void {
         return err;
     };
     defer lock_backend.close();
-    handler.setLockChecker(handler_mod.makeLockChecker(OpBackendType, &lock_store, allocator));
+    var lock_checker: handler_mod.LockStoreChecker(OpBackendType) = undefined;
+    lock_checker.init(&lock_store, allocator);
+    handler.setLockChecker(lock_checker.checker);
 
     // The (iss, sub) -> localpart binding map lives in the same {db}/auth
     // env. It needs the read-write handle: first-login claims write both
@@ -577,8 +587,7 @@ pub const Daemon = struct {
         };
 
         // Send MechanismList: OAUTHBEARER + PLAIN
-        const mechs = [_]protocol.MechanismId{ .oauthbearer, .plain };
-        const ml_msg = protocol.Message{ .mechanism_list = protocol.MechanismList.init(&mechs) };
+        const ml_msg = protocol.Message{ .mechanism_list = protocol.MechanismList.init(&AUTH_MECHS) };
         conn.queueSend(ml_msg) catch {
             self.closeLane(slot);
             return;
@@ -684,7 +693,7 @@ pub const Daemon = struct {
                     return true;
                 }
                 const token = oidc.bearerToken(req.payload) orelse {
-                    self.replyAuthFailure(req.conn_id, slot, "invalid-encoding");
+                    self.replyAuthFailure(req.conn_id, slot, .invalid_encoding);
                     return true;
                 };
                 cred = .{ .token = token };
@@ -773,18 +782,18 @@ pub const Daemon = struct {
         self: *Daemon,
         typed_name: []const u8,
         client_ip: []const u8,
-    ) ?[]const u8 {
+    ) ?policy_mod.FailureReason {
         return self.handler.policy.check(typed_name, client_ip);
     }
 
     /// Answer a request with an auth_failure reason without handler
     /// involvement. Pre-gate denials carry the policy's own reason so the
     /// client sees what a direct request would have seen.
-    fn replyAuthFailure(self: *Daemon, conn_id: u32, slot: u16, reason: []const u8) void {
+    fn replyAuthFailure(self: *Daemon, conn_id: u32, slot: u16, reason: policy_mod.FailureReason) void {
         const conn = self.ipc.getClient(slot) orelse return;
         conn.queueSend(.{ .auth_failure = .{
             .conn_id = conn_id,
-            .reason = reason,
+            .reason = reason.text(),
         } }) catch {
             self.closeLane(slot);
             return;
@@ -796,7 +805,7 @@ pub const Daemon = struct {
     /// in-flight caps and a full pool are transport backpressure, not a
     /// failed credential, so nothing is counted or recorded.
     fn replyTemporary(self: *Daemon, conn_id: u32, slot: u16) void {
-        self.replyAuthFailure(conn_id, slot, "temporary-auth-failure");
+        self.replyAuthFailure(conn_id, slot, .temporary_auth_failure);
     }
 
     /// Deliver a message to the handler and queue its reply.
@@ -895,7 +904,7 @@ pub const Daemon = struct {
                     switch (response) {
                         .auth_success => self.handler.policy.recordOutcome("", client_ip, .success),
                         .auth_failure => |f| {
-                            if (std.mem.eql(u8, f.reason, "not-authorized")) {
+                            if (std.mem.eql(u8, f.reason, policy_mod.FailureReason.not_authorized.text())) {
                                 self.handler.policy.recordOutcome("", client_ip, .failure);
                             }
                         },
@@ -2109,7 +2118,7 @@ test "a rejected credential replays as not-authorized and records the failure" {
     // lockout_threshold 1 alice is now locked.
     try std.testing.expectEqualStrings(
         "account-disabled",
-        fx.handler.policy.check("alice", "10.0.0.9") orelse return error.ExpectedLock,
+        (fx.handler.policy.check("alice", "10.0.0.9") orelse return error.ExpectedLock).text(),
     );
 }
 

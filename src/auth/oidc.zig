@@ -21,7 +21,7 @@
 //! ## Store Interface
 //!
 //! Provides `validateToken` and `validatePassword` -- the AuthHandler
-//! uses `@hasDecl` at comptime to route OAUTHBEARER and PLAIN accordingly.
+//! routes OAUTHBEARER and PLAIN on the declared store capabilities.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -315,6 +315,14 @@ const IntrospectionClaims = struct {
 };
 
 pub const OidcStore = struct {
+    /// Auth store capabilities (handler.Capabilities): IdP-delegated
+    /// password and token validation, and a photo URL on auth success.
+    pub const capabilities = .{
+        .validate_password = true,
+        .validate_token = true,
+        .photo_url = true,
+    };
+
     config: OidcConfig,
     allocator: Allocator,
 
@@ -1592,8 +1600,8 @@ test "OidcStore: init and deinit" {
 }
 
 test "OidcStore: no lookup (SCRAM not supported)" {
-    // OidcStore deliberately has no `lookup` function.
-    // AuthHandler uses @hasDecl to skip SCRAM when lookup is absent.
+    // OidcStore deliberately has no `lookup` function and does not declare
+    // the lookup capability, so the handler's SCRAM path compiles away.
     try std.testing.expect(!@hasDecl(OidcStore, "lookup"));
 }
 
@@ -1850,7 +1858,6 @@ test "OidcStore: bindIdentity verified copies the bound localpart" {
     try std.testing.expectEqual(OidcStore.BindVerdict.verified, store.bindIdentity(allocator, "https://idp.example/", "s-1", "ignored", &id));
     try std.testing.expectEqualStrings("alice", id.username());
 }
-
 
 // --- Replay seam tests ------------------------------------------------
 
