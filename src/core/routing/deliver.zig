@@ -510,6 +510,13 @@ test "V14: per-session filters apply to a remote target" {
     drainDeliveryQueue(&server, &changes);
     try std.testing.expect(!session.conn.hasPendingWrite());
 
+    // A session that never enabled carbons gets no remote copy.
+    session.carbons_enabled = false;
+    try delivery_sys.deliverDelivery(0, 1, route.token, "<message from='bob@localhost' to='bob@localhost/desktop' type='chat'><body>copy</body></message>", 0, 0, .carbon);
+    changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(!session.conn.hasPendingWrite());
+
     // Positive control: the same envelope classes land when the flags allow.
     session.csi_active = true;
     try delivery_sys.deliverDelivery(0, 1, route.token, chatstate, 0, 0, .chatstate);
