@@ -20,6 +20,7 @@ const Listener = @import("../listener.zig").Listener;
 const Event = @import("../worker/loop.zig").Event;
 
 const ssl = @import("ssl");
+const net = @import("net");
 const IpcClient = @import("ipc_client").IpcClient;
 const ipc_protocol = @import("ipc_protocol");
 const backend_mod = @import("backend");
@@ -93,9 +94,24 @@ pub noinline fn noteJidOverflow(comptime fmt: []const u8, args: anytype) void {
 /// path: it is logged, and a full write buffer flags the session for
 /// overflow teardown (R1), the same classification dispatchStanza uses.
 pub fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
-    session.queueSendStanza(stanza) catch |err| {
-        noteQueueDrop(session, stanza, err, what);
-    };
+    if (session.stanza(stanza) == .failed_closed) noteSendDrop(session, stanza, what);
+}
+
+/// The SendResult twin of noteQueueDrop for converted call sites:
+/// failed_closed on a live conn is classified by noteQueueOverflow
+/// (oversize drop vs slow-reader teardown), on a dead conn it is the
+/// old ConnectionClosed path.
+pub noinline fn noteSendDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
+    @branchHint(.cold);
+    if (!session.conn.isClosed()) {
+        if (noteQueueOverflow(session, stanza)) {
+            log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, session.conn.outbox.spill_limit });
+            return;
+        }
+        log.warn("connection {d}: {s} could not be queued (WriteBufferFull)", .{ session.conn.id, what });
+        return;
+    }
+    log.warn("connection {d}: {s} could not be queued (ConnectionClosed)", .{ session.conn.id, what });
 }
 
 /// Classify and log one refused queueSendStanza on the cold path (R5).
@@ -106,7 +122,7 @@ pub fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: [
 pub noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerror, comptime what: []const u8) void {
     @branchHint(.cold);
     if (err == error.WriteBufferFull and noteQueueOverflow(session, stanza)) {
-        log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, connection_mod.WRITE_BUF_SIZE });
+        log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, session.conn.outbox.spill_limit });
         return;
     }
     log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
@@ -119,7 +135,7 @@ pub noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerr
 /// reader: flag the session for the XEP-0198 overflow teardown. Returns
 /// true only for the oversize case.
 pub fn noteQueueOverflow(session: *Session, stanza: []const u8) bool {
-    if (stanza.len <= connection_mod.WRITE_BUF_SIZE) {
+    if (stanza.len <= session.conn.outbox.spill_limit) {
         session.sm_overflow = true;
         return false;
     }
@@ -169,10 +185,11 @@ pub noinline fn answerOversizeIq(session: *Session, stanza: []const u8) void {
         noteJidOverflow("iq error reply to connection {d} exceeds {d} bytes; dropped", .{ session.conn.id, session.write_scratch.len });
         return;
     };
-    session.queueSendStanza(reply) catch |err| {
-        if (err == error.WriteBufferFull) session.sm_overflow = true;
-        noteDrop("connection {d}: iq error reply could not be queued ({s})", .{ session.conn.id, @errorName(err) });
-    };
+    if (session.stanza(reply) == .failed_closed) {
+        const closed = session.conn.isClosed();
+        if (!closed) session.sm_overflow = true;
+        noteDrop("connection {d}: iq error reply could not be queued ({s})", .{ session.conn.id, if (closed) "ConnectionClosed" else "WriteBufferFull" });
+    }
 }
 
 /// Id of an `<iq type='result' ...>` opening tag, or null. The scan stops
@@ -522,7 +539,7 @@ pub const Session = struct {
         // peer must not be able to spend the post-auth budget (H6).
         reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
         return .{
-            .conn = Connection.init(fd, id),
+            .conn = Connection.init(fd, id, allocator),
             .reader = reader,
             .stream = xmpp.Stream.init(server_host, direct_tls),
         };
@@ -536,7 +553,7 @@ pub const Session = struct {
         }
         if (self.pep_payload.capacity > 0) self.pep_payload.deinit(self.reader.allocator);
         self.reader.deinit();
-        if (!self.conn.isClosed()) self.conn.close();
+        self.conn.deinit();
     }
 
     pub fn resetSasl(self: *Session) void {
@@ -563,15 +580,94 @@ pub const Session = struct {
         self.stanza_type = "";
     }
 
+    /// The outcome of handing one outbound element to the send path
+    /// (ADR-2). Only `.failed_closed` is a refusal; noteQueueDrop
+    /// classifies it (dead fd vs full ring vs oversize).
+    pub const SendResult = enum {
+        /// Buffered on the live connection.
+        queued,
+        /// Detached SM session: counted into the unacked queue with no
+        /// fd to write to; delivery happens on resume.
+        tracked_detached,
+        /// Accepted into the bounded spill behind the ring.
+        spilled,
+        /// Refused: the conn is closed or the outbox is full. The append
+        /// already bumped the per-worker drop counter by reason.
+        failed_closed,
+    };
+
     /// Queue a complete outbound stanza (message/presence/iq) and count it
     /// for XEP-0198 (S15). Counting is not optional: `<a h='...'/>` maps by
     /// position, so every stanza sent outside this helper shifts the ack
     /// window and makes a later ack discard a stanza the client never saw.
     /// Nonzas (`<r/>`, `<a/>`, features, SASL elements, stream errors) must
-    /// go through conn.queueSend directly.
+    /// go through nonza().
+    ///
+    /// Compat !void form of stanza() for call sites not yet converted to
+    /// the SendResult API: failed_closed maps back to the pre-Outbox
+    /// error pair, while tracked_detached is success: a detached SM
+    /// session that buffers for resume is delivering, not dropping.
     pub fn queueSendStanza(self: *Session, data: []const u8) !void {
-        try self.conn.queueSend(data);
-        self.smTrackOutbound(data);
+        switch (self.stanza(data)) {
+            .queued, .spilled, .tracked_detached => {},
+            .failed_closed => return if (self.conn.isClosed())
+                error.ConnectionClosed
+            else
+                error.WriteBufferFull,
+        }
+    }
+
+    /// Queue a complete outbound stanza (message/presence/iq) and count it
+    /// for XEP-0198 (S15, ADR-2). A refused stanza that could still fit
+    /// the outbox is tracked anyway: the unacked queue is authoritative,
+    /// so a slow-reader refusal lands in replay rather than vanishing.
+    /// A stanza longer than the whole outbound bound can never go out;
+    /// it stays untracked like the pre-Outbox drop (an SM entry that can
+    /// never be sent would wedge the replay queue). A detached session
+    /// has no fd; its stanzas go straight to unacked.
+    pub fn stanza(self: *Session, data: []const u8) SendResult {
+        if (self.sm_detached) {
+            self.smTrackOutbound(data);
+            return .tracked_detached;
+        }
+        return self.finishTrack(data, sendResult(self.conn.append(data)));
+    }
+
+    /// stanza() with the queueSendWithFlush policy: one non-blocking
+    /// flush first when the outbox cannot fit the stanza whole, so a
+    /// buffer the server filled itself is drained rather than torn down.
+    pub fn stanzaWithFlush(self: *Session, data: []const u8) SendResult {
+        if (self.sm_detached) {
+            self.smTrackOutbound(data);
+            return .tracked_detached;
+        }
+        return self.finishTrack(data, sendResult(self.conn.appendWithFlush(data)));
+    }
+
+    /// Track after the append: delivered results count like the
+    /// pre-Outbox path, and a refused stanza that could fit the bound
+    /// counts too: SM replay is where it goes next. The oversize drop
+    /// (len > spill_limit) stays untracked.
+    fn finishTrack(self: *Session, data: []const u8, r: SendResult) SendResult {
+        if (r != .failed_closed or data.len <= self.conn.outbox.spill_limit) {
+            self.smTrackOutbound(data);
+        }
+        return r;
+    }
+
+    /// Queue a nonza: anything that is not a message/presence/iq stanza:
+    /// SM elements, stream features and errors, SASL elements, the stream
+    /// close. Never counted for XEP-0198.
+    pub fn nonza(self: *Session, data: []const u8) SendResult {
+        return sendResult(self.conn.append(data));
+    }
+
+    fn sendResult(r: net.AppendResult) SendResult {
+        return switch (r) {
+            .queued => .queued,
+            .spilled => .spilled,
+            .failed_closed => .failed_closed,
+        };
     }
 
     /// Track an outbound stanza for SM purposes.
@@ -601,7 +697,7 @@ pub const Session = struct {
             if (!self.sm_detached and !self.sm_r_outstanding and
                 queue.pending() >= sm_state.SM_R_THRESHOLD)
             {
-                self.conn.queueSend("<r xmlns='urn:xmpp:sm:3'/>") catch return;
+                if (self.nonza("<r xmlns='urn:xmpp:sm:3'/>") == .failed_closed) return;
                 self.sm_r_outstanding = true;
             }
         }
@@ -619,9 +715,9 @@ pub fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes
         log.info("connection {d} TLS handshake complete", .{id});
         // AGENTS.md: kTLS engagement and cipher must be logged after
         // every handshake; userland fallback is otherwise silent.
-        if (session.conn.tls_conn) |*tls| {
+        if (session.conn.tls) |*t| {
             log.info("connection {d} tls: {s} cipher={s} ktls tx={} rx={}", .{
-                id, tls.versionName(), tls.cipherName(), tls.ktlsSend(), tls.ktlsRecv(),
+                id, t.conn.versionName(), t.conn.cipherName(), t.ktls_tx, t.ktls_rx,
             });
         }
         // Notify the stream FSM that TLS is established
@@ -646,13 +742,13 @@ pub fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes
             changes.addRead(session.conn.fd, id) catch {};
         }
     } else {
-        // Re-arm the appropriate kqueue filter. Write interest is
-        // one-shot: a persistent filter fires on every kevent while
-        // the handshake waits for the client's next flight (S10).
+        // Re-arm the appropriate kqueue filter. The write knote is the
+        // accept-time DISPATCH registration: a bare enableWrite re-arms
+        // it, and the next delivery auto-disables it again (S10).
         if (session.conn.tls_state) |state| {
             switch (state) {
                 .handshake_want_read => changes.addRead(session.conn.fd, id) catch {},
-                .handshake_want_write => changes.addWriteOnce(session.conn.fd, id) catch {},
+                .handshake_want_write => changes.enableWrite(session.conn.fd) catch {},
                 .established => {},
             }
         }
@@ -705,7 +801,7 @@ pub fn handleReadable(self: *Server, id: usize, changes: *ChangeList) void {
         // type 0x16 = handshake, major version 0x03) on a fresh plaintext
         // stream and close with a clear log line instead.
         if (session.stream.state == .awaiting_stream_open and
-            session.conn.tls_conn == null and
+            session.conn.tls == null and
             data.len >= 2 and data[0] == 0x16 and data[1] == 0x03)
         {
             log.info("connection {d}: TLS handshake on the STARTTLS port — client is configured for direct TLS, closing", .{id});
@@ -804,9 +900,6 @@ pub fn handleReadable(self: *Server, id: usize, changes: *ChangeList) void {
 
     if (session.conn.hasPendingWrite()) {
         _ = session.conn.flushSend() catch {};
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, id) catch {};
-        }
     }
 }
 
@@ -928,6 +1021,7 @@ pub fn enforcePreBindStanzaPolicy(self: *Server, session: *Session, elem: xml.El
 /// the connection stays open so the client can proceed to bind. Error
 /// stanzas are never answered with further errors (RFC 6120 §8.3.1).
 pub fn sendPreBindStanzaError(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = self;
     var to_attr: []const u8 = "";
     var id_attr: []const u8 = "";
@@ -969,9 +1063,6 @@ pub fn sendPreBindStanzaError(self: *Server, session: *Session, elem: xml.Elemen
         return;
     };
     queueStanzaOrDrop(session, reply_xml, "pre-bind stanza error");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 /// F6: fold local-domain to/from attribute values once at stanza ingress
@@ -1466,9 +1557,6 @@ pub fn handleElementEnd(self: *Server, session: *Session, name: []const u8, chan
                 session.bind_iq_id = "";
                 session.bind_iq_id_len = 0;
             }
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
             return;
         }
         return;
@@ -1481,9 +1569,6 @@ pub fn handleElementEnd(self: *Server, session: *Session, name: []const u8, chan
         iq_handler.sendIqErrorWithType(self, session, session.bind_iq_id, "auth", "not-authorized");
         session.bind_iq_id = "";
         session.bind_iq_id_len = 0;
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
         return;
     }
 
@@ -1566,9 +1651,6 @@ pub fn handleElementEnd(self: *Server, session: *Session, name: []const u8, chan
     // IQ stanza dispatch — when the IQ closes (depth back to stream child level)
     if (session.iq_active and session.reader.depth == 1) {
         self.dispatchIq(session, changes);
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
     }
 }
 
@@ -1624,8 +1706,15 @@ pub fn processSaslAuthComplete(self: *Server, session: *Session, changes: *Chang
         return;
     };
 
-    // Extract channel binding data from TLS session
-    const cb = session.conn.getChannelBinding();
+    // Extract channel binding data from TLS session. An allocation
+    // failure is not "no binding": the exchange fails closed rather than
+    // silently downgrading a -PLUS client to an unbound exchange.
+    const cb = session.conn.getChannelBinding() catch {
+        log.warn("connection {d} channel binding unavailable (allocation failure)", .{session.conn.id});
+        const fail_action = session.stream.saslFailure("temporary-auth-failure");
+        executeAction(self, session, fail_action, changes);
+        return;
+    };
 
     // Increment generation before encoding — the response must carry this gen
     session.auth_ipc_gen +%= 1;
@@ -1901,47 +1990,42 @@ pub fn handlePresence(self: *Server, session: *Session, elem: xml.Element, chang
     presence_handler.handlePresence(self, session, elem, changes);
 }
 
-pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction, changes: *ChangeList) void {
+pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction, _: *ChangeList) void {
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const writer = fbs.writer();
 
     switch (action) {
         .send_stream_open => |params| {
             xmpp.stream.writeStreamOpen(writer, params) catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
             session.stream.response_opened = true;
 
             // Immediately send features after stream open
             if (session.stream.getFeatures()) |features| {
                 var fbs2 = std.io.fixedBufferStream(session.write_scratch[fbs.pos..]);
                 xmpp.stream.writeFeatures(fbs2.writer(), self.applyDynamicMechanisms(features)) catch return;
-                session.conn.queueSend(fbs2.getWritten()) catch return;
+                if (session.nonza(fbs2.getWritten()) == .failed_closed) return;
             }
         },
         .send_features => |features| {
             xmpp.stream.writeFeatures(writer, self.applyDynamicMechanisms(features)) catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
         },
         .send_tls_proceed, .start_tls => {
             writer.writeAll("<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>") catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
-
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
             // T215: the handshake starts only after the plaintext
             // <proceed/> has fully flushed; leftover bytes would be
-            // written through the TLS record layer. handleWritable
-            // completes the upgrade once the buffer drains.
-            _ = session.conn.flushSend() catch {};
-            if (session.conn.hasPendingWrite()) return;
-            // Nothing in this branch touches the session afterwards, and
-            // every caller returns on reaching it, so a failed upgrade
-            // that frees the session is not read here.
-            _ = startTlsUpgrade(self, session, changes);
+            // written through the TLS record layer. The batch tail (or
+            // handleWritable) completes the upgrade once the outbox
+            // drains: readableSlice() is only honest after consume(),
+            // so no upgrade decision may be taken inside the parse.
         },
         .send_sasl_success => |server_final| {
             writer.writeAll("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch return;
             writer.writeAll(server_final) catch return;
             writer.writeAll("</success>") catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
             // Reset XML reader and clear read buffer for post-SASL stream restart
             // (same treatment as post-STARTTLS at line ~706)
             session.reader.reset();
@@ -1952,7 +2036,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
             writer.writeAll("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><") catch return;
             writer.writeAll(reason) catch return;
             writer.writeAll("/></failure>") catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
         },
         .send_bind_result => |bound_jid| {
             writer.writeAll("<iq type='result'") catch return;
@@ -1972,7 +2056,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
                 xml.escapeWrite(writer, bound_jid.resource) catch return;
             }
             writer.writeAll("</jid></bind></iq>") catch return;
-            session.queueSendStanza(fbs.getWritten()) catch return;
+            if (session.stanza(fbs.getWritten()) == .failed_closed) return;
         },
         .send_error => |err| {
             sendStreamError(self, session, err);
@@ -1982,10 +2066,61 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
         },
         .close => {
             writer.writeAll("</stream:stream>") catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
         },
         .none, .begin_sasl, .send_sasl_challenge => {},
     }
+}
+
+/// One bounded outbox flush for a live session, shared by the
+/// fd_writable event and the worker's end-of-iteration dirty walk
+/// (ADR-2). EVFILT_WRITE arms only on a real EAGAIN (want_write) or a
+/// spent budget: the accept-time DISPATCH knote re-arms with a bare
+/// enableWrite and every delivery auto-disables it. A want_read stall
+/// marks flush_want_read so the next readable event re-drives the
+/// flush through the dirty list. The deferred continuations run on
+/// every drain path, not just the fd_writable event: a batch-tail
+/// drain arms nothing, so they would never fire otherwise. Returns
+/// false when the flush error or a failed STARTTLS upgrade closed the
+/// session: callers must stop touching it.
+pub fn flushSessionOutbox(self: *Server, session: *Session, changes: *ChangeList) bool {
+    const conn = &session.conn;
+    switch (conn.flushOutbox(connection_mod.FLUSH_BUDGET_BYTES)) {
+        .drained => {},
+        .want_write, .budget_left => {
+            // A budget_left flush proved the socket writable, so the
+            // level-triggered arm also covers the spill-continuation
+            // case; want_write is the real EAGAIN.
+            changes.enableWrite(conn.fd) catch {
+                // The staged arm is lost; re-link so the dirty walk
+                // re-drives the flush instead of stranding the outbox.
+                conn.linkDirty();
+            };
+        },
+        .want_read => conn.flush_want_read = true,
+        .err => |e| {
+            log.debug("connection {d} outbox flush failed ({s}); closing session", .{ conn.id, @errorName(e) });
+            session_lifecycle.closeSession(self, conn.id, changes);
+            return false;
+        },
+    }
+    // With <proceed/> fully on the wire, a STARTTLS upgrade deferred by
+    // backpressure starts now (T215). A failed upgrade frees the
+    // session, so nothing below may touch it.
+    if (!conn.hasPendingWrite() and
+        session.stream.state == .starttls_pending and !conn.isTlsHandshaking())
+    {
+        if (!startTlsUpgrade(self, session, changes)) return false;
+    }
+    // S13: with the buffer at the low-water mark, continue a stalled
+    // offline drain; the tail goes out before any newer traffic.
+    if (session.offline_pending and
+        conn.pendingWriteBytes() <= connection_mod.WRITE_SUPPRESS_LOW)
+    {
+        session_lifecycle.drainOfflinePending(self, session, changes);
+    }
+    applyReadBackpressure(self, session, changes);
+    return true;
 }
 
 pub fn handleWritable(self: *Server, id: usize, changes: *ChangeList) void {
@@ -1996,39 +2131,10 @@ pub fn handleWritable(self: *Server, id: usize, changes: *ChangeList) void {
         return;
     }
 
-    _ = session.conn.flushSend() catch |err| {
-        switch (err) {
-            error.WouldBlock => return,
-            // The fd is already gone, so there is nothing to flush or
-            // close. Preserve the detached session for a possible resume.
-            error.ConnectionClosed => return,
-            else => {
-                session_lifecycle.closeSession(self, id, changes);
-                return;
-            },
-        }
-    };
-
-    // If write buffer is drained, stop watching for writability
-    if (!session.conn.hasPendingWrite()) {
-        changes.removeWrite(session.conn.fd) catch {};
-        // T215: a STARTTLS upgrade deferred by backpressure starts now
-        // that <proceed/> is fully on the wire. A failed upgrade frees
-        // the session, so nothing below may touch it.
-        if (session.stream.state == .starttls_pending and !session.conn.isTlsHandshaking()) {
-            if (!startTlsUpgrade(self, session, changes)) return;
-        }
-    }
-
-    // S13: with the buffer at the low-water mark, continue a stalled
-    // offline drain; the tail goes out before any newer traffic.
-    if (session.offline_pending and
-        session.conn.pendingWriteBytes() <= connection_mod.WRITE_SUPPRESS_LOW)
-    {
-        session_lifecycle.drainOfflinePending(self, session, changes);
-    }
-
-    applyReadBackpressure(self, session, changes);
+    // The DISPATCH knote auto-disabled on this delivery; flushSession-
+    // Outbox re-arms it only while bytes remain and runs the drain
+    // continuations.
+    _ = flushSessionOutbox(self, session, changes);
 }
 
 /// Begin the TLS handshake once the plaintext <proceed/> is fully
@@ -2038,6 +2144,18 @@ pub fn handleWritable(self: *Server, id: usize, changes: *ChangeList) void {
 /// the caller must stop touching it.
 pub fn startTlsUpgrade(self: *Server, session: *Session, changes: *ChangeList) bool {
     if (self.ssl_ctx) |ctx| {
+        // ADR-2 upgrade-point rule (net.Conn.startTls): anything queued
+        // behind the upgrade or buffered past it would be written
+        // through or parsed past the TLS layer. Callers hold
+        // starttls_pending until <proceed/> drains, so a non-empty
+        // outbox or read-ahead here is a real protocol violation.
+        if (!session.conn.outbox.empty() or session.conn.readableSlice().len != 0) {
+            log.warn("connection {d} STARTTLS refused: outbox={d} read-ahead={d} bytes", .{
+                session.conn.id, session.conn.outbox.bytes(), session.conn.readableSlice().len,
+            });
+            session_lifecycle.closeSession(self, session.conn.id, changes);
+            return false;
+        }
         if (self.fail_next_tls_upgrade) {
             self.fail_next_tls_upgrade = false;
             log.warn("connection {d} TLS upgrade failed", .{session.conn.id});
@@ -2093,12 +2211,12 @@ pub fn sendStreamError(self: *Server, session: *Session, err: xmpp.stream.Stream
         .id = &session.stream.stream_id_hex,
     };
     xmpp.stream.writeStreamError(fbs.writer(), err, open_params) catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
     session.stream.response_opened = true;
 }
 
 pub fn sendRaw(_: *Server, session: *Session, data: []const u8) void {
-    session.conn.queueSend(data) catch return;
+    _ = session.nonza(data);
 }
 
 /// Helper: fill the connection's write buffer so it has pending bytes that
@@ -2156,14 +2274,14 @@ test "Server: read backpressure toggles EVFILT_READ across write-buffer threshol
 
     // Suppression is sticky in the hysteresis band (between LOW and HIGH)
     changes.reset();
-    session.conn.write_end = connection_mod.WRITE_SUPPRESS_HIGH - 16;
+    session.conn.outbox.used = connection_mod.WRITE_SUPPRESS_HIGH - 16;
     applyReadBackpressure(&server, session, &changes);
     try std.testing.expect(session.conn.read_suppressed);
     try std.testing.expectEqual(@as(usize, 0), changes.count());
 
     // Drained at/below low-water: read watch re-enabled
     changes.reset();
-    session.conn.write_end = connection_mod.WRITE_SUPPRESS_LOW;
+    session.conn.outbox.used = connection_mod.WRITE_SUPPRESS_LOW;
     applyReadBackpressure(&server, session, &changes);
     try std.testing.expect(!session.conn.read_suppressed);
     var saw_enable = false;
@@ -3046,9 +3164,11 @@ test "F6: disco info to the MUC host in another case is the conference service" 
 test "F6: Session carries one shared IQ payload prep buffer" {
     // LOW-3: the roster/block item JID and the MAM 'with' JID share
     // iq_jid_prep_buf; a second 3071-octet payload buffer must not return.
-    // 80296 covers the 1023-octet auth_username_buf, iq_pubsub_verb and the
+    // 80512 covers the 1023-octet auth_username_buf, iq_pubsub_verb and the
     // SslConn DANE fields the shared verifier added (fatal, syscall_errno).
-    try std.testing.expect(@sizeOf(Session) <= 80296);
+    // 80512 adds the Outbox bookkeeping (ring ptr, spill list, counters)
+    // and the Transport/Tls union to the pre-C2 size.
+    try std.testing.expect(@sizeOf(Session) <= 80512);
 }
 
 test "Server: registration submits are PRECIS-prepared and invalid names get not-acceptable" {
@@ -3192,7 +3312,7 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
 
     // Upgrade deferred: FSM is pending but TLS has NOT started.
     try std.testing.expect(session.stream.state == .starttls_pending);
-    try std.testing.expect(session.conn.tls_conn == null);
+    try std.testing.expect(session.conn.tls == null);
     try std.testing.expect(session.conn.hasPendingWrite());
 
     // Drain the peer, then let the write-ready handler finish.
@@ -3203,7 +3323,102 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     try std.testing.expect(!session.conn.hasPendingWrite());
 
     // Buffer drained: the deferred upgrade has started the handshake.
-    try std.testing.expect(session.conn.tls_conn != null);
+    try std.testing.expect(session.conn.tls != null);
+    try std.testing.expect(session.conn.isTlsHandshaking());
+}
+
+// ADR-2 upgrade-point rule: bytes queued behind <proceed/> or client
+// bytes read ahead of the upgrade would cross the TLS boundary in
+// plaintext, so the upgrade refuses and closes the session.
+test "Server: STARTTLS upgrade refuses a non-empty outbox" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(std.testing.allocator, tmp.dir);
+    defer std.testing.allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    _ = session.nonza("<proceed/>");
+    try std.testing.expect(!session.conn.outbox.empty());
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    try std.testing.expect(!startTlsUpgrade(&server, session, &changes));
+    try std.testing.expect(server.sessions[1] == null);
+}
+
+test "Server: STARTTLS upgrade refuses unread client bytes" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(std.testing.allocator, tmp.dir);
+    defer std.testing.allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    // Bytes pipelined past <starttls/> sit in the read buffer: upgrading
+    // now would feed them to the TLS layer as handshake bytes.
+    session.conn.read_end = 7;
+    try std.testing.expect(session.conn.readableSlice().len != 0);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    try std.testing.expect(!startTlsUpgrade(&server, session, &changes));
+    try std.testing.expect(server.sessions[1] == null);
+}
+
+// The normal negotiation: nothing after <starttls/>, <proceed/> flushes
+// promptly. The upgrade must still run at the deferred flush; a guard
+// that reads the un-consumed parse window would refuse it here.
+test "Server: STARTTLS upgrade proceeds through the deferred flush" {
+    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(std.testing.allocator, tmp.dir);
+    defer std.testing.allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    handleReadable(&server, 1, &changes);
+
+    _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
+    handleReadable(&server, 1, &changes);
+
+    // handleReadable's tail flush already put <proceed/> on the wire,
+    // but the upgrade itself waits for the deferred continuation.
+    try std.testing.expect(session.stream.state == .starttls_pending);
+    try std.testing.expect(session.conn.tls == null);
+    try std.testing.expect(session.conn.outbox.empty());
+
+    try std.testing.expect(flushSessionOutbox(&server, session, &changes));
+    try std.testing.expect(server.sessions[1] != null);
     try std.testing.expect(session.conn.isTlsHandshaking());
 }
 
@@ -3579,6 +3794,42 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     try std.testing.expectEqual(@as(u32, 1), queue.pending());
 }
 
+test "S15: an oversize stanza is refused untracked, a fitting refusal still counts" {
+    const allocator = std.testing.allocator;
+    const fds = try makeSocketPair();
+    // session.deinit() closes fds[0].
+    defer posix.close(fds[1]);
+    var session = Session.init(fds[0], 1, "localhost", false, allocator);
+    defer session.deinit();
+    session.sm_enabled = true;
+    // Owned by session.deinit once assigned.
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    session.sm_unacked = queue;
+    // Shrink the outbound bound to the ring so the fixtures stay small.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
+
+    // A stanza longer than the whole outbound bound can never go out, on
+    // this session or a resumed one: counting it would wedge the unacked
+    // queue over a stanza the client can never receive.
+    const big = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 32);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    try std.testing.expectEqual(Session.SendResult.failed_closed, session.stanza(big));
+    try std.testing.expectEqual(@as(u32, 0), session.sm_out_seq);
+    try std.testing.expectEqual(@as(u32, 0), queue.pending());
+
+    // A stanza that could still fit is tracked even when the ring refuses
+    // it: the unacked queue is authoritative and replay delivers it next.
+    try std.testing.expect(session.conn.ensureWriteBuf());
+    @memset(session.conn.write_buf.?[0..], 'x');
+    session.conn.outbox.head = 0;
+    session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    try std.testing.expectEqual(Session.SendResult.failed_closed, session.stanza("<presence/>"));
+    try std.testing.expectEqual(@as(u32, 1), session.sm_out_seq);
+    try std.testing.expectEqual(@as(u32, 1), queue.pending());
+}
+
 test "R-385: an oversized queued iq result keeps the session and answers resource-constraint" {
     const allocator = std.testing.allocator;
 
@@ -3591,9 +3842,10 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     defer session.deinit();
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     session.iq_to = "localhost";
+    // A reply longer than the outbound bound: the append refuses it even
+    // with the outbox empty, so this is oversize, not a slow reader.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
-    // A reply longer than the whole write buffer: queueSend refuses it even
-    // with the buffer empty, so this is oversize, not a slow reader.
     const stanza = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 32);
     defer allocator.free(stanza);
     const head = "<iq type='result' from='localhost' to='alice@localhost/mobile' id='big1'><query>";
@@ -3626,9 +3878,11 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     var session = Session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
-    @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
-    session.conn.write_start = 0;
-    session.conn.write_end = connection_mod.WRITE_BUF_SIZE;
+    try std.testing.expect(session.conn.ensureWriteBuf());
+    @memset(session.conn.write_buf.?[0..], 'x');
+    session.conn.outbox.head = 0;
+    session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
     const drops_before = delivery_queue_mod.oversize_queue_drops.load(.monotonic);
     queueStanzaOrDrop(&session, "<iq type='result' id='q1'/>", "small iq result");

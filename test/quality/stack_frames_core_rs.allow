@@ -17,10 +17,12 @@
 #   worker.Server.run +32 M1 merge a56c464 (363da75 iter_timer + dump args)
 #   main.main -192 Q1 203a49b (pre-rebase fc7d7de): -Dallocator default c
 #                  lands an empty TrivialRoot where the DebugAllocator sat
+#   worker.worker.Server.dispatchEvents -32256 C2 9799e21: dirty-list
+#                  flush at the batch tail shrank the frame (measured)
 main.configureServer	173672
 main.main	2710472
 muc.fanout.longestEncodedRealJid	210536
 muc.handler.handleMucDiscoItems	175944
 registry.RoomRegistry.createRoom	214104
-worker.worker.Server.dispatchEvents	77880
+worker.worker.Server.dispatchEvents	45624
 worker.worker.Server.run	70632

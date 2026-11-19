@@ -28,6 +28,7 @@ const Affiliation = room_store.Affiliation;
 
 const connection_mod = @import("../connection.zig");
 const server_mod = @import("../worker/worker.zig");
+const c2s_session = @import("../c2s/session.zig");
 const Server = server_mod.Server;
 const Session = server_mod.Session;
 const ChangeList = @import("../worker/loop.zig").ChangeList;
@@ -85,23 +86,9 @@ noinline fn logJoin(real_jid: []const u8, room_jid: []const u8, nick: []const u8
 /// path: it is logged, and a full write buffer flags the session for
 /// overflow teardown (R1), the same classification deliverToTriple uses.
 fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
-    session.queueSendStanza(stanza) catch |err| {
-        noteQueueDrop(session, stanza, err, what);
-    };
-}
-
-/// Classify and log one refused queueSendStanza on the cold path (R5).
-/// WriteBufferFull is two different refusals, split by noteQueueOverflow:
-/// a stanza longer than the whole buffer is dropped as oversize and the
-/// session lives; a deliverable stanza that cannot fit means a slow reader
-/// and flags overflow teardown (R1).
-noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerror, comptime what: []const u8) void {
-    @branchHint(.cold);
-    if (err == error.WriteBufferFull and server_mod.noteQueueOverflow(session, stanza)) {
-        log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, connection_mod.WRITE_BUF_SIZE });
-        return;
+    if (session.stanza(stanza) == .failed_closed) {
+        c2s_session.noteSendDrop(session, stanza, what);
     }
-    log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
 }
 
 /// Handle a presence stanza addressed to a MUC room JID.
@@ -292,7 +279,7 @@ pub fn handleMucGroupchat(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -373,6 +360,7 @@ pub fn drainPendingFanout(
     pf: *PendingFanout,
     changes: *ChangeList,
 ) bool {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const reg = server.room_registry orelse {
         pf.complete();
         return true;
@@ -406,7 +394,7 @@ pub fn drainPendingFanout(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -438,6 +426,7 @@ fn deliverRemainingSync(
     suffix: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     // Only local occupants — multicast was already sent in initial call
     var i: usize = start_slot;
     while (i < room_registry.MAX_OCCUPANTS) : (i += 1) {
@@ -447,7 +436,7 @@ fn deliverRemainingSync(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, buf, prefix, occ.getRealJid(), suffix, local_sid);
     }
 }
 
@@ -458,6 +447,7 @@ pub fn handleMucDiscoInfo(
     iq_id: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const muc_host = server.muc_host orelse return;
     var buf: [2048]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -483,9 +473,6 @@ pub fn handleMucDiscoInfo(
     };
 
     queueStanzaOrDrop(session, reply_xml, "disco#info reply");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 /// Handle disco#items for the MUC service domain (list public rooms).
@@ -495,6 +482,7 @@ pub fn handleMucDiscoItems(
     iq_id: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
@@ -610,9 +598,6 @@ pub fn handleMucDiscoItems(
     } else {
         queueStanzaOrDrop(session, fbs.getWritten(), "disco#items reply");
     }
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 /// Handle disco#info for a specific room.
@@ -623,6 +608,7 @@ pub fn handleRoomDiscoInfo(
     iq_id: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const reg = server.room_registry orelse return;
     const muc_host = server.muc_host orelse return;
 
@@ -714,9 +700,6 @@ pub fn handleRoomDiscoInfo(
     };
 
     queueStanzaOrDrop(session, reply_xml, "room disco#info reply");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 /// Handle MUC admin IQ (kick/ban/voice).
@@ -855,9 +838,6 @@ pub fn handleMucAdminIq(
     };
 
     queueStanzaOrDrop(session, result_xml, "admin result");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 fn sendIqErrorFromRoom(
@@ -880,6 +860,7 @@ fn sendIqErrorFromRoomTyped(
     err_type: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = server;
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -904,9 +885,6 @@ fn sendIqErrorFromRoomTyped(
     };
 
     queueStanzaOrDrop(session, err_xml, "IQ error reply");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 // ============================================================================
@@ -995,9 +973,6 @@ pub fn handleMucOwnerGet(
     };
 
     queueStanzaOrDrop(session, form_xml, "config form reply");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 /// Handle IQ set for room configuration form submission.
@@ -1090,9 +1065,6 @@ pub fn handleMucOwnerSet(
     };
 
     queueStanzaOrDrop(session, result_xml, "owner-set result");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 
     // Broadcast status 104 (room config changed) to occupants
     broadcastConfigChange(server, room, muc_host, changes);
@@ -1160,6 +1132,7 @@ fn parseFormValue(xml_data: []const u8, field_var: []const u8, buf: []u8) !?[]co
 
 /// Broadcast status code 104 (config changed) to all room occupants.
 fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u8, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
@@ -1179,7 +1152,7 @@ fn broadcastConfigChange(server: *Server, room: *const Room, muc_host: []const u
             noteJidOverflow("config-change notice for '{s}' exceeds {d} bytes; not sent to session {d}", .{ room.getJid(), router.JID_STANZA_MAX, occ.session_id });
             continue;
         };
-        fanout.deliverToSession(target, notice_xml, target.conn.id, changes);
+        fanout.deliverToSession(target, notice_xml, target.conn.id);
     }
 }
 
@@ -1471,6 +1444,7 @@ fn sendOccupantPresence(
     status_code: ?[]const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -1507,7 +1481,7 @@ fn sendOccupantPresence(
         return;
     };
 
-    fanout.deliverToSession(target, stanza_xml, target.conn.id, changes);
+    fanout.deliverToSession(target, stanza_xml, target.conn.id);
 }
 
 fn sendSelfPresence(
@@ -1518,6 +1492,7 @@ fn sendSelfPresence(
     muc_host: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
     _ = server;
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
@@ -1543,9 +1518,6 @@ fn sendSelfPresence(
     };
 
     queueStanzaOrDrop(session, stanza_xml, "self presence");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 fn broadcastOccupantJoin(
@@ -1559,6 +1531,7 @@ fn broadcastOccupantJoin(
     new_session_id: usize,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
 
     // Look up avatar hash for the joining user
@@ -1638,7 +1611,7 @@ fn broadcastOccupantJoin(
         const target = server.sessions[occ.session_id] orelse continue;
 
         const use_suffix = if (occ.session_id == new_session_id) suffix_110 else suffix;
-        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), use_suffix, occ.session_id, changes);
+        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), use_suffix, occ.session_id);
     }
 }
 
@@ -1650,6 +1623,7 @@ fn broadcastOccupantLeave(
     status_code: ?[]const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
 
     // Build prefix/suffix for multicast (no status 110)
@@ -1709,7 +1683,7 @@ fn broadcastOccupantLeave(
         if (occ.worker_id != server.worker_id) continue;
         const target = server.sessions[occ.session_id] orelse continue;
 
-        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.session_id, changes);
+        fanout.deliverPrebuiltToSession(target, deliver_lease.buf, prefix, occ.getRealJid(), suffix, occ.session_id);
     }
 
     // Send unavailable presence to the removed occupant themselves (with status 110)
@@ -1738,7 +1712,7 @@ fn broadcastOccupantLeave(
             return;
         };
 
-        fanout.deliverPrebuiltToSession(self_target, deliver_lease.buf, prefix, removed.getRealJid(), suffix_110, removed.session_id, changes);
+        fanout.deliverPrebuiltToSession(self_target, deliver_lease.buf, prefix, removed.getRealJid(), suffix_110, removed.session_id);
     }
 }
 
@@ -1791,6 +1765,7 @@ comptime {
 /// never receives it; a target on another worker goes through the
 /// generation-checked unicast.
 fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupant, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     // Every variable byte may become a six-byte XML entity; the remaining
     // 256 bytes cover the literal markup and affiliation name. The worst
     // case is ~10 KB, so the notice is built in a leased scratch bank, not
@@ -1830,7 +1805,7 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
     var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
     const target_jid = buildFullJid(&jid_buf, bound.local, bound.domain, bound.resource) orelse return;
     if (!std.mem.eql(u8, target_jid, before.getRealJid())) return;
-    fanout.deliverToSession(target, stanza, before.session_id, changes);
+    fanout.deliverToSession(target, stanza, before.session_id);
 }
 
 /// Presence error to a joiner on another worker.
@@ -1866,6 +1841,7 @@ fn sendRoomHistory(
     muc_host: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = muc_host;
     const archive = server.archive orelse return;
     const history_max = room.config.history_length;
@@ -1951,16 +1927,12 @@ fn sendRoomHistory(
             continue;
         };
 
-        session.queueSendStanza(hist_xml) catch |err| {
+        if (session.stanza(hist_xml) == .failed_closed) {
             // A refused queue means the session's buffer is full; the rest
             // of the replay would fail the same way, so stop here (R5).
-            noteQueueDrop(session, hist_xml, err, "room history stanza");
+            c2s_session.noteSendDrop(session, hist_xml, "room history stanza");
             break;
-        };
-    }
-
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
+        }
     }
 }
 
@@ -1994,6 +1966,7 @@ fn sendRoomSubject(
     muc_host: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = server;
     _ = muc_host;
     const subject = room.config.getSubject();
@@ -2019,9 +1992,6 @@ fn sendRoomSubject(
     };
 
     queueStanzaOrDrop(session, subj_xml, "room subject");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 // ============================================================================
@@ -2036,6 +2006,7 @@ fn sendPresenceError(
     condition: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = server;
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -2058,9 +2029,6 @@ fn sendPresenceError(
     };
 
     queueStanzaOrDrop(session, stanza_xml, "presence error");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 fn sendMessageError(
@@ -2072,6 +2040,7 @@ fn sendMessageError(
     condition: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = server;
     var buf: [router.JID_STANZA_MAX]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -2100,9 +2069,6 @@ fn sendMessageError(
     };
 
     queueStanzaOrDrop(session, stanza_xml, "message error");
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 // ============================================================================
@@ -2464,7 +2430,7 @@ pub fn processRemoteGroupchat(
 
         const local_sid = occ.session_id;
         const target_session = server.sessions[local_sid] orelse continue;
-        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid, changes);
+        fanout.deliverPrebuiltToSession(target_session, deliver_lease.buf, prefix, occ.getRealJid(), suffix, local_sid);
 
         delivered += 1;
         if (delivered >= batch_size) {
@@ -3086,18 +3052,16 @@ fn sendIqWaitError(server: *Server, room_jid: []const u8, iq_id: []const u8, wor
 /// Deliver a small stanza to a (worker, session, generation) triple, locally
 /// when the session lives on this worker or via the MPSC otherwise.
 fn deliverToTriple(server: *Server, stanza: []const u8, worker: u16, session_id: usize, generation: u32, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     if (worker == server.worker_id) {
         // The triple may be stale: a reused session slot must never get a
         // stanza meant for its previous holder.
         const sm = server.session_map orelse return;
         if (!sm.getGenerationById(worker, @intCast(session_id), generation)) return;
         const session = server.sessions[session_id] orelse return;
-        session.queueSendStanza(stanza) catch |err| {
-            noteQueueDrop(session, stanza, err, "local MUC delivery");
+        if (session.stanza(stanza) == .failed_closed) {
+            c2s_session.noteSendDrop(session, stanza, "local MUC delivery");
             return;
-        };
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
         }
     } else {
         const ds = server.delivery_system orelse return;
@@ -3316,6 +3280,9 @@ fn sendIqErrorToRemote(server: *Server, room_jid: []const u8, iq_id: []const u8,
     };
 }
 
+/// Scratch for pendingOutboxCopy peeks in tests.
+var outbox_peek_buf: [connection_mod.WRITE_BUF_SIZE]u8 = undefined;
+
 test "S6: self-kick is rejected and the room survives actor processing" {
     var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
@@ -3439,7 +3406,7 @@ test "S1: a wrong room secret of the same decoded length is still refused" {
 
     handleMucPresence(&server, bob, "secret", "bob", "", &changes);
     try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
-    const out = bob.conn.write_buf[bob.conn.write_start..bob.conn.write_end];
+    const out = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "not-authorized") != null);
 }
 
@@ -3502,7 +3469,7 @@ test "S1: room config form values are stored decoded, escaped once on output" {
 
     // The config form response escapes exactly once: no &amp;amp; growth.
     handleMucOwnerGet(&server, session, "room", "cfg2", &changes);
-    const out = session.conn.write_buf[session.conn.write_start..session.conn.write_end];
+    const out = session.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "A&amp;B &lt;C&gt;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "&amp;amp;") == null);
 }
@@ -3571,7 +3538,7 @@ test "G1: an overflowing room secret rejects the whole config form" {
     var changes = ChangeList.init(&scratch);
     handleMucOwnerSet(&server, session, "room", "cfg1", &changes);
 
-    const out = session.conn.write_buf[session.conn.write_start..session.conn.write_end];
+    const out = session.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "type='error'") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "not-acceptable") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "type='modify'") != null);
@@ -3611,7 +3578,7 @@ test "G1: a protected room with no stored secret refuses the join" {
     handleMucPresence(&server, bob, "room", "bob", "", &changes);
 
     try std.testing.expectEqual(@as(usize, 0), room.occupant_count);
-    const out = bob.conn.write_buf[bob.conn.write_start..bob.conn.write_end];
+    const out = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "not-authorized") != null);
 }
 
@@ -3672,7 +3639,9 @@ test "S16: mailbox-full bounce targets the sender and fails closed on overflow" 
     const cn = posix.read(carol_fds[1], &cbuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), cn);
 
-    bob.conn.write_end = bob.conn.write_buf.len;
+    try std.testing.expect(bob.conn.ensureWriteBuf());
+    bob.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    bob.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     bounceRoomMailboxFull(&server, msg, "room@conference.localhost", &changes);
     try std.testing.expect(bob.sm_overflow);
 }
@@ -3927,7 +3896,9 @@ test "S16: local replaced-resource notice overflow fails the session" {
     target.stream.bound_jid = .{ .local = "eve", .domain = "localhost", .resource = "phone" };
     server.sessions[0] = target;
 
-    target.conn.write_end = target.conn.write_buf.len;
+    try std.testing.expect(target.conn.ensureWriteBuf());
+    target.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    target.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
     notifyReplacedResource(&server, room, &before, &changes);
@@ -3973,7 +3944,7 @@ test "S16: a maximum-length escape-heavy replaced-resource notice is built in a 
     try std.testing.expect(server.byte_scratch.len > 0);
     for (server.byte_scratch_in_use) |in_use| try std.testing.expect(!in_use);
 
-    const queued = target.conn.write_buf[target.conn.write_start..target.conn.write_end];
+    const queued = target.conn.pendingOutboxCopy(&outbox_peek_buf);
     const expected = "<presence from='" ++ ("&apos;" ** 512) ++ "/" ++ ("&apos;" ** 64) ++
         "' to='" ++ ("&apos;" ** 511) ++ "@" ++ ("&apos;" ** 500) ++ "/" ++ ("&apos;" ** 11) ++
         "' type='unavailable'><x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='member' role='none'/><status code='110'/></x></presence>";
@@ -4058,7 +4029,8 @@ test "H5: the first fan-out after a genuine buffer-full loss still reaches the r
 
     // bob's connection is nearly full, so a small stanza no longer fits. This
     // is the genuinely-full case the teardown is for, not the H5 size case.
-    server.sessions[1].?.conn.write_end = connection_mod.WRITE_BUF_SIZE - 64;
+    server.sessions[1].?.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
+    server.sessions[1].?.conn.outbox.used = connection_mod.WRITE_BUF_SIZE - 64;
 
     const body = "<body>one</body>";
     handleMucGroupchat(&server, server.sessions[0].?, "arena", body, "m1", &changes);
@@ -4074,7 +4046,7 @@ test "H5: the first fan-out after a genuine buffer-full loss still reaches the r
     }
     var sink: [8192]u8 = undefined;
     while ((posix.read(peer_fds[1], &sink) catch 0) > 0) {}
-    server.sessions[1].?.conn.write_end = 0;
+    server.sessions[1].?.conn.outbox.used = 0;
     const body2 = "<body>two</body>";
     handleMucGroupchat(&server, server.sessions[0].?, "arena", body2, "m2", &changes);
     for (0..3) |idx| {
@@ -4208,7 +4180,7 @@ test "H5: an oversized groupchat body is rejected with a bounce, not a room tear
     // The sender is told, and neither session is marked for teardown.
     try std.testing.expect(!alice.sm_overflow);
     try std.testing.expect(!bob.sm_overflow);
-    const reply = alice.conn.write_buf[alice.conn.write_start..alice.conn.write_end];
+    const reply = alice.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "id='big1'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "resource-constraint") != null);
@@ -4361,7 +4333,7 @@ test "H5: ingress sizing accounts for an occupant JID that escapes wider" {
 
     // Rejected at ingress: the sender is told and no session is torn down.
     try std.testing.expect(!alice.sm_overflow);
-    const reply = alice.conn.write_buf[alice.conn.write_start..alice.conn.write_end];
+    const reply = alice.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, reply, "type='error'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "resource-constraint") != null);
 }
@@ -4542,7 +4514,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     handleMucOwnerSet(&server, owner, "room", "cfg1", &changes);
 
     // Read-side: the bound 'NaplesTB@localhost' is the stored owner.
-    const set_out = owner.conn.write_buf[owner.conn.write_start..owner.conn.write_end];
+    const set_out = owner.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, set_out, "type='result'") != null);
     try std.testing.expect(std.mem.indexOf(u8, set_out, "forbidden") == null);
     // Write-side: the re-persisted affiliation lands under the folded key.
@@ -4550,7 +4522,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     try std.testing.expectEqual(Affiliation.none, try store.getAffiliation("room@conference.localhost", "NaplesTB@localhost"));
 
     handleMucOwnerGet(&server, owner, "room", "cfg2", &changes);
-    const out = owner.conn.write_buf[owner.conn.write_start..owner.conn.write_end];
+    const out = owner.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "forbidden") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "muc#roomconfig") != null);
 
@@ -4569,7 +4541,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     const occupants_before = room.occupant_count;
     handleMucPresence(&server, carol, "room", "carolx", "", &changes);
     try std.testing.expectEqual(occupants_before, room.occupant_count);
-    const cout = carol.conn.write_buf[carol.conn.write_start..carol.conn.write_end];
+    const cout = carol.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, cout, "forbidden") != null);
 
     // Remote join path: the same folded lookup applies to a member
@@ -4599,9 +4571,10 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     defer session.deinit();
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     session.iq_to = "conference.localhost";
+    // A reply longer than the outbound bound: the append refuses it even
+    // with the outbox empty, so this is oversize, not a slow reader.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
-    // A reply longer than the whole write buffer: queueSend refuses it even
-    // with the buffer empty, so this is oversize, not a slow reader.
     const stanza = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 32);
     defer allocator.free(stanza);
     const head = "<iq type='result' from='conference.localhost' to='alice@localhost/mobile' id='big1'><query>";
@@ -4635,9 +4608,11 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     var session = Session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
-    @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
-    session.conn.write_start = 0;
-    session.conn.write_end = connection_mod.WRITE_BUF_SIZE;
+    try std.testing.expect(session.conn.ensureWriteBuf());
+    @memset(session.conn.write_buf.?[0..], 'x');
+    session.conn.outbox.head = 0;
+    session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
     const drops_before = delivery_queue.oversize_queue_drops.load(.monotonic);
     queueStanzaOrDrop(&session, "<iq type='result' id='q1'/>", "small iq result");

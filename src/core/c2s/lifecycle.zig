@@ -47,7 +47,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
             break;
         };
 
-        var conn = server.listener.accept(id) catch |err| {
+        var conn = server.listener.accept(id, server.allocator) catch |err| {
             releaseId(server, id);
             switch (err) {
                 error.WouldBlock => break,
@@ -70,19 +70,40 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
         // any aborted zombie exchange the auth daemon still held (T32).
         session.auth_ipc_gen = std.crypto.random.int(u16);
         session.conn = conn;
+        // The conn reached its permanent home: point the outbox ring at
+        // its write_buf, its counters at this worker's block, and its
+        // dirty links at this worker's end-of-iteration flush list (C2).
+        session.conn.bindOutbox(connection_mod.countersForWorker(server.worker_id), connection_mod.dirtyForWorker(server.worker_id));
         server.sessions[id] = session;
 
         changes.addRead(conn.fd, id) catch {
             log.err("changelist full on accept", .{});
-            session.deinit();
-            server.allocator.destroy(session);
-            server.sessions[id] = null;
-            releaseId(server, id);
+            failAcceptedSession(server, session, id);
+            break;
+        };
+
+        // The write knote lives for the fd's life, registered disabled in
+        // DISPATCH mode: every delivery auto-disables it, so a stall arms
+        // with a bare enableWrite and a drained flush needs no EV_DELETE
+        // (ADR-2).
+        changes.addWriteDisabled(conn.fd, id) catch {
+            log.err("changelist full on accept (write knote)", .{});
+            failAcceptedSession(server, session, id);
             break;
         };
 
         log.info("accepted connection id={d} fd={d}", .{ id, conn.fd });
     }
+}
+
+/// Accept-path teardown for a session whose kqueue registration failed:
+/// the same deinit/destroy/slot/id release destroySession does before its
+/// stream-state cleanup, which does not exist yet at accept.
+fn failAcceptedSession(server: *Server, session: *Session, id: usize) void {
+    session.deinit();
+    server.allocator.destroy(session);
+    server.sessions[id] = null;
+    releaseId(server, id);
 }
 
 /// Process resource bind and register session in the unified session map.
@@ -197,7 +218,7 @@ fn sendBindRejected(session: *Session) void {
     w.writeAll("><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>" ++
         "<error type='cancel'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>" ++
         "</error></iq>") catch return;
-    session.queueSendStanza(fbs.getWritten()) catch return;
+    if (session.stanza(fbs.getWritten()) == .failed_closed) return;
 }
 
 /// T154: the session_kick reply arrived — the full JID is free now. Retry
@@ -215,9 +236,6 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
             log.info("connection {d} session established (kicked remote resource)", .{sess.conn.id});
             if (sess.conn.hasPendingWrite()) {
                 _ = sess.conn.flushSend() catch {};
-                if (sess.conn.hasPendingWrite()) {
-                    changes_.addWrite(sess.conn.fd, sess.conn.id) catch {};
-                }
             }
             // Answered — the id's job is done.
             sess.bind_iq_id = "";
@@ -253,9 +271,6 @@ pub fn completeBindAfterKick(server: *Server, session: *Session, changes: *Chang
         sendBindRejected(session);
         session.bind_iq_id = "";
         session.bind_iq_id_len = 0;
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
     }
 }
 
@@ -370,6 +385,13 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
         c2s_sm.smIdMapRemove(server, session.sm_id[0..session.sm_id_len]);
     }
 
+    // A detached session that dies without a resume still owns an unacked
+    // queue; its messages go to offline storage rather than vanishing
+    // (ADR-2). Live-session overflow reaps drain in reapOutboundOverflow.
+    if (session.sm_detached) {
+        drainUnackedToOffline(server, session);
+    }
+
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
     if (session.stream.bound_jid) |bound| close_cleanup: {
         var close_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
@@ -437,7 +459,9 @@ fn recordLastOffline(roster: anytype, bound: anytype) void {
 /// Detached sessions are destroyed; a later resume fails with item-not-found
 /// and the client performs a full bind and MAM catch-up.
 /// Called once per event batch from the worker event loop.
-pub fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
+/// noinline: the teardown chains (destroySession, drainUnackedToOffline)
+/// are cold paths and must stay out of the Server.run frame.
+pub noinline fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
     for (server.sessions, 0..) |slot, i| {
         const session = slot orelse continue;
         if (!session.sm_overflow) continue;
@@ -451,7 +475,53 @@ pub fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
             c2s_session.sendStreamError(server, session, .resource_constraint);
             // Flush the stream error before teardown so the client sees it.
             session.conn.flushSync();
+            // ADR-2 fail-closed policy: the unacked queue is authoritative
+            // for what the client never acknowledged; its messages go to
+            // offline storage instead of dying with the session.
+            drainUnackedToOffline(server, session);
             forceCloseSession(server, i, changes);
+        }
+    }
+}
+
+/// ADR-2 fail-closed drain: on teardown of a session with an SM unacked
+/// queue, offer each pending `<message>` stanza to the recipient's offline
+/// store so an over-cap session loses nothing the client never
+/// acknowledged. Only `<message>` qualifies (RFC 6121): type='error' and
+/// type='groupchat' are never stored, presence and iq are skipped. Store
+/// failures count against offline_drain_drops. C11 builds the full
+/// XEP-0198 section 5 policy on this path; C2 only drains.
+fn drainUnackedToOffline(server: *Server, session: *Session) void {
+    const store = server.offline orelse return;
+    const queue = session.sm_unacked orelse return;
+    const bound = session.stream.bound_jid orelse return;
+    var recipient_buf: [router.BARE_JID_MAX]u8 = undefined;
+    const recipient = router.buildBareJid(bound.local, bound.domain, &recipient_buf) catch {
+        noteDrop("session {d} unacked drain skipped: bare JID exceeds {d} bytes", .{ session.conn.id, router.BARE_JID_MAX });
+        return;
+    };
+    const now: u64 = @intCast(@max(std.time.timestamp(), 0));
+    var iter = queue.getUnacked();
+    while (iter.next()) |stanza| {
+        const head_end = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
+        const head = stanza[0..head_end];
+        if (head.len < 8 or !std.mem.eql(u8, head[0..8], "<message")) continue;
+        if (head.len > 8 and head[8] != ' ' and head[8] != '/') continue;
+        if (c2s_session.headAttr(head, "type")) |stanza_type| {
+            if (std.mem.eql(u8, stanza_type, "error") or std.mem.eql(u8, stanza_type, "groupchat")) continue;
+        }
+        const stored = store.storeHeldPointer(
+            recipient,
+            c2s_session.headAttr(head, "from") orelse "",
+            c2s_session.headAttr(head, "id") orelse "offline",
+            now,
+            stanza,
+        ) catch {
+            _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
+            continue;
+        };
+        if (!stored) {
+            _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
         }
     }
 }
@@ -603,7 +673,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                     continue;
                 }
             }
-            session.queueSendStanza(wire) catch {
+            if (session.stanza(wire) == .failed_closed) {
                 // Send buffer full: stop here and let the writable handler
                 // drain the tail at the low-water mark. This message and the
                 // rest stay in the store, so nothing is lost.
@@ -612,7 +682,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
                 session.offline_store_stalls = 0;
                 completed = false;
                 break;
-            };
+            }
             // Only delete what was actually handed to the connection. If the
             // delete fails the pointer survives, so record its sequence: the
             // next drain redoes the delete without sending the stanza twice.
@@ -655,7 +725,10 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
         if (arrived_mid_drain) {
             session.offline_pending = true;
             if (!session.conn.hasPendingWrite()) {
-                changes.addWriteOnce(session.conn.fd, session.conn.id) catch |stage_err| {
+                // Nothing queued means nothing re-drives the drain
+                // continuation; one enableWrite on the DISPATCH knote
+                // prompts a single writable event for it.
+                changes.enableWrite(session.conn.fd) catch |stage_err| {
                     server.offline_retry_sweep_needed = true;
                     log.warn("offline re-drain arm for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
                 };
@@ -664,10 +737,6 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
             cancelOfflineRetryTimer(session, changes);
             session.offline_pending = false;
         }
-    }
-
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
     }
 
     log.info("delivered {d} offline messages to {s}", .{ delivered, bare_jid });
@@ -933,10 +1002,10 @@ const OFFLINE_STALL_RETRY_MAX: u8 = 8;
 pub const OFFLINE_RETRY_DELAY_MS: u32 = 5_000;
 
 /// Mark the drain stalled after a store error and make sure something will
-/// retry it. A buffer-full stall leaves data in the write buffer, so
-/// EVFILT_WRITE fires again; a store error with an empty buffer leaves
-/// nothing armed and the tail would sit undelivered until the next presence
-/// stanza or reconnect.
+/// retry it. A buffer-full stall leaves data in the outbox, so the dirty
+/// link or armed knote already re-drives the drain continuation; a store
+/// error with an empty outbox leaves nothing pending, so one enableWrite
+/// on the DISPATCH knote prompts a writable event for the retry.
 fn stallOnStoreError(
     server: *Server,
     session: *Session,
@@ -947,13 +1016,6 @@ fn stallOnStoreError(
     session.offline_pending = true;
     if (session.offline_store_stalls < std.math.maxInt(u8)) {
         session.offline_store_stalls += 1;
-    }
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch |stage_err| {
-            server.offline_retry_sweep_needed = true;
-            log.warn("offline retry write arm for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
-        };
-        return;
     }
     if (session.offline_store_stalls > OFFLINE_STALL_RETRY_MAX) {
         if (!session.offline_retry_timer_armed) {
@@ -969,9 +1031,10 @@ fn stallOnStoreError(
         });
         return;
     }
-    // One-shot so the retry is a single prompt attempt, not a level-triggered
-    // wake that fires on every loop pass while the store stays broken.
-    changes.addWriteOnce(session.conn.fd, session.conn.id) catch |stage_err| {
+    // The DISPATCH knote auto-disables on delivery, so one enable is a
+    // single prompt attempt, not a level-triggered wake that fires on
+    // every loop pass while the store stays broken.
+    changes.enableWrite(session.conn.fd) catch |stage_err| {
         server.offline_retry_sweep_needed = true;
         log.warn("offline prompt retry for {s} failed: {s}; using the fallback sweep", .{ bare_jid, @errorName(stage_err) });
     };
@@ -1103,6 +1166,10 @@ fn makeAuthenticatedSession(server: *Server, id: usize, local: []const u8) !*Ses
 
 // T158 regression test: SM detach timer (300s) must expire sessions correctly —
 // not early (which would kill resumable sessions) and not late/never (memory leak).
+
+/// Scratch for pendingOutboxCopy peeks in tests.
+var outbox_peek_buf: [connection_mod.WRITE_BUF_SIZE]u8 = undefined;
+
 test "T158: detach timer expires sessions at 300s, not before" {
     const allocator = std.testing.allocator;
 
@@ -1319,14 +1386,14 @@ test "S13: a row stored mid-drain is re-armed for rather than stranded" {
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(session.offline_pending);
 
-    // It also armed a pass of its own, so no presence event is needed. With
-    // bytes still buffered the level-triggered write registration carries the
-    // resume; with none, the drain arms a one-shot. Either one wakes it.
-    var armed = false;
+    // It also re-armed a pass of its own, so no presence event is needed.
+    // Bytes still buffered mean the dirty-list flush drives the drain
+    // continuation; an empty outbox stages a bare enableWrite on the
+    // DISPATCH knote instead. Either one wakes it.
+    var armed = session.conn.hasPendingWrite();
     for (changes.slice()) |ev| {
         if (ev.ident != @as(usize, @intCast(session.conn.fd))) continue;
         if (ev.filter != std.c.EVFILT.WRITE) continue;
-        if (ev.udata != 1) continue;
         armed = true;
     }
     try std.testing.expect(armed);
@@ -1382,8 +1449,9 @@ test "S13: offline delivery keeps undelivered messages when the send buffer fill
         destroySession(&server, 1, session, &changes);
     }
 
-    // 40 messages of ~1 KiB each: roughly 40 KiB of backlog against the
-    // 16 KiB connection write buffer, so delivery must pause partway.
+    // 40 messages of ~1 KiB each: roughly 40 KiB of backlog against an
+    // outbox bounded at the 16 KiB ring, so delivery must pause partway.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     const total: usize = 40;
     var stanza_buf: [1024]u8 = undefined;
     const pad = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
@@ -1475,6 +1543,8 @@ test "S13: stalled offline drain resumes via drainOfflinePending" {
         _ = try offline_store.storePointer("bob@localhost", "alice@localhost", stanza_id, ts);
     }
 
+    // Bound the outbox at the ring so the backlog stalls mid-drain.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
     try std.testing.expect(session.offline_pending);
     try std.testing.expect(try offline_store.countMessages("bob@localhost") > 0);
@@ -1497,6 +1567,62 @@ test "S13: stalled offline drain resumes via drainOfflinePending" {
     try std.testing.expect(!session.offline_pending);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(rounds > 1);
+}
+
+// ADR-2 fail-closed: an over-cap session's unacked <message>s reach the
+// recipient's offline store at teardown; non-messages and the types RFC
+// 6121 forbids offline (error, groupchat) are skipped.
+test "S15: an overflowed session drains unacked messages to offline storage" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // Live peer end so the stream error can flush during teardown.
+    const fds = try testSocketPair();
+    defer posix.close(fds[1]);
+    const session = try server.allocator.create(Session);
+    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.stream.state = .active;
+    session.stream.authenticated = true;
+    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    server.sessions[1] = session;
+    server.free_count -= 1;
+    // Owned by session.deinit once assigned.
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    session.sm_unacked = queue;
+
+    _ = queue.push("<message from='alice@localhost' to='bob@localhost' id='m1'><body>held</body></message>");
+    _ = queue.push("<presence from='bob@localhost/res'/>");
+    _ = queue.push("<message type='error' from='alice@localhost' id='e1'/>");
+    _ = queue.push("<message type='groupchat' from='alice@localhost' id='g1'/>");
+    _ = queue.push("<iq type='result' id='i1'/>");
+
+    session.sm_overflow = true;
+    reapOutboundOverflow(&server, &changes);
+
+    // Only the plain <message> reached the offline store; the session
+    // was reaped with resource-constraint.
+    try std.testing.expect(server.sessions[1] == null);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
+    const ptrs = try offline_store.getPointers("bob@localhost");
+    defer offline_store.freePointers(ptrs);
+    try std.testing.expectEqualStrings("m1", ptrs[0].stanza_id);
 }
 
 // S13: a pointer whose archive entry is gone must not be skipped on every
@@ -1910,13 +2036,13 @@ test "S13: store-error stall with an empty buffer re-arms the drain" {
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(!session.conn.hasPendingWrite());
 
-    // Nothing else can wake this session, so the drain armed its own retry.
+    // Nothing else can wake this session, so the drain armed its own
+    // retry: a bare EV_ENABLE on the DISPATCH write knote.
     var armed = false;
     for (changes.slice()) |ev| {
         if (ev.ident != @as(usize, @intCast(session.conn.fd))) continue;
         if (ev.filter != std.c.EVFILT.WRITE) continue;
-        if ((ev.flags & std.c.EV.ONESHOT) == 0) continue;
-        if (ev.udata != 1) continue;
+        if ((ev.flags & std.c.EV.ENABLE) == 0) continue;
         armed = true;
     }
     try std.testing.expect(armed);
@@ -1991,7 +2117,7 @@ test "S13: store-error retries are bounded, then a one-shot timer resumes" {
 
         var armed = false;
         for (changes.slice()) |ev| {
-            if (ev.filter == std.c.EVFILT.WRITE and (ev.flags & std.c.EV.ONESHOT) != 0) armed = true;
+            if (ev.filter == std.c.EVFILT.WRITE and (ev.flags & std.c.EV.ENABLE) != 0) armed = true;
         }
         if (!armed) break;
     }
@@ -2498,7 +2624,7 @@ test "S35: a stanza that only fits unstamped is sent without a stamp" {
 
     // The stored bytes went out untouched and the pointer is gone: the drain
     // neither stalls on the stamp nor loses the message.
-    const pending = session.conn.write_buf[0..session.conn.write_end];
+    const pending = session.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expectEqualStrings(stanza, pending);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(!session.offline_pending);
@@ -2556,7 +2682,7 @@ test "S35: an unsendable stored stanza is dropped and the drain continues" {
     // The oversized pointer is counted and deleted, and the message behind it
     // was still delivered: one bad row cannot park the queue.
     try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.offline_drain_drops.load(.monotonic));
-    const pending = session.conn.write_buf[0..session.conn.write_end];
+    const pending = session.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, pending, "<body>small</body>") != null);
     try std.testing.expect(std.mem.indexOf(u8, pending, "id='big'") == null);
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));

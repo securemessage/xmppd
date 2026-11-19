@@ -94,6 +94,7 @@ const MAX_SM_REDIRECT_HOPS: u8 = 8;
 /// If the client includes resume='true', session resumption is enabled and
 /// an SM-ID is generated for future reconnection.
 pub fn handleSmEnable(self: *Server, session: *Session, elem: xml.Element, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     session.sm_enabled = true;
     session.sm_in_h = 0;
     session.sm_out_h = 0;
@@ -124,10 +125,7 @@ pub fn handleSmEnable(self: *Server, session: *Session, elem: xml.Element, chang
             session.sm_resume_enabled = false;
             session.sm_id_len = 0;
             w.writeAll("<enabled xmlns='urn:xmpp:sm:3'/>") catch return;
-            session.conn.queueSend(fbs.getWritten()) catch return;
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
+            if (session.nonza(fbs.getWritten()) == .failed_closed) return;
             return;
         };
         queue.* = sm_state.SmUnackedQueue.init(self.allocator);
@@ -147,10 +145,7 @@ pub fn handleSmEnable(self: *Server, session: *Session, elem: xml.Element, chang
         log.info("connection {d} stream management enabled", .{session.conn.id});
     }
 
-    session.conn.queueSend(fbs.getWritten()) catch return;
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
 }
 
 /// Handle <resume xmlns='urn:xmpp:sm:3' previd='...' h='N'/> — attempt session resume.
@@ -379,21 +374,20 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     w.writeAll("' previd='") catch return;
     w.writeAll(session.sm_id[0..session.sm_id_len]) catch return;
     w.writeAll("'/>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
 
     // Replay unacked stanzas
     if (session.sm_unacked) |queue| {
         var iter = queue.getUnacked();
         while (iter.next()) |stanza| {
-            session.conn.queueSend(stanza) catch break;
+            // Replayed stanzas are already counted in sm_unacked: nonza
+            // appends without re-tracking, or resume would count them twice.
+            if (session.nonza(stanza) == .failed_closed) break;
         }
     }
 
     if (session.conn.hasPendingWrite()) {
         _ = session.conn.flushSend() catch {};
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
     }
 
     // Resume sends no initial presence, so nothing else would restart a
@@ -747,20 +741,19 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
     w.writeAll("' previd='") catch return;
     w.writeAll(session.sm_id[0..session.sm_id_len]) catch return;
     w.writeAll("'/>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
 
     if (session.sm_unacked) |q| {
         var iter = q.getUnacked();
         while (iter.next()) |stanza| {
-            session.conn.queueSend(stanza) catch break;
+            // Replayed stanzas are already counted in sm_unacked: nonza
+            // appends without re-tracking, or resume would count them twice.
+            if (session.nonza(stanza) == .failed_closed) break;
         }
     }
 
     if (session.conn.hasPendingWrite()) {
         _ = session.conn.flushSend() catch {};
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
     }
 
     // Resume sends no initial presence, so nothing else would restart a
@@ -962,13 +955,14 @@ pub fn sendSmHandledCountError(self: *Server, session: *Session, h: ?u32, change
         w.print(" h='{d}' send-count='{d}'", .{ v, session.sm_out_seq }) catch return;
     }
     w.writeAll("/></stream:error>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
     session.conn.flushSync();
     session_lifecycle.forceCloseSession(self, session.conn.id, changes);
 }
 
 /// Send SM <failed/> with a specific error condition.
 pub fn sendSmFailed(self: *Server, session: *Session, condition: []const u8, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = self;
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
@@ -983,12 +977,9 @@ pub fn sendSmFailed(self: *Server, session: *Session, condition: []const u8, cha
     w.writeAll(" xmlns='") catch return;
     w.writeAll(ns) catch return;
     w.writeAll("'/></failed>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
     if (session.conn.hasPendingWrite()) {
         _ = session.conn.flushSend() catch {};
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
     }
 }
 
@@ -1084,19 +1075,18 @@ pub fn smRedirectsPurgeExpired(self: *Server, now: i64) void {
 /// Handle <r xmlns='urn:xmpp:sm:3'/> — respond with server's inbound h value.
 /// Flushes immediately to avoid latency from changelist-based deferred writes.
 pub fn handleSmRequest(self: *Server, session: *Session, changes: *ChangeList) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     _ = self;
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
     w.writeAll("<a xmlns='urn:xmpp:sm:3' h='") catch return;
     std.fmt.format(w, "{d}", .{session.sm_in_h}) catch return;
     w.writeAll("'/>") catch return;
-    session.conn.queueSend(fbs.getWritten()) catch return;
-    // Attempt immediate flush — SM acks are latency-critical.
-    // If flush leaves pending data (WouldBlock), fall back to kqueue write.
+    if (session.nonza(fbs.getWritten()) == .failed_closed) return;
+    // Attempt immediate flush: SM acks are latency-critical. A stall
+    // leaves the conn dirty-linked; the batch tail arms EVFILT_WRITE
+    // only on a real EAGAIN.
     _ = session.conn.flushSend() catch {};
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session.conn.id) catch {};
-    }
 }
 
 test "S17: SM-ID map holds more than 64 detached sessions" {

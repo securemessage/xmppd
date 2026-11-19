@@ -20,7 +20,9 @@ const posix = std.posix;
 
 const log = std.log.scoped(.metrics);
 
-/// Mirrors room_registry.MAX_WORKERS without importing it.
+/// Worker counters bound: core MAX_LISTEN_FDS is comptime-asserted
+/// against this and the room-registry bound in core main, so every
+/// spawned worker id has a counters slot the SIGUSR1 dump reads (gate R5).
 pub const MAX_WORKERS = 64;
 
 /// log2 microsecond buckets: bucket k holds iterations in [2^k, 2^(k+1)) us.
@@ -59,6 +61,7 @@ pub const Counters = struct {
     envelopes_xworker: Counter = .init(0),
     // Appendix C drop reasons counted at their central choke points.
     drop_send_buffer_full: Counter = .init(0),
+    drop_send_alloc: Counter = .init(0),
     drop_send_closed: Counter = .init(0),
     drop_changelist_full: Counter = .init(0),
     drop_no_route: Counter = .init(0),
@@ -131,22 +134,25 @@ fn read(c: *const Counter) u64 {
 
 /// Log the worker's counters and loop-time histogram. Called from the
 /// worker's own EVFILT_SIGNAL handler, so plain relaxed loads suffice.
-pub fn dump(worker_id: u16, ext: Externals) void {
+/// noinline: the dump path is cold and must stay out of the dispatch
+/// and run frames (ReleaseSafe caps).
+pub noinline fn dump(worker_id: u16, ext: Externals) void {
     if (worker_id >= MAX_WORKERS) return;
     const c = &workers[worker_id].counters;
     log.info("worker {d} counters: stanzas msg={d} pres={d} iq={d} bytes in={d} out={d} wakes={d}", .{
-        worker_id,          read(&c.stanzas_message), read(&c.stanzas_presence), read(&c.stanzas_iq),
-        read(&c.bytes_in),  read(&c.bytes_out),       read(&c.wakes),
+        worker_id,         read(&c.stanzas_message), read(&c.stanzas_presence), read(&c.stanzas_iq),
+        read(&c.bytes_in), read(&c.bytes_out),       read(&c.wakes),
     });
     log.info("worker {d} loop: iterations={d} kevent events={d} changes={d} envelopes xworker={d}", .{
         worker_id, read(&c.loop_iterations), read(&c.kevent_events), read(&c.kevent_changes), read(&c.envelopes_xworker),
     });
-    log.info("worker {d} drops (App. C): send_buf_full={d} send_closed={d} changelist_full={d} no_route={d} ring_full={d} ring_payload={d} room_mailbox={d}", .{
-        worker_id,           read(&c.drop_send_buffer_full), read(&c.drop_send_closed), read(&c.drop_changelist_full),
-        read(&c.drop_no_route), ext.ring_drops_full,          ext.ring_drops_payload,   ext.room_mailbox_drops,
+    log.info("worker {d} drops (App. C): send_buf_full={d} send_alloc={d} send_closed={d} changelist_full={d} no_route={d} ring_full={d} ring_payload={d} room_mailbox={d}", .{
+        worker_id,                     read(&c.drop_send_buffer_full), read(&c.drop_send_alloc), read(&c.drop_send_closed),
+        read(&c.drop_changelist_full), read(&c.drop_no_route),         ext.ring_drops_full,      ext.ring_drops_payload,
+        ext.room_mailbox_drops,
     });
     log.info("worker {d} drops (module-global): jid_overflow={d} xworker={d} s2s_bounces={d} offline_not_stored={d} offline_hold_bounces={d} offline_drain={d}", .{
-        worker_id,             ext.jid_overflow_drops, ext.cross_worker_drops,   ext.s2s_bounces,
+        worker_id,              ext.jid_overflow_drops,   ext.cross_worker_drops,  ext.s2s_bounces,
         ext.offline_not_stored, ext.offline_hold_bounces, ext.offline_drain_drops,
     });
     var buf: [HIST_BUCKETS * 24]u8 = undefined;

@@ -22,6 +22,10 @@
 #                  silent drops rework: dir_entries[256] + reply builders)
 #   muc.handler.handleMucGroupchat +32 2e67b8b (S32 mints a stanza id into
 #                  sid_buf[32] for id-less groupchat), +32 8b91874 (R5)
+#   C2 merge: Connection's 16 KiB outbox ring backing moved to a lazy heap
+#     block (ensureWriteBuf), so by-value Connection frames shrank ~16 KiB
+#     per slot and Session.init fell under the 16 KiB threshold entirely;
+#     its row is removed so any return is flagged as new.
 #   c2s.session.Session.init +16: not a code change; codegen only. A
 #     -Dcpu=baseline build at the original measurement point 8086a6a
 #     already probes 0x7B30 (31536) where the native build probes 0x7B20
@@ -33,9 +37,8 @@
 #                  wraps the DebugAllocator in Debug builds (-Dallocator
 #                  default debug)
 archive_queue.ArchiveWriteQueue.init	186000
-c2s.lifecycle.acceptConnections	130112
-c2s.session.Session.init	31536
-listener.Listener.accept	74704
+c2s.lifecycle.acceptConnections	81344
+listener.Listener.accept	25952
 main.configureServer	167696
 main.main	3067512
 main.workerThread	710912

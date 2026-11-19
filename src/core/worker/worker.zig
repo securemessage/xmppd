@@ -113,7 +113,6 @@ const SaslCollecting = c2s_session.SaslCollecting;
 const noteDrop = c2s_session.noteDrop;
 const noteJidOverflow = c2s_session.noteJidOverflow;
 const queueStanzaOrDrop = c2s_session.queueStanzaOrDrop;
-const noteQueueDrop = c2s_session.noteQueueDrop;
 pub const noteQueueOverflow = c2s_session.noteQueueOverflow;
 const fillWriteBuffer = c2s_session.fillWriteBuffer;
 const makeSocketPair = c2s_session.makeSocketPair;
@@ -184,6 +183,13 @@ const CHANGE_BUF_SIZE = 1024;
 /// dropIpcAuth's per-session writes stay best-effort because one entry per
 /// mid-SASL session cannot be bounded by a fixed tail.
 const IPC_RECONCILE_RESERVED = 8;
+
+/// Upper bound on dirty-list pops per batch tail. A link placed during
+/// the walk (a flush error's close broadcasts, a re-drive after a lost
+/// arm) extends the walk; the cap keeps that bounded and leftovers
+/// re-drive through the wake pipe.
+const DIRTY_FLUSH_POPS_MAX: u32 = 256;
+
 /// The XMPP core server.
 pub const Server = struct {
     loop: EventLoop,
@@ -563,9 +569,6 @@ pub const Server = struct {
             session.auth_state = .none;
             session.sasl_collecting = .none;
             c2s_session.executeAction(self, session, session.stream.saslFailure("temporary-auth-failure"), changes);
-            if (session.conn.hasPendingWrite()) {
-                changes.addWrite(session.conn.fd, session.conn.id) catch {};
-            }
         }
         // The mechanism list is re-sent by the daemon on connect; don't
         // advertise a dead daemon's set meanwhile.
@@ -1050,6 +1053,11 @@ pub const Server = struct {
             // Fail sessions whose outbound delivery overflowed in this batch.
             session_lifecycle.reapOutboundOverflow(self, &changes);
 
+            // ADR-2 end-of-iteration flush: every conn that accepted
+            // outbound bytes this batch sits on outbox_dirty; flush each
+            // once so EVFILT_WRITE arms only after a real EAGAIN.
+            self.flushDirtyOutboxes(&changes);
+
             // S10: single point of truth for IPC write interest; heals
             // any re-arm lost while handling this batch.
             self.reconcileIpcWriteInterest(&changes);
@@ -1096,11 +1104,49 @@ pub const Server = struct {
 
     fn handleReadableOrHandshake(self: *Server, id: usize, changes: *ChangeList) void {
         const session = self.sessions[id] orelse return;
+        // A flush that stalled on TLS want_read gets its read event now:
+        // re-link so the batch tail retries it (ADR-2).
+        if (session.conn.flush_want_read) {
+            session.conn.flush_want_read = false;
+            session.conn.linkDirty();
+        }
         if (session.conn.isTlsHandshaking()) {
             c2s_session.continueTlsHandshake(self, id, session, changes);
             return;
         }
         c2s_session.handleReadable(self, id, changes);
+    }
+
+    /// The ADR-2 end-of-iteration walk: each conn that accepted outbound
+    /// bytes this batch links itself on the worker's dirty list and is
+    /// flushed once here. Only the population linked at walk start belongs
+    /// to this iteration; a link placed mid-walk (a failed write arm's
+    /// re-link, a flush error's close broadcasts) appends at the tail past
+    /// that bound, so no conn is ever popped twice in one walk. Pop count
+    /// is bounded so the tail cannot spin forever; leftovers re-drive on
+    /// the loop's own EVFILT_USER knote, which exists on every worker
+    /// whether or not a delivery system does.
+    fn flushDirtyOutboxes(self: *Server, changes: *ChangeList) void {
+        const dirty = connection_mod.dirtyForWorker(self.worker_id);
+        var todo = dirty.count;
+        var pops: u32 = 0;
+        while (pops < DIRTY_FLUSH_POPS_MAX and todo > 0) : (pops += 1) {
+            const conn = dirty.pop() orelse break;
+            todo -= 1;
+            // close() unlinks, so a popped conn is normally live; a link
+            // that raced an inline close pops a dead conn, skip it.
+            if (conn.closed) continue;
+            const session: *Session = @fieldParentPtr("conn", conn);
+            _ = c2s_session.flushSessionOutbox(self, session, changes);
+        }
+        if (!dirty.empty()) {
+            // The pop cap or a mid-walk link left conns queued; the
+            // self-wake knote guarantees another iteration to finish
+            // them (single-worker mode has no delivery pipe to lean on).
+            self.loop.selfWake() catch |err| {
+                log.warn("dirty-list self-wake failed: {s}; leftovers wait for the next event", .{@errorName(err)});
+            };
+        }
     }
 
     fn handleWritableOrHandshake(self: *Server, id: usize, changes: *ChangeList) void {
@@ -1129,6 +1175,13 @@ pub const Server = struct {
                         // Already handled in the first pass
                     } else {
                         self.handleReadableOrHandshake(e.udata, changes);
+                    }
+                },
+                .user => |u| {
+                    // The dirty-list self-wake carries no work itself; the
+                    // batch tail below re-flushes whatever stayed linked.
+                    if (u.ident != @import("loop.zig").SELF_WAKE_IDENT) {
+                        log.warn("unknown EVFILT_USER event ident={d}", .{u.ident});
                     }
                 },
                 .fd_writable => |e| {
@@ -1203,6 +1256,7 @@ pub const Server = struct {
     /// on the per-stanza path only while inlined it cost one probed frame
     /// inside handleElementStart.
     pub noinline fn sendIngressJidMalformed(self: *Server, session: *Session, elem: *xml.Element, changes: *ChangeList) void {
+        _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
         _ = self;
         var to_attr: []const u8 = "";
         var id_attr: []const u8 = "";
@@ -1240,9 +1294,6 @@ pub const Server = struct {
             return;
         };
         queueStanzaOrDrop(session, stanza, "jid-malformed reply");
-        if (session.conn.hasPendingWrite()) {
-            changes.addWrite(session.conn.fd, session.conn.id) catch {};
-        }
     }
 
     // ========================================================================
@@ -1450,15 +1501,11 @@ pub const Server = struct {
                     noteDrop("SASL challenge to connection {d} exceeds {d} bytes; dropped", .{ conn_id, session.write_scratch.len });
                     return;
                 };
-                session.conn.queueSend(challenge_xml) catch |err| {
-                    noteQueueDrop(session, challenge_xml, err, "SASL challenge");
+                if (session.nonza(challenge_xml) == .failed_closed) {
+                    c2s_session.noteSendDrop(session, challenge_xml, "SASL challenge");
                     return;
-                };
-                session.auth_state = .none;
-
-                if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, conn_id) catch {};
                 }
+                session.auth_state = .none;
             },
             .auth_success => |m| {
                 // Base64-encode server_final for the <success> element
@@ -1523,16 +1570,13 @@ pub const Server = struct {
                     // Flush immediately rather than deferring to kqueue
                     // EVFILT_WRITE which intermittently fails to fire.
                     _ = session.conn.flushSend() catch {};
-                    if (session.conn.hasPendingWrite()) {
-                        changes.addWrite(session.conn.fd, conn_id) catch {};
-                    }
                 }
                 // OpenSSL may have buffered the client's post-auth stream open
                 // internally. kqueue won't fire for data already consumed from
                 // the socket. Drain the SSL buffer immediately — same pattern
                 // as post-TLS and the S2S post-SASL fix.
-                if (session.conn.tls_conn) |*tls| {
-                    if (tls.pending() > 0) {
+                if (session.conn.tls) |*t| {
+                    if (t.conn.pending() > 0) {
                         c2s_session.handleReadable(self, conn_id, changes);
                     }
                 }
@@ -1542,10 +1586,6 @@ pub const Server = struct {
                 const fail_action = session.stream.saslFailure(m.reason);
                 c2s_session.executeAction(self, session, fail_action, changes);
                 session.resetSasl();
-
-                if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, conn_id) catch {};
-                }
             },
             .register_result => |m| {
                 const iq_id = session.reg_pending_iq_id;
@@ -1568,13 +1608,9 @@ pub const Server = struct {
                     noteJidOverflow("register result to connection {d} exceeds {d} bytes; dropped", .{ conn_id, session.write_scratch.len });
                     return;
                 };
-                session.conn.queueSend(reply_xml) catch |err| {
-                    noteQueueDrop(session, reply_xml, err, "register result");
+                if (session.stanza(reply_xml) == .failed_closed) {
+                    c2s_session.noteSendDrop(session, reply_xml, "register result");
                     return;
-                };
-
-                if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, conn_id) catch {};
                 }
             },
             .password_change_result => |m| {
@@ -1599,10 +1635,6 @@ pub const Server = struct {
                     return;
                 };
                 queueStanzaOrDrop(session, reply_xml, "password-change result");
-
-                if (session.conn.hasPendingWrite()) {
-                    changes.addWrite(session.conn.fd, conn_id) catch {};
-                }
             },
             .account_delete_result => |m| {
                 const iq_id = session.reg_pending_iq_id;
@@ -1630,11 +1662,7 @@ pub const Server = struct {
                     queueStanzaOrDrop(session, reply_xml, "account-delete result");
 
                     // Close the stream per XEP-0077 §3.2
-                    session.conn.queueSend("</stream:stream>") catch {};
-
-                    if (session.conn.hasPendingWrite()) {
-                        changes.addWrite(session.conn.fd, conn_id) catch {};
-                    }
+                    _ = session.nonza("</stream:stream>");
                 } else {
                     var fbs = std.io.fixedBufferStream(&session.write_scratch);
                     const w = fbs.writer();
@@ -1649,10 +1677,6 @@ pub const Server = struct {
                         return;
                     };
                     queueStanzaOrDrop(session, reply_xml, "account-delete error");
-
-                    if (session.conn.hasPendingWrite()) {
-                        changes.addWrite(session.conn.fd, conn_id) catch {};
-                    }
                 }
             },
             else => {},
@@ -1747,6 +1771,7 @@ pub const Server = struct {
     }
 
     pub fn dispatchS2sResponse(self: *Server, msg: ipc_protocol.Message, changes: *ChangeList) void {
+        _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
         switch (msg) {
             .s2s_inbound => |m| {
                 // Inbound stanza from remote — deliver to local session(s) by
@@ -1868,7 +1893,7 @@ pub const Server = struct {
                             }
                             continue;
                         }
-                        fanout_mod.deliverToSession(target_session, m.stanza_xml, entry.local_session_id, changes);
+                        fanout_mod.deliverToSession(target_session, m.stanza_xml, entry.local_session_id);
                     } else if (self.delivery_system) |ds| {
                         // Carry this dispatch's token: the receiving worker holds
                         // under the same identity, so the store writes one row
@@ -1912,7 +1937,7 @@ pub const Server = struct {
                 for (sender_entries[0..sender_count]) |sentry| {
                     if (sentry.worker_id == self.worker_id) {
                         const sender_session = self.sessions[sentry.local_session_id] orelse continue;
-                        fanout_mod.deliverToSession(sender_session, err_xml, sentry.local_session_id, changes);
+                        fanout_mod.deliverToSession(sender_session, err_xml, sentry.local_session_id);
                     } else if (self.delivery_system) |ds| {
                         ds.deliver(sentry.worker_id, sentry.local_session_id, sentry.generation, err_xml) catch {};
                     }
@@ -2225,7 +2250,7 @@ test "Server: S28 stale writable event does not destroy a detached session" {
     // fillWriteBuffer rather than a raw conn.queueSend, which the S15 ratchet
     // deliberately rejects outside its allowlist.
     try std.testing.expect(fillWriteBuffer(session));
-    try std.testing.expect(session.conn.write_end > session.conn.write_start);
+    try std.testing.expect(session.conn.outbox.used > session.conn.outbox.head);
 
     // Detach for SM resume: purge the fd, close it, keep the session.
     session.sm_resume_enabled = true;
@@ -2386,9 +2411,297 @@ test "Server: M1 counters track client traffic through the read path" {
 
     // The drop counters are bumped at their choke points, not per session.
     const base_full = c.drop_send_buffer_full.load(.monotonic);
+    // The bounded spill makes the ring stop being the refusal bound;
+    // shrink it so an oversized append still exercises failed_closed.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     const big = [_]u8{'x'} ** (16384 + 1);
     try std.testing.expectError(error.WriteBufferFull, session.conn.queueSend(&big));
     try std.testing.expectEqual(base_full + 1, c.drop_send_buffer_full.load(.monotonic));
+}
+
+// ADR-2: an append links the conn on the worker's dirty list and the
+// end-of-iteration walk flushes it once; the socket took everything, so
+// no EVFILT_WRITE arm may appear.
+test "Server: an appended conn rides the dirty list to the batch-tail flush" {
+    const allocator = std.testing.allocator;
+    // The worker slot is process-global; reset it after server.deinit so a
+    // failed run leaves no links into a freed Session for the next test.
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+    var ctrs: connection_mod.OutboxCounters = .{};
+    const dirty = connection_mod.dirtyForWorker(server.worker_id);
+    session.conn.bindOutbox(&ctrs, dirty);
+
+    _ = session.nonza("<features/>");
+
+    // The append linked the conn; nothing reached the peer yet.
+    try std.testing.expect(session.conn.on_dirty);
+    try std.testing.expect(!dirty.empty());
+    var buf: [256]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, posix.read(fds[1], &buf));
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.flushDirtyOutboxes(&changes);
+
+    try std.testing.expect(!session.conn.on_dirty);
+    try std.testing.expect(dirty.empty());
+    const n = try posix.read(fds[1], &buf);
+    try std.testing.expectEqualStrings("<features/>", buf[0..n]);
+    for (changes.slice()) |ev| {
+        try std.testing.expect(ev.filter != std.c.EVFILT.WRITE);
+    }
+}
+
+// ADR-2: when the tail's flush stalls on a real EAGAIN the conn arms
+// EVFILT_WRITE once (a bare EV_ENABLE on the DISPATCH knote).
+test "Server: a stalled batch-tail flush arms EVFILT_WRITE once" {
+    const allocator = std.testing.allocator;
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+    var ctrs: connection_mod.OutboxCounters = .{};
+    const dirty = connection_mod.dirtyForWorker(server.worker_id);
+    session.conn.bindOutbox(&ctrs, dirty);
+
+    // Pack the kernel side so the tail flush cannot drain.
+    try std.testing.expect(c2s_session.fillWriteBuffer(session));
+    _ = session.nonza("<more/>");
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.flushDirtyOutboxes(&changes);
+
+    try std.testing.expect(session.conn.hasPendingWrite());
+    var armed = false;
+    for (changes.slice()) |ev| {
+        if (ev.ident == @as(usize, @intCast(session.conn.fd)) and
+            ev.filter == std.c.EVFILT.WRITE and
+            (ev.flags & std.c.EV.ENABLE) != 0) armed = true;
+    }
+    try std.testing.expect(armed);
+}
+
+// ADR-2 stranding fix: with no delivery system (single-worker mode) the
+// loop's own EVFILT_USER knote re-drives dirty-list leftovers. More than
+// DIRTY_FLUSH_POPS_MAX conns are linked; one tail walk pops only the cap
+// and triggers the knote, so the next wait returns a .user event with no
+// external input and a second walk drains the rest. Fails when the knote
+// registration or the leftover trigger is removed.
+test "Server: dirty-list leftovers re-drive on the loop self-wake" {
+    const allocator = std.testing.allocator;
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    try std.testing.expect(server.delivery_system == null);
+
+    const total = DIRTY_FLUSH_POPS_MAX + 16;
+    const dirty = connection_mod.dirtyForWorker(server.worker_id);
+    var ctrs: connection_mod.OutboxCounters = .{};
+    var peers: [total]posix.fd_t = undefined;
+    defer {
+        for (peers) |fd| posix.close(fd);
+    }
+
+    for (0..total) |i| {
+        const fds = try makeSocketPair();
+        peers[i] = fds[1];
+        const session = try allocator.create(Session);
+        session.* = Session.init(fds[0], i + 1, "localhost", false, allocator);
+        session.conn.bindOutbox(&ctrs, dirty);
+        server.sessions[i + 1] = session;
+        _ = session.nonza("<x/>");
+    }
+    try std.testing.expectEqual(total, dirty.count);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.flushDirtyOutboxes(&changes);
+
+    // The walk stopped at the pop cap and triggered the self-wake.
+    try std.testing.expectEqual(total - DIRTY_FLUSH_POPS_MAX, dirty.count);
+
+    // The next wait returns the .user event with no external input; a
+    // 100 ms timeout caps the wait when the wake is broken.
+    const events = try server.loop.submitAndPoll(&.{}, 100);
+    var woke = false;
+    for (events) |ev| {
+        switch (ev) {
+            .user => |u| {
+                if (u.ident == @import("loop.zig").SELF_WAKE_IDENT) woke = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(woke);
+
+    server.flushDirtyOutboxes(&changes);
+    try std.testing.expect(dirty.empty());
+}
+
+// ADR-2 STARTTLS on the real path: a plaintext session drives
+// <starttls/> through handleReadable and the batch-tail
+// flushDirtyOutboxes with no manual flushSend. <proceed/> must reach
+// the peer and the deferred upgrade must start the handshake. A guard
+// that runs the upgrade inside the parse loop reads the un-consumed
+// read window and refuses, so this fails when the deferred-only upgrade
+// is reverted.
+test "Server: STARTTLS negotiation upgrades through the batch-tail dirty flush" {
+    const allocator = std.testing.allocator;
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    // A real cert so upgradeToTls runs; without ssl_ctx the upgrade path
+    // only logs and the handshake assert could never fire.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    var ctrs: connection_mod.OutboxCounters = .{};
+    const dirty = connection_mod.dirtyForWorker(server.worker_id);
+    session.conn.bindOutbox(&ctrs, dirty);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    _ = try posix.write(fds[1], stream_open);
+    c2s_session.handleReadable(&server, 1, &changes);
+
+    _ = try posix.write(fds[1], "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>");
+    c2s_session.handleReadable(&server, 1, &changes);
+
+    // A refusal inside the parse loop closes the session outright.
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expect(session.stream.state == .starttls_pending);
+    try std.testing.expect(session.conn.tls == null);
+    try std.testing.expect(session.conn.on_dirty);
+
+    // The batch tail flushes the queued <proceed/> and runs the upgrade.
+    server.flushDirtyOutboxes(&changes);
+
+    var buf: [4096]u8 = undefined;
+    var got: usize = 0;
+    while (true) {
+        const n = posix.read(fds[1], buf[got..]) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        got += n;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..got], "<proceed") != null);
+    try std.testing.expect(server.sessions[1] != null);
+    try std.testing.expect(session.conn.isTlsHandshaking());
+}
+
+// Channel binding must not silently downgrade: on a session that has
+// binding data, a cb_data_buf allocation failure ends the exchange with
+// temporary-auth-failure before any auth_request leaves for the auth
+// daemon. Fails when getChannelBinding's error return is reverted to
+// the (0, "") "no binding" answer.
+test "Server: channel binding OOM fails the SASL exchange" {
+    const allocator = std.testing.allocator;
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    // A socketpair stands in for the auth daemon link; its peer is read
+    // at the end to prove no auth_request was encoded.
+    const ipc_fds = try makeSocketPair();
+    defer posix.close(ipc_fds[1]);
+    server.ipc.fd = ipc_fds[0];
+    server.ipc.connected = true;
+
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    var ctrs: connection_mod.OutboxCounters = .{};
+    const dirty = connection_mod.dirtyForWorker(server.worker_id);
+    session.conn.bindOutbox(&ctrs, dirty);
+    server.sessions[1] = session;
+
+    var client_tls = try ssl.SslConn.initClient(client_ctx, fds[1], null);
+    defer client_tls.deinit();
+
+    try session.conn.upgradeToTls(server.ssl_ctx.?);
+    var client_done = false;
+    var iter: usize = 0;
+    while (iter < 10000 and !(session.conn.isTlsEstablished() and client_done)) : (iter += 1) {
+        // ConnectionReset is fatal: bail to the established-check below.
+        if (!session.conn.isTlsEstablished()) _ = session.conn.continueHandshake() catch break;
+        if (!client_done) {
+            client_done = (client_tls.doHandshake() catch .want_read) == .complete;
+        }
+    }
+    try std.testing.expect(session.conn.isTlsEstablished());
+    try std.testing.expect(client_done);
+
+    // write_buf must exist before the allocator starts failing, or the
+    // failure stanza itself could not queue.
+    try std.testing.expect(session.conn.ensureWriteBuf());
+
+    session.sasl_mechanism = "SCRAM-SHA-256";
+    const payload = "biwsbj11c2VyLHI9YWJjZGVm"; // "n,,n=user,r=abcdef"
+    @memcpy(session.sasl_buf[0..payload.len], payload);
+    session.sasl_buf_len = payload.len;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const real_alloc = session.conn.outbox.alloc;
+    session.conn.outbox.alloc = failing.allocator();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    c2s_session.processSaslAuthComplete(&server, session, &changes);
+    session.conn.outbox.alloc = real_alloc;
+
+    // The exchange failed closed and the peer gets temporary-auth-failure.
+    try std.testing.expect(server.sessions[1] != null);
+    server.flushDirtyOutboxes(&changes);
+    var buf: [4096]u8 = undefined;
+    var got: usize = 0;
+    iter = 0;
+    while (iter < 1000) : (iter += 1) {
+        switch (client_tls.read(buf[got..]) catch .want_read) {
+            .ok => |n| got += n,
+            else => break,
+        }
+    }
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..got], "<temporary-auth-failure") != null);
+
+    // No auth_request ever reached the auth daemon link.
+    var ibuf: [64]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, posix.read(ipc_fds[1], &ibuf));
 }
 
 test "Server: M1 SIGUSR1 dump runs against a live worker block" {
@@ -2425,16 +2738,16 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
     };
     const cases = .{
         .{ "connection.zig", @embedFile("../connection.zig"), 17 }, // Connection layer self-tests incl. the M1 counter test; no Session.
-        .{ "muc/fanout.zig", @embedFile("../muc/fanout.zig"), 1 }, // deliverToSession: tracked via smTrackOutbound.
+        .{ "muc/fanout.zig", @embedFile("../muc/fanout.zig"), 1 }, // MockSession.stanza in tests; the live path uses Session.stanza().
         .{ "presence/handler.zig", @embedFile("../presence/handler.zig"), 0 },
         .{ "presence/subscription.zig", @embedFile("../presence/subscription.zig"), 0 },
         .{ "presence/broadcast.zig", @embedFile("../presence/broadcast.zig"), 0 },
-        .{ "routing/router.zig", @embedFile("../routing/router.zig"), 2 }, // one comment; queueSendWithFlush is tracked.
+        .{ "routing/router.zig", @embedFile("../routing/router.zig"), 0 }, // local delivery goes through stanzaWithFlush().
         .{ "c2s/lifecycle.zig", @embedFile("../c2s/lifecycle.zig"), 0 },
-        .{ "worker/worker.zig", @embedFile("worker.zig"), 4 }, // stream/SASL/SM nonzas + M1 counter self-test.
-        .{ "routing/deliver.zig", @embedFile("../routing/deliver.zig"), 1 }, // cross-worker drain queues the stanza raw.
-        .{ "c2s/session.zig", @embedFile("../c2s/session.zig"), 13 }, // queueSendStanza itself + stream/SASL nonzas.
-        .{ "c2s/sm.zig", @embedFile("../c2s/sm.zig"), 9 }, // SM enable/resume/failed nonzas.
+        .{ "worker/worker.zig", @embedFile("worker.zig"), 1 }, // stream/SASL/SM nonzas went through nonza()/stanza(); 1 test filler remains.
+        .{ "routing/deliver.zig", @embedFile("../routing/deliver.zig"), 0 }, // the cross-worker drain goes through stanza().
+        .{ "c2s/session.zig", @embedFile("../c2s/session.zig"), 2 }, // stream/SASL nonzas went through nonza(); 2 test fillers remain.
+        .{ "c2s/sm.zig", @embedFile("../c2s/sm.zig"), 0 }, // SM enable/resume/failed nonzas go through nonza().
         .{ "iq/dispatch.zig", @embedFile("../iq/dispatch.zig"), 0 },
         .{ "iq/carbons.zig", @embedFile("../iq/carbons.zig"), 0 },
         .{ "muc/handler.zig", @embedFile("../muc/handler.zig"), 0 },
@@ -2513,7 +2826,7 @@ test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down
 
     // The buffer is nearly full, but the peer's socket is empty: a flush frees
     // all of it.
-    target.conn.write_end = connection_mod.WRITE_BUF_SIZE - 16;
+    target.conn.outbox.used = connection_mod.WRITE_BUF_SIZE - 16;
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
@@ -2587,9 +2900,11 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
             _ = posix.write(target.conn.fd, &chunk) catch break;
         }
     }
-    @memset(target.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
-    target.conn.write_start = 0;
-    target.conn.write_end = connection_mod.WRITE_BUF_SIZE;
+    try std.testing.expect(target.conn.ensureWriteBuf());
+    @memset(target.conn.write_buf.?[0..], 'x');
+    target.conn.outbox.head = 0;
+    target.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    target.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     try std.testing.expectError(error.WouldBlock, target.conn.flushSend());
 
     const alice_fds = try makeSocketPair();
@@ -2835,8 +3150,8 @@ test "Re-review 6.8: a successful retry delete clears the recorded sequence" {
     try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
 }
 
-// A delivery form between the write buffer and the scratch bank fits the
-// serializer but never the socket buffer. That is not a slow reader: the form
+// A delivery form between the outbound bound and the scratch bank fits the
+// serializer but never the outbox. That is not a slow reader: the form
 // could never be queued for anyone, so it bounces and the recipient stays
 // healthy.
 test "Re-review 7.6: a form over the write buffer but inside the bank does not mark overflow" {
@@ -2857,6 +3172,8 @@ test "Re-review 7.6: a form over the write buffer but inside the bank does not m
     bob.stream.authenticated = true;
     bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
     server.sessions[5] = bob;
+    // Bound bob's outbox at the ring so the form below cannot queue.
+    bob.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
     _ = try sm.bind(0, 5, "bob", "localhost", "desk");
     sm.setPresenceAvailable("bob", "localhost", "desk", true);
 
@@ -3459,12 +3776,13 @@ test "Re-review 6.4: a failed count arms a retry instead of parking the session"
 
     session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
 
-    // The stall is recorded and a prompt retry is staged on the connection.
+    // The stall is recorded and a prompt retry is staged on the connection:
+    // a bare EV_ENABLE re-arms the accept-time DISPATCH write knote.
     try std.testing.expect(session.offline_pending);
     try std.testing.expectEqual(@as(u8, 1), session.offline_store_stalls);
     var staged_write = false;
     for (changes.buf[0..changes.len]) |ev| {
-        if (ev.filter == std.c.EVFILT.WRITE and ev.udata == session.conn.id) staged_write = true;
+        if (ev.filter == std.c.EVFILT.WRITE and ev.ident == @as(usize, @intCast(session.conn.fd))) staged_write = true;
     }
     try std.testing.expect(staged_write);
 
@@ -4778,16 +5096,18 @@ test "Server: S10 handshake write interest is one-shot" {
     c2s_session.continueTlsHandshake(&server, 1, session, &changes);
     try std.testing.expectEqual(connection_mod.TlsState.handshake_want_write, session.conn.tls_state.?);
 
-    // The staged re-arm must be EV_ONESHOT; a persistent filter fires on
-    // every kevent while the client's next flight is in flight (S10).
-    var found_oneshot = false;
+    // The staged re-arm must be a bare EV_ENABLE on the accept-time
+    // DISPATCH write knote: one delivery auto-disables it, so it cannot
+    // fire on every kevent while the client's next flight is in flight
+    // (S10). A fresh ADD|ENABLE would be a persistent filter.
+    var found_enable = false;
     for (changes.slice()) |ev| {
         if (ev.filter == std.c.EVFILT.WRITE) {
-            try std.testing.expect((ev.flags & std.c.EV.ONESHOT) != 0);
-            found_oneshot = true;
+            try std.testing.expectEqual(@as(u16, std.c.EV.ENABLE), ev.flags);
+            found_enable = true;
         }
     }
-    try std.testing.expect(found_oneshot);
+    try std.testing.expect(found_enable);
 }
 
 test "S13: offline archive failure injection stays out of production" {

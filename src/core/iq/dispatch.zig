@@ -55,27 +55,14 @@ noinline fn noteCrossWorkerDrop(comptime fmt: []const u8, args: anytype) void {
 /// path: it is logged, and a full write buffer flags the session for
 /// overflow teardown (R1), the same classification dispatchStanza uses.
 fn queueStanzaOrDrop(session: *Session, stanza: []const u8, comptime what: []const u8) void {
-    session.queueSendStanza(stanza) catch |err| {
-        noteQueueDrop(session, stanza, err, what);
-    };
-}
-
-/// Classify and log one refused queueSendStanza on the cold path (R5).
-/// WriteBufferFull is two different refusals, split by noteQueueOverflow:
-/// a stanza longer than the whole buffer is dropped as oversize and the
-/// session lives; a deliverable stanza that cannot fit means a slow reader
-/// and flags overflow teardown (R1).
-noinline fn noteQueueDrop(session: *Session, stanza: []const u8, err: anyerror, comptime what: []const u8) void {
-    @branchHint(.cold);
-    if (err == error.WriteBufferFull and server_mod.noteQueueOverflow(session, stanza)) {
-        log.warn("connection {d}: {s} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session.conn.id, what, stanza.len, connection_mod.WRITE_BUF_SIZE });
-        return;
+    if (session.stanza(stanza) == .failed_closed) {
+        c2s_session.noteSendDrop(session, stanza, what);
     }
-    log.warn("connection {d}: {s} could not be queued ({s})", .{ session.conn.id, what, @errorName(err) });
 }
 
 // Types from server.zig — imported via the parent module's compilation unit.
 const server_mod = @import("../worker/worker.zig");
+const c2s_session = @import("../c2s/session.zig");
 const precis = @import("precis_username");
 
 /// Per-thread registration preparation scratch, shared by this worker's
@@ -2105,6 +2092,7 @@ fn sendPepNotification(
     payload: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const roster = server.roster orelse return;
     const sm = server.session_map orelse return;
 
@@ -2172,7 +2160,7 @@ fn sendPepNotification(
                     noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ bound.local, bound.domain, entry.resource(), self_msg_lease.buf.len });
                     continue;
                 };
-                fanout.deliverToSession(target, notif_xml, entry.local_session_id, changes);
+                fanout.deliverToSession(target, notif_xml, entry.local_session_id);
             } else {
                 // Cross-thread: build full stanza and deliver via MPSC
                 if (server.delivery_system) |ds| {
@@ -2265,7 +2253,7 @@ fn sendPepNotification(
                     noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ sub_local, sub_domain, entry.resource(), sub_msg_lease.buf.len });
                     continue;
                 };
-                fanout.deliverToSession(target, notif_xml, entry.local_session_id, changes);
+                fanout.deliverToSession(target, notif_xml, entry.local_session_id);
             } else {
                 if (server.delivery_system) |ds| {
                     var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
@@ -2469,6 +2457,7 @@ fn pushBlockPush(
     item_jid: []const u8,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
     var lease_b = server.leaseScratch(.b);
     defer lease_b.release();
@@ -2509,7 +2498,7 @@ fn pushBlockPush(
                 continue;
             };
 
-            fanout.deliverToSession(target, push_xml, entry.local_session_id, changes);
+            fanout.deliverToSession(target, push_xml, entry.local_session_id);
         }
         // Cross-thread push: deferred to post-V1 (T89 pattern)
     }
@@ -2607,6 +2596,7 @@ pub fn pushRosterItem(
     ask: bool,
     changes: *ChangeList,
 ) void {
+    _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
     var lease_b = server.leaseScratch(.b);
     defer lease_b.release();
@@ -2699,7 +2689,7 @@ pub fn pushRosterItem(
         if (entry.worker_id == server.worker_id) {
             const target = server.sessions[entry.local_session_id] orelse continue;
             if (!target.roster_interested) continue;
-            fanout.deliverToSession(target, full_xml, entry.local_session_id, changes);
+            fanout.deliverToSession(target, full_xml, entry.local_session_id);
         } else if (server.delivery_system) |ds| {
             ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, full_xml) catch |err| {
                 noteCrossWorkerDrop("roster push to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.local_session_id, @errorName(err) });
@@ -3179,9 +3169,10 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     defer session.deinit();
     session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
     session.iq_to = "localhost";
+    // A reply longer than the outbound bound: the append refuses it even
+    // with the outbox empty, so this is oversize, not a slow reader.
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
-    // A reply longer than the whole write buffer: queueSend refuses it even
-    // with the buffer empty, so this is oversize, not a slow reader.
     const stanza = try allocator.alloc(u8, connection_mod.WRITE_BUF_SIZE + 32);
     defer allocator.free(stanza);
     const head = "<iq type='result' from='localhost' to='alice@localhost/phone' id='big1'><query>";
@@ -3214,9 +3205,11 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
     var session = Session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
-    @memset(session.conn.write_buf[0..connection_mod.WRITE_BUF_SIZE], 'x');
-    session.conn.write_start = 0;
-    session.conn.write_end = connection_mod.WRITE_BUF_SIZE;
+    try std.testing.expect(session.conn.ensureWriteBuf());
+    @memset(session.conn.write_buf.?[0..], 'x');
+    session.conn.outbox.head = 0;
+    session.conn.outbox.used = connection_mod.WRITE_BUF_SIZE;
+    session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
 
     const drops_before = delivery_queue.oversize_queue_drops.load(.monotonic);
     queueStanzaOrDrop(&session, "<iq type='result' id='q1'/>", "small iq result");

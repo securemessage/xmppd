@@ -16,22 +16,70 @@
 //!
 //! - **Read buffer**: Fixed 8KB. Data is consumed from the front by the XML
 //!   parser; unconsumed bytes are compacted (shifted to front) after each parse.
-//! - **Write buffer**: Fixed 16KB. Data is appended by the stream handler and
-//!   drained to the socket when writable. When it fills beyond WRITE_SUPPRESS_HIGH
-//!   the worker disables EVFILT_READ for the fd (T110): TCP flow control
-//!   pushes back on the sender until the buffer drains below WRITE_SUPPRESS_LOW.
-//!   If it fills completely, queueSend() fails with error.WriteBufferFull.
+//! - **Outbox**: a lib/net Outbox whose ring borrows a lazily allocated
+//!   16KB heap block (`write_buf`). Data is appended by the stream handler
+//!   and drained to the socket when writable. When it fills beyond
+//!   WRITE_SUPPRESS_HIGH the worker disables EVFILT_READ for the fd (T110):
+//!   TCP flow control pushes back on the sender until the outbox drains
+//!   below WRITE_SUPPRESS_LOW. If it fills completely, queueSend() fails
+//!   with error.WriteBufferFull.
 //!
 //! ## TLS
 //!
 //! The `tls` field is null for plain TCP. After STARTTLS, `upgradeToTls()`
 //! sets it and all subsequent `recv()` / `flushSend()` calls go through
-//! the TLS layer transparently. The TLS implementation comes in step 5f/5g.
+//! the TLS layer transparently.
 
 const std = @import("std");
 const posix = std.posix;
 const ssl = @import("ssl");
+const net = @import("net");
 const metrics = @import("worker/metrics.zig");
+
+/// The counter block a bound outbox reports to (lib/net Counters).
+pub const OutboxCounters = net.Counters;
+
+/// Outbox accounting for a Connection never bound to a worker's counter
+/// block (unit tests, the window before bindOutbox). threadlocal keeps
+/// it per-worker in production anyway.
+threadlocal var fallback_outbox_counters: net.Counters = .{};
+
+/// Zero-length ring placeholder for Outbox.init inside Connection.init:
+/// the real ring borrows write_buf once ensureWriteBuf has allocated it
+/// (ob() re-derives the binding on every use).
+var placeholder_outbox_ring: [0]u8 = .{};
+
+/// One counter block per worker, padded like metrics.workers: the owning
+/// loop thread is the only writer (its conns bind here at accept via
+/// bindOutbox) and the SIGUSR1 dump the only reader. Unbound conns (unit
+/// tests, the window before bindOutbox) report to the threadlocal
+/// fallback block instead.
+const OutboxCounterSlot = struct {
+    counters: OutboxCounters align(std.atomic.cache_line) = .{},
+    /// The worker's ADR-2 end-of-iteration flush list; kept in the slot so
+    /// Server stays the same size as before the outbox work.
+    dirty: DirtyList = .{},
+};
+pub var worker_outbox_counters: [metrics.MAX_WORKERS]OutboxCounterSlot = @splat(.{});
+
+/// Dirty list for a Connection never bound to a worker (unit tests, the
+/// window before bindOutbox). threadlocal matches fallback_outbox_counters.
+threadlocal var fallback_dirty_list: DirtyList = .{};
+
+/// The counter block a connection on `worker_id` binds at accept. Ids past
+/// the table share the threadlocal fallback so a misconfigured worker can
+/// never index out of bounds.
+pub fn countersForWorker(worker_id: u16) *OutboxCounters {
+    if (worker_id < metrics.MAX_WORKERS) return &worker_outbox_counters[worker_id].counters;
+    return &fallback_outbox_counters;
+}
+
+/// The dirty list a connection on `worker_id` binds at accept. Ids past
+/// the table share the threadlocal fallback.
+pub fn dirtyForWorker(worker_id: u16) *DirtyList {
+    if (worker_id < metrics.MAX_WORKERS) return &worker_outbox_counters[worker_id].dirty;
+    return &fallback_dirty_list;
+}
 
 /// Create a non-blocking Unix socketpair. Used in tests.
 fn makeSocketPair() ![2]posix.fd_t {
@@ -58,9 +106,18 @@ const READ_BUF_SIZE = 8192;
 /// Write buffer size — 16KB per connection.
 /// Larger than read because the server may need to send stream features + multiple
 /// stanzas before the client has a chance to ACK at the TCP level.
-/// A stanza larger than this can never be queued in one piece, so producers
-/// that can size a stanza up front (MUC fan-out) reject it instead.
 pub const WRITE_BUF_SIZE = 16384;
+
+/// Per-connection outbound bound (ring plus spill): the lib/net
+/// max_outbound_bytes default for c2s (F3-DESIGN section 1). An append
+/// that cannot fit fails closed and the session is failed with
+/// resource-constraint; undelivered messages drain to offline storage.
+pub const MAX_OUTBOUND_BYTES: usize = 1 << 20;
+
+/// Per-connection, per-pass flush budget for the end-of-iteration dirty
+/// walk (F3 flush_budget_bytes). Bounds how long one conn can hold the
+/// batch tail before the walk moves on.
+pub const FLUSH_BUDGET_BYTES: usize = 64 << 10;
 
 /// T110 backpressure: at/above this buffered-bytes level the server disables
 /// EVFILT_READ for the connection, so TCP-level flow control propagates to
@@ -71,6 +128,53 @@ pub const WRITE_SUPPRESS_HIGH: usize = WRITE_BUF_SIZE * 3 / 4;
 /// T110 backpressure: reading resumes once the buffer drained to or below
 /// this level. 50% — hysteresis against flapping at the threshold.
 pub const WRITE_SUPPRESS_LOW: usize = WRITE_BUF_SIZE / 2;
+
+/// Intrusive per-worker dirty list over `*Connection` (FIFO, O(1)
+/// link/unlink): an append links its conn, and the worker's
+/// end-of-iteration walk pops and flushes each link once (ADR-2), so
+/// EVFILT_WRITE arms only after a real EAGAIN instead of per send.
+/// Same shape as lib/net's ConnList.
+pub const DirtyList = struct {
+    head: ?*Connection = null,
+    tail: ?*Connection = null,
+    /// Linked-conn count; a flush walk bounded by the count at its start
+    /// leaves mid-walk links (re-drives, close broadcasts) to the next
+    /// iteration instead of popping them twice.
+    count: usize = 0,
+
+    /// Append `c` if it is not linked already (idempotent).
+    pub fn link(l: *DirtyList, c: *Connection) void {
+        if (c.on_dirty) return;
+        c.on_dirty = true;
+        c.dirty_prev = l.tail;
+        c.dirty_next = null;
+        if (l.tail) |t| t.dirty_next = c else l.head = c;
+        l.tail = c;
+        l.count += 1;
+    }
+
+    /// Detach `c` without disturbing the order of the rest.
+    pub fn unlink(l: *DirtyList, c: *Connection) void {
+        if (!c.on_dirty) return;
+        if (c.dirty_prev) |p| p.dirty_next = c.dirty_next else l.head = c.dirty_next;
+        if (c.dirty_next) |n| n.dirty_prev = c.dirty_prev else l.tail = c.dirty_prev;
+        c.dirty_next = null;
+        c.dirty_prev = null;
+        c.on_dirty = false;
+        l.count -= 1;
+    }
+
+    /// Remove and return the head, or null.
+    pub fn pop(l: *DirtyList) ?*Connection {
+        const c = l.head orelse return null;
+        l.unlink(c);
+        return c;
+    }
+
+    pub fn empty(l: *const DirtyList) bool {
+        return l.head == null;
+    }
+};
 
 /// Per-client XMPP connection state.
 pub const Connection = struct {
@@ -86,25 +190,41 @@ pub const Connection = struct {
     /// End of valid data in read_buf (next write position).
     read_end: usize = 0,
 
-    /// Outgoing data buffer. Stream handler appends at `write_end`,
-    /// socket drains from `write_start`.
-    write_buf: [WRITE_BUF_SIZE]u8 = undefined,
-    /// Start of unsent data in write_buf.
-    write_start: usize = 0,
-    /// Length of the TLS write slice pinned by an in-flight `SSL_write`
-    /// (0 = none). While > 0, flushSend retries exactly
-    /// `write_buf[write_start..][0..tls_write_pending]`: OpenSSL retains the
-    /// buffer across WANT_WRITE, and retrying the same pointer with a longer
-    /// length violates the identical pointer-and-length rule and corrupts the
-    /// stream with kTLS (S23). Bytes queued after the pin stay behind it.
-    tls_write_pending: usize = 0,
-    /// End of buffered data in write_buf (next append position).
-    write_end: usize = 0,
+    /// Outgoing data buffer. Backing storage for `outbox`'s ring: a lazy
+    /// heap block allocated on first send (ensureWriteBuf) and freed by
+    /// deinit(). Keeping it out of the struct lets the M4 stack-frame caps
+    /// hold where by-value Connection moves occur (accept, Session.init);
+    /// heap memory is also what makes the TLS (ptr, len) pin stable across
+    /// every by-value move. Null means "never sent": recv-only
+    /// connections never pay for it.
+    write_buf: ?*[WRITE_BUF_SIZE]u8 = null,
 
-    /// TLS connection — null for plain TCP, set after STARTTLS upgrade.
-    tls_conn: ?ssl.SslConn = null,
+    /// Outbound queue over `write_buf` (lib/net Outbox): a fixed ring
+    /// first, a bounded spill behind it up to MAX_OUTBOUND_BYTES. The
+    /// ring binding is re-derived on each use via ob() because a
+    /// Connection is moved by value before the owning Session is placed
+    /// on the heap.
+    outbox: net.Outbox,
 
-    /// TLS handshake progress — only meaningful when tls_conn is set.
+    /// Intrusive links for the owning worker's dirty list, bound at
+    /// accept by bindOutbox. An append links the conn so the batch tail
+    /// flushes it; close()/deinit() unlink.
+    dirty_next: ?*Connection = null,
+    dirty_prev: ?*Connection = null,
+    on_dirty: bool = false,
+    /// The worker's dirty list, or null before bindOutbox and in unit
+    /// tests: unbound conns link nowhere.
+    dirty_list: ?*DirtyList = null,
+
+    /// The last flush stalled on TLS want_read (a write that needs a
+    /// read event); the next readable event re-links the conn so the
+    /// tail retries the flush.
+    flush_want_read: bool = false,
+
+    /// TLS state: null for plain TCP, set after STARTTLS upgrade.
+    tls: ?net.Tls = null,
+
+    /// TLS handshake progress: only meaningful when tls is set.
     tls_state: ?TlsState = null,
 
     /// Unique connection ID (for use as kqueue udata).
@@ -123,18 +243,83 @@ pub const Connection = struct {
     peer_addr_buf: [64]u8 = undefined,
     peer_addr_len: usize = 0,
 
-    /// Stable buffer for channel binding data (outlives the getChannelBinding call).
-    cb_data_buf: [32]u8 = undefined,
+    /// Stable buffer for channel binding data (outlives the getChannelBinding
+    /// call). Lazy like write_buf: only TLS sessions doing SASL channel
+    /// binding ever allocate it.
+    cb_data_buf: ?*[32]u8 = null,
 
     /// Initialize a new connection from an accepted socket.
     ///
     /// - `fd` — the accepted client socket (must already be non-blocking)
     /// - `id` — unique identifier for this connection (used as kqueue udata)
-    pub fn init(fd: posix.fd_t, id: usize) Connection {
+    /// - `alloc`: allocator for outbox spill growth (bounded by the
+    ///   outbox's own spill_limit)
+    pub fn init(fd: posix.fd_t, id: usize, alloc: std.mem.Allocator) Connection {
         return .{
             .fd = fd,
             .id = id,
+            .outbox = net.Outbox.init(placeholder_outbox_ring[0..], alloc, MAX_OUTBOUND_BYTES, &fallback_outbox_counters),
         };
+    }
+
+    /// The outbox ring borrows `write_buf` storage; the binding is
+    /// re-derived on each use so a Connection moved by value before heap
+    /// placement (the Session.init return, the accept-time field copy)
+    /// never leaves a dangling ring slice behind.
+    fn ob(self: *Connection) *net.Outbox {
+        self.outbox.ring = if (self.write_buf) |p| p[0..] else placeholder_outbox_ring[0..];
+        return &self.outbox;
+    }
+
+    /// ob() for the append path: grows the ring backing on first send.
+    /// Null on allocation failure, which callers surface as failed_closed.
+    fn obSend(self: *Connection) ?*net.Outbox {
+        if (!self.ensureWriteBuf()) return null;
+        return self.ob();
+    }
+
+    /// Allocate the ring backing once; later calls are a no-op. The block
+    /// comes from the outbox's allocator and is freed by deinit().
+    pub fn ensureWriteBuf(self: *Connection) bool {
+        if (self.write_buf != null) return true;
+        if (self.outbox.alloc.create([WRITE_BUF_SIZE]u8)) |buf| {
+            self.write_buf = buf;
+            return true;
+        } else |_| {
+            return false;
+        }
+    }
+
+    /// Bind the per-worker counter block and dirty list once the
+    /// Connection has reached its permanent home (the heap Session
+    /// slot). ob() keeps the ring binding self-healing; this call is
+    /// what points counters at the worker-owned block and dirty links
+    /// at the worker's end-of-iteration flush list.
+    pub fn bindOutbox(self: *Connection, counters: *OutboxCounters, dirty: *DirtyList) void {
+        self.outbox.ring = if (self.write_buf) |p| p[0..] else placeholder_outbox_ring[0..];
+        self.outbox.counters = counters;
+        self.dirty_list = dirty;
+    }
+
+    /// Link this conn on the bound dirty list so the worker's batch
+    /// tail flushes it once (ADR-2). A no-op for unbound conns (unit
+    /// tests); idempotent through DirtyList.link.
+    pub fn linkDirty(self: *Connection) void {
+        if (self.dirty_list) |l| l.link(self);
+    }
+
+    /// Detach from the bound dirty list (close/deinit paths). Safe on
+    /// unbound or unlinked conns.
+    fn unlinkDirty(self: *Connection) void {
+        if (self.dirty_list) |l| l.unlink(self);
+    }
+
+    /// Derived fresh on each call: the .tls arm points at this
+    /// Connection's own Tls, so the union can never hold a stale pointer
+    /// across the same by-value moves ob() guards against.
+    fn transport(self: *Connection) net.Transport {
+        if (self.tls) |*t| return .{ .tls = t };
+        return .{ .plain = self.fd };
     }
 
     /// Returns the peer address as a string slice, or empty if unknown.
@@ -145,13 +330,21 @@ pub const Connection = struct {
     /// Extract channel binding data from the TLS session.
     /// Returns cb_type (0=none, 1=tls-server-end-point, 2=tls-exporter) and
     /// a pointer to 32 bytes of binding data. Returns (0, empty) if no TLS or
-    /// binding data unavailable.
-    pub fn getChannelBinding(self: *Connection) struct { cb_type: u8, data: []const u8 } {
-        if (self.tls_conn) |*tls| {
-            if (tls.getChannelBinding()) |cb| {
+    /// binding data unavailable. An allocation failure is
+    /// error.ChannelBindingUnavailable: it must not pass for "no binding"
+    /// or a -PLUS exchange would silently downgrade to unbound.
+    pub fn getChannelBinding(self: *Connection) error{ChannelBindingUnavailable}!struct { cb_type: u8, data: []const u8 } {
+        if (self.tls) |*t| {
+            if (t.conn.getChannelBinding()) |cb| {
                 // Store in a stable buffer so the slice outlives this call
-                self.cb_data_buf = cb.data;
-                return .{ .cb_type = @intFromEnum(cb.cb_type), .data = &self.cb_data_buf };
+                const buf = self.cb_data_buf orelse blk: {
+                    const b = self.outbox.alloc.create([32]u8) catch
+                        return error.ChannelBindingUnavailable;
+                    self.cb_data_buf = b;
+                    break :blk b;
+                };
+                buf.* = cb.data;
+                return .{ .cb_type = @intFromEnum(cb.cb_type), .data = buf[0..] };
             }
         }
         return .{ .cb_type = 0, .data = "" };
@@ -188,8 +381,8 @@ pub const Connection = struct {
 
         const buf = self.read_buf[self.read_end..READ_BUF_SIZE];
 
-        if (self.tls_conn) |*tls| {
-            const result = tls.read(buf) catch |err| {
+        if (self.tls) |*t| {
+            const result = t.conn.read(buf) catch |err| {
                 return switch (err) {
                     ssl.SslError.ConnectionClosed => @as(usize, 0), // EOF
                     else => error.ConnectionReset,
@@ -236,7 +429,7 @@ pub const Connection = struct {
         std.debug.assert(self.read_start <= self.read_end);
     }
 
-    /// Append data to the write buffer for later sending.
+    /// Append data to the outbox for later sending.
     ///
     /// Returns `error.WriteBufferFull` if there is not enough space — the
     /// caller should wait for `flushSend()` to drain some data before queueing
@@ -244,25 +437,44 @@ pub const Connection = struct {
     /// closed; the stanza should be dropped or tracked for SM replay instead.
     pub fn queueSend(self: *Connection, data: []const u8) !void {
         // T155: refuse to buffer for a closed connection. Without this the data
-        // lands in write_buf, hasPendingWrite() then reports true, and the
+        // lands in the outbox, hasPendingWrite() then reports true, and the
         // caller arms kqueue on a dead fd. Mirrors S2sSession.queueSend.
         if (self.closed) {
             if (metrics.get()) |c| metrics.bump(&c.drop_send_closed, 1);
             return error.ConnectionClosed;
         }
+        return switch (self.append(data)) {
+            .queued, .spilled => {},
+            .failed_closed => error.WriteBufferFull,
+        };
+    }
 
-        const space = WRITE_BUF_SIZE - self.write_end;
-        if (data.len > space) {
-            // Try compacting first
-            self.compactWriteBuf();
-            const space_after = WRITE_BUF_SIZE - self.write_end;
-            if (data.len > space_after) {
-                if (metrics.get()) |c| metrics.bump(&c.drop_send_buffer_full, 1);
-                return error.WriteBufferFull;
-            }
+    /// Append `data` to the outbox and report the ADR-2 outcome instead of
+    /// an error: the SendResult layer folds a dead fd and a full ring into
+    /// failed_closed (noteQueueDrop uses isClosed() to split them). A
+    /// refused append bumps the per-worker drop counter by reason here, so
+    /// every call site gets counted whether it inspects the result or not.
+    pub fn append(self: *Connection, data: []const u8) net.AppendResult {
+        if (self.closed) {
+            if (metrics.get()) |c| metrics.bump(&c.drop_send_closed, 1);
+            return .failed_closed;
         }
-        @memcpy(self.write_buf[self.write_end .. self.write_end + data.len], data);
-        self.write_end += data.len;
+        const parts = [_][]const u8{data};
+        const o = self.obSend() orelse {
+            // OOM on the lazy ring backing is not slow-reader
+            // backpressure: it gets its own drop reason (App. C).
+            if (metrics.get()) |c| metrics.bump(&c.drop_send_alloc, 1);
+            return .failed_closed;
+        };
+        const r = o.append(&parts);
+        if (r == .failed_closed) {
+            if (metrics.get()) |c| metrics.bump(&c.drop_send_buffer_full, 1);
+            return r;
+        }
+        // Accepted bytes owe the worker's batch tail one flush; the tail
+        // arms EVFILT_WRITE only when the flush stalls on a real EAGAIN.
+        self.linkDirty();
+        return r;
     }
 
     /// Queue `data`, first making room with one non-blocking flush when the
@@ -278,6 +490,17 @@ pub const Connection = struct {
         };
     }
 
+    /// append() with the queueSendWithFlush policy: one non-blocking flush
+    /// when the first append is refused on a live conn, then a second
+    /// append. A dead conn returns the first failed_closed as-is so the
+    /// drop counter is bumped once, not twice.
+    pub fn appendWithFlush(self: *Connection, data: []const u8) net.AppendResult {
+        const r = self.append(data);
+        if (r != .failed_closed or self.closed) return r;
+        _ = self.flushSend() catch 0;
+        return self.append(data);
+    }
+
     /// Returns true if there is unsent data in the write buffer.
     /// When true, the caller should register this fd for EVFILT_WRITE.
     pub fn hasPendingWrite(self: *const Connection) bool {
@@ -285,14 +508,36 @@ pub const Connection = struct {
         // undeliverable, not pending. A detached SM session retains those bytes
         // for resume but must not arm EVFILT_WRITE until it has a new fd (S28).
         if (self.closed) return false;
-        return self.write_start < self.write_end;
+        return !self.outbox.empty();
     }
 
     /// Bytes currently buffered for writing (T110 backpressure thresholds).
     /// Zero once closed: there is no fd left to drain them to (S28).
     pub fn pendingWriteBytes(self: *const Connection) usize {
         if (self.closed) return 0;
-        return self.write_end - self.write_start;
+        return self.outbox.bytes();
+    }
+
+    /// Flush the outbox to the socket with a byte budget, reporting the
+    /// lib/net FlushResult so the caller arms the right interest: the
+    /// batch tail arms EVFILT_WRITE only on want_write or a spent
+    /// budget, and marks flush_want_read for the next readable event
+    /// (ADR-2).
+    ///
+    /// The outbox owns the TLS (ptr, len) pin: a pending want_* retry
+    /// presents the identical slice OpenSSL was first given, formed
+    /// only from ring memory (S23, kTLS D3).
+    pub fn flushOutbox(self: *Connection, budget: usize) net.FlushResult {
+        if (self.closed) return .{ .err = error.ConnectionClosed };
+        const o = self.ob();
+        const before = o.bytes();
+        var tr = self.transport();
+        const result = o.flush(&tr, budget);
+        const wrote = before - o.bytes();
+        if (wrote > 0) {
+            if (metrics.get()) |c| metrics.bump(&c.bytes_out, wrote);
+        }
+        return result;
     }
 
     /// Flush the write buffer to the socket.
@@ -311,60 +556,15 @@ pub const Connection = struct {
         if (self.closed) return error.ConnectionClosed;
         if (!self.hasPendingWrite()) return 0;
 
-        if (self.tls_conn) |*tls| {
-            // A pending WANT_WRITE retry must use the identical (pointer,
-            // length) pair OpenSSL was first given; bytes appended since are
-            // not part of the retried slice (S23).
-            std.debug.assert(self.tls_write_pending == 0 or
-                self.tls_write_pending <= self.write_end - self.write_start);
-            const data = if (self.tls_write_pending > 0)
-                self.write_buf[self.write_start..][0..self.tls_write_pending]
-            else
-                self.write_buf[self.write_start..self.write_end];
-            const result = tls.write(data) catch {
-                return error.ConnectionReset;
-            };
-            return switch (result) {
-                .ok => |n| blk: {
-                    self.tls_write_pending = 0;
-                    self.write_start += n;
-                    if (self.write_start == self.write_end) {
-                        self.write_start = 0;
-                        self.write_end = 0;
-                    }
-                    if (metrics.get()) |c| metrics.bump(&c.bytes_out, n);
-                    break :blk n;
-                },
-                .want_read, .want_write => blk: {
-                    // Pin the exact slice for the retry (only on the first
-                    // WANT; later WANTs keep the original pin).
-                    if (self.tls_write_pending == 0) self.tls_write_pending = data.len;
-                    break :blk error.WouldBlock;
-                },
-            };
-        }
-
-        const data = self.write_buf[self.write_start..self.write_end];
-        const n = posix.write(self.fd, data) catch |err| {
-            return switch (err) {
-                error.WouldBlock => error.WouldBlock,
-                error.BrokenPipe => error.ConnectionReset,
-                error.ConnectionResetByPeer => error.ConnectionReset,
-                error.NotOpenForWriting => error.ConnectionReset,
-                else => error.ConnectionReset,
-            };
+        const o = self.ob();
+        const before = o.bytes();
+        const result = self.flushOutbox(WRITE_BUF_SIZE);
+        const wrote = before - o.bytes();
+        return switch (result) {
+            .drained, .budget_left => wrote,
+            .want_read, .want_write => if (wrote > 0) wrote else error.WouldBlock,
+            .err => error.ConnectionReset,
         };
-
-        self.write_start += n;
-
-        // If fully drained, reset positions to reclaim buffer space
-        if (self.write_start == self.write_end) {
-            self.write_start = 0;
-            self.write_end = 0;
-        }
-
-        if (metrics.get()) |c| metrics.bump(&c.bytes_out, n);
-        return n;
     }
 
     /// Synchronous flush — blocks until all pending write data is sent.
@@ -385,7 +585,8 @@ pub const Connection = struct {
     /// After the handshake completes, `recv()` and `flushSend()` transparently
     /// use the TLS layer.
     pub fn upgradeToTls(self: *Connection, ctx: ssl.SslContext) !void {
-        self.tls_conn = ssl.SslConn.init(ctx, self.fd) catch return error.ConnectionReset;
+        const conn = ssl.SslConn.init(ctx, self.fd) catch return error.ConnectionReset;
+        self.tls = .{ .conn = conn };
         self.tls_state = .handshake_want_read; // Start expecting readable
     }
 
@@ -394,11 +595,18 @@ pub const Connection = struct {
     /// Returns `true` when the handshake is complete. Returns `false` if
     /// more I/O is needed (check `tls_state` for the required kqueue filter).
     pub fn continueHandshake(self: *Connection) !bool {
-        var tls = &(self.tls_conn orelse return error.ConnectionReset);
+        const tls = if (self.tls) |*t| &t.conn else return error.ConnectionReset;
         const result = tls.doHandshake() catch return error.ConnectionReset;
         switch (result) {
             .complete => {
                 self.tls_state = .established;
+                // Record kTLS offload on the Tls wrapper so the token
+                // reflects what the socket actually negotiated; userland
+                // fallback is silent without checking both directions.
+                if (self.tls) |*t| {
+                    t.ktls_tx = t.conn.ktlsSend();
+                    t.ktls_rx = t.conn.ktlsRecv();
+                }
                 return true;
             },
             .want_read => {
@@ -417,7 +625,7 @@ pub const Connection = struct {
     /// Non-zero means read() can return data without a syscall — and kqueue
     /// won't fire because the socket buffer is empty.
     pub fn tlsPending(self: *Connection) usize {
-        if (self.tls_conn) |*tls| return tls.pending();
+        if (self.tls) |*t| return t.conn.pending();
         return 0;
     }
 
@@ -436,14 +644,19 @@ pub const Connection = struct {
 
     /// Close the connection and release resources.
     pub fn close(self: *Connection) void {
+        // A closed fd cannot drain; leave nothing linked that the
+        // worker's dirty walk could pop after the Session is freed.
+        self.unlinkDirty();
         if (!self.closed) {
-            if (self.tls_conn) |*tls| {
-                tls.shutdown();
-                tls.deinit();
-                self.tls_conn = null;
+            if (self.tls) |*t| {
+                t.conn.shutdown();
+                t.conn.deinit();
+                self.tls = null;
                 self.tls_state = null;
             }
-            posix.close(self.fd);
+            // fd -1 is already the "gone" sentinel (T155); posix.close on a
+            // dead descriptor panics on EBADF.
+            if (self.fd >= 0) posix.close(self.fd);
             // T155: reset fd to a sentinel. Any code path still holding this
             // Connection (a detached SM session lingering in server.sessions,
             // a room occupant slot) would otherwise hand a recycled descriptor
@@ -454,27 +667,44 @@ pub const Connection = struct {
         }
     }
 
+    /// Full teardown: close the fd (if not already) and release the heap
+    /// ring backing and any outbox spill. Kept separate from close()
+    /// because a detached SM session closes its fd while the buffered
+    /// bytes stay queued for the resume window; deinit runs when the
+    /// owning Session is destroyed for real. Idempotent.
+    pub fn deinit(self: *Connection) void {
+        self.close();
+        self.outbox.deinit();
+        if (self.write_buf) |p| {
+            self.outbox.alloc.free(p[0..]);
+            self.write_buf = null;
+            // A freed conn reports an empty outbox rather than a dangling ring.
+            self.outbox.ring = &.{};
+            self.outbox.head = 0;
+            self.outbox.used = 0;
+            self.outbox.pin = null;
+        }
+        if (self.cb_data_buf) |p| {
+            self.outbox.alloc.destroy(p);
+            self.cb_data_buf = null;
+        }
+    }
+
     /// Returns true if the connection has been closed.
     pub fn isClosed(self: *const Connection) bool {
         return self.closed;
     }
 
-    // --- Private helpers ---
-
-    fn compactWriteBuf(self: *Connection) void {
-        // A TLS write retried after WANT_WRITE must keep the pinned
-        // (pointer, length) pair; moving it gives "bad write retry" (or
-        // corrupt data with kTLS). Only an active pin blocks compaction:
-        // gating on tls_conn left write_start to creep until queueSend
-        // failed with the front of the buffer free.
-        if (self.tls_write_pending != 0) return;
-        if (self.write_start == 0) return;
-        const remaining = self.write_end - self.write_start;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, self.write_buf[0..remaining], self.write_buf[self.write_start..self.write_end]);
-        }
-        self.write_end = remaining;
-        self.write_start = 0;
+    /// Copy the queued outbox bytes (ring order) into `buf`, returning
+    /// the slice written. Tests inspect queued output without draining
+    /// a socketpair; production sends go through flushSend instead.
+    pub fn pendingOutboxCopy(self: *Connection, buf: []u8) []const u8 {
+        const o = self.ob();
+        const n = @min(o.used, buf.len);
+        const first = @min(n, o.ring.len - o.head);
+        @memcpy(buf[0..first], o.ring[o.head..][0..first]);
+        @memcpy(buf[first..n], o.ring[0..][0 .. n - first]);
+        return buf[0..n];
     }
 };
 
@@ -483,7 +713,7 @@ pub const Connection = struct {
 // ============================================================================
 
 test "Connection: init" {
-    var conn = Connection.init(42, 1);
+    var conn = Connection.init(42, 1, std.testing.allocator);
     try std.testing.expectEqual(@as(posix.fd_t, 42), conn.fd);
     try std.testing.expectEqual(@as(usize, 1), conn.id);
     try std.testing.expect(!conn.closed);
@@ -496,7 +726,7 @@ test "Connection: recv and readableSlice over socketpair" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 100);
+    var conn = Connection.init(fds[0], 100, std.testing.allocator);
 
     // Write from peer side
     _ = try posix.write(fds[1], "hello xmpp");
@@ -512,7 +742,7 @@ test "Connection: consume advances read position" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
     _ = try posix.write(fds[1], "ABCDE");
     _ = try conn.recv();
 
@@ -528,10 +758,10 @@ test "Connection: consume advances read position" {
 
 test "Connection: queueSend and flushSend" {
     const fds = try makeSocketPair();
-    defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer conn.deinit();
 
     // Queue data
     try conn.queueSend("<stream:stream>");
@@ -550,10 +780,10 @@ test "Connection: queueSend and flushSend" {
 
 test "Connection: multiple queueSend accumulates" {
     const fds = try makeSocketPair();
-    defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer conn.deinit();
 
     try conn.queueSend("<a>");
     try conn.queueSend("<b>");
@@ -571,7 +801,7 @@ test "Connection: close sets closed flag" {
     // Don't defer close fds[0] — connection will close it
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
     try std.testing.expect(!conn.isClosed());
     conn.close();
     try std.testing.expect(conn.isClosed());
@@ -581,7 +811,7 @@ test "Connection: recv returns 0 on peer close (EOF)" {
     const fds = try makeSocketPair();
     defer posix.close(fds[0]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
 
     // Close peer side
     posix.close(fds[1]);
@@ -596,7 +826,7 @@ test "Connection: recv WouldBlock when no data" {
     defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
     const result = conn.recv();
     try std.testing.expectError(error.WouldBlock, result);
 }
@@ -606,7 +836,7 @@ test "Connection: close resets fd to sentinel (T155)" {
     // Don't defer close fds[0] — connection will close it
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
     try std.testing.expect(conn.fd >= 0);
     conn.close();
     // The descriptor number must not survive close — a recycled fd handed to
@@ -619,12 +849,12 @@ test "Connection: queueSend on closed connection is rejected (T155)" {
     // Don't defer close fds[0] — connection will close it
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
     conn.close();
 
     try std.testing.expectError(error.ConnectionClosed, conn.queueSend("<message/>"));
     // Critically, the rejected data must not leave the connection looking
-    // writable — callers gate `changes.addWrite(conn.fd, ..)` on this.
+    // writable: the dirty-list flush is gated on this.
     try std.testing.expect(!conn.hasPendingWrite());
 }
 
@@ -641,7 +871,8 @@ test "Connection: M1 counters track bytes and queueSend drops" {
     // fds[0] is closed by conn.close() below; do not double-close.
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer conn.deinit();
 
     try conn.queueSend("hello");
     _ = try conn.flushSend();
@@ -651,20 +882,97 @@ test "Connection: M1 counters track bytes and queueSend drops" {
     _ = try conn.recv();
     try std.testing.expectEqual(base_in + 4, c.bytes_in.load(.monotonic));
 
+    // The bounded spill makes the ring stop being the refusal bound;
+    // shrink it so an oversized append still exercises failed_closed.
+    conn.outbox.spill_limit = WRITE_BUF_SIZE;
     const big = [_]u8{'x'} ** (WRITE_BUF_SIZE + 1);
     try std.testing.expectError(error.WriteBufferFull, conn.queueSend(&big));
     try std.testing.expectEqual(base_full + 1, c.drop_send_buffer_full.load(.monotonic));
 
-    conn.close();
+    conn.deinit();
     try std.testing.expectError(error.ConnectionClosed, conn.queueSend("x"));
     try std.testing.expectEqual(base_closed + 1, c.drop_send_closed.load(.monotonic));
+}
+
+// The lazy write_buf allocation failing is memory pressure, not
+// slow-reader backpressure: the refusal still reads failed_closed to the
+// caller but lands on drop_send_alloc, not drop_send_buffer_full.
+test "Connection: write_buf OOM counts drop_send_alloc" {
+    metrics.bind(7);
+    defer metrics.current = null;
+    const c = metrics.get().?;
+    const base_alloc = c.drop_send_alloc.load(.monotonic);
+    const base_full = c.drop_send_buffer_full.load(.monotonic);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+
+    var conn = Connection.init(fds[0], 1, failing.allocator());
+    defer conn.deinit();
+
+    // append(), not queueSend(): the S15 raw-send ratchet bounds the
+    // queueSend call count in this file.
+    try std.testing.expectEqual(net.AppendResult.failed_closed, conn.append("x"));
+    try std.testing.expectEqual(base_alloc + 1, c.drop_send_alloc.load(.monotonic));
+    try std.testing.expectEqual(base_full, c.drop_send_buffer_full.load(.monotonic));
+}
+
+// A session that has channel binding data must never report (0, "") on
+// an allocation failure: the SASL layer would read it as "no binding"
+// and a -PLUS exchange would silently downgrade. getChannelBinding fails
+// the call instead.
+test "Connection: channel binding OOM is an error, not a downgrade" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+
+    var server_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+    defer server_ctx.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+
+    const fds = try makeSocketPair();
+    var server_conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer server_conn.deinit();
+    var client_tls = try ssl.SslConn.initClient(client_ctx, fds[1], null);
+    defer client_tls.deinit();
+
+    try server_conn.upgradeToTls(server_ctx);
+
+    var client_done = false;
+    var iter: usize = 0;
+    while (iter < 10000 and !(server_conn.isTlsEstablished() and client_done)) : (iter += 1) {
+        // ConnectionReset is fatal: bail to the established-check below.
+        if (!server_conn.isTlsEstablished()) _ = server_conn.continueHandshake() catch break;
+        if (!client_done) {
+            client_done = (client_tls.doHandshake() catch .want_read) == .complete;
+        }
+    }
+    try std.testing.expect(server_conn.isTlsEstablished());
+    try std.testing.expect(client_done);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const real_alloc = server_conn.outbox.alloc;
+    server_conn.outbox.alloc = failing.allocator();
+    try std.testing.expectError(error.ChannelBindingUnavailable, server_conn.getChannelBinding());
+    try std.testing.expect(server_conn.cb_data_buf == null);
+
+    // Same session with a working allocator proves binding data exists.
+    server_conn.outbox.alloc = real_alloc;
+    const cb = try server_conn.getChannelBinding();
+    try std.testing.expect(cb.cb_type != 0);
+    try std.testing.expectEqual(@as(usize, 32), cb.data.len);
 }
 
 test "Connection: a closed connection with a full buffer is not pending (S28)" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
     try conn.queueSend("<message><body>still buffered</body></message>");
     try std.testing.expect(conn.hasPendingWrite());
     try std.testing.expect(conn.pendingWriteBytes() > 0);
@@ -683,27 +991,29 @@ test "Connection: a closed connection with a full buffer is not pending (S28)" {
     try std.testing.expectError(error.ConnectionClosed, conn.flushSend());
 
     // The buffered bytes are untouched: a resume still has them if it wants.
-    try std.testing.expect(conn.write_end > conn.write_start);
+    try std.testing.expect(conn.outbox.bytes() > 0);
+    conn.deinit();
 }
 
 test "Connection: flushSync on a dead descriptor returns instead of spinning" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer conn.deinit();
     try conn.queueSend("<stream:error/>");
 
     // The fd dies mid-flush (peer teardown raced the graceful close).
     // flushSend surfaces EBADF as an error and flushSync must give up
     // immediately, not retry the dead descriptor 100 times.
     posix.close(fds[0]);
+    conn.fd = -1;
     conn.flushSync();
     try std.testing.expect(conn.hasPendingWrite());
 }
 
 test "Connection: flushSync makes short-write progress then exits bounded" {
     const fds = try makeSocketPair();
-    defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
     // Fill the kernel buffer so only part of the payload fits.
@@ -718,7 +1028,8 @@ test "Connection: flushSync makes short-write progress then exits bounded" {
     var drain: [4096]u8 = undefined;
     _ = try posix.read(fds[1], &drain);
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer conn.deinit();
     // Bigger than the freed window, smaller than the 16KB write buffer.
     var payload_buf: [8192]u8 = @splat('y');
     const marker = "<stream:error";
@@ -746,7 +1057,6 @@ test "Connection: flushSync on a blocking fd coalesces short writes to completio
     var fds: [2]posix.fd_t = undefined;
     const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds);
     try std.testing.expectEqual(@as(isize, 0), rc);
-    defer posix.close(fds[0]);
     defer posix.close(fds[1]);
 
     const payload_len = 12 * 1024;
@@ -768,7 +1078,8 @@ test "Connection: flushSync on a blocking fd coalesces short writes to completio
     var got: usize = 0;
     const t = try std.Thread.spawn(.{}, Drainer.run, .{ fds[1], payload_len, &got });
 
-    var conn = Connection.init(fds[0], 1);
+    var conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer conn.deinit();
     try conn.queueSend(&payload);
     conn.flushSync();
 
@@ -852,8 +1163,8 @@ test "S23: TLS write retry resends only the pinned slice" {
     defer client_ctx.deinit();
 
     const fds = try makeSocketPair();
-    var server_conn = Connection.init(fds[0], 1);
-    defer server_conn.close();
+    var server_conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer server_conn.deinit();
     var client_tls = try ssl.SslConn.initClient(client_ctx, fds[1], null);
     defer client_tls.deinit();
 
@@ -873,7 +1184,7 @@ test "S23: TLS write retry resends only the pinned slice" {
 
     // Q11: the accessors behind the post-handshake kTLS log line.
     {
-        const tls = &(server_conn.tls_conn orelse unreachable);
+        const tls = &(server_conn.tls orelse unreachable).conn;
         try std.testing.expect(tls.versionName().len > 0);
         try std.testing.expect(tls.cipherName().len > 0);
         _ = tls.ktlsSend();
@@ -893,11 +1204,11 @@ test "S23: TLS write retry resends only the pinned slice" {
     try server_conn.queueSend(a);
     try std.testing.expectError(error.WouldBlock, server_conn.flushSend());
     // The failed write pinned exactly the queued slice...
-    try std.testing.expectEqual(@as(usize, a.len), server_conn.tls_write_pending);
+    try std.testing.expectEqual(@as(usize, a.len), server_conn.ob().pin.?.len);
 
     // ...and bytes queued afterwards must not extend the retried slice.
     try server_conn.queueSend(b);
-    try std.testing.expectEqual(@as(usize, a.len), server_conn.tls_write_pending);
+    try std.testing.expectEqual(@as(usize, a.len), server_conn.ob().pin.?.len);
 
     // Drain: alternate server flushes with client reads; collect everything.
     var received = std.ArrayList(u8){};
@@ -915,11 +1226,11 @@ test "S23: TLS write retry resends only the pinned slice" {
     try std.testing.expectEqual(a.len + b.len, received.items.len);
     try std.testing.expectEqualSlices(u8, a, received.items[0..a.len]);
     try std.testing.expectEqualSlices(u8, b, received.items[a.len..]);
-    try std.testing.expectEqual(@as(usize, 0), server_conn.tls_write_pending);
+    try std.testing.expect(server_conn.ob().pin == null);
     try std.testing.expect(!server_conn.hasPendingWrite());
 }
 
-test "S23: TLS connection with no pinned retry compacts the write buffer" {
+test "S23: TLS connection wraps the outbox ring after a pinned retry" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -933,8 +1244,8 @@ test "S23: TLS connection with no pinned retry compacts the write buffer" {
     defer client_ctx.deinit();
 
     const fds = try makeSocketPair();
-    var server_conn = Connection.init(fds[0], 1);
-    defer server_conn.close();
+    var server_conn = Connection.init(fds[0], 1, std.testing.allocator);
+    defer server_conn.deinit();
     var client_tls = try ssl.SslConn.initClient(client_ctx, fds[1], null);
     defer client_tls.deinit();
 
@@ -961,33 +1272,36 @@ test "S23: TLS connection with no pinned retry compacts the write buffer" {
     const b = "B" ** 512;
     try server_conn.queueSend(a);
     try std.testing.expectError(error.WouldBlock, server_conn.flushSend());
-    try std.testing.expectEqual(@as(usize, a.len), server_conn.tls_write_pending);
+    try std.testing.expectEqual(@as(usize, a.len), server_conn.ob().pin.?.len);
     try server_conn.queueSend(b);
 
-    // Drain only the pinned slice, then stop: write_start has crept past
-    // 0 with no retry pinned.
+    // Drain only the pinned slice, then stop: the ring head has crept
+    // past 0 with no retry pinned.
     var received = std.ArrayList(u8){};
     defer received.deinit(allocator);
     var rbuf: [16384]u8 = undefined;
     iter = 0;
     while (iter < 100000) : (iter += 1) {
         _ = server_conn.flushSend() catch {};
-        if (server_conn.tls_write_pending == 0 and server_conn.write_start > 0) break;
+        if (server_conn.ob().pin == null and server_conn.ob().head > 0) break;
         switch (client_tls.read(&rbuf) catch .want_read) {
             .ok => |n| try received.appendSlice(allocator, rbuf[0..n]),
             else => {},
         }
     }
-    try std.testing.expectEqual(@as(usize, 0), server_conn.tls_write_pending);
-    try std.testing.expectEqual(a.len, server_conn.write_start);
-    try std.testing.expectEqual(a.len + b.len, server_conn.write_end);
+    // The pin is cleared and at least the pinned slice drained; a single
+    // flush pass may also have written some or all of b behind it.
+    try std.testing.expect(server_conn.ob().pin == null);
+    try std.testing.expect(server_conn.ob().head >= a.len);
+    try std.testing.expect(server_conn.ob().used <= b.len);
 
-    // Fewer than c.len bytes remain at the tail; queueSend must compact
-    // the freed front instead of failing WriteBufferFull.
+    // The tail of the ring has no contiguous room for c (the append
+    // point is 3872 bytes from the end); the ring wraps it into the
+    // freed front instead of failing WriteBufferFull.
     const c = "C" ** 4096;
+    const used_before = server_conn.ob().used;
     try server_conn.queueSend(c);
-    try std.testing.expectEqual(@as(usize, 0), server_conn.write_start);
-    try std.testing.expectEqual(b.len + c.len, server_conn.write_end);
+    try std.testing.expectEqual(used_before + c.len, server_conn.ob().used);
 
     // Everything queued still arrives, in order.
     iter = 0;

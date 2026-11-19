@@ -234,35 +234,29 @@ pub fn exceedsWriteBuffer(prefix_len: usize, suffix_len: usize, encoded_recipien
 /// Every live or detached delivery updates XEP-0198 tracking so the server and
 /// client acknowledgment windows stay aligned with the replay queue.
 ///
-/// `session` is a `*Session` and `changes` a `*ChangeList`; both are taken as
-/// `anytype` because `Session` lives in server.zig, which imports this module.
+/// `session` is a `*Session`, taken as `anytype` because `Session` lives in
+/// server.zig, which imports this module. A queued append self-links the
+/// conn for the worker's end-of-iteration flush, so there is no write
+/// interest to arm here (ADR-2).
 pub fn deliverToSession(
     session: anytype,
     data: []const u8,
     session_id: usize,
-    changes: anytype,
 ) void {
-    if (session.sm_detached) {
-        session.smTrackOutbound(data);
-        return;
-    }
-    session.conn.queueSend(data) catch |err| {
-        if (err == error.WriteBufferFull) {
-            // Two cases share the error (noteQueueOverflow): a stanza that
-            // can never fit is an oversize drop, not a slow reader.
-            if (data.len <= connection_mod.WRITE_BUF_SIZE) {
-                session.sm_overflow = true;
-                log.warn("local delivery to session {d} failed: {s}; marking the session for overflow teardown", .{ session_id, @errorName(err) });
-            } else {
-                _ = delivery_queue_mod.oversize_queue_drops.fetchAdd(1, .monotonic);
-                log.warn("local delivery to session {d} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session_id, data.len, connection_mod.WRITE_BUF_SIZE });
-            }
+    if (session.stanza(data) == .failed_closed) {
+        // A dead conn needs no classification (the old ConnectionClosed
+        // path was silent). On a live conn a full outbox is two cases
+        // (noteQueueOverflow): a stanza that can never fit is an oversize
+        // drop, not a slow reader.
+        if (session.conn.isClosed()) return;
+        if (data.len <= session.conn.outbox.spill_limit) {
+            session.sm_overflow = true;
+            log.warn("local delivery to session {d} failed: WriteBufferFull; marking the session for overflow teardown", .{session_id});
+        } else {
+            _ = delivery_queue_mod.oversize_queue_drops.fetchAdd(1, .monotonic);
+            log.warn("local delivery to session {d} of {d} bytes exceeds the {d}-byte send buffer; dropped, session kept", .{ session_id, data.len, session.conn.outbox.spill_limit });
         }
         return;
-    };
-    session.smTrackOutbound(data);
-    if (session.conn.hasPendingWrite()) {
-        changes.addWrite(session.conn.fd, session_id) catch {};
     }
 }
 
@@ -278,10 +272,9 @@ pub fn deliverPrebuiltToSession(
     recipient_jid: []const u8,
     suffix: []const u8,
     session_id: usize,
-    changes: anytype,
 ) void {
     const total = buildComplete(buf, prefix, recipient_jid, suffix) orelse return;
-    deliverToSession(session, buf[0..total], session_id, changes);
+    deliverToSession(session, buf[0..total], session_id);
 }
 
 // ============================================================================
@@ -478,16 +471,24 @@ const MockConn = struct {
     fail_full: bool = false,
     sent: [1024]u8 = undefined,
     sent_len: usize = 0,
+    /// Mirrors Connection.append's self-link on the worker dirty list.
+    on_dirty: bool = false,
+    outbox: struct { spill_limit: usize } = .{ .spill_limit = connection_mod.MAX_OUTBOUND_BYTES },
 
     pub fn queueSend(self: *MockConn, data: []const u8) !void {
         if (self.closed) return error.ConnectionClosed;
         if (self.fail_full) return error.WriteBufferFull;
         @memcpy(self.sent[self.sent_len .. self.sent_len + data.len], data);
         self.sent_len += data.len;
+        self.on_dirty = true;
     }
 
     pub fn hasPendingWrite(self: *const MockConn) bool {
         return self.sent_len > 0;
+    }
+
+    pub fn isClosed(self: *const MockConn) bool {
+        return self.closed;
     }
 };
 
@@ -495,7 +496,7 @@ const MockSession = struct {
     sm_detached: bool = false,
     sm_overflow: bool = false,
     conn: MockConn = .{},
-    tracked: [1024]u8 = undefined,
+    tracked: [20480]u8 = undefined,
     tracked_len: usize = 0,
     track_calls: usize = 0,
 
@@ -504,29 +505,32 @@ const MockSession = struct {
         self.tracked_len += data.len;
         self.track_calls += 1;
     }
-};
 
-const MockChanges = struct {
-    add_write_calls: usize = 0,
-    last_fd: std.posix.fd_t = -99,
-
-    pub fn addWrite(self: *MockChanges, fd: std.posix.fd_t, udata: usize) !void {
-        _ = udata;
-        self.add_write_calls += 1;
-        self.last_fd = fd;
+    /// Mirrors Session.stanza: detached sessions are tracked for resume,
+    /// live sessions track unless the stanza can never fit the outbox
+    /// (the oversize drop class).
+    pub fn stanza(self: *MockSession, data: []const u8) enum { queued, tracked_detached, spilled, failed_closed } {
+        if (self.sm_detached) {
+            self.smTrackOutbound(data);
+            return .tracked_detached;
+        }
+        self.conn.queueSend(data) catch {
+            if (data.len <= self.conn.outbox.spill_limit) self.smTrackOutbound(data);
+            return .failed_closed;
+        };
+        self.smTrackOutbound(data);
+        return .queued;
     }
 };
 
-test "deliverToSession: live session sends, tracks, and arms kqueue" {
+test "deliverToSession: live session sends, tracks, and links the conn dirty" {
     var session = MockSession{};
-    var changes = MockChanges{};
 
-    deliverToSession(&session, "<message/>", 3, &changes);
+    deliverToSession(&session, "<message/>", 3);
 
     try std.testing.expectEqualStrings("<message/>", session.conn.sent[0..session.conn.sent_len]);
     try std.testing.expectEqual(@as(usize, 1), session.track_calls);
-    try std.testing.expectEqual(@as(usize, 1), changes.add_write_calls);
-    try std.testing.expectEqual(@as(std.posix.fd_t, 7), changes.last_fd);
+    try std.testing.expect(session.conn.on_dirty);
 }
 
 test "deliverToSession: detached session tracks for replay, never touches the fd (T153)" {
@@ -534,24 +538,22 @@ test "deliverToSession: detached session tracks for replay, never touches the fd
     // detachSession() already closed the connection; fd is a sentinel (T155).
     session.conn.closed = true;
     session.conn.fd = -1;
-    var changes = MockChanges{};
 
-    deliverToSession(&session, "<message/>", 3, &changes);
+    deliverToSession(&session, "<message/>", 3);
 
     // Tracked for resume replay...
     try std.testing.expectEqualStrings("<message/>", session.tracked[0..session.tracked_len]);
     try std.testing.expectEqual(@as(usize, 1), session.track_calls);
-    // ...and nothing was written or registered with kqueue.
+    // ...and nothing was written or linked for the flush walk.
     try std.testing.expectEqual(@as(usize, 0), session.conn.sent_len);
-    try std.testing.expectEqual(@as(usize, 0), changes.add_write_calls);
+    try std.testing.expect(!session.conn.on_dirty);
 }
 
 test "deliverPrebuiltToSession: assembles prefix + JID + suffix" {
     var session = MockSession{};
-    var changes = MockChanges{};
     var buf: [2048]u8 = undefined;
 
-    deliverPrebuiltToSession(&session, &buf, "<message to='", "bob@example.com", "'/>", 1, &changes);
+    deliverPrebuiltToSession(&session, &buf, "<message to='", "bob@example.com", "'/>", 1);
 
     try std.testing.expectEqualStrings(
         "<message to='bob@example.com'/>",
@@ -564,13 +566,12 @@ test "deliverPrebuiltToSession: detached occupant is not delivered live" {
     var session = MockSession{ .sm_detached = true };
     session.conn.closed = true;
     session.conn.fd = -1;
-    var changes = MockChanges{};
     var buf: [2048]u8 = undefined;
 
-    deliverPrebuiltToSession(&session, &buf, "<message to='", "bob@example.com", "'/>", 1, &changes);
+    deliverPrebuiltToSession(&session, &buf, "<message to='", "bob@example.com", "'/>", 1);
 
     try std.testing.expectEqual(@as(usize, 0), session.conn.sent_len);
-    try std.testing.expectEqual(@as(usize, 0), changes.add_write_calls);
+    try std.testing.expect(!session.conn.on_dirty);
     try std.testing.expectEqualStrings(
         "<message to='bob@example.com'/>",
         session.tracked[0..session.tracked_len],
@@ -580,19 +581,20 @@ test "deliverPrebuiltToSession: detached occupant is not delivered live" {
 test "deliverToSession: oversized stanza keeps the session, full buffer flags it" {
     var session = MockSession{};
     session.conn.fail_full = true;
-    var changes = MockChanges{};
+    // Small bound so the oversized case does not need a 1 MiB stanza.
+    session.conn.outbox.spill_limit = 64;
 
     const drops_before = delivery_queue_mod.oversize_queue_drops.load(.monotonic);
 
-    // A stanza longer than the whole write buffer is an oversize drop, not
-    // a slow reader: the session stays up and the drop is counted.
-    const big = "x" ** (connection_mod.WRITE_BUF_SIZE + 1);
-    deliverToSession(&session, big, 3, &changes);
+    // A stanza longer than the whole outbound bound is an oversize drop,
+    // not a slow reader: the session stays up and the drop is counted.
+    const big = "x" ** 65;
+    deliverToSession(&session, big, 3);
     try std.testing.expect(!session.sm_overflow);
     try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.oversize_queue_drops.load(.monotonic));
 
     // A deliverable stanza refused by a full buffer is the slow-reader case.
-    deliverToSession(&session, "<presence/>", 3, &changes);
+    deliverToSession(&session, "<presence/>", 3);
     try std.testing.expect(session.sm_overflow);
     try std.testing.expectEqual(drops_before + 1, delivery_queue_mod.oversize_queue_drops.load(.monotonic));
 }
