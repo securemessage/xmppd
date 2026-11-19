@@ -335,6 +335,11 @@ pub fn build(b: *std.Build) void {
         .root_module = conf_mod,
     });
 
+    const schema_tests = b.addTest(.{
+        .name = "schema-tests",
+        .root_module = schema_mod,
+    });
+
     const net_tests = b.addTest(.{
         .name = "net-tests",
         .root_module = net_mod,
@@ -443,6 +448,7 @@ pub fn build(b: *std.Build) void {
 
     const run_xml_tests = b.addRunArtifact(xml_tests);
     const run_conf_tests = b.addRunArtifact(conf_tests);
+    const run_schema_tests = b.addRunArtifact(schema_tests);
     const run_net_tests = b.addRunArtifact(net_tests);
     const run_xml_writer_tests = b.addRunArtifact(xml_writer_tests);
 
@@ -2265,16 +2271,19 @@ pub fn build(b: *std.Build) void {
     const test_s2s_step = b.step("test-s2s", "Run only the s2s daemon tests");
     const test_auth_step = b.step("test-auth", "Run only the auth daemon startup tests");
     const test_auth_oidc_step = b.step("test-auth-oidc", "Run only the OIDC auth daemon tests");
+    const test_schema_step = b.step("test-schema", "Run only the shared configuration schema tests");
     test_core_step.dependOn(&run_core_tests.step);
     test_s2s_step.dependOn(&run_s2s_main_tests.step);
     test_auth_step.dependOn(&run_auth_main_tests.step);
     test_auth_oidc_step.dependOn(&run_oidc_main_tests.step);
+    test_schema_step.dependOn(&run_schema_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
     // A green test suite must also prove every install artifact compiles.
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_xml_tests.step);
     test_step.dependOn(&run_conf_tests.step);
+    test_step.dependOn(&run_schema_tests.step);
     test_step.dependOn(&run_net_tests.step);
     test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
