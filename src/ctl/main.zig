@@ -68,7 +68,7 @@ pub fn main() !void {
     // file keys and bad values are startup errors with the Diag.
     var diag: conf.Diag = .{};
     var loaded = loadCtlConfig(allocator, prescanned.args.items, &diag) catch |err| {
-        log.err("{f}", .{diag});
+        log.err("{f}", .{&diag});
         return err;
     };
     defer loaded.deinit();

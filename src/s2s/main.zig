@@ -1144,7 +1144,7 @@ pub fn main() !void {
 
     var diag: conf.Diag = .{};
     var loaded = loadS2sConfig(allocator, argv.items, &diag) catch |err| {
-        log.err("{f}", .{diag});
+        log.err("{f}", .{&diag});
         return err;
     };
     defer loaded.deinit();

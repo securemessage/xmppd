@@ -71,7 +71,7 @@ pub fn main() !void {
         .path = schema.configPathArg(argv.items),
         .args = argv.items,
     }, &diag) catch |err| {
-        log.err("{f}", .{diag});
+        log.err("{f}", .{&diag});
         return err;
     };
     defer loaded.deinit();
@@ -299,7 +299,7 @@ pub fn main() !void {
     defer conf_arena.deinit();
     var fwd_diag: conf.Diag = .{};
     const conf_blob = loaded.forwardBlob(conf_arena.allocator(), &fwd_diag) catch |err| {
-        log.err("cannot serialize the forwarded config: {f}", .{fwd_diag});
+        log.err("cannot serialize the forwarded config: {f}", .{&fwd_diag});
         return err;
     };
     var conf_fd = conf.ConfFd.create(conf_blob) catch |err| {
@@ -556,13 +556,13 @@ const ConfReloader = struct {
             .args = self.argv,
         }, &diag) catch {
             self.last_ok = false;
-            log.warn("config reload failed; keeping the previous forwarded config: {f}", .{diag});
+            log.warn("config reload failed; keeping the previous forwarded config: {f}", .{&diag});
             return;
         };
         defer rel.deinit();
         const blob = rel.forwardBlob(arena.allocator(), &diag) catch {
             self.last_ok = false;
-            log.warn("config reload failed; keeping the previous forwarded config: {f}", .{diag});
+            log.warn("config reload failed; keeping the previous forwarded config: {f}", .{&diag});
             return;
         };
         self.conf_fd.rebuild(blob) catch |err| {
