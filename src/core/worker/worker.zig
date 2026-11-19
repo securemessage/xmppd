@@ -421,37 +421,46 @@ pub const Server = struct {
         self.s2s_ipc.alloc = self.allocator;
     }
 
-    /// Initialize the server.
+    /// Initialize the server into the caller's `self` slot.
+    ///
+    /// Out-param rather than `!Server`: a failed init materializes only a
+    /// `!void` union on the caller's stack, while `!Server` reserved a full
+    /// Server-sized error slot per `try` and pushed several src/core
+    /// functions over the 16 KiB stack-frame cap.
     ///
     /// - `host` — the XMPP server hostname (e.g., "example.com")
     /// - `address` — bind address (e.g., "0.0.0.0", "127.0.0.1")
     /// - `port` — TCP port (e.g., 5222)
     /// - `allocator` — allocator for session objects
     pub fn init(
+        self: *Server,
         host: []const u8,
         address: []const u8,
         port: u16,
         allocator: std.mem.Allocator,
-    ) !Server {
-        return initWithMaxSessions(host, address, port, allocator, DEFAULT_MAX_SESSIONS);
+    ) !void {
+        return self.initWithMaxSessions(host, address, port, allocator, DEFAULT_MAX_SESSIONS);
     }
 
     pub fn initWithMaxSessions(
+        self: *Server,
         host: []const u8,
         address: []const u8,
         port: u16,
         allocator: std.mem.Allocator,
         max_sessions: usize,
-    ) !Server {
+    ) !void {
         if (max_sessions > std.math.maxInt(u32)) {
             log.err("max_sessions ({d}) exceeds the u32 token index space", .{max_sessions});
             return error.MaxSessionsTooLarge;
         }
         const sessions = try allocator.alloc(?*Session, max_sessions);
+        errdefer allocator.free(sessions);
         @memset(sessions, null);
 
         // Pre-populate free-list with all valid IDs (1..max_sessions-1) in reverse order
         const free_ids = try allocator.alloc(usize, max_sessions);
+        errdefer allocator.free(free_ids);
         var fc: usize = 0;
         var idx: usize = max_sessions - 1;
         while (idx >= 1) : (idx -= 1) {
@@ -461,6 +470,7 @@ pub const Server = struct {
         }
 
         const slot_gen = try allocator.alloc(u24, max_sessions);
+        errdefer allocator.free(slot_gen);
         @memset(slot_gen, 1);
 
         const loop = try EventLoop.init(allocator, 256);
@@ -475,7 +485,7 @@ pub const Server = struct {
         // kern.ipc.soacceptqueue either way.
         const listener = try Listener.init(address, port, false, 4096);
 
-        var server = Server{
+        self.* = .{
             .loop = loop,
             .listener = listener,
             .sessions = sessions,
@@ -488,37 +498,40 @@ pub const Server = struct {
             .start_time = std.time.timestamp(),
             .hold_token_seed = std.crypto.random.int(u64),
         };
-        server.bindIpcAllocators();
-        return server;
+        self.bindIpcAllocators();
     }
 
     /// Initialize with a pre-bound listener fd (received from master via fd inheritance).
     /// If `skip_tls` is true, SASL is offered without requiring STARTTLS (for benchmarks/trusted networks).
     pub fn initFromFd(
+        self: *Server,
         host: []const u8,
         fd: std.posix.fd_t,
         allocator: std.mem.Allocator,
         max_sessions: usize,
-    ) !Server {
-        return initFromFdOpts(host, fd, allocator, max_sessions, false);
+    ) !void {
+        return self.initFromFdOpts(host, fd, allocator, max_sessions, false);
     }
 
     pub fn initFromFdOpts(
+        self: *Server,
         host: []const u8,
         fd: std.posix.fd_t,
         allocator: std.mem.Allocator,
         max_sessions: usize,
         skip_tls: bool,
-    ) !Server {
+    ) !void {
         if (max_sessions > std.math.maxInt(u32)) {
             log.err("max_sessions ({d}) exceeds the u32 token index space", .{max_sessions});
             return error.MaxSessionsTooLarge;
         }
         const sessions = try allocator.alloc(?*Session, max_sessions);
+        errdefer allocator.free(sessions);
         @memset(sessions, null);
 
         // Pre-populate free-list with all valid IDs (1..max_sessions-1) in reverse order
         const free_ids = try allocator.alloc(usize, max_sessions);
+        errdefer allocator.free(free_ids);
         var fc: usize = 0;
         var idx: usize = max_sessions - 1;
         while (idx >= 1) : (idx -= 1) {
@@ -528,6 +541,7 @@ pub const Server = struct {
         }
 
         const slot_gen = try allocator.alloc(u24, max_sessions);
+        errdefer allocator.free(slot_gen);
         @memset(slot_gen, 1);
 
         const loop = try EventLoop.init(allocator, 256);
@@ -538,7 +552,7 @@ pub const Server = struct {
 
         const listener = Listener.initFromFd(fd, skip_tls);
 
-        var server = Server{
+        self.* = .{
             .loop = loop,
             .listener = listener,
             .sessions = sessions,
@@ -551,8 +565,7 @@ pub const Server = struct {
             .start_time = std.time.timestamp(),
             .hold_token_seed = std.crypto.random.int(u64),
         };
-        server.bindIpcAllocators();
-        return server;
+        self.bindIpcAllocators();
     }
 
     /// Connect to the auth daemon IPC socket.
@@ -2136,14 +2149,16 @@ pub const Server = struct {
 // ============================================================================
 
 test "Server: init and deinit" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     try std.testing.expect(server.listener.fd >= 0);
     try std.testing.expect(server.running);
 }
 test "Server: S18 scratch banks size to the session map resource cap" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var sm = SessionMap.init(std.testing.allocator, false, 0);
@@ -2173,7 +2188,8 @@ test "Server: S18 scratch banks size to the session map resource cap" {
 }
 
 test "Server: S18 byte scratch pool failure uses the heap fallback" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer {
         server.allocator = std.testing.allocator;
         server.deinit();
@@ -2191,7 +2207,8 @@ test "Server: S18 byte scratch pool failure uses the heap fallback" {
 }
 
 test "Server: S18 scratch lease release is scoped to the lease" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var first = server.leaseScratch(.a);
@@ -2209,7 +2226,8 @@ test "Server: S18 scratch lease release is scoped to the lease" {
 }
 
 test "Server: S18 byte scratch banks are distinct and reusable" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     // Every bank is handed out separately, so a serializer nested inside
@@ -2292,13 +2310,14 @@ fn isOverlapping(x: []const u8, y: []const u8) bool {
 // arena alive for as long as it stays connected. The stanza arrives in chunks
 // so the parser sees it unterminated, the way a hostile peer would send it.
 test "Server: the bound localpart keeps the full prepared auth username" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -2318,14 +2337,15 @@ test "Server: the bound localpart keeps the full prepared auth username" {
 }
 
 test "Server: S28 stale writable event does not destroy a detached session" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
     defer {
         if (server.sessions[1]) |s| {
@@ -2384,14 +2404,15 @@ test "Server: S28 a same-batch kqueue race keeps a detached session resumable" {
     // The real shape of the bug: kevent returns readable and writable for a
     // session fd, the session detaches for SM resume before that batch is
     // dispatched, and the stale events reach the handlers anyway.
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
     defer {
         if (server.sessions[1]) |s| {
@@ -2440,14 +2461,15 @@ test "Server: S28 a same-batch kqueue race keeps a detached session resumable" {
 }
 
 test "Server: S28 a stale writable event on a closed live session is skipped" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
     defer {
         if (server.sessions[1]) |s| {
@@ -2476,14 +2498,15 @@ test "Server: M1 counters track client traffic through the read path" {
     const base_in = c.bytes_in.load(.monotonic);
     const base_out = c.bytes_out.load(.monotonic);
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -2517,13 +2540,14 @@ test "Server: an appended conn rides the dirty list to the batch-tail flush" {
     // The worker slot is process-global; reset it after server.deinit so a
     // failed run leaves no links into a freed Session for the next test.
     defer connection_mod.dirtyForWorker(0).* = .{};
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     server.sessions[1] = session;
     var ctrs: connection_mod.OutboxCounters = .{};
     const dirty = connection_mod.dirtyForWorker(server.worker_id);
@@ -2555,13 +2579,14 @@ test "Server: an appended conn rides the dirty list to the batch-tail flush" {
 test "Server: a stalled batch-tail flush arms EVFILT_WRITE once" {
     const allocator = std.testing.allocator;
     defer connection_mod.dirtyForWorker(0).* = .{};
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     server.sessions[1] = session;
     var ctrs: connection_mod.OutboxCounters = .{};
     const dirty = connection_mod.dirtyForWorker(server.worker_id);
@@ -2594,7 +2619,8 @@ test "Server: a stalled batch-tail flush arms EVFILT_WRITE once" {
 test "Server: dirty-list leftovers re-drive on the loop self-wake" {
     const allocator = std.testing.allocator;
     defer connection_mod.dirtyForWorker(0).* = .{};
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     try std.testing.expect(server.delivery_system == null);
 
@@ -2610,7 +2636,7 @@ test "Server: dirty-list leftovers re-drive on the loop self-wake" {
         const fds = try makeSocketPair();
         peers[i] = fds[1];
         const session = try allocator.create(Session);
-        session.* = Session.init(fds[0], i + 1, "localhost", false, allocator);
+        session.init(fds[0], i + 1, "localhost", false, allocator);
         session.conn.bindOutbox(&ctrs, dirty);
         server.sessions[i + 1] = session;
         _ = session.nonza("<x/>");
@@ -2652,7 +2678,8 @@ test "Server: dirty-list leftovers re-drive on the loop self-wake" {
 test "Server: STARTTLS negotiation upgrades through the batch-tail dirty flush" {
     const allocator = std.testing.allocator;
     defer connection_mod.dirtyForWorker(0).* = .{};
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     // A real cert so upgradeToTls runs; without ssl_ctx the upgrade path
@@ -2666,7 +2693,7 @@ test "Server: STARTTLS negotiation upgrades through the batch-tail dirty flush" 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     var ctrs: connection_mod.OutboxCounters = .{};
     const dirty = connection_mod.dirtyForWorker(server.worker_id);
     session.conn.bindOutbox(&ctrs, dirty);
@@ -2714,7 +2741,8 @@ test "Server: STARTTLS negotiation upgrades through the batch-tail dirty flush" 
 test "Server: channel binding OOM fails the SASL exchange" {
     const allocator = std.testing.allocator;
     defer connection_mod.dirtyForWorker(0).* = .{};
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -2735,7 +2763,7 @@ test "Server: channel binding OOM fails the SASL exchange" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     var ctrs: connection_mod.OutboxCounters = .{};
     const dirty = connection_mod.dirtyForWorker(server.worker_id);
     session.conn.bindOutbox(&ctrs, dirty);
@@ -2900,7 +2928,8 @@ test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -2908,7 +2937,7 @@ test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -2920,7 +2949,8 @@ test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -2964,7 +2994,8 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -2976,7 +3007,7 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
     var tiny: c_int = 1024;
     _ = std.c.setsockopt(target_fds[1], std.c.SOL.SOCKET, std.c.SO.RCVBUF, &tiny, @sizeOf(c_int));
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -2999,7 +3030,8 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -3039,7 +3071,8 @@ test "Server: a non-archivable message stores offline with no archive" {
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -3047,7 +3080,8 @@ test "Server: a non-archivable message stores offline with no archive" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -3094,7 +3128,8 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -3103,7 +3138,7 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
     target.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
@@ -3127,7 +3162,8 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -3163,14 +3199,15 @@ test "Re-review 6.8: an empty tail cancels the retry timer" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
@@ -3210,14 +3247,15 @@ test "Re-review 6.8: a successful retry delete clears the recorded sequence" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     server.sessions[1] = session;
@@ -3249,7 +3287,8 @@ test "Re-review 7.6: a form over the write buffer but inside the bank does not m
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -3257,7 +3296,7 @@ test "Re-review 7.6: a form over the write buffer but inside the bank does not m
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.stream.state = .active;
     bob.stream.authenticated = true;
     bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
@@ -3269,7 +3308,8 @@ test "Re-review 7.6: a form over the write buffer but inside the bank does not m
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.state = .active;
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
@@ -3310,14 +3350,15 @@ test "Re-review 5.4: a stuck delete retry deletes without resending" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
@@ -3365,14 +3406,15 @@ test "Re-review 6.2: a real delete failure records the sequence, the retry does 
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
@@ -3432,7 +3474,8 @@ test "Server: H4 an inbound S2S message lands behind an existing offline tail" {
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -3445,7 +3488,7 @@ test "Server: H4 an inbound S2S message lands behind an existing offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
@@ -3507,7 +3550,8 @@ test "Server: H4 a type normal message lands behind an existing offline tail" {
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -3520,7 +3564,7 @@ test "Server: H4 a type normal message lands behind an existing offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
@@ -3529,7 +3573,8 @@ test "Server: H4 a type normal message lands behind an existing offline tail" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -3597,7 +3642,8 @@ test "Server: S13 offline store delivers without a committed archive row" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -3608,7 +3654,8 @@ test "Server: S13 offline store delivers without a committed archive row" {
     // bob has no session at all, so alice's message goes to offline storage.
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -3639,7 +3686,7 @@ test "Server: S13 offline store delivers without a committed archive row" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(fds[0], 7, "localhost", false, allocator);
+    bob.init(fds[0], 7, "localhost", false, allocator);
     bob.stream.state = .active;
     bob.stream.authenticated = true;
     bob.stream.authenticated_jid = .{ .local = "bob", .domain = "localhost" };
@@ -3683,7 +3730,8 @@ test "Server: E2d an oversized archive form is not stored offline" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -3694,7 +3742,8 @@ test "Server: E2d an oversized archive form is not stored offline" {
     // bob is offline: the stanza takes the offline-store path.
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -3757,7 +3806,8 @@ test "Server: H3 a resume carries the stalled offline tail" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -3769,7 +3819,7 @@ test "Server: H3 a resume carries the stalled offline tail" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     const previd = "cccccccccccccccccccccccccccccccc";
@@ -3841,14 +3891,15 @@ test "Re-review 6.4: a failed count arms a retry instead of parking the session"
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
@@ -3901,7 +3952,8 @@ test "Re-review 6.3: a cross-worker resume carries the recorded sequence" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.offline = &offline_store;
     sm_handoff.resetForTesting();
@@ -3912,7 +3964,7 @@ test "Re-review 6.3: a cross-worker resume carries the recorded sequence" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     server.sessions[1] = session;
 
     const previd = "dddddddddddddddddddddddddddddddd";
@@ -3985,7 +4037,8 @@ test "Re-review 6.3: a local resume carries the recorded sequence" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -4007,7 +4060,7 @@ test "Re-review 6.3: a local resume carries the recorded sequence" {
     const det_fds = try makeSocketPair();
     defer posix.close(det_fds[1]);
     const detached = try allocator.create(Session);
-    detached.* = Session.init(det_fds[0], 2, "localhost", false, allocator);
+    detached.init(det_fds[0], 2, "localhost", false, allocator);
     @memcpy(detached.auth_username_buf[0..5], "alice");
     detached.auth_username_len = 5;
     detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
@@ -4030,7 +4083,7 @@ test "Re-review 6.3: a local resume carries the recorded sequence" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     server.sessions[1] = session;
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
@@ -4082,7 +4135,8 @@ test "Server: H3 a local resume carries the stalled offline tail" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -4094,7 +4148,7 @@ test "Server: H3 a local resume carries the stalled offline tail" {
     const det_fds = try makeSocketPair();
     defer posix.close(det_fds[1]);
     const detached = try allocator.create(Session);
-    detached.* = Session.init(det_fds[0], 2, "localhost", false, allocator);
+    detached.init(det_fds[0], 2, "localhost", false, allocator);
     @memcpy(detached.auth_username_buf[0..5], "alice");
     detached.auth_username_len = 5;
     detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
@@ -4124,7 +4178,7 @@ test "Server: H3 a local resume carries the stalled offline tail" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     server.sessions[1] = session;
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
@@ -4164,7 +4218,8 @@ test "Server: H3 a local resume carries the stalled offline tail" {
 // directly so the test does not depend on the wall clock staying within one
 // second.
 test "Server: E2c stanza ids sort in generation order across counter boundaries" {
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, std.testing.allocator, 4);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, std.testing.allocator, 4);
     defer server.deinit();
     server.worker_id = 1;
 
@@ -4206,7 +4261,8 @@ test "Server: E2c an offline queue drains in the order it was filled" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 4);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 4);
     defer server.deinit();
     server.worker_id = 1;
 
@@ -4388,7 +4444,8 @@ test "Server: S13 writable handler resumes the stalled offline drain" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -4399,7 +4456,7 @@ test "Server: S13 writable handler resumes the stalled offline drain" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = "localhost" };
@@ -4459,7 +4516,8 @@ test "Server: R5 S2S cross-worker delivery drops are counted" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -4494,7 +4552,8 @@ test "Server: R5 S2S cross-worker delivery drops are counted" {
 // The scanner cap is 512 KiB, so the name is driven past it in chunks through
 // the real parse path.
 test "Server: S10 reconcile arms and disarms auth IPC write interest" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
@@ -4687,7 +4746,8 @@ test "S10: the IPC reconnect timers are armed in exactly one place" {
 }
 
 test "Server: S10 failed reconnect timer staging keeps retries pending" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var change_buf: [1]posix.Kevent = undefined;
@@ -4704,7 +4764,8 @@ test "Server: S10 failed reconnect timer staging keeps retries pending" {
 }
 
 test "Server: S10 a reconnect owed by a full batch still gets its timer" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -4744,7 +4805,8 @@ test "Server: S10 a reconnect owed by a full batch still gets its timer" {
 }
 
 test "Server: S10 a reconnect that cannot arm reads drops the link and owes a retry" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -4786,7 +4848,8 @@ test "Server: S10 an auth reconnect that cannot arm reads drops the link and owe
     // tryAuthReconnect and tryS2sReconnect each carry their own copy of the
     // fail-closed handling, so the auth one needs its own gate: a revert that
     // only touches it would otherwise pass the suite.
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -4819,7 +4882,8 @@ test "Server: S10 an auth reconnect that cannot arm reads drops the link and owe
 }
 
 test "Server: S10 reconcile arms IPC write interest from a full batch" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
@@ -4862,7 +4926,8 @@ test "Server: S10 reconcile arms IPC write interest from a full batch" {
 }
 
 test "Server: S10 a deferred IPC disarm keeps the armed flag set" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
@@ -4937,7 +5002,8 @@ pub const TestIpcListener = struct {
 };
 
 test "Server: S10 dropped S2S link arms a reconnect and recovers" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     // A per-test directory: a fixed socket path under /tmp would collide if two
@@ -5005,7 +5071,8 @@ test "Server: S10 dropped S2S link arms a reconnect and recovers" {
 }
 
 test "Server: S10 S2S reconnect with no daemon re-arms and stays down" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     // Nothing listening: the retry must re-arm rather than give up, and must
@@ -5039,7 +5106,8 @@ test "Server: S10 S2S reconnect with no daemon re-arms and stays down" {
 // G6: the auth half of the reconnect-timer guarantee is gated on its own, so
 // the S2S tests alone cannot cover a regression in auth staging or re-arm.
 test "Server: G6 an auth reconnect owed by a full batch still gets its timer" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     // A batch already at its ordinary limit, built the way the event loop
@@ -5067,7 +5135,8 @@ test "Server: G6 an auth reconnect owed by a full batch still gets its timer" {
 }
 
 test "Server: G6 auth reconnect with no daemon re-arms and stays down" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     // Nothing listening: the retry must re-arm rather than give up, and must
@@ -5098,7 +5167,8 @@ test "Server: G6 auth reconnect with no daemon re-arms and stays down" {
 }
 
 test "Server: S10 auth IPC decode error drops the link" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
@@ -5120,7 +5190,8 @@ test "Server: S10 auth IPC decode error drops the link" {
 }
 
 test "Server: S10 s2s IPC decode error drops the link" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
@@ -5142,7 +5213,8 @@ test "Server: S10 s2s IPC decode error drops the link" {
 
 test "Server: S10 handshake write interest is one-shot" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -5157,7 +5229,7 @@ test "Server: S10 handshake write interest is one-shot" {
     defer posix.close(fds[1]);
 
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     server.sessions[1] = session;
 
     // Small send buffer: the server's first handshake flight cannot go out
@@ -5219,7 +5291,8 @@ test {
 test "Server: inline archiveStore failure increments archive_store_failed (S31)" {
     const allocator = std.testing.allocator;
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -5269,7 +5342,8 @@ test "Server: H8 an inline offline archive failure on the c2s path is counted" {
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -5278,7 +5352,8 @@ test "Server: H8 an inline offline archive failure on the c2s path is counted" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -5329,7 +5404,8 @@ test "Server: H8 an inline offline archive failure on the S2S path is counted" {
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -5413,9 +5489,11 @@ test "every store namespace constant is registered and every registry entry is o
 test "hold token: a second incarnation in the same second mints a new token" {
     const allocator = std.testing.allocator;
 
-    var first = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
+    var first: Server = undefined;
+    try first.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
     defer first.deinit();
-    var second = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
+    var second: Server = undefined;
+    try second.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
     defer second.deinit();
 
     try std.testing.expectEqual(@as(u32, 0), first.stanza_id_counter);
@@ -5433,13 +5511,14 @@ test "hold token: a second incarnation in the same second mints a new token" {
 // to the reused slot's session and the drop must be counted.
 test "ADR-4: a stale token for a reused slot is dropped and counted" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     server.sessions[1] = session;
     server.free_count -= 1;
 
@@ -5456,7 +5535,7 @@ test "ADR-4: a stale token for a reused slot is dropped and counted" {
     const fds2 = try makeSocketPair();
     defer posix.close(fds2[1]);
     const replacement = try allocator.create(Session);
-    replacement.* = Session.init(fds2[0], 1, "localhost", false, allocator);
+    replacement.init(fds2[0], 1, "localhost", false, allocator);
     defer allocator.destroy(replacement);
     defer replacement.deinit();
     server.sessions[1] = replacement;

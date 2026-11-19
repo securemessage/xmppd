@@ -349,7 +349,8 @@ test "cross-thread delivery: enqueue and drain" {
     defer delivery_sys.deinit();
 
     // Create a server that acts as worker 1 (the one draining)
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
     server.session_map = &sm;
@@ -360,7 +361,7 @@ test "cross-thread delivery: enqueue and drain" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 5, "localhost", false, allocator);
+    session.init(fds[0], 5, "localhost", false, allocator);
     server.sessions[5] = session;
 
     // Bind in session map (session slot = 5, worker = 1)
@@ -400,7 +401,8 @@ test "cross-thread delivery: a token minted for a freed-then-reused slot is drop
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
     server.delivery_system = &delivery_sys;
@@ -409,7 +411,7 @@ test "cross-thread delivery: a token minted for a freed-then-reused slot is drop
     const fds_a = try makeSocketPair();
     defer posix.close(fds_a[1]);
     const session_a = try allocator.create(Session);
-    session_a.* = Session.init(fds_a[0], 5, "localhost", false, allocator);
+    session_a.init(fds_a[0], 5, "localhost", false, allocator);
     server.sessions[5] = session_a;
     const stale = server.sessionToken(5);
 
@@ -421,7 +423,7 @@ test "cross-thread delivery: a token minted for a freed-then-reused slot is drop
     const fds_b = try makeSocketPair();
     defer posix.close(fds_b[1]);
     const session_b = try allocator.create(Session);
-    session_b.* = Session.init(fds_b[0], 5, "localhost", false, allocator);
+    session_b.init(fds_b[0], 5, "localhost", false, allocator);
     server.sessions[5] = session_b;
     const fresh = server.sessionToken(5);
     try std.testing.expectEqual(stale.index, fresh.index);
@@ -447,7 +449,8 @@ test "V13: shadow multicast to a freed-then-reused slot is not delivered (ADR-4)
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
     server.delivery_system = &delivery_sys;
@@ -461,7 +464,7 @@ test "V13: shadow multicast to a freed-then-reused slot is not delivered (ADR-4)
     const fds_a = try makeSocketPair();
     defer posix.close(fds_a[1]);
     const session_a = try allocator.create(Session);
-    session_a.* = Session.init(fds_a[0], 5, "localhost", false, allocator);
+    session_a.init(fds_a[0], 5, "localhost", false, allocator);
     server.sessions[5] = session_a;
     const stale = server.sessionToken(5);
     _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", stale, 1, .participant, .none);
@@ -474,7 +477,7 @@ test "V13: shadow multicast to a freed-then-reused slot is not delivered (ADR-4)
     const fds_b = try makeSocketPair();
     defer posix.close(fds_b[1]);
     const session_b = try allocator.create(Session);
-    session_b.* = Session.init(fds_b[0], 5, "localhost", false, allocator);
+    session_b.init(fds_b[0], 5, "localhost", false, allocator);
     server.sessions[5] = session_b;
 
     // A multicast arriving for the stale occupant record must not reach
@@ -506,7 +509,8 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.worker_id = 1;
     server.session_map = &sm;
@@ -519,7 +523,7 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 5, "localhost", false, allocator);
+    session.init(fds[0], 5, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp.Jid{ .local = "bob", .domain = "localhost" };
@@ -551,7 +555,8 @@ test "cross-thread delivery: generation mismatch drops stanza" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -597,7 +602,8 @@ test "Server: S13 message held behind a draining offline tail" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -609,7 +615,7 @@ test "Server: S13 message held behind a draining offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.offline_pending = true;
     server.sessions[5] = target;
 
@@ -618,7 +624,8 @@ test "Server: S13 message held behind a draining offline tail" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -677,7 +684,8 @@ test "Re-review 6.8: the router holds a bare-JID message once per worker" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -688,7 +696,7 @@ test "Re-review 6.8: the router holds a bare-JID message once per worker" {
         const fds = try makeSocketPair();
         defer posix.close(fds[1]);
         const sess = try allocator.create(Session);
-        sess.* = Session.init(fds[0], r.id, "localhost", false, allocator);
+        sess.init(fds[0], r.id, "localhost", false, allocator);
         sess.offline_pending = true;
         server.sessions[r.id] = sess;
         _ = try sm.bind(0, server.sessionToken(r.id), "bob", "localhost", r.res);
@@ -697,7 +705,8 @@ test "Re-review 6.8: the router holds a bare-JID message once per worker" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -737,7 +746,8 @@ test "Re-review 6.8: the S2S hold asks the store once per worker" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -748,7 +758,7 @@ test "Re-review 6.8: the S2S hold asks the store once per worker" {
         const fds = try makeSocketPair();
         defer posix.close(fds[1]);
         const sess = try allocator.create(Session);
-        sess.* = Session.init(fds[0], r.id, "localhost", false, allocator);
+        sess.init(fds[0], r.id, "localhost", false, allocator);
         sess.offline_pending = true;
         server.sessions[r.id] = sess;
         _ = try sm.bind(0, server.sessionToken(r.id), "bob", "localhost", r.res);
@@ -783,7 +793,8 @@ test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -793,7 +804,7 @@ test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
@@ -834,7 +845,8 @@ test "Server: G3 inbound S2S delivery parks behind a draining offline tail" {
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -843,7 +855,7 @@ test "Server: G3 inbound S2S delivery parks behind a draining offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
@@ -887,7 +899,8 @@ test "Server: G3 type normal parks behind a draining offline tail" {
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -896,7 +909,7 @@ test "Server: G3 type normal parks behind a draining offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
@@ -905,7 +918,8 @@ test "Server: G3 type normal parks behind a draining offline tail" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -961,7 +975,8 @@ test "Server: H4 a cross-worker message lands behind an existing offline tail" {
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -976,7 +991,7 @@ test "Server: H4 a cross-worker message lands behind an existing offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
@@ -1052,7 +1067,8 @@ test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1125,7 +1141,8 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1136,7 +1153,7 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     server.sessions[9] = alice;
     _ = try sm.bind(0, server.sessionToken(9), "alice", "localhost", "mobile");
     const alice_bound = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
@@ -1146,7 +1163,7 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.offline_pending = true;
     bob.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
     server.sessions[5] = bob;
@@ -1189,7 +1206,8 @@ test "Server: H2 a cross-worker hold failure bounces across workers" {
     defer delivery_sys.deinit();
 
     // Worker 1 drains bob's queue; alice lives on worker 0.
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
     server.session_map = &sm;
@@ -1198,7 +1216,7 @@ test "Server: H2 a cross-worker hold failure bounces across workers" {
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.offline_pending = true;
     bob.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
     server.sessions[5] = bob;
@@ -1258,7 +1276,8 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1268,7 +1287,7 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(fds[0], 5, "localhost", false, allocator);
+    target.init(fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.sm_detached = true;
     target.sm_resume_enabled = true;
@@ -1336,7 +1355,8 @@ test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1352,7 +1372,7 @@ test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.offline_pending = true;
     server.sessions[5] = bob;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -1433,7 +1453,8 @@ test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1507,7 +1528,8 @@ test "Server: E2b an unstorable inbound S2S stanza bounces but an error stanza d
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1603,7 +1625,8 @@ test "Server: G7 an inbound id with an entity is escaped once in the bounce" {
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1664,7 +1687,8 @@ test "Server: G7 a storage error on the offline hold still bounces" {
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1724,7 +1748,8 @@ test "Server: S13 hold at quota bounces instead of dropping silently" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1745,7 +1770,7 @@ test "Server: S13 hold at quota bounces instead of dropping silently" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.offline_pending = true;
     server.sessions[5] = target;
 
@@ -1754,7 +1779,8 @@ test "Server: S13 hold at quota bounces instead of dropping silently" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -1811,7 +1837,8 @@ test "N1: two draining resources hold a bare-JID message once" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1821,7 +1848,7 @@ test "N1: two draining resources hold a bare-JID message once" {
     const desktop_fds = try makeSocketPair();
     defer posix.close(desktop_fds[1]);
     const desktop = try allocator.create(Session);
-    desktop.* = Session.init(desktop_fds[0], 5, "localhost", false, allocator);
+    desktop.init(desktop_fds[0], 5, "localhost", false, allocator);
     desktop.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
     desktop.offline_pending = true;
     server.sessions[5] = desktop;
@@ -1831,7 +1858,7 @@ test "N1: two draining resources hold a bare-JID message once" {
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.bound_jid = xmpp.Jid.parse("bob@localhost/phone") catch unreachable;
     phone.offline_pending = true;
     server.sessions[6] = phone;
@@ -1840,7 +1867,8 @@ test "N1: two draining resources hold a bare-JID message once" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
     alice.stanza_kind = .message;
@@ -1893,7 +1921,8 @@ test "N1: two identical stanza-less messages to a draining bare JID are two rows
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1902,7 +1931,7 @@ test "N1: two identical stanza-less messages to a draining bare JID are two rows
     const desktop_fds = try makeSocketPair();
     defer posix.close(desktop_fds[1]);
     const desktop = try allocator.create(Session);
-    desktop.* = Session.init(desktop_fds[0], 5, "localhost", false, allocator);
+    desktop.init(desktop_fds[0], 5, "localhost", false, allocator);
     desktop.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     desktop.offline_pending = true;
     server.sessions[5] = desktop;
@@ -1911,7 +1940,8 @@ test "N1: two identical stanza-less messages to a draining bare JID are two rows
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
     alice.stanza_kind = .message;
@@ -1961,7 +1991,8 @@ test "c2s: one routed message to two draining workers holds one row" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w1: Server = undefined;
+    try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
     w1.session_map = &sm;
@@ -1971,14 +2002,15 @@ test "c2s: one routed message to two draining workers holds one row" {
     const desk_fds = try makeSocketPair();
     defer posix.close(desk_fds[1]);
     const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.offline_pending = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w1.sessions[5] = desk;
     _ = try sm.bind(1, w1.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -1988,7 +2020,7 @@ test "c2s: one routed message to two draining workers holds one row" {
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.offline_pending = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     w0.sessions[6] = phone;
@@ -1997,7 +2029,8 @@ test "c2s: one routed message to two draining workers holds one row" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -2052,7 +2085,8 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     defer delivery_sys.deinit();
 
     // Worker 1 receives the stanza and owns the first resource of the bare JID.
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w1: Server = undefined;
+    try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
     w1.session_map = &sm;
@@ -2062,7 +2096,7 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     const desk_fds = try makeSocketPair();
     defer posix.close(desk_fds[1]);
     const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.offline_pending = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w1.sessions[5] = desk;
@@ -2070,7 +2104,8 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     // Worker 0 owns the second resource, so the second target is remote.
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -2080,7 +2115,7 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.offline_pending = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     w0.sessions[6] = phone;
@@ -2120,7 +2155,8 @@ test "N1: two workers draining one bare JID hold a message once" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.session_map = &sm;
     server.delivery_system = &delivery_sys;
@@ -2131,7 +2167,7 @@ test "N1: two workers draining one bare JID hold a message once" {
     const desk_fds = try makeSocketPair();
     defer posix.close(desk_fds[1]);
     const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.offline_pending = true;
     server.sessions[5] = desk;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -2140,7 +2176,7 @@ test "N1: two workers draining one bare JID hold a message once" {
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.offline_pending = true;
     server.sessions[6] = phone;
     _ = try sm.bind(1, server.sessionToken(6), "bob", "localhost", "phone");

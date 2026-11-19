@@ -395,10 +395,11 @@ pub fn main() !void {
 
     // Single-fd (legacy / dev mode): run directly on main thread
     if (listen_fd_count <= 1) {
-        var server = if (listen_fd_count == 1)
-            try Server.initFromFdOpts(host, listen_fds[0], allocator, per_worker_sessions, ctx.skip_tls)
+        var server: Server = undefined;
+        if (listen_fd_count == 1)
+            try server.initFromFdOpts(host, listen_fds[0], allocator, per_worker_sessions, ctx.skip_tls)
         else
-            try Server.initWithMaxSessions(host, address, port, allocator, per_worker_sessions);
+            try server.initWithMaxSessions(host, address, port, allocator, per_worker_sessions);
         server.fanout_queue.batch_size = fan_out_batch_size;
         defer server.deinit();
 
@@ -428,7 +429,8 @@ pub fn main() !void {
     // Main thread runs the last worker
     log.info("main thread running worker {d}", .{listen_fd_count - 1});
     {
-        var server = try Server.initFromFdOpts(host, listen_fds[listen_fd_count - 1], allocator, per_worker_sessions, ctx.skip_tls);
+        var server: Server = undefined;
+        try server.initFromFdOpts(host, listen_fds[listen_fd_count - 1], allocator, per_worker_sessions, ctx.skip_tls);
         server.fanout_queue.batch_size = fan_out_batch_size;
         defer server.deinit();
         configureServer(&server, &ctx, @intCast(listen_fd_count - 1));
@@ -578,7 +580,8 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
 fn workerThread(args: *WorkerArgs) void {
     log.info("worker {d} starting (fd={d})", .{ args.worker_id, args.fd });
 
-    var server = Server.initFromFdOpts(
+    var server: Server = undefined;
+    server.initFromFdOpts(
         args.ctx.host,
         args.fd,
         args.ctx.allocator,

@@ -1093,7 +1093,8 @@ fn st(index: u32, gen: u24) Token {
 
 test "S17: SM-ID map holds more than 64 detached sessions" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
     defer server.deinit();
 
     // 200 inserts: the old 64-entry table silently dropped everything past 64.
@@ -1115,7 +1116,8 @@ test "S17: SM-ID map holds more than 64 detached sessions" {
 
 test "S17: SM-ID map remove does not break later lookups" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
     defer server.deinit();
 
     // Insert a batch, remove every third entry, then verify the rest are
@@ -1147,7 +1149,8 @@ test "S17: SM-ID map remove does not break later lookups" {
 
 test "Server: replaced-resource notice fits worst-case XML escaping" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -1207,14 +1210,15 @@ test "Server: replaced-resource notice fits worst-case XML escaping" {
 }
 
 test "Server: S24 a h above the sent count fails the stream" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1250,14 +1254,15 @@ test "Server: S24 a h above the sent count fails the stream" {
 }
 
 test "Server: S24 malformed a h fails the stream" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1286,14 +1291,15 @@ test "Server: S24 malformed a h fails the stream" {
 }
 
 test "Server: S24 SM without resume rejects h above the sent count" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1329,14 +1335,15 @@ test "Server: S24 SM without resume rejects h above the sent count" {
 }
 
 test "Server: S24 a backwards or duplicate a h does not corrupt the accepted count" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1374,7 +1381,8 @@ test "Server: S24 a backwards or duplicate a h does not corrupt the accepted cou
 }
 
 test "Server: S24 backwards and too-high resume h fail without replay" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1384,7 +1392,7 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
     const det_fds = try makeSocketPair();
     defer posix.close(det_fds[1]);
     const detached = try std.testing.allocator.create(Session);
-    detached.* = Session.init(det_fds[0], 2, "localhost", false, std.testing.allocator);
+    detached.init(det_fds[0], 2, "localhost", false, std.testing.allocator);
     detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
     detached.sm_detached = true;
     detached.sm_detach_time = std.time.timestamp();
@@ -1406,7 +1414,7 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
@@ -1454,7 +1462,8 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
 }
 
 test "Server: S24 cross-worker handoff carries last_h" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
     sm_handoff.resetForTesting();
 
@@ -1464,7 +1473,7 @@ test "Server: S24 cross-worker handoff carries last_h" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
@@ -1558,7 +1567,7 @@ pub fn makeDetachedForResume(
     fd: posix.fd_t,
 ) !*Session {
     const detached = try std.testing.allocator.create(Session);
-    detached.* = Session.init(fd, slot, "localhost", false, std.testing.allocator);
+    detached.init(fd, slot, "localhost", false, std.testing.allocator);
     detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
     detached.sm_detached = true;
     detached.sm_detach_time = std.time.timestamp();
@@ -1578,7 +1587,8 @@ pub fn makeDetachedForResume(
 }
 
 test "Server: S24 cross-worker resume validates the reported h before handoff" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
     server.worker_id = 1;
     var delivery_sys = try DeliverySystem.init(std.testing.allocator, 2);
@@ -1654,7 +1664,8 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
 }
 
 test "Re-review 7.4: the resume request carries the drain sequence into the bundle" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
     server.worker_id = 1;
     var delivery_sys = try DeliverySystem.init(std.testing.allocator, 2);
@@ -1690,7 +1701,8 @@ test "Re-review 7.4: the resume request carries the drain sequence into the bund
 }
 
 test "Server: S24 cross-worker resume rejects a wrapped h above the sent count" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
     server.worker_id = 1;
     var delivery_sys = try DeliverySystem.init(std.testing.allocator, 2);

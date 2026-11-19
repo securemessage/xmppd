@@ -64,7 +64,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
             releaseId(server, id);
             break;
         };
-        session.* = Session.init(conn.fd, id, server.server_host, server.listener.direct_tls, server.allocator);
+        session.init(conn.fd, id, server.server_host, server.listener.direct_tls, server.allocator);
         // Random seed decorrelates the auth-IPC generation from session slot
         // reuse: a recycled conn.id previously restarted at gen 0, aliasing
         // any aborted zombie exchange the auth daemon still held (T32).
@@ -76,7 +76,8 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
         session.conn.bindOutbox(connection_mod.countersForWorker(server.worker_id), connection_mod.dirtyForWorker(server.worker_id));
         server.sessions[id] = session;
 
-        changes.addRead(conn.fd, server.sessionToken(id).toUdata()) catch {
+        const udata = server.sessionToken(id).toUdata();
+        changes.addRead(conn.fd, udata) catch {
             log.err("changelist full on accept", .{});
             failAcceptedSession(server, session, id);
             break;
@@ -86,7 +87,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
         // DISPATCH mode: every delivery auto-disables it, so a stall arms
         // with a bare enableWrite and a drained flush needs no EV_DELETE
         // (ADR-2).
-        changes.addWriteDisabled(conn.fd, server.sessionToken(id).toUdata()) catch {
+        changes.addWriteDisabled(conn.fd, udata) catch {
             log.err("changelist full on accept (write knote)", .{});
             failAcceptedSession(server, session, id);
             break;
@@ -1164,7 +1165,7 @@ fn makeAuthenticatedSession(server: *Server, id: usize, local: []const u8) !*Ses
     const fds = try testSocketPair();
     posix.close(fds[1]); // unused peer end, avoid leaking fds across test cases
     const session = try server.allocator.create(Session);
-    session.* = Session.init(fds[0], @intCast(id), server.server_host, false, server.allocator);
+    session.init(fds[0], @intCast(id), server.server_host, false, server.allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = local, .domain = server.server_host };
@@ -1181,7 +1182,8 @@ var outbox_peek_buf: [connection_mod.WRITE_BUF_SIZE]u8 = undefined;
 test "T158: detach timer expires sessions at 300s, not before" {
     const allocator = std.testing.allocator;
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1244,7 +1246,8 @@ test "offline delivery drains a store with no archive configured" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -1254,7 +1257,7 @@ test "offline delivery drains a store with no archive configured" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -1305,7 +1308,8 @@ test "S13: a failed pointer delete stops the drain instead of reordering" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -1315,7 +1319,7 @@ test "S13: a failed pointer delete stops the drain instead of reordering" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -1361,7 +1365,8 @@ test "S13: a row stored mid-drain is re-armed for rather than stranded" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -1371,7 +1376,7 @@ test "S13: a row stored mid-drain is re-armed for rather than stranded" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try server.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.init(fds[0], 1, server.server_host, false, server.allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
@@ -1442,7 +1447,8 @@ test "S13: offline delivery keeps undelivered messages when the send buffer fill
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1514,7 +1520,8 @@ test "S13: stalled offline drain resumes via drainOfflinePending" {
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1526,7 +1533,7 @@ test "S13: stalled offline drain resumes via drainOfflinePending" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try server.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.init(fds[0], 1, server.server_host, false, server.allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
@@ -1593,7 +1600,8 @@ test "S15: an overflowed session drains unacked messages to offline storage" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -1604,7 +1612,7 @@ test "S15: an overflowed session drains unacked messages to offline storage" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try server.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.init(fds[0], 1, server.server_host, false, server.allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
@@ -1655,7 +1663,8 @@ test "S13: dangling offline pointer is dropped, not skipped forever" {
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1683,7 +1692,8 @@ test "S13: dangling offline pointer is dropped, not skipped forever" {
 
 test "T158: detach timer does not expire session at exactly 299s" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1717,7 +1727,8 @@ test "T158: detach timer does not expire session at exactly 299s" {
 
 test "T158: detach timer expires session at exactly 300s" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1749,7 +1760,8 @@ test "T158: detach timer expires session at exactly 300s" {
 // silently leaving the client believing it's bound while unroutable.
 test "T152: rebind with same resource evicts stale session" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
     var sm = SessionMap.init(allocator, false, 0);
@@ -1864,7 +1876,8 @@ test "S13: held stanza is delivered before the archive row is committed" {
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1876,7 +1889,7 @@ test "S13: held stanza is delivered before the archive row is committed" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try server.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.init(fds[0], 1, server.server_host, false, server.allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
@@ -1930,7 +1943,8 @@ test "G2: a legacy offline row drains before newly sequenced rows" {
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1940,7 +1954,7 @@ test "G2: a legacy offline row drains before newly sequenced rows" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try server.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.init(fds[0], 1, server.server_host, false, server.allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
@@ -2009,7 +2023,8 @@ test "S13: store-error stall with an empty buffer re-arms the drain" {
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -2021,7 +2036,7 @@ test "S13: store-error stall with an empty buffer re-arms the drain" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try server.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.init(fds[0], 1, server.server_host, false, server.allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
@@ -2090,7 +2105,8 @@ test "S13: store-error retries are bounded, then a one-shot timer resumes" {
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(archive_backend.Backend).init(&arch_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -2102,7 +2118,7 @@ test "S13: store-error retries are bounded, then a one-shot timer resumes" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try server.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.init(fds[0], 1, server.server_host, false, server.allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
@@ -2154,13 +2170,14 @@ test "S13: store-error retries are bounded, then a one-shot timer resumes" {
 
 test "S13: full changelist preserves the offline retry fallback" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try server.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.init(fds[0], 1, server.server_host, false, server.allocator);
     server.sessions[1] = session;
     server.free_count -= 1;
 
@@ -2210,7 +2227,8 @@ test "S35: offline delivery stamps the queue time once (XEP-0203)" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -2220,7 +2238,7 @@ test "S35: offline delivery stamps the queue time once (XEP-0203)" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -2255,7 +2273,8 @@ test "S35: a foreign delay stamp is kept and ours is added once" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -2265,7 +2284,7 @@ test "S35: a foreign delay stamp is kept and ours is added once" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -2302,7 +2321,8 @@ test "S35: a stale stamp of ours is replaced by the queue time" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -2312,7 +2332,7 @@ test "S35: a stale stamp of ours is replaced by the queue time" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -2349,7 +2369,8 @@ test "S35: a forged top-level delay from our domain is stripped" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -2359,7 +2380,7 @@ test "S35: a forged top-level delay from our domain is stripped" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -2399,7 +2420,8 @@ test "S35: SM replay resends the stamped stanza unchanged" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -2409,7 +2431,7 @@ test "S35: SM replay resends the stamped stanza unchanged" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -2457,7 +2479,8 @@ test "S35: a message held behind the tail (cross-worker path) is stamped on drai
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -2467,7 +2490,7 @@ test "S35: a message held behind the tail (cross-worker path) is stamped on drai
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -2497,7 +2520,8 @@ test "S35: a message held behind the tail (cross-worker path) is stamped on drai
 test "S35: live delivery carries no delay stamp" {
     const allocator = std.testing.allocator;
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -2506,7 +2530,7 @@ test "S35: live delivery carries no delay stamp" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -2597,7 +2621,8 @@ test "S35: a stanza that only fits unstamped is sent without a stamp" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -2607,7 +2632,7 @@ test "S35: a stanza that only fits unstamped is sent without a stamp" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -2651,7 +2676,8 @@ test "S35: an unsendable stored stanza is dropped and the drain continues" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -2661,7 +2687,7 @@ test "S35: an unsendable stored stanza is dropped and the drain continues" {
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
@@ -2698,7 +2724,8 @@ test "S35: an unsendable stored stanza is dropped and the drain continues" {
 }
 
 test "Server: accept and close session" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     // Get bound port
@@ -2741,13 +2768,14 @@ test "Server: accept and close session" {
 // sessions[id] no longer holding the session.
 test "T316: a repeated destroySession is a counted no-op" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
     const fds = try testSocketPair();
     defer posix.close(fds[1]);
     const session = try server.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, server.allocator);
+    session.init(fds[0], 1, server.server_host, false, server.allocator);
     server.sessions[1] = session;
     server.free_count -= 1;
 

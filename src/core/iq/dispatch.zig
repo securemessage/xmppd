@@ -2719,7 +2719,8 @@ fn writeGravatarHash(writer: anytype, bare_jid: []const u8) !void {
 
 test "S11: staged reg IQ id survives the reader-arena reset" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
@@ -2728,7 +2729,7 @@ test "S11: staged reg IQ id survives the reader-arena reset" {
 
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit(); // closes fds[0]
 
     // The id arrives as a slice into the connection's reader arena.
@@ -2752,7 +2753,8 @@ test "S11: staged reg IQ id survives the reader-arena reset" {
 
 test "A62: roster get for a >256-byte owner bare JID" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -2778,7 +2780,7 @@ test "A62: roster get for a >256-byte owner bare JID" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, allocator);
+    session.init(fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = session;
     session.stream.bound_jid = .{ .local = owner_local, .domain = "localhost", .resource = "res" };
 
@@ -2795,7 +2797,8 @@ test "A62: roster get for a >256-byte owner bare JID" {
 
 test "F6: last-activity query to the domain in another case is server-addressed" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
@@ -2804,7 +2807,7 @@ test "F6: last-activity query to the domain in another case is server-addressed"
 
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
     session.iq_to = "LOCALHOST";
@@ -2819,7 +2822,8 @@ test "F6: last-activity query to the domain in another case is server-addressed"
 
 test "F6: last-activity query for a mixed-case local domain is not remote" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
@@ -2828,7 +2832,7 @@ test "F6: last-activity query for a mixed-case local domain is not remote" {
 
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
     session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
@@ -2854,7 +2858,8 @@ test "F6: roster set stores the contact under the configured local spelling" {
     defer db.close();
     var roster = GenericRosterStore.init(&db);
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.roster = &roster;
 
@@ -2864,7 +2869,7 @@ test "F6: roster set stores the contact under the configured local spelling" {
 
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
     session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
     session.iq_roster_item_jid = "NaplesTB@LOCALHOST";
@@ -2896,7 +2901,8 @@ test "F6: block and unblock use the configured local spelling for the store key"
     const GenericBlockStore = @import("block_store").BlockStore(server_mod.OpBackendType);
     var bs = GenericBlockStore.init(&db);
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.block_store = &bs;
 
@@ -2906,7 +2912,7 @@ test "F6: block and unblock use the configured local spelling for the store key"
 
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
     session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
 
@@ -2937,7 +2943,8 @@ test "F6: MAM 'with' matches the folded archive contact key" {
     defer arch_db.close();
     var arch_store = @import("archive_store").ArchiveStore(ArchBackend).init(&arch_db, allocator);
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.archive = &arch_store;
 
@@ -2949,7 +2956,7 @@ test "F6: MAM 'with' matches the folded archive contact key" {
 
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
     session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
     session.mam_with = "NaplesTB@LOCALHOST";
@@ -2982,7 +2989,8 @@ test "F6: MUC MAM 'with' matches the folded archive contact key" {
     var reg = room_registry_mod.RoomRegistry.init(allocator);
     defer reg.deinit();
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.archive = &arch_store;
     server.room_registry = &reg;
@@ -2996,7 +3004,7 @@ test "F6: MUC MAM 'with' matches the folded archive contact key" {
 
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
     session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
     session.mam_with = "NaplesTB@LOCALHOST";
@@ -3029,7 +3037,8 @@ fn f6Drain(_: void, _: Token, payload: []const u8) void {
 
 test "F6: cross-worker MUC MAM forwards the prepared 'with'" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var ds = try @import("delivery_queue").DeliverySystem.init(allocator, 2);
     defer ds.deinit();
@@ -3049,7 +3058,7 @@ test "F6: cross-worker MUC MAM forwards the prepared 'with'" {
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
     session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
     session.mam_with = "NaplesTB@LOCALHOST";
@@ -3062,7 +3071,8 @@ test "F6: cross-worker MUC MAM forwards the prepared 'with'" {
 
 test "R5: an unaddressable IQ error reply is counted, never a truncated stanza" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
@@ -3070,7 +3080,7 @@ test "R5: an unaddressable IQ error reply is counted, never a truncated stanza" 
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
     // A bound localpart wider than the 4 KiB scratch: the header cannot be
@@ -3088,7 +3098,8 @@ test "R5: an unaddressable IQ error reply is counted, never a truncated stanza" 
 
 test "R5: a roster push to a full remote queue is counted" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var sm = session_map_mod.SessionMap.init(allocator, true, 0);
     defer sm.deinit();
@@ -3121,7 +3132,8 @@ test "R5: an unbuildable PEP self-notification is counted, never silent" {
     defer db.close();
     var roster = GenericRosterStore.init(&db);
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.roster = &roster;
     server.worker_id = 0;
@@ -3142,7 +3154,7 @@ test "R5: an unbuildable PEP self-notification is counted, never silent" {
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
     session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
 
@@ -3160,13 +3172,15 @@ test "R5: an unbuildable PEP self-notification is counted, never silent" {
 
 test "R-385: an oversized queued iq result keeps the session and answers resource-constraint" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
     session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
     session.iq_to = "localhost";
@@ -3197,13 +3211,15 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
 
 test "R-385: a full buffer on a deliverable stanza still flags overflow teardown" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
     try std.testing.expect(session.conn.ensureWriteBuf());
@@ -3312,13 +3328,15 @@ test "Server: every advertised pubsub feature is dispatched" {
     defer op_db.close();
     var pep_store = GenericPepStore.init(&op_db);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
     defer server.deinit();
     server.pep_store = &pep_store;
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 1, "localhost", false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 1, "localhost", false, allocator);
     defer session.deinit();
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
 
@@ -3408,13 +3426,15 @@ test "Server: pubsub set routes on the verb, not blindly to publish" {
     defer op_db.close();
     var pep_store = GenericPepStore.init(&op_db);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 8);
     defer server.deinit();
     server.pep_store = &pep_store;
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 1, "localhost", false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 1, "localhost", false, allocator);
     defer session.deinit();
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
 

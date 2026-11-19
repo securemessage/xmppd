@@ -533,12 +533,14 @@ pub const Session = struct {
     bind_kick_resource_buf: [64]u8 = undefined,
     bind_kick_resource_len: u8 = 0,
 
-    pub fn init(fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) Session {
+    /// Initialize into the caller's `self` slot (out-param, same shape as
+    /// Server.init: no Session-sized temporary on the caller's stack).
+    pub fn init(self: *Session, fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) void {
         var reader = xml.Reader.init(allocator);
         // Pre-auth cap: negotiation elements are small, and an unauthenticated
         // peer must not be able to spend the post-auth budget (H6).
         reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
-        return .{
+        self.* = .{
             .conn = Connection.init(fd, id, allocator),
             .reader = reader,
             .stream = xmpp.Stream.init(server_host, direct_tls),
@@ -2244,14 +2246,15 @@ pub fn makeSocketPair() ![2]posix.fd_t {
 }
 
 test "Server: read backpressure toggles EVFILT_READ across write-buffer thresholds (T110)" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [32]posix.Kevent = undefined;
@@ -2301,7 +2304,7 @@ test "H6: the c2s reader cap follows authentication" {
         session.deinit();
         allocator.destroy(session);
     }
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
 
     // Before auth the reader holds the pre-auth budget, not the 1 MiB default.
     try std.testing.expectEqual(xml.max_item_bytes_pre_auth, session.reader.scan.max_item_bytes);
@@ -2313,14 +2316,15 @@ test "H6: the c2s reader cap follows authentication" {
 }
 
 test "H6: an oversized pre-auth element is a policy violation, not a silent drop" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -2350,14 +2354,15 @@ test "H6: an oversized pre-auth element is a policy violation, not a silent drop
 }
 
 test "H6: a stanza the accumulator can deliver is accepted after auth" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
     // Authenticated, so the post-auth cap applies.
     session.stream.authenticated = true;
@@ -2397,14 +2402,15 @@ test "H6: a stanza the accumulator can deliver is accepted after auth" {
 }
 
 test "H6: a broken stanza closes the stream before its close tag arrives" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
     // Bound and active: a pre-bind message is refused by the RFC 6120 7.1
     // policy before its accumulation could overflow, so the stanza has to be
@@ -2455,7 +2461,8 @@ test "H6: a broken stanza closes the stream before its close tag arrives" {
 }
 
 test "Server: stream open produces response" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     // Create a direct socketpair to bypass listener
@@ -2464,7 +2471,7 @@ test "Server: stream open produces response" {
 
     // Manually create a session
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     // Simulate client sending stream open
@@ -2490,14 +2497,15 @@ test "Server: stream open produces response" {
 }
 
 test "Server: stream open with mixed-case 'to' produces response" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='LOCALHOST' version='1.0'>";
@@ -2517,14 +2525,15 @@ test "Server: stream open with mixed-case 'to' produces response" {
 }
 
 test "Server: pre-bind stanza to the domain in another case is server-addressed" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     const to_attr = [_]xml.Attribute{
@@ -2550,7 +2559,8 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -2558,7 +2568,7 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
     target.stream.bound_jid = xmpp.Jid.parse("naplestb@localhost/desk") catch null;
@@ -2572,7 +2582,7 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     alice.stream.state = .active;
     alice.stream.authenticated = true;
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mob") catch null;
@@ -2606,14 +2616,15 @@ test "F6: ingress preparation folds the local 'to' before routing" {
 }
 
 test "F6: pre-bind stanza to the folded account is server-addressed" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
     session.stream.state = .features_bind;
     session.stream.authenticated_jid = .{ .local = "NaplesTB", .domain = "localhost" };
@@ -2643,7 +2654,8 @@ test "F6: pre-bind stanza to the folded account is server-addressed" {
 }
 
 test "F6: a 320-octet localpart survives the pre-bind account compare" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
@@ -2655,7 +2667,7 @@ test "F6: a 320-octet localpart survives the pre-bind account compare" {
     const to = try std.fmt.bufPrint(&to_buf, "{s}@localhost", .{&local_upper});
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
     session.stream.state = .features_bind;
     session.stream.authenticated_jid = .{ .local = &local_upper, .domain = "localhost" };
@@ -2684,7 +2696,8 @@ test "F6: a 320-octet localpart survives the pre-bind account compare" {
 }
 
 test "F6: a maximum-length prepared username is not judged third party" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
@@ -2699,7 +2712,7 @@ test "F6: a maximum-length prepared username is not judged third party" {
     const to = try std.fmt.bufPrint(&to_buf, "{s}@localhost", .{&local_upper});
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
     session.stream.state = .features_bind;
     session.stream.authenticated_jid = .{ .local = &local_upper, .domain = "localhost" };
@@ -2730,14 +2743,15 @@ test "F6: a maximum-length prepared username is not judged third party" {
 }
 
 test "F6: malformed local 'to' gets jid-malformed for message and iq" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
     session.stream.state = .active;
     session.stream.authenticated = true;
@@ -2804,7 +2818,7 @@ pub fn f6WireSetupBound(allocator: std.mem.Allocator, server: *Server, sm: *Sess
     server.worker_id = 0;
     server.session_map = sm;
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
     target.stream.bound_jid = .{ .local = bound_local, .domain = "localhost", .resource = "desk" };
@@ -2814,7 +2828,7 @@ pub fn f6WireSetupBound(allocator: std.mem.Allocator, server: *Server, sm: *Sess
     sm.setPresenceAvailable(bound_local, "localhost", "desk", true);
 
     const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     server.sessions[9] = alice;
     var changes_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&changes_buf);
@@ -2847,7 +2861,8 @@ test "F6: self-closing top-level message with malformed 'to' gets jid-malformed"
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -2866,7 +2881,8 @@ test "F6: self-closing top-level message to a mixed-case local JID is routed fol
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -2886,7 +2902,8 @@ test "F6: a non-ASCII localpart reaches the account under its prepared spelling"
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -2910,7 +2927,8 @@ test "F6: a migrated account receives mail addressed to its legacy spelling" {
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -2933,7 +2951,8 @@ test "F6: self-closing presence subscribe to a mixed-case local JID is routed fo
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2963,7 +2982,8 @@ test "F6: a self-closing stanza-named child inside an IQ is not prepared" {
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -2984,7 +3004,8 @@ test "F6: type=error stanza with malformed 'to' is dropped without a reply" {
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -3004,7 +3025,8 @@ test "F6: presence with malformed 'to' gets a jid-malformed reply to the full JI
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -3026,7 +3048,8 @@ test "F6: a malformed 'from' gets jid-malformed" {
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -3045,7 +3068,8 @@ test "F6: jid-malformed reply echoes the offending 'to' in its 'from'" {
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -3063,12 +3087,13 @@ test "F6: jid-malformed reply echoes the offending 'to' in its 'from'" {
 
 test "F6: pre-auth stanza with a malformed 'to' closes the stream not-authorized (T182)" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const af = try makeSocketPair();
     defer posix.close(af[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(af[0], 9, "localhost", false, allocator);
+    alice.init(af[0], 9, "localhost", false, allocator);
     server.sessions[9] = alice;
 
     var changes_buf: [16]posix.Kevent = undefined;
@@ -3095,7 +3120,8 @@ test "F6: groupchat message to the MUC host in another case stays local" {
     defer sm.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -3120,7 +3146,8 @@ test "F6: directed presence to the MUC host in another case joins the room" {
     defer sm.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -3143,7 +3170,8 @@ test "F6: disco info to the MUC host in another case is the conference service" 
     const allocator = std.testing.allocator;
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     const tf = try makeSocketPair();
     defer posix.close(tf[1]);
@@ -3172,7 +3200,8 @@ test "F6: Session carries one shared IQ payload prep buffer" {
 }
 
 test "Server: registration submits are PRECIS-prepared and invalid names get not-acceptable" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     // Stand-in for xmppd-auth on the other end of the IPC socketpair.
@@ -3184,7 +3213,7 @@ test "Server: registration submits are PRECIS-prepared and invalid names get not
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -3246,14 +3275,15 @@ test "Server: registration submits are PRECIS-prepared and invalid names get not
 }
 
 test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error (T160)" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 3, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 3, "localhost", false, std.testing.allocator);
     server.sessions[3] = session;
 
     // Simulate a direct-TLS client sending a TLS record header (ClientHello)
@@ -3274,7 +3304,8 @@ test "Server: TLS ClientHello on STARTTLS port is closed without XML parse error
 }
 
 test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     // A real cert so the deferred upgrade actually starts (without it the
@@ -3289,7 +3320,7 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -3331,7 +3362,8 @@ test "Server: T215 proceed must fully flush before the TLS upgrade starts" {
 // bytes read ahead of the upgrade would cross the TLS boundary in
 // plaintext, so the upgrade refuses and closes the session.
 test "Server: STARTTLS upgrade refuses a non-empty outbox" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -3343,7 +3375,7 @@ test "Server: STARTTLS upgrade refuses a non-empty outbox" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     _ = session.nonza("<proceed/>");
@@ -3356,7 +3388,8 @@ test "Server: STARTTLS upgrade refuses a non-empty outbox" {
 }
 
 test "Server: STARTTLS upgrade refuses unread client bytes" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -3368,7 +3401,7 @@ test "Server: STARTTLS upgrade refuses unread client bytes" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     // Bytes pipelined past <starttls/> sit in the read buffer: upgrading
@@ -3386,7 +3419,8 @@ test "Server: STARTTLS upgrade refuses unread client bytes" {
 // promptly. The upgrade must still run at the deferred flush; a guard
 // that reads the un-consumed parse window would refuse it here.
 test "Server: STARTTLS upgrade proceeds through the deferred flush" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -3398,7 +3432,7 @@ test "Server: STARTTLS upgrade proceeds through the deferred flush" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -3423,7 +3457,8 @@ test "Server: STARTTLS upgrade proceeds through the deferred flush" {
 }
 
 test "Server: T215 failed deferred upgrade does not touch the freed session" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     // A real cert so the deferred path is reached at all: without ssl_ctx,
@@ -3438,7 +3473,7 @@ test "Server: T215 failed deferred upgrade does not touch the freed session" {
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -3474,14 +3509,15 @@ test "Server: T215 failed deferred upgrade does not touch the freed session" {
 }
 
 test "Server: T215 plaintext in a later segment while STARTTLS pending is a policy-violation" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -3515,14 +3551,15 @@ test "Server: T215 plaintext in a later segment while STARTTLS pending is a poli
 }
 
 test "Server: T215 plaintext read-ahead past <starttls/> is a policy-violation" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -3545,14 +3582,15 @@ test "Server: T215 plaintext read-ahead past <starttls/> is a policy-violation" 
 }
 
 test "Server: S27 nested stream:stream closes with not-well-formed" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -3582,14 +3620,15 @@ test "Server: S27 nested stream:stream closes with not-well-formed" {
 /// Feed a bad stream root, then keep feeding stanzas. The connection must
 /// close on the root and the reader arena must stay bounded.
 pub fn expectBadRootBounded(root: []const u8) !void {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -3655,7 +3694,8 @@ test "Server: E1 a non-stream root closes with not-well-formed" {
 }
 
 test "Server: direct TLS skips STARTTLS features" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
@@ -3663,7 +3703,7 @@ test "Server: direct TLS skips STARTTLS features" {
 
     // Create session with direct_tls=true
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 2, "localhost", true, std.testing.allocator);
+    session.init(fds[0], 2, "localhost", true, std.testing.allocator);
     server.sessions[2] = session;
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
@@ -3686,7 +3726,8 @@ test "Server: direct TLS skips STARTTLS features" {
 
 test "S1: PEP accumulator escapes attributes, namespaces and text" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 4);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 4);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
@@ -3695,7 +3736,7 @@ test "S1: PEP accumulator escapes attributes, namespaces and text" {
 
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
     // The scanner decodes entities, so these values arrive decoded; a raw
@@ -3727,7 +3768,8 @@ test "S15: queueSendStanza counts the stanza for XEP-0198" {
     const fds = try makeSocketPair();
     // session.deinit() closes fds[0].
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 1, "localhost", false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 1, "localhost", false, allocator);
     defer session.deinit();
     session.sm_enabled = true;
     // Owned by session.deinit once assigned.
@@ -3747,7 +3789,8 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -3755,7 +3798,7 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
@@ -3770,7 +3813,8 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -3799,7 +3843,8 @@ test "S15: an oversize stanza is refused untracked, a fitting refusal still coun
     const fds = try makeSocketPair();
     // session.deinit() closes fds[0].
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 1, "localhost", false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 1, "localhost", false, allocator);
     defer session.deinit();
     session.sm_enabled = true;
     // Owned by session.deinit once assigned.
@@ -3833,12 +3878,14 @@ test "S15: an oversize stanza is refused untracked, a fitting refusal still coun
 test "R-385: an oversized queued iq result keeps the session and answers resource-constraint" {
     const allocator = std.testing.allocator;
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     session.iq_to = "localhost";
@@ -3870,12 +3917,14 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
 test "R-385: a full buffer on a deliverable stanza still flags overflow teardown" {
     const allocator = std.testing.allocator;
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
     try std.testing.expect(session.conn.ensureWriteBuf());
@@ -3892,14 +3941,15 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
 }
 
 test "Server: S11 stray close tag closes the stream not-well-formed" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -3927,14 +3977,15 @@ test "Server: S11 stray close tag closes the stream not-well-formed" {
 }
 
 test "Server: S11 overlong bind id is rejected, not truncated" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -3964,14 +4015,15 @@ test "Server: S11 overlong bind id is rejected, not truncated" {
 }
 
 test "Server: S11 register flow iq ids survive the reader-arena reset" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -4025,7 +4077,8 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -4037,7 +4090,7 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.init(bob_fds[0], 5, "localhost", false, allocator);
     server.sessions[5] = bob;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
@@ -4046,7 +4099,7 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     server.sessions[9] = alice;
     alice.stream.state = .active;
     alice.stream.authenticated = true;
@@ -4107,14 +4160,15 @@ test "Server: G4 an oversized vCard is rejected without replacing the stored val
     const old_vcard = "<vCard xmlns='vcard-temp'><FN>Old</FN></vCard>";
     try vcard_store.set("alice@localhost", old_vcard);
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.vcard = &vcard_store;
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     server.sessions[1] = session;
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -4150,13 +4204,14 @@ test "Server: G4 an oversized vCard is rejected without replacing the stored val
 
 test "Server: E6 non-whitespace between stanzas closes the stream" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     server.sessions[1] = session;
 
     var change_buf: [64]posix.Kevent = undefined;
@@ -4178,13 +4233,14 @@ test "Server: E6 non-whitespace between stanzas closes the stream" {
 
 test "Server: E6 an over-long token is a policy-violation" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, allocator);
+    session.init(fds[0], 1, "localhost", false, allocator);
     server.sessions[1] = session;
 
     var change_buf: [64]posix.Kevent = undefined;
@@ -4220,13 +4276,14 @@ test "Server: E6 an over-long token is a policy-violation" {
 
 test "Server: S4 jid-malformed subscription escapes the stanza id" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, allocator);
+    session.init(fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = session;
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
     session.stream.authenticated_jid = session.stream.bound_jid;

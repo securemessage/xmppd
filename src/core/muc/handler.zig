@@ -3269,7 +3269,8 @@ fn st(index: u32, gen: u24) Token {
 }
 
 test "S6: self-kick is rejected and the room survives actor processing" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(std.testing.allocator);
     defer reg.deinit();
@@ -3319,7 +3320,8 @@ test "S6: self-kick is rejected and the room survives actor processing" {
 test "S1: room secret with XML specials is accepted on join" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -3336,7 +3338,7 @@ test "S1: room secret with XML specials is accepted on join" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    alice.init(fds[0], 0, server.server_host, false, allocator);
     alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
     server.sessions[0] = alice; // owned by server.deinit from here on
 
@@ -3358,7 +3360,8 @@ test "S1: room secret with XML specials is accepted on join" {
 test "S1: a wrong room secret of the same decoded length is still refused" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -3373,7 +3376,7 @@ test "S1: a wrong room secret of the same decoded length is still refused" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(fds[0], 1, server.server_host, false, allocator);
+    bob.init(fds[0], 1, server.server_host, false, allocator);
     bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
     server.sessions[1] = bob;
 
@@ -3407,7 +3410,8 @@ test "S1: vcard update photo requires a hex hash" {
 test "S1: room config form values are stored decoded, escaped once on output" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -3430,7 +3434,7 @@ test "S1: room config form values are stored decoded, escaped once on output" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     session.stream.bound_jid = .{ .local = "owner", .domain = "localhost", .resource = "desk" };
     server.sessions[0] = session; // owned by server.deinit from here on
     _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", st(0, 1), 0, .moderator, .owner);
@@ -3490,7 +3494,8 @@ test "G1: an invalid boolean literal rejects the whole config form" {
 test "G1: an overflowing room secret rejects the whole config form" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -3503,7 +3508,7 @@ test "G1: an overflowing room secret rejects the whole config form" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     session.stream.bound_jid = .{ .local = "owner", .domain = "localhost", .resource = "desk" };
     server.sessions[0] = session;
     _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", st(0, 1), 0, .moderator, .owner);
@@ -3533,7 +3538,8 @@ test "G1: an overflowing room secret rejects the whole config form" {
 test "G1: a protected room with no stored secret refuses the join" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -3547,7 +3553,7 @@ test "G1: a protected room with no stored secret refuses the join" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    bob.init(fds[0], 0, server.server_host, false, allocator);
     bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
     server.sessions[0] = bob;
 
@@ -3570,7 +3576,8 @@ test "S16: mailbox-full bounce targets the sender and fails closed on overflow" 
     const allocator = std.testing.allocator;
     const sm_mod = @import("session_map");
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var sm = sm_mod.SessionMap.init(allocator, true, 0);
     defer sm.deinit();
@@ -3583,7 +3590,7 @@ test "S16: mailbox-full bounce targets the sender and fails closed on overflow" 
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 0, server.server_host, false, allocator);
+    bob.init(bob_fds[0], 0, server.server_host, false, allocator);
     server.sessions[0] = bob;
     _ = try sm.bind(0, server.sessionToken(0), "bob", "localhost", "phone");
 
@@ -3591,7 +3598,7 @@ test "S16: mailbox-full bounce targets the sender and fails closed on overflow" 
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &carol_fds));
     defer posix.close(carol_fds[1]);
     const carol = try allocator.create(Session);
-    carol.* = Session.init(carol_fds[0], 1, server.server_host, false, allocator);
+    carol.init(carol_fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = carol;
     _ = try sm.bind(0, server.sessionToken(1), "carol", "localhost", "tablet");
 
@@ -3634,7 +3641,8 @@ test "T256: remote-join twin collapses onto the existing occupant" {
     const reg_mod = @import("room_registry");
     const dq_mod = @import("delivery_queue");
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var registry = reg_mod.RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -3706,7 +3714,8 @@ test "S1: takeover notice escapes the replaced resource's nick and JID" {
     const reg_mod = @import("room_registry");
     const dq_mod = @import("delivery_queue");
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var registry = reg_mod.RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -3788,7 +3797,8 @@ test "S1: remote presence error escapes the room and target JIDs" {
 
 test "T413: replaced-resource delivery drops are counted" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -3850,7 +3860,8 @@ test "T413: remote presence error delivery drops are counted" {
 test "S16: local replaced-resource notice overflow fails the session" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -3866,7 +3877,7 @@ test "S16: local replaced-resource notice overflow fails the session" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    target.init(fds[0], 0, server.server_host, false, allocator);
     target.stream.bound_jid = .{ .local = "eve", .domain = "localhost", .resource = "phone" };
     server.sessions[0] = target;
 
@@ -3883,7 +3894,8 @@ test "S16: local replaced-resource notice overflow fails the session" {
 test "S16: a maximum-length escape-heavy replaced-resource notice is built in a leased bank and delivered whole" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -3903,7 +3915,7 @@ test "S16: a maximum-length escape-heavy replaced-resource notice is built in a 
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    target.init(fds[0], 0, server.server_host, false, allocator);
     // The local check compares raw (unescaped) bytes, so the bound parts
     // must concatenate to the same 1024-byte real JID: 511+1+500+1+11.
     target.stream.bound_jid = .{ .local = "'" ** 511, .domain = "'" ** 500, .resource = "'" ** 11 };
@@ -3930,7 +3942,8 @@ test "S16: local delivery refuses a stale session generation" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
     const sm_mod = @import("session_map");
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var sm = sm_mod.SessionMap.init(allocator, true, 0);
     defer sm.deinit();
@@ -3941,7 +3954,7 @@ test "S16: local delivery refuses a stale session generation" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     server.sessions[0] = session;
     try sm.bind(0, server.sessionToken(0), "bob", "localhost", "phone");
 
@@ -3972,7 +3985,8 @@ test "H5: the first fan-out after a genuine buffer-full loss still reaches the r
     const posix = std.posix;
     const allocator = std.testing.allocator;
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -3989,7 +4003,7 @@ test "H5: the first fan-out after a genuine buffer-full loss still reaches the r
         try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &pair));
         peer_fds[idx] = pair[1];
         const session = try allocator.create(Session);
-        session.* = Session.init(pair[0], idx, server.server_host, false, allocator);
+        session.init(pair[0], idx, server.server_host, false, allocator);
         session.stream.state = .active;
         session.stream.authenticated = true;
         session.stream.bound_jid = .{ .local = name, .domain = "localhost", .resource = "desk" };
@@ -4044,7 +4058,8 @@ test "H5: the first fan-out after a rejected oversized groupchat reaches every o
     const posix = std.posix;
     const allocator = std.testing.allocator;
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -4063,7 +4078,7 @@ test "H5: the first fan-out after a rejected oversized groupchat reaches every o
     defer for (pair_fds) |pair| posix.close(pair[1]);
     for (names, resources, pair_fds, 0..) |name, res, pair, idx| {
         const session = try allocator.create(Session);
-        session.* = Session.init(pair[0], idx, server.server_host, false, allocator);
+        session.init(pair[0], idx, server.server_host, false, allocator);
         session.stream.state = .active;
         session.stream.authenticated = true;
         session.stream.bound_jid = .{ .local = name, .domain = "localhost", .resource = res };
@@ -4106,7 +4121,8 @@ test "H5: an oversized groupchat body is rejected with a bounce, not a room tear
     const posix = std.posix;
     const allocator = std.testing.allocator;
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -4120,7 +4136,7 @@ test "H5: an oversized groupchat body is rejected with a bounce, not a room tear
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 0, server.server_host, false, allocator);
+    alice.init(alice_fds[0], 0, server.server_host, false, allocator);
     alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
     alice.stream.state = .active;
     alice.stream.authenticated = true;
@@ -4130,7 +4146,7 @@ test "H5: an oversized groupchat body is rejected with a bounce, not a room tear
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 1, server.server_host, false, allocator);
+    bob.init(bob_fds[0], 1, server.server_host, false, allocator);
     bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     bob.stream.state = .active;
     bob.stream.authenticated = true;
@@ -4186,7 +4202,8 @@ test "S32: id-less groupchat messages archive under minted stanza ids" {
     defer arch_db.close();
     var arch_store = ArchiveStore.init(&arch_db, allocator);
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -4200,7 +4217,7 @@ test "S32: id-less groupchat messages archive under minted stanza ids" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    alice.init(fds[0], 0, server.server_host, false, allocator);
     alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
     alice.stream.state = .active;
     alice.stream.authenticated = true;
@@ -4238,7 +4255,8 @@ test "H5: ingress sizing accounts for an occupant JID that escapes wider" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -4252,7 +4270,7 @@ test "H5: ingress sizing accounts for an occupant JID that escapes wider" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 0, server.server_host, false, allocator);
+    alice.init(alice_fds[0], 0, server.server_host, false, allocator);
     alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
     alice.stream.state = .active;
     alice.stream.authenticated = true;
@@ -4343,7 +4361,8 @@ test "S4: an over-long remote presence error JID is counted, never silent" {
 
 test "R5: an over-long remote disco#info requester JID is counted, never silent" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -4379,7 +4398,8 @@ test "R5: an over-long remote disco#info requester JID is counted, never silent"
 
 test "S4: a near-maximum remote join conflict error is delivered whole" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -4436,7 +4456,8 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     const allocator = std.testing.allocator;
     const dq_mod = @import("delivery_queue");
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var reg = RoomRegistry.init(allocator);
     defer reg.deinit();
@@ -4473,7 +4494,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const owner = try allocator.create(Session);
-    owner.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    owner.init(fds[0], 0, server.server_host, false, allocator);
     owner.stream.bound_jid = .{ .local = "NaplesTB", .domain = "localhost", .resource = "desk" };
     server.sessions[0] = owner;
 
@@ -4504,7 +4525,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &cfds));
     defer posix.close(cfds[1]);
     const carol = try allocator.create(Session);
-    carol.* = Session.init(cfds[0], 1, server.server_host, false, allocator);
+    carol.init(cfds[0], 1, server.server_host, false, allocator);
     carol.stream.bound_jid = .{ .local = "CarolX", .domain = "localhost", .resource = "wind" };
     server.sessions[1] = carol;
     const join = "<x xmlns='http://jabber.org/protocol/muc'/>";
@@ -4532,13 +4553,15 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
 test "R-385: an oversized queued iq result keeps the session and answers resource-constraint" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     session.iq_to = "conference.localhost";
@@ -4570,13 +4593,15 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
 test "R-385: a full buffer on a deliverable stanza still flags overflow teardown" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
     try std.testing.expect(session.conn.ensureWriteBuf());
