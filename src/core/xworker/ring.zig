@@ -285,7 +285,9 @@ pub const ActorRetryList = struct {
             _ = actor_retry_drops.fetchAdd(1, .monotonic);
             return error.RetryListFull;
         }
-        const e = self.allocator.create(ActorRetry) catch return error.OutOfMemory;
+        const e = self.allocator.create(ActorRetry) catch {
+            return error.OutOfMemory;
+        };
         blob.addRef();
         e.* = .{
             .target_worker = target_worker,

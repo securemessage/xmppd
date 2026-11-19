@@ -40,7 +40,9 @@ pub const RoomMailbox = struct {
     pub fn enqueue(self: *RoomMailbox, pool: *std.heap.MemoryPool(Item), blob: *delivery_queue.Blob) !void {
         if (self.count >= MAX_ITEMS) return error.MailboxFull;
         if (self.bytes + blob.len > BYTE_BUDGET) return error.MailboxFull;
-        const item = pool.create() catch return error.MailboxFull;
+        const item = pool.create() catch {
+            return error.MailboxFull;
+        };
         blob.addRef();
         item.* = .{ .blob = blob };
         if (self.tail) |t| {

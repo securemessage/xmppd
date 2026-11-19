@@ -188,6 +188,12 @@ pub const Room = struct {
         return .{ .allocator = allocator };
     }
 
+    /// Initialize an already-allocated room; used where a by-value init
+    /// result would enlarge the caller's stack frame.
+    pub fn initInPlace(self: *Room, allocator: std.mem.Allocator) void {
+        self.* = .{ .allocator = allocator };
+    }
+
     pub fn deinit(self: *Room) void {
         self.nick_map.deinit(self.allocator);
         self.jid_map.deinit(self.allocator);
@@ -385,7 +391,15 @@ pub const RoomRegistry = struct {
     directory_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) RoomRegistry {
-        return .{
+        var self: RoomRegistry = undefined;
+        self.initInPlace(allocator);
+        return self;
+    }
+
+    /// Initialize an already-allocated registry; used where a by-value
+    /// init result would enlarge the caller's stack frame.
+    pub fn initInPlace(self: *RoomRegistry, allocator: std.mem.Allocator) void {
+        self.* = .{
             .allocator = allocator,
             .item_pool = std.heap.MemoryPool(RoomMailbox.Item).init(allocator),
         };
@@ -458,7 +472,7 @@ pub const RoomRegistry = struct {
         for (&self.rooms) |*slot| {
             if (slot.* == null) {
                 const room = try self.allocator.create(Room);
-                room.* = Room.init(self.allocator);
+                room.initInPlace(self.allocator);
                 room.setJid(jid);
                 room.config = config;
                 room.active = true;
