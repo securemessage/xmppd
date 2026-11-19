@@ -228,7 +228,7 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
             }
 
             // Unicast: the slot generation check replaces the session-map
-            // scan — a token minted for a freed-then-reused slot fails here.
+            // scan. A token minted for a freed-then-reused slot fails here.
             const target_session = c.server.sessionForEventToken(target) orelse return;
             const local_session_id = target.index;
             const parts = stanza_facts.extractStanzaParts(payload);

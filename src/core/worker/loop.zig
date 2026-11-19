@@ -712,7 +712,7 @@ pub const EventLoop = struct {
     /// - `interval_ms` — timer interval in milliseconds
     /// - `one_shot` — if `true`, the timer fires once and is automatically removed.
     ///   If `false`, the timer repeats at the given interval until explicitly removed.
-    /// - `udata` — opaque user data returned with each firing event
+    /// - `udata` - opaque user data returned with each firing event
     ///
     /// If a timer with the same `ident` already exists, it is replaced.
     ///

@@ -20,7 +20,7 @@
 //!
 //! Each delivery carries the target slot's `Token` (ADR-4) captured at
 //! enqueue time. The consumer validates kind, bounds and generation against
-//! its own slot table — no lock, no map scan — and a slot that was freed
+//! its own slot table (no lock, no map scan) and a slot that was freed
 //! and reused makes the token stale, so the delivery is counted and dropped.
 
 const std = @import("std");

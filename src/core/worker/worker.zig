@@ -819,7 +819,7 @@ pub const Server = struct {
     }
 
     /// ADR-4: does this token still name a live session slot on this
-    /// worker? One kind check, one bounds check, one generation compare —
+    /// worker? One kind check, one bounds check, one generation compare:
     /// no lock, no map scan.
     pub fn validateSessionToken(self: *const Server, token: Token) bool {
         return token.kind == token_kinds.session and

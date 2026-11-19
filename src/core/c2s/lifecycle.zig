@@ -297,7 +297,7 @@ fn evictStaleResource(
 
     const old_id: usize = entry.token.index;
     const old_session = server.sessionForEventToken(entry.token) orelse {
-        // Stale entry or an already-empty slot — just unbind and retry.
+        // Stale entry or an already-empty slot: just unbind and retry.
         _ = sm.unbind(local, domain, resource);
         return true;
     };

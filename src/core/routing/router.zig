@@ -922,7 +922,7 @@ fn enqueueCrossThreadStanza(
 }
 
 fn dropOversize(inner_len: usize, route: SessionEntry) bool {
-    noteCrossWorkerDrop("cross-thread stanza exceeds {d}-byte delivery slot (inner {d} bytes) to worker {d} session {d} — routed to offline/bounce fallback (S14)", .{ delivery_queue_mod.MAX_PAYLOAD_SIZE, inner_len, route.worker_id, route.token.index });
+    noteCrossWorkerDrop("cross-thread stanza exceeds {d}-byte delivery slot (inner {d} bytes) to worker {d} session {d}: routed to offline/bounce fallback (S14)", .{ delivery_queue_mod.MAX_PAYLOAD_SIZE, inner_len, route.worker_id, route.token.index });
     return false;
 }
 

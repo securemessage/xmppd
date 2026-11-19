@@ -315,7 +315,7 @@ pub const Room = struct {
         return self.removeOccupant(idx);
     }
 
-    /// Move an occupant to another (worker, token) address — the SM-resume
+    /// Move an occupant to another (worker, token) address: the SM-resume
     /// migration (T177). The occupant's identity (nick, role, affiliation,
     /// JIDs) is unchanged; only the delivery address moves.
     /// Returns the worker the record pointed at before the move, or null if
