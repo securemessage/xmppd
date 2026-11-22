@@ -102,7 +102,7 @@ pub const Blob = struct {
   same worker never allocates a blob; the existing `session.stanza(bytes)`
   path stays. A blob is created only when the payload crosses a worker
   boundary or must be retained (SM replay queue, room mailbox, retry
-  list) — matching the section-6 target of zero allocations on the 1:1
+  list), matching the section-6 target of zero allocations on the 1:1
   steady-state path beyond the one shared blob when cross-worker or
   SM-tracked.
 
@@ -247,7 +247,7 @@ disappear; the stack-frame ratchet must show no NEW/GREW entries.
 - `deliver.zig`: a >4080 B stanza across workers is delivered (S14);
   reverting the blob path returns `error.PayloadTooLarge` and the test
   fails.
-- `ring.zig`: multicast to N target workers serializes once — a
+- `ring.zig`: multicast to N target workers serializes once; a
   serialization counter proves one `Blob` produced and N descriptors
   published.
 - `mailbox.zig`/`actor.zig`: a full room mailbox bounces the sender with

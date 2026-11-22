@@ -1,4 +1,4 @@
-//! # RoomMailbox — Per-room actor message deque
+//! # RoomMailbox: per-room actor message deque
 //!
 //! A bounded FIFO of refcounted blob envelopes (ADR-3). The owning worker is
 //! the sole consumer; the MPSC drain handler is the sole producer (SPSC).

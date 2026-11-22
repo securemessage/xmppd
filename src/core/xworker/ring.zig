@@ -446,7 +446,7 @@ pub const MpscQueue = struct {
             const slot_idx = current_tail % QUEUE_SLOTS;
             const slot = &self.slots[slot_idx];
 
-            // Write the descriptor (non-atomic — we own this slot until
+            // Write the descriptor (non-atomic; we own this slot until
             // ready.store). The slot takes its own blob reference.
             blob.addRef();
             slot.target = target;

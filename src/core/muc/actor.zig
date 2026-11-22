@@ -105,7 +105,7 @@ pub fn handleRoomActorMessage(self: *Server, blob: *delivery_queue_mod.Blob, cha
 }
 
 /// Drain per-room mailboxes via the registry's pending FIFO: only rooms
-/// that actually hold mail are visited — no per-tick scan of reg.rooms.
+/// that actually hold mail are visited; no per-tick scan of reg.rooms.
 /// One message per room per visit, re-linked at the tail when more
 /// remains, so the round-robin fairness is identical to the old scan.
 /// Bounded to MAX_DRAIN_PER_TICK total messages.
