@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const sm_state = @import("sm_state.zig");
+const delivery_queue = @import("delivery_queue");
 
 const log = std.log.scoped(.sm_handoff);
 
@@ -49,7 +50,9 @@ pub const ResumeBundle = struct {
     resource: []u8,
     last_presence: []u8,
     /// Remaining unacked stanzas (source queue was ack()-trimmed first).
-    stanzas: std.ArrayListUnmanaged([]u8) = .{},
+    /// Blob references, not copies (C11): the producer's allocation crosses
+    /// workers under an atomic refcount.
+    stanzas: std.ArrayListUnmanaged(*delivery_queue.Blob) = .{},
     /// sm_out_seq value of stanzas[0], i.e. the source queue's base_seq.
     base_seq: u32,
     /// Source queue's last acked h (S24). Carried so a backwards h after the
@@ -74,7 +77,7 @@ pub const ResumeBundle = struct {
         allocator.free(self.username);
         allocator.free(self.resource);
         allocator.free(self.last_presence);
-        for (self.stanzas.items) |s| allocator.free(s);
+        for (self.stanzas.items) |s| s.release();
         self.stanzas.deinit(allocator);
         for (self.rooms.items) |r| allocator.free(r);
         self.rooms.deinit(allocator);
@@ -175,6 +178,20 @@ pub fn resetForTesting() void {
 // Tests
 // ============================================================================
 
+/// Budget for test-produced stanza blobs; the C allocator keeps blob
+/// release on any worker legal, matching the production contract.
+var test_stanza_budget: ?delivery_queue.BlobBudget = null;
+
+fn testStanzaBudget() *delivery_queue.BlobBudget {
+    if (test_stanza_budget == null) {
+        test_stanza_budget = .{
+            .allocator = allocator,
+            .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT,
+        };
+    }
+    return &test_stanza_budget.?;
+}
+
 fn testBundle(previd_suffix: u8) !*ResumeBundle {
     const b = try allocator.create(ResumeBundle);
     b.* = .{
@@ -190,10 +207,11 @@ fn testBundle(previd_suffix: u8) !*ResumeBundle {
         .resource = try allocator.dupe(u8, "phone"),
         .last_presence = try allocator.dupe(u8, "<show>away</show>"),
         .base_seq = 3,
+        .last_h = 5,
         .created = std.time.timestamp(),
     };
-    try b.stanzas.append(allocator, try allocator.dupe(u8, "<message/>"));
-    try b.stanzas.append(allocator, try allocator.dupe(u8, "<presence/>"));
+    try b.stanzas.append(allocator, try testStanzaBudget().produce("<message/>"));
+    try b.stanzas.append(allocator, try testStanzaBudget().produce("<presence/>"));
     try b.rooms.append(allocator, try allocator.dupe(u8, "dev@conference.example.com"));
     return b;
 }
@@ -207,8 +225,11 @@ test "handoff store: put and take roundtrip" {
     const got = take(&b.previd) orelse return error.Missing;
     try std.testing.expectEqual(@as(u32, 7), got.sm_in_h);
     try std.testing.expectEqual(@as(u32, 3), got.base_seq);
+    try std.testing.expectEqual(@as(u32, 5), got.last_h);
     try std.testing.expectEqualStrings("alice", got.username);
     try std.testing.expectEqual(@as(usize, 2), got.stanzas.items.len);
+    try std.testing.expectEqualStrings("<message/>", got.stanzas.items[0].bytes());
+    try std.testing.expectEqualStrings("<presence/>", got.stanzas.items[1].bytes());
     try std.testing.expectEqual(@as(usize, 1), got.rooms.items.len);
     try std.testing.expectEqualStrings("dev@conference.example.com", got.rooms.items[0]);
     release(got);

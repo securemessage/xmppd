@@ -381,9 +381,9 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     if (session.sm_unacked) |queue| {
         var iter = queue.getUnacked();
         while (iter.next()) |blob| {
-            // Replayed stanzas are already counted in sm_unacked: nonza
-            // appends without re-tracking, or resume would count them twice.
-            if (session.nonza(blob.bytes()) == .failed_closed) break;
+            // stanzaReplay appends stanza-classed without re-tracking:
+            // the queue being replayed is already the SM ledger.
+            if (session.stanzaReplay(blob.bytes()) == .failed_closed) break;
         }
     }
 
@@ -544,13 +544,12 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
     if (detached.sm_unacked) |q| {
         var iter = q.getUnacked();
         while (iter.next()) |blob| {
-            const copy = sm_handoff.allocator.dupe(u8, blob.bytes()) catch {
-                bundle.deinit();
-                sm_handoff.allocator.destroy(bundle);
-                return fail(self, req, "item-not-found", "bundle alloc failed");
-            };
-            bundle.stanzas.append(sm_handoff.allocator, copy) catch {
-                sm_handoff.allocator.free(copy);
+            // The bundle carries a reference, not a copy (C11): the queue's
+            // ref is freed by detached.deinit below, the bundle's keeps the
+            // allocation alive for the resuming worker.
+            blob.addRef();
+            bundle.stanzas.append(sm_handoff.allocator, blob) catch {
+                blob.release();
                 bundle.deinit();
                 sm_handoff.allocator.destroy(bundle);
                 return fail(self, req, "item-not-found", "bundle alloc failed");
@@ -659,8 +658,8 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
     queue.base_seq = bundle.base_seq;
     queue.last_h = bundle.last_h;
     var replay_count: u32 = 0;
-    for (bundle.stanzas.items) |stanza| {
-        switch (queue.push(stanza)) {
+    for (bundle.stanzas.items) |blob| {
+        switch (queue.pushBlob(blob)) {
             .pushed => replay_count += 1,
             else => {
                 // Source was already ack-trimmed and bounded by
@@ -745,9 +744,9 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
     if (session.sm_unacked) |q| {
         var iter = q.getUnacked();
         while (iter.next()) |blob| {
-            // Replayed stanzas are already counted in sm_unacked: nonza
-            // appends without re-tracking, or resume would count them twice.
-            if (session.nonza(blob.bytes()) == .failed_closed) break;
+            // stanzaReplay appends stanza-classed without re-tracking:
+            // the queue being replayed is already the SM ledger.
+            if (session.stanzaReplay(blob.bytes()) == .failed_closed) break;
         }
     }
 
@@ -1500,7 +1499,7 @@ test "Server: S24 cross-worker handoff carries last_h" {
         .last_h = 5,
         .created = std.time.timestamp(),
     };
-    bundle.stanzas.append(sm_handoff.allocator, sm_handoff.allocator.dupe(u8, "<message/>") catch unreachable) catch unreachable;
+    bundle.stanzas.append(sm_handoff.allocator, testSmBudget().produce("<message/>") catch unreachable) catch unreachable;
     try sm_handoff.put(&previd, bundle);
 
     handleSmResumeReply(&server, .{
