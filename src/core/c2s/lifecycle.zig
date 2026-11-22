@@ -366,6 +366,10 @@ fn detachSession(server: *Server, id: usize, session: *Session, changes: *Change
     server.detached_count += 1;
     c2s_sm.smIdMapInsert(server, session.sm_id[0..session.sm_id_len], id);
     session.sm_detach_time = std.time.timestamp();
+    // C11: the resume deadline joins the worker's expiry wheel; the single
+    // one-shot timer is re-armed at the iteration tail (sm_expiry_pending).
+    server.sm_expiry.insert(session, session.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
+    server.sm_expiry_pending = true;
 
     // Remove from kqueue and close the fd. Purge instead of staging deletes:
     // close(2) drops the knotes, and a staged delete/add for this number
@@ -396,6 +400,10 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
         server.detached_count -= 1;
         c2s_sm.smIdMapRemove(server, session.sm_id[0..session.sm_id_len]);
     }
+
+    // A linked session still sits in the expiry wheel; drop the node before
+    // the memory goes back (flag-guarded no-op for never-detached sessions).
+    if (server.sm_expiry.unlink(session)) server.sm_expiry_pending = true;
 
     // A detached session that dies without a resume still owns an unacked
     // queue; its messages go to offline storage rather than vanishing
@@ -526,24 +534,35 @@ fn drainUnackedToOffline(server: *Server, session: *Session) void {
 }
 
 /// Sweep detached sessions that have exceeded the resume timeout.
-/// Called periodically from the event loop (e.g., every 30 seconds via timer).
+/// C11: driven by the worker's single one-shot expiry timer at the wheel's
+/// earliest deadline, so a call costs O(due) instead of O(sessions). The
+/// fired knote deleted itself; the iteration tail re-arms via
+/// armSmExpiry.
 pub fn expireDetachedSessions(server: *Server, changes: *ChangeList) void {
-    if (server.detached_count == 0) return;
-    const now = std.time.timestamp();
-    for (server.sessions, 0..) |slot, i| {
-        const session = slot orelse continue;
-        if (!session.sm_detached) continue;
-        const elapsed = now - session.sm_detach_time;
-        if (elapsed >= sm_state.DEFAULT_RESUME_TIMEOUT) {
-            log.info("session {d} SM resume expired (id={s}, elapsed={d}s)", .{
-                i,
-                session.sm_id[0..session.sm_id_len],
-                elapsed,
-            });
-            session.sm_resume_enabled = false; // Prevent re-detach
-            destroySession(server, i, session, changes);
-        }
+    server.sm_expiry_armed = false;
+    if (server.sm_expiry.count > 0) {
+        server.sm_expiry.expireDue(std.time.timestamp(), ExpireCtx{
+            .server = server,
+            .changes = changes,
+        }, expireOneDetached);
     }
+    server.sm_expiry_pending = true;
+}
+
+const ExpireCtx = struct {
+    server: *Server,
+    changes: *ChangeList,
+};
+
+fn expireOneDetached(ctx: ExpireCtx, session: *Session) void {
+    const id = session.conn.id;
+    log.info("session {d} SM resume expired (id={s}, elapsed={d}s)", .{
+        id,
+        session.sm_id[0..session.sm_id_len],
+        std.time.timestamp() - session.sm_detach_time,
+    });
+    session.sm_resume_enabled = false; // Prevent re-detach
+    destroySession(ctx.server, id, session, ctx.changes);
 }
 
 /// Deliver queued offline messages to a user who just became available.
@@ -1189,6 +1208,7 @@ test "T158: detach timer expires sessions at 300s, not before" {
     @memcpy(&s1.sm_id, id1);
     server.detached_count = 2;
     c2s_sm.smIdMapInsert(&server, &s1.sm_id, 1);
+    server.sm_expiry.insert(s1, s1.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
 
     // Session 2: detached only 10 seconds ago — MUST NOT be expired
     const s2 = try makeAuthenticatedSession(&server, 2, "bob");
@@ -1199,6 +1219,7 @@ test "T158: detach timer expires sessions at 300s, not before" {
     const id2 = "eeee5555ffff6666aaaa7777bbbb8888";
     @memcpy(&s2.sm_id, id2);
     c2s_sm.smIdMapInsert(&server, &s2.sm_id, 2);
+    server.sm_expiry.insert(s2, s2.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
 
     // Mark slots 1 and 2 as consumed from the free list (tests bypass normal alloc)
     server.free_count -= 2;
@@ -1706,6 +1727,7 @@ test "T158: detach timer does not expire session at exactly 299s" {
     @memcpy(&s1.sm_id, id1);
     server.detached_count = 1;
     c2s_sm.smIdMapInsert(&server, &s1.sm_id, 1);
+    server.sm_expiry.insert(s1, s1.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
     server.free_count -= 1;
 
     expireDetachedSessions(&server, &changes);
@@ -1741,6 +1763,7 @@ test "T158: detach timer expires session at exactly 300s" {
     @memcpy(&s1.sm_id, id1);
     server.detached_count = 1;
     c2s_sm.smIdMapInsert(&server, &s1.sm_id, 1);
+    server.sm_expiry.insert(s1, s1.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
     server.free_count -= 1;
 
     expireDetachedSessions(&server, &changes);
@@ -1748,6 +1771,61 @@ test "T158: detach timer expires session at exactly 300s" {
     // Session must be destroyed — 300 >= 300 (exact boundary)
     try std.testing.expect(server.sessions[1] == null);
     try std.testing.expectEqual(@as(u16, 0), server.detached_count);
+}
+
+// C11 regression: a session detached through the production close path
+// carries an expiry-wheel link, and the wheel drain destroys it while a
+// non-due session stays linked.
+test "C11: detach links the expiry wheel and the drain fires once" {
+    const allocator = std.testing.allocator;
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const s1 = try makeAuthenticatedSession(&server, 1, "alice");
+    s1.stream.state = .active;
+    s1.sm_resume_enabled = true;
+    s1.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const id1 = "aaaa1111bbbb2222cccc3333dddd4444";
+    @memcpy(&s1.sm_id, id1);
+    server.free_count -= 1;
+
+    closeSession(&server, 1, &changes);
+    try std.testing.expect(s1.sm_detached);
+    try std.testing.expect(s1.sm_expiry_linked);
+    try std.testing.expectEqual(@as(usize, 1), server.sm_expiry.count);
+    try std.testing.expect(server.sm_expiry_pending);
+
+    // A second detached session with a later deadline must survive the drain.
+    const s2 = try makeAuthenticatedSession(&server, 2, "bob");
+    s2.sm_resume_enabled = true;
+    s2.sm_detached = true;
+    s2.sm_detach_time = std.time.timestamp();
+    s2.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const id2 = "eeee5555ffff6666aaaa7777bbbb8888";
+    @memcpy(&s2.sm_id, id2);
+    server.detached_count += 1;
+    c2s_sm.smIdMapInsert(&server, &s2.sm_id, 2);
+    server.sm_expiry.insert(s2, s2.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
+    server.free_count -= 1;
+
+    // Push s1's deadline into the past, then drain.
+    _ = server.sm_expiry.unlink(s1);
+    server.sm_expiry.insert(s1, std.time.timestamp() - 1);
+    expireDetachedSessions(&server, &changes);
+
+    try std.testing.expect(server.sessions[1] == null);
+    try std.testing.expect(s2.sm_expiry_linked);
+    try std.testing.expectEqual(@as(u16, 1), server.detached_count);
+    try std.testing.expect(server.sm_expiry_pending);
+
+    // s2's own destroy path unlinks the wheel node (no dangling pointer).
+    destroySession(&server, 2, s2, &changes);
+    try std.testing.expectEqual(@as(usize, 0), server.sm_expiry.count);
+    try std.testing.expectEqual(@as(?i64, null), server.sm_expiry.nextDeadline());
 }
 
 // T152 regression test: a stale (already-bound) resource must be evicted so

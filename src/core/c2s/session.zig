@@ -486,6 +486,15 @@ pub const Session = struct {
     sm_detached: bool = false,
     /// Monotonic timestamp (seconds) when the session was detached.
     sm_detach_time: i64 = 0,
+    /// C11 expiry-wheel link (detached sessions only): an intrusive
+    /// doubly-linked node in one of the worker's per-second buckets.
+    /// `sm_expiry_linked` guards unlink so every teardown path can call it
+    /// unconditionally; the wheel removes the node before the memory is
+    /// freed.
+    sm_expiry_prev: ?*Session = null,
+    sm_expiry_next: ?*Session = null,
+    sm_expiry_deadline: i64 = 0,
+    sm_expiry_linked: bool = false,
     /// Unacked stanza queue for resume replay. Allocated when resume is enabled.
     sm_unacked: ?*sm_state.SmUnackedQueue = null,
     /// S13: offline delivery stalled on a full send buffer (or a store

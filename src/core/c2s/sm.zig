@@ -341,8 +341,10 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     smIdMapRemove(self, detached.sm_id[0..detached.sm_id_len]);
     smRedirectDrop(self, previd); // session lives here again
 
-    // Destroy the detached session (slot freed for reuse)
+    // Destroy the detached session (slot freed for reuse); its expiry-wheel
+    // link goes first or the wheel keeps a dangling node.
     detached.sm_resume_enabled = false; // Prevent re-detach
+    if (self.sm_expiry.unlink(detached)) self.sm_expiry_pending = true;
     detached.deinit();
     self.allocator.destroy(detached);
     self.sessions[detached_id] = null;
@@ -590,6 +592,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
     if (self.detached_count > 0) self.detached_count -= 1;
     smIdMapRemove(self, detached.sm_id[0..detached.sm_id_len]);
     detached.sm_resume_enabled = false; // Prevent re-detach
+    if (self.sm_expiry.unlink(detached)) self.sm_expiry_pending = true;
     detached.deinit();
     self.allocator.destroy(detached);
     self.sessions[detached_id] = null;
@@ -1597,6 +1600,8 @@ pub fn makeDetachedForResume(
     detached.sm_unacked = queue;
     server.sessions[slot] = detached;
     smIdMapInsert(server, previd, slot);
+    // Mirror detachSession: detached sessions always carry a wheel link.
+    server.sm_expiry.insert(detached, detached.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
     return detached;
 }
 
