@@ -284,9 +284,10 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
                 bounceCrossWorkerUnavailable(c.server, from_jid, target_session.stream.boundBare(), parts.msg_id, "message", c.changes);
                 return;
             }
-            // stanza() covers the T153 detached case itself: it tracks
-            // for resume replay and reports tracked_detached.
-            if (target_session.stanza(payload) == .failed_closed) return;
+            // stanzaBlob() covers the T153 detached case itself: it tracks
+            // for resume replay and reports tracked_detached. A resumable
+            // target stores the ring slot's blob, not a private copy (C11).
+            if (target_session.stanzaBlob(payload, c.queue.current_slot_blob) == .failed_closed) return;
         }
     }.handle);
 }
@@ -1426,7 +1427,8 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     @memcpy(&target.sm_id, sm_id);
     target.offline_pending = true;
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
     queue.base_seq = 1;
     target.sm_unacked = queue;
     server.sessions[5] = target;
@@ -1456,6 +1458,61 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     }
     // The flag survives: the tail is still outstanding.
     try std.testing.expect(target.offline_pending);
+}
+
+// C11: the unacked queue stores the ring slot's blob, not a private copy.
+test "Server: a cross-worker delivery to a resumable session shares the ring blob" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const target = try allocator.create(Session);
+    target.init(fds[0], 5, "localhost", false, allocator);
+    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.sm_enabled = true;
+    target.sm_detached = true;
+    target.sm_resume_enabled = true;
+    target.sm_detach_time = std.time.timestamp();
+    target.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const sm_id = "11112222333344445555666677778888";
+    @memcpy(&target.sm_id, sm_id);
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
+    queue.base_seq = 1;
+    target.sm_unacked = queue;
+    server.sessions[5] = target;
+    server.detached_count = 1;
+    c2s_sm.smIdMapInsert(&server, &target.sm_id, 5);
+    try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
+
+    const payload = "<message from='alice@localhost/mobile' to='bob@localhost' id='s1' type='chat'><body>live</body></message>";
+    try delivery_sys.deliver(0, 0, server.sessionToken(5), payload);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+
+    // The queue entry IS the ring blob: its budget is the producing
+    // worker's, not the queue's own, and after the slot's release the
+    // queue holds the only reference.
+    try std.testing.expectEqual(@as(u32, 1), queue.count);
+    const entry = queue.entries[queue.head].?;
+    try std.testing.expect(entry.budget == &delivery_sys.budgets[0]);
+    try std.testing.expect(entry.budget != &sm_budget);
+    try std.testing.expectEqual(@as(u32, 1), entry.refs.load(.monotonic));
+    try std.testing.expectEqualStrings(payload, entry.bytes());
 }
 
 test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {

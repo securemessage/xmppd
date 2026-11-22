@@ -402,6 +402,11 @@ pub const Server = struct {
     /// Number of currently detached SM sessions (T124 — avoids full sweep when 0).
     detached_count: u16 = 0,
 
+    /// Fallback blob budget for SM unacked queues when no delivery system
+    /// is wired (tests, single-process rigs). Lazily initialized by
+    /// smBlobBudget(); the field never moves after init.
+    sm_blob_budget_fallback: ?delivery_queue_mod.BlobBudget = null,
+
     /// Stale per-session events skipped because the session was detached or
     /// closed after kevent returned this batch (S28). Counted and logged at
     /// debug so a regression here is visible instead of silent.
@@ -1026,6 +1031,25 @@ pub const Server = struct {
             return;
         };
         for (self.scram_param_cache) |*e| e.* = .{};
+    }
+
+    /// The blob budget that bounds this worker's SM unacked queues (ADR-3):
+    /// the producer-side budget of the delivery system when one is wired,
+    /// else a server-owned fallback so tests and rigs without a delivery
+    /// system still run with a real bound.
+    pub fn smBlobBudget(self: *Server) *delivery_queue_mod.BlobBudget {
+        if (self.delivery_system) |ds| {
+            if (self.worker_id < ds.worker_count) {
+                return &ds.budgets[self.worker_id];
+            }
+        }
+        if (self.sm_blob_budget_fallback == null) {
+            self.sm_blob_budget_fallback = .{
+                .allocator = self.allocator,
+                .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT,
+            };
+        }
+        return &self.sm_blob_budget_fallback.?;
     }
 
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
@@ -4201,7 +4225,8 @@ test "Re-review 6.3: a local resume carries the recorded sequence" {
     detached.offline_pending = true;
     detached.offline_last_sent_sequence = sent_sequence;
     const det_queue = try allocator.create(sm_state.SmUnackedQueue);
-    det_queue.* = sm_state.SmUnackedQueue.init(allocator);
+    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    det_queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
     det_queue.base_seq = 1;
     detached.sm_unacked = det_queue;
     server.sessions[2] = detached;
@@ -4288,7 +4313,8 @@ test "Server: H3 a local resume carries the stalled offline tail" {
     detached.sm_resume_enabled = true;
     detached.offline_pending = true;
     const det_queue = try allocator.create(sm_state.SmUnackedQueue);
-    det_queue.* = sm_state.SmUnackedQueue.init(allocator);
+    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    det_queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
     det_queue.base_seq = 1;
     detached.sm_unacked = det_queue;
     server.sessions[2] = detached;

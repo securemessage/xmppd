@@ -633,11 +633,18 @@ pub const Session = struct {
     /// never be sent would wedge the replay queue). A detached session
     /// has no fd; its stanzas go straight to unacked.
     pub fn stanza(self: *Session, data: []const u8) SendResult {
+        return self.stanzaBlob(data, null);
+    }
+
+    /// stanza() carrying the delivery slot's shared blob (ADR-3, C11): the
+    /// unacked queue stores the reference instead of producing a private
+    /// copy, so a cross-worker payload is allocated once.
+    pub fn stanzaBlob(self: *Session, data: []const u8, blob: ?*delivery_queue_mod.Blob) SendResult {
         if (self.sm_detached) {
-            self.smTrackOutbound(data);
+            self.smTrackOutbound(data, blob);
             return .tracked_detached;
         }
-        return self.finishTrack(data, sendResult(self.conn.append(data)));
+        return self.finishTrack(data, sendResult(self.conn.append(data)), blob);
     }
 
     /// stanza() with the queueSendWithFlush policy: one non-blocking
@@ -645,19 +652,26 @@ pub const Session = struct {
     /// buffer the server filled itself is drained rather than torn down.
     pub fn stanzaWithFlush(self: *Session, data: []const u8) SendResult {
         if (self.sm_detached) {
-            self.smTrackOutbound(data);
+            self.smTrackOutbound(data, null);
             return .tracked_detached;
         }
-        return self.finishTrack(data, sendResult(self.conn.appendWithFlush(data)));
+        return self.finishTrack(data, sendResult(self.conn.appendWithFlush(data)), null);
+    }
+
+    /// Append a stanza being replayed after SM resume: stanza-classed like
+    /// stanza() but untracked. The unacked queue it replays from is already
+    /// the ledger, so re-tracking would count it twice.
+    pub fn stanzaReplay(self: *Session, data: []const u8) SendResult {
+        return sendResult(self.conn.append(data));
     }
 
     /// Track after the append: delivered results count like the
     /// pre-Outbox path, and a refused stanza that could fit the bound
     /// counts too: SM replay is where it goes next. The oversize drop
     /// (len > spill_limit) stays untracked.
-    fn finishTrack(self: *Session, data: []const u8, r: SendResult) SendResult {
+    fn finishTrack(self: *Session, data: []const u8, r: SendResult, blob: ?*delivery_queue_mod.Blob) SendResult {
         if (r != .failed_closed or data.len <= self.conn.outbox.spill_limit) {
-            self.smTrackOutbound(data);
+            self.smTrackOutbound(data, blob);
         }
         return r;
     }
@@ -682,11 +696,15 @@ pub const Session = struct {
     /// Call this after successfully queueing a complete stanza (message/presence/iq) to the client.
     /// On queue overflow the session is flagged for failure (T178) and reaped
     /// by session_lifecycle.reapOutboundOverflow at the end of the event batch.
-    pub fn smTrackOutbound(self: *Session, stanza_data: []const u8) void {
+    pub fn smTrackOutbound(self: *Session, stanza_data: []const u8, blob: ?*delivery_queue_mod.Blob) void {
         if (!self.sm_enabled) return;
         self.sm_out_seq +%= 1;
         if (self.sm_unacked) |queue| {
-            switch (queue.push(stanza_data)) {
+            const result = if (blob) |b|
+                queue.pushBlob(b)
+            else
+                queue.push(stanza_data);
+            switch (result) {
                 .pushed => {},
                 // A stanza the client will count but we cannot replay is the
                 // same silent-gap class as overflow (S15) — fail the session.
@@ -3918,7 +3936,8 @@ test "S15: queueSendStanza counts the stanza for XEP-0198" {
     session.sm_enabled = true;
     // Owned by session.deinit once assigned.
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    var budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    queue.* = sm_state.SmUnackedQueue.init(&budget);
     session.sm_unacked = queue;
 
     const before = session.sm_out_seq;
@@ -3948,7 +3967,8 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.sm_enabled = true;
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    var budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    queue.* = sm_state.SmUnackedQueue.init(&budget);
     target.sm_unacked = queue;
     server.sessions[5] = target;
 
@@ -3993,7 +4013,8 @@ test "S15: an oversize stanza is refused untracked, a fitting refusal still coun
     session.sm_enabled = true;
     // Owned by session.deinit once assigned.
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    var budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    queue.* = sm_state.SmUnackedQueue.init(&budget);
     session.sm_unacked = queue;
     // Shrink the outbound bound to the ring so the fixtures stay small.
     session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;

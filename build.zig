@@ -1099,6 +1099,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    sm_handoff_test_mod.addImport("delivery_queue", delivery_queue_mod);
 
     const sm_handoff_tests = b.addTest(.{
         .name = "sm-handoff-tests",
@@ -1485,6 +1486,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    sm_state_test_mod.addImport("delivery_queue", delivery_queue_mod);
 
     const sm_state_tests = b.addTest(.{
         .name = "sm-state-tests",

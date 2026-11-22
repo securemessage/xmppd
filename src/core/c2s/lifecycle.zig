@@ -500,7 +500,8 @@ fn drainUnackedToOffline(server: *Server, session: *Session) void {
     const recipient = session.stream.boundBare();
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
     var iter = queue.getUnacked();
-    while (iter.next()) |stanza| {
+    while (iter.next()) |blob| {
+        const stanza = blob.bytes();
         const head_end = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
         const head = stanza[0..head_end];
         if (head.len < 8 or !std.mem.eql(u8, head[0..8], "<message")) continue;
@@ -1612,7 +1613,8 @@ test "S15: an overflowed session drains unacked messages to offline storage" {
     server.free_count -= 1;
     // Owned by session.deinit once assigned.
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
     session.sm_unacked = queue;
 
     _ = queue.push("<message from='alice@localhost' to='bob@localhost' id='m1'><body>held</body></message>");
@@ -2438,7 +2440,8 @@ test "S35: SM replay resends the stamped stanza unchanged" {
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
     session.sm_enabled = true;
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
     session.sm_unacked = queue;
     server.sessions[1] = session;
     defer {
@@ -2460,7 +2463,8 @@ test "S35: SM replay resends the stamped stanza unchanged" {
     // they carry the stamp written at drain time, still exactly once.
     var iter = session.sm_unacked.?.getUnacked();
     var replayed: usize = 0;
-    while (iter.next()) |replayed_stanza| {
+    while (iter.next()) |replayed_blob| {
+        const replayed_stanza = replayed_blob.bytes();
         replayed += 1;
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(replayed_stanza, "urn:xmpp:delay"));
         try std.testing.expect(std.mem.indexOf(u8, replayed_stanza, "stamp='1970-01-01T00:16:40Z'") != null);

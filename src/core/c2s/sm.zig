@@ -130,7 +130,7 @@ pub fn handleSmEnable(self: *Server, session: *Session, elem: xml.Element, chang
             if (session.nonza(fbs.getWritten()) == .failed_closed) return;
             return;
         };
-        queue.* = sm_state.SmUnackedQueue.init(self.allocator);
+        queue.* = sm_state.SmUnackedQueue.init(self.smBlobBudget());
         session.sm_unacked = queue;
 
         w.writeAll("<enabled xmlns='urn:xmpp:sm:3' id='") catch return;
@@ -380,10 +380,10 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     // Replay unacked stanzas
     if (session.sm_unacked) |queue| {
         var iter = queue.getUnacked();
-        while (iter.next()) |stanza| {
+        while (iter.next()) |blob| {
             // Replayed stanzas are already counted in sm_unacked: nonza
             // appends without re-tracking, or resume would count them twice.
-            if (session.nonza(stanza) == .failed_closed) break;
+            if (session.nonza(blob.bytes()) == .failed_closed) break;
         }
     }
 
@@ -543,8 +543,8 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
 
     if (detached.sm_unacked) |q| {
         var iter = q.getUnacked();
-        while (iter.next()) |stanza| {
-            const copy = sm_handoff.allocator.dupe(u8, stanza) catch {
+        while (iter.next()) |blob| {
+            const copy = sm_handoff.allocator.dupe(u8, blob.bytes()) catch {
                 bundle.deinit();
                 sm_handoff.allocator.destroy(bundle);
                 return fail(self, req, "item-not-found", "bundle alloc failed");
@@ -655,7 +655,7 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
         sendSmFailed(self, session, "item-not-found", changes);
         return;
     };
-    queue.* = sm_state.SmUnackedQueue.init(self.allocator);
+    queue.* = sm_state.SmUnackedQueue.init(self.smBlobBudget());
     queue.base_seq = bundle.base_seq;
     queue.last_h = bundle.last_h;
     var replay_count: u32 = 0;
@@ -744,10 +744,10 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
 
     if (session.sm_unacked) |q| {
         var iter = q.getUnacked();
-        while (iter.next()) |stanza| {
+        while (iter.next()) |blob| {
             // Replayed stanzas are already counted in sm_unacked: nonza
             // appends without re-tracking, or resume would count them twice.
-            if (session.nonza(stanza) == .failed_closed) break;
+            if (session.nonza(blob.bytes()) == .failed_closed) break;
         }
     }
 
@@ -1230,7 +1230,8 @@ test "Server: S24 a h above the sent count fails the stream" {
     session.stream.state = .active;
     session.sm_enabled = true;
     const queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(std.testing.allocator);
+    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = std.testing.allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
     _ = queue.push("<message/>");
     _ = queue.push("<presence/>");
     session.sm_unacked = queue;
@@ -1394,7 +1395,8 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
     detached.sm_detached = true;
     detached.sm_detach_time = std.time.timestamp();
     const det_queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
-    det_queue.* = sm_state.SmUnackedQueue.init(std.testing.allocator);
+    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = std.testing.allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    det_queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
     det_queue.base_seq = 6;
     det_queue.last_h = 5;
     _ = det_queue.push("<message/>");
@@ -1550,6 +1552,22 @@ pub fn captureSmResumeStatus(ds: *DeliverySystem, req_worker: u16, out: *Capture
     }.handle);
 }
 
+/// Stable budget for test-built unacked queues: a queue can outlive the
+/// helper that built it (released inside `server.deinit`, which may run
+/// after a test's `delivery_sys.deinit`), so the budget must live for the
+/// whole test process.
+var test_sm_budget: ?delivery_queue_mod.BlobBudget = null;
+
+pub fn testSmBudget() *delivery_queue_mod.BlobBudget {
+    if (test_sm_budget == null) {
+        test_sm_budget = .{
+            .allocator = std.testing.allocator,
+            .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT,
+        };
+    }
+    return &test_sm_budget.?;
+}
+
 /// Build a detached session on `slot` (acked up to `last_h`, `unacked` stanzas
 /// outstanding from `base_seq`) registered under `previd`, ready for a
 /// cross-worker resume request. The caller owns the session; on a rejected
@@ -1572,7 +1590,7 @@ pub fn makeDetachedForResume(
     @memcpy(&detached.sm_id, previd[0..sm_state.SM_ID_HEX_LEN]);
     detached.sm_id_len = sm_state.SM_ID_HEX_LEN;
     const queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(std.testing.allocator);
+    queue.* = sm_state.SmUnackedQueue.init(testSmBudget());
     queue.base_seq = base_seq;
     queue.last_h = last_h;
     var i: u32 = 0;
