@@ -1004,3 +1004,77 @@ test "lib/net FrameWriter hosts encode() in place" {
     const decoded = try decode(frame.payload);
     try std.testing.expectEqual(@as(u32, 7), decoded.auth_failure.conn_id);
 }
+
+// ---------------------------------------------------------------------------
+// R7: fuzz target and split-feed coverage
+// ---------------------------------------------------------------------------
+
+fn fuzzIpcCodec(_: void, input: []const u8) !void {
+    var buf: [MAX_FRAME_SIZE]u8 = undefined;
+    const n = @min(input.len, buf.len);
+    @memcpy(buf[0..n], input[0..n]);
+    var r = FrameReader.init(&buf);
+    // Deliver the bytes in two segments derived from the input so a pass
+    // covers both complete and incremental framing.
+    const split = if (n == 0) 0 else input[0] % (n + 1);
+    for ([_]usize{ split, n }) |end| {
+        r.len = end;
+        while (true) {
+            const f: Frame = if (r.next()) |opt| opt orelse break else |_| break;
+            if (decode(f.payload)) |_| {} else |_| {}
+            r.consume(f.consumed);
+        }
+    }
+}
+
+test "fuzz: IPC codec parses arbitrary bytes without crashing" {
+    try std.testing.fuzz({}, fuzzIpcCodec, .{ .corpus = &.{
+        "\x0A\x00\x00\x00\x04\x2A\x00\x00\x00\x06denied",
+        "\x05\x00\x00\x00\x01",
+        "\xFF\xFF\xFF\xFF",
+        "\x01\x00\x00\x00",
+    } });
+}
+
+test "codec: a two-part feed split at every byte boundary yields the same frame" {
+    var wire: [1024]u8 = undefined;
+    const msg = Message{ .auth_request = .{
+        .conn_id = 42,
+        .mechanism = .scram_sha_256,
+        .client_ip = "192.168.1.100",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "alice",
+        .payload = "n,,n=alice,r=rOprNGfwEbeRWgbNEkqO",
+    } };
+    const frame_bytes = wire[0..try encode(msg, &wire)];
+
+    var buf: [MAX_FRAME_SIZE]u8 = undefined;
+    @memcpy(buf[0..frame_bytes.len], frame_bytes);
+    for (0..frame_bytes.len + 1) |split| {
+        var r = FrameReader.init(&buf);
+        r.len = split;
+        // Whatever the first segment completes is consumed before the
+        // rest arrives; a two-part feed must end at exactly one frame
+        // with nothing buffered behind it.
+        var frames: usize = 0;
+        var last: Frame = undefined;
+        while (try r.next()) |f| {
+            frames += 1;
+            last = f;
+            r.consume(f.consumed);
+        }
+        r.len = frame_bytes.len;
+        while (try r.next()) |f| {
+            frames += 1;
+            last = f;
+            r.consume(f.consumed);
+        }
+        try std.testing.expectEqual(@as(usize, 1), frames);
+        try std.testing.expectEqual(r.len, r.consumed);
+        const decoded = try decode(last.payload);
+        var re_encoded: [1024]u8 = undefined;
+        const n = try encode(decoded, &re_encoded);
+        try std.testing.expectEqualSlices(u8, frame_bytes, re_encoded[0..n]);
+    }
+}
