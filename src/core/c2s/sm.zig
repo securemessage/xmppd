@@ -325,14 +325,20 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
 
     // Re-bind in session map: unbind old slot, bind new slot with same JID
     var bound_token: ?Token = null;
+    var rebind_failed = false;
     if (self.session_map) |sm| {
         _ = sm.unbind(detached_jid.local, detached_jid.domain, detached_jid.resource);
         if (sm.bind(self.worker_id, self.sessionToken(session.conn.id), detached_jid.local, detached_jid.domain, detached_jid.resource)) |_| {
             bound_token = self.sessionToken(session.conn.id);
         } else |err| {
-            log.err("SM resume: session_map re-bind failed for {s}@{s}/{s}: {}", .{
+            // T317: without a session-map entry the resumed session is
+            // unroutable; it is torn down below instead of left half-alive.
+            // warn not err: a second live resource can trip the account cap,
+            // which is a client-reachable refusal, not a server bug.
+            log.warn("SM resume: session_map re-bind failed for {s}@{s}/{s}: {}", .{
                 detached_jid.local, detached_jid.domain, detached_jid.resource, err,
             });
+            rebind_failed = true;
         }
     }
 
@@ -352,6 +358,11 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     // Return the detached slot to the free-list; the generation bump
     // retires every token minted for the detached session (ADR-4).
     self.releaseSessionSlot(detached_id);
+
+    if (rebind_failed) {
+        failResumedSession(self, session, changes);
+        return;
+    }
 
     // T177 occupant migration: replay the room moves before <resumed/> —
     // the detached slot was just destroyed, so every room record pointing
@@ -714,9 +725,14 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
         if (sm.bind(self.worker_id, self.sessionToken(session.conn.id), bundle.username, self.server_host, bundle.resource)) |_| {
             bound_token = self.sessionToken(session.conn.id);
         } else |err| {
-            log.err("cross-worker SM resume: session_map bind failed for {s}@{s}/{s}: {}", .{
+            // warn not err: see the local re-bind site (T317).
+            log.warn("cross-worker SM resume: session_map bind failed for {s}@{s}/{s}: {}", .{
                 bundle.username, self.server_host, bundle.resource, err,
             });
+            // T317: the owning worker already dismantled its slot; fail
+            // and close rather than leave a live but unroutable session.
+            failResumedSession(self, session, changes);
+            return;
         }
     }
 
@@ -977,6 +993,18 @@ pub fn sendSmFailed(self: *Server, session: *Session, condition: []const u8, cha
     if (session.conn.hasPendingWrite()) {
         _ = session.conn.flushSend() catch {};
     }
+}
+
+/// T317: a resume whose session-map re-bind failed leaves the session live
+/// but unroutable. The client hears <failed>, the transferred unacked queue
+/// reaches a counted outcome (XEP-0198 section 5) and the connection closes
+/// so the client starts over with a full bind.
+fn failResumedSession(self: *Server, session: *Session, changes: *ChangeList) void {
+    sendSmFailed(self, session, "internal-server-error", changes);
+    // The failed element must reach the wire before the teardown.
+    session.conn.flushSync();
+    session_lifecycle.drainUnackedToOffline(self, session);
+    session_lifecycle.forceCloseSession(self, session.conn.id, changes);
 }
 
 /// Find a detached session by SM-ID. O(1) via hash map (T127).
@@ -1754,4 +1782,124 @@ test "Server: S24 cross-worker resume rejects a wrapped h above the sent count" 
     try std.testing.expectEqualStrings("handled-count-too-high", status.slice());
     try std.testing.expectEqual(@as(usize, 0), sm_handoff.count());
     try std.testing.expect(server.sessions[2] != null);
+}
+
+test "T317: local resume re-bind failure fails and closes both slots" {
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    // One other live resource fills the per-account cap (max 1): the
+    // re-bind of alice@localhost/res fails and, before T317, left the
+    // resumed session live but unroutable.
+    var sm = SessionMap.init(std.testing.allocator, false, 1);
+    defer sm.deinit();
+    server.session_map = &sm;
+    try sm.bind(0, server.sessionToken(9), "alice", "localhost", "res2");
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const previd = "cccccccccccccccccccccccccccccccc";
+    const det_fds = try makeSocketPair();
+    defer posix.close(det_fds[1]);
+    _ = try makeDetachedForResume(&server, 2, previd, 6, 5, 2, det_fds[0]);
+    server.detached_count = 1; // detachSession would have counted it
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    session.stream.authenticated_jid = xmpp.Jid.parse("alice@localhost") catch null;
+    server.free_count -= 2; // both slots claimed directly
+
+    const attrs = [_]xml.Attribute{
+        .{ .name = "previd", .value = previd, .prefix = "", .local_name = "previd" },
+        .{ .name = "h", .value = "5", .prefix = "", .local_name = "h" },
+    };
+    handleSmResume(&server, session, .{
+        .name = "resume",
+        .prefix = "",
+        .local_name = "resume",
+        .namespace_uri = "urn:xmpp:sm:3",
+        .attributes = &attrs,
+        .self_closing = true,
+    }, &changes);
+
+    // The detached slot is dismantled and the unroutable session closed:
+    // both slots are empty and the SM-ID is unfindable.
+    try std.testing.expect(server.sessions[1] == null);
+    try std.testing.expect(server.sessions[2] == null);
+    try std.testing.expect(findDetachedSession(&server, previd) == null);
+    try std.testing.expectEqual(@as(u32, 0), server.detached_count);
+
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "internal-server-error") != null);
+}
+
+test "T317: cross-worker resume re-bind failure fails and closes the session" {
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+    sm_handoff.resetForTesting();
+
+    var sm = SessionMap.init(std.testing.allocator, false, 1);
+    defer sm.deinit();
+    server.session_map = &sm;
+    try sm.bind(0, server.sessionToken(9), "alice", "localhost", "res2");
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try std.testing.allocator.create(Session);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    server.sessions[1] = session;
+    server.free_count -= 1;
+
+    var previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
+    sm_state.generateSmId(server.worker_id, &previd);
+
+    session.sm_resume_pending = true;
+    session.sm_resume_epoch = 7;
+    @memcpy(&session.sm_resume_previd, &previd);
+
+    const bundle = sm_handoff.allocator.create(sm_handoff.ResumeBundle) catch unreachable;
+    bundle.* = .{
+        .previd = previd,
+        .sm_in_h = 0,
+        .sm_out_seq = 8,
+        .sm_out_h = 3,
+        .r_outstanding = false,
+        .roster_interested = false,
+        .carbons_enabled = false,
+        .csi_active = false,
+        .username = sm_handoff.allocator.dupe(u8, "alice") catch unreachable,
+        .resource = sm_handoff.allocator.dupe(u8, "res") catch unreachable,
+        .last_presence = sm_handoff.allocator.dupe(u8, "") catch unreachable,
+        .base_seq = 6,
+        .last_h = 5,
+        .created = std.time.timestamp(),
+    };
+    bundle.stanzas.append(sm_handoff.allocator, testSmBudget().produce("<message/>") catch unreachable) catch unreachable;
+    try sm_handoff.put(&previd, bundle);
+
+    handleSmResumeReply(&server, .{
+        .previd = &previd,
+        .req_token = server.sessionToken(1),
+        .req_epoch = 7,
+        .status = "ok",
+    }, &changes);
+
+    // The session slot is torn down; the client hears the failure first.
+    try std.testing.expect(server.sessions[1] == null);
+
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "<failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "internal-server-error") != null);
 }

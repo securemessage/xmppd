@@ -506,7 +506,7 @@ pub noinline fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void
 /// map (local) or the S2S daemon (remote). type='error', type='result' and
 /// groupchat stanzas are counted drops: RFC 6120 forbids an error for an
 /// error, and a groupchat bounce would target a room JID.
-fn drainUnackedToOffline(server: *Server, session: *Session) void {
+pub fn drainUnackedToOffline(server: *Server, session: *Session) void {
     const queue = session.sm_unacked orelse return;
     if (session.stream.bound_jid == null) {
         // The recipient cannot be named without a bound JID; count every
