@@ -573,7 +573,10 @@ fn drainOneUnacked(server: *Server, stanza: []const u8, recipient: []const u8, n
                 c2s_session.headAttr(head, "id") orelse "offline",
                 now,
                 stanza,
-            ) catch false
+            ) catch |err| refused: {
+                noteDrop("unacked drain: offline store failed for {s}: {s}", .{ recipient, @errorName(err) });
+                break :refused false;
+            }
         else
             false;
         if (stored) {
@@ -605,9 +608,15 @@ fn bounceUnackedStanza(server: *Server, recipient: []const u8, head: []const u8,
 
     var sender_buf: [512]u8 = undefined;
     var sender_fbs = std.io.fixedBufferStream(&sender_buf);
-    xml.decodeWrite(sender_fbs.writer(), from_wire) catch return false;
+    xml.decodeWrite(sender_fbs.writer(), from_wire) catch |err| {
+        noteDrop("unacked drain: undecodable 'from' attribute: {s}", .{@errorName(err)});
+        return false;
+    };
     const sender_full = sender_fbs.getWritten();
-    const sender = xmpp.Jid.parse(sender_full) catch return false;
+    const sender = xmpp.Jid.parse(sender_full) catch |err| {
+        noteDrop("unacked drain: unparsable 'from' JID: {s}", .{@errorName(err)});
+        return false;
+    };
     if (sender.resource.len == 0) return false;
 
     if (!std.mem.eql(u8, sender.domain, server.server_host)) {
@@ -619,7 +628,10 @@ fn bounceUnackedStanza(server: *Server, recipient: []const u8, head: []const u8,
 
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    stanza_writer.writeCrossWorkerError(fbs.writer(), tag_name, recipient, sender_full, stanza_id) catch return false;
+    stanza_writer.writeCrossWorkerError(fbs.writer(), tag_name, recipient, sender_full, stanza_id) catch |err| {
+        noteDrop("unacked drain: bounce encode failed: {s}", .{@errorName(err)});
+        return false;
+    };
     const bounce = fbs.getWritten();
 
     if (entry.worker_id == server.worker_id) {
@@ -627,7 +639,10 @@ fn bounceUnackedStanza(server: *Server, recipient: []const u8, head: []const u8,
         return target.stanza(bounce) != .failed_closed;
     }
     const ds = server.delivery_system orelse return false;
-    ds.deliver(server.worker_id, entry.worker_id, entry.token, bounce) catch return false;
+    ds.deliver(server.worker_id, entry.worker_id, entry.token, bounce) catch |err| {
+        noteDrop("unacked drain: bounce delivery to worker {d} failed: {s}", .{ entry.worker_id, @errorName(err) });
+        return false;
+    };
     return true;
 }
 
