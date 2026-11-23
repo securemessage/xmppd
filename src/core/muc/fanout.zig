@@ -20,6 +20,7 @@
 //! falling back to per-occupant stanza construction.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const xml = @import("xml");
 const room_registry = @import("room_registry");
 const delivery_queue_mod = @import("delivery_queue");
@@ -37,6 +38,11 @@ pub const DEFAULT_BATCH_SIZE: u8 = 32;
 
 /// Maximum concurrent pending fan-out operations.
 pub const MAX_PENDING: usize = 4;
+
+/// Test-only count of multicast payload encodes. The remote fan-out must
+/// serialize exactly once per batch regardless of target count (ADR-3).
+pub var encode_count: if (builtin.is_test) std.atomic.Value(u32) else void =
+    if (builtin.is_test) .init(0) else {};
 
 /// Capacity of a queued pre-built stanza prefix. The prefix is
 /// "<message|presence from='" plus an occupant JID (a maximum-length room
@@ -289,6 +295,7 @@ pub fn encodeMulticastPayload(
     prefix: []const u8,
     suffix: []const u8,
 ) ?usize {
+    if (builtin.is_test) _ = encode_count.fetchAdd(1, .monotonic);
     const header_size = 2 + room_jid.len + 2 + prefix.len + suffix.len;
     if (header_size > buf.len) return null;
 

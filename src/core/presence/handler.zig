@@ -1210,7 +1210,7 @@ fn broadcastToOwnResources(
             if (target.stanza(presence_xml) == .failed_closed) continue;
             _ = target.conn.flushSend() catch {};
         } else if (server.delivery_system) |ds| {
-            ds.deliver(entry.worker_id, entry.token, presence_xml) catch {};
+            ds.deliver(server.worker_id, entry.worker_id, entry.token, presence_xml) catch {};
         }
     }
 }
@@ -1334,7 +1334,7 @@ pub fn dispatchDirectedPresenceToBareJid(
             const target = server.sessionForEventToken(entry.token) orelse continue;
             fanout.deliverToSession(target, presence_xml, entry.token.index);
         } else if (server.delivery_system) |ds| {
-            ds.deliver(entry.worker_id, entry.token, presence_xml) catch {};
+            ds.deliver(server.worker_id, entry.worker_id, entry.token, presence_xml) catch {};
         }
     }
 }
@@ -1408,7 +1408,7 @@ fn deliverPresenceToSubscribers(
                 var pending = false;
                 for (entries[0..count]) |entry| {
                     if (entry.worker_id != w) continue;
-                    ds.enqueue(w, entry.token, presence_xml) catch continue;
+                    ds.enqueue(server.worker_id, w, entry.token, presence_xml) catch continue;
                     pending = true;
                 }
                 if (pending) ds.wakeWorker(w);
@@ -1441,7 +1441,7 @@ pub fn deliverPresenceToTarget(
             const target_session = server.sessionForEventToken(ent.token) orelse continue;
             fanout.deliverToSession(target_session, presence_xml, ent.token.index);
         } else if (server.delivery_system) |ds| {
-            ds.deliver(ent.worker_id, ent.token, presence_xml) catch {};
+            ds.deliver(server.worker_id, ent.worker_id, ent.token, presence_xml) catch {};
         }
     }
 }

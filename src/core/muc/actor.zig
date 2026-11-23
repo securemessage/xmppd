@@ -23,7 +23,8 @@ const log = std.log.scoped(.xmppd);
 /// Room-targeted messages (join, part, groupchat, disco) are pushed into the
 /// target room's per-room mailbox for fair scheduling. Non-room messages
 /// (shadow updates, session close) are dispatched immediately.
-pub fn handleRoomActorMessage(self: *Server, payload: []const u8, changes: *ChangeList) void {
+pub fn handleRoomActorMessage(self: *Server, blob: *delivery_queue_mod.Blob, changes: *ChangeList) void {
+    const payload = blob.bytes();
     const msg = actor_message.decode(payload) orelse {
         log.warn("malformed room actor message ({d} bytes)", .{payload.len});
         return;
@@ -47,7 +48,11 @@ pub fn handleRoomActorMessage(self: *Server, payload: []const u8, changes: *Chan
             if (room == null) {
                 if (std.meta.activeTag(msg) == .room_join) {
                     // Create a minimal room so the mailbox exists for enqueue
-                    room = reg.createRoom(room_jid, .{ .persistent = false }) catch return;
+                    room = reg.createRoom(room_jid, .{ .persistent = false }) catch {
+                        _ = room_mailbox_mod.mailbox_drops.fetchAdd(1, .monotonic);
+                        log.warn("room_join for {s} dropped: room table full", .{room_jid});
+                        return;
+                    };
                     // Mark that processRemoteJoin should treat this as new
                     room.?.occupant_count = 0;
                 } else {
@@ -56,11 +61,12 @@ pub fn handleRoomActorMessage(self: *Server, payload: []const u8, changes: *Chan
                 }
             }
             const r = room.?;
-            r.mailbox.enqueue(payload) catch {
+            r.mailbox.enqueue(&reg.item_pool, blob) catch {
                 _ = room_mailbox_mod.mailbox_drops.fetchAdd(1, .monotonic);
                 log.warn("room mailbox full for {s} — bouncing to sender (S16)", .{room_jid});
                 muc_handler.bounceRoomMailboxFull(self, msg, room_jid, changes);
             };
+            if (r.mailbox.hasPending()) reg.markPending(r);
         },
         .room_directory_update => |ev| {
             muc_handler.handleRoomDirectoryUpdate(self, ev);
@@ -98,27 +104,27 @@ pub fn handleRoomActorMessage(self: *Server, payload: []const u8, changes: *Chan
     }
 }
 
-/// Drain per-room mailboxes with round-robin fair scheduling.
-/// Called after drainDeliveryQueue in the event loop. Processes one message
-/// per room per iteration, bounded to MAX_DRAIN_PER_TICK total messages to
-/// prevent infinite spinning when cross-thread traffic generates responses.
-/// Returns true if there are still pending messages (caller should self-wake).
+/// Drain per-room mailboxes via the registry's pending FIFO: only rooms
+/// that actually hold mail are visited; no per-tick scan of reg.rooms.
+/// One message per room per visit, re-linked at the tail when more
+/// remains, so the round-robin fairness is identical to the old scan.
+/// Bounded to MAX_DRAIN_PER_TICK total messages.
+/// Returns true if rooms still hold mail (caller should self-wake).
 pub fn drainRoomMailboxes(self: *Server, changes: *ChangeList) bool {
     const reg = self.room_registry orelse return false;
     const MAX_DRAIN_PER_TICK: usize = 32;
     var processed: usize = 0;
-    var any_pending = false;
 
-    for (&reg.rooms) |*slot| {
-        if (processed >= MAX_DRAIN_PER_TICK) {
-            any_pending = true;
-            break;
-        }
-        const room = slot.* orelse continue;
-        if (!room.active) continue;
-        if (!room.mailbox.hasPending()) continue;
-        const payload = room.mailbox.dequeue() orelse continue;
-        processRoomMailboxMessage(self, room, payload, changes);
+    while (processed < MAX_DRAIN_PER_TICK) {
+        const room = reg.popPending() orelse break;
+        const blob = room.mailbox.dequeue(&reg.item_pool) orelse continue;
+        // Re-link BEFORE processing: the handler may destroy the room
+        // (cleanupEmptyRooms runs below, but a handler can still end its
+        // active flag), and a still-pending room must keep its place in
+        // the FIFO.
+        if (room.mailbox.hasPending()) reg.markPending(room);
+        processRoomMailboxMessage(self, room, blob.bytes(), changes);
+        blob.release();
         processed += 1;
     }
 
@@ -128,17 +134,7 @@ pub fn drainRoomMailboxes(self: *Server, changes: *ChangeList) bool {
     // and avoids use-after-free of decoded payload slices during processing.
     muc_handler.cleanupEmptyRooms(self);
 
-    // Check if any room still has pending messages
-    if (!any_pending) {
-        for (&reg.rooms) |*slot| {
-            const room = slot.* orelse continue;
-            if (room.active and room.mailbox.hasPending()) {
-                any_pending = true;
-                break;
-            }
-        }
-    }
-    return any_pending;
+    return reg.pending_head != null;
 }
 
 /// Process a single message from a room's mailbox.
@@ -177,14 +173,26 @@ fn processRoomMailboxMessage(self: *Server, room: *room_registry_mod.Room, paylo
 /// Used by muc_handler when a MUC operation lands on a non-owning worker.
 pub fn enqueueRoomActorMessage(self: *Server, target_worker: u16, msg: actor_message.Message) void {
     const ds = self.delivery_system orelse return;
-    var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
-    const len = actor_message.encode(&buf, msg) orelse {
+    var enc_lease = self.leaseByteScratch() orelse {
+        log.warn("byte-scratch exhausted; room actor message dropped", .{});
+        return;
+    };
+    defer enc_lease.release();
+    const len = actor_message.encode(enc_lease.buf, msg) orelse {
         log.warn("room actor message encode failed", .{});
         return;
     };
-    ds.deliver(target_worker, delivery_queue_mod.ROOM_ACTOR_TARGET, buf[0..len]) catch |err| {
+    ds.deliverActor(self.worker_id, target_worker, delivery_queue_mod.ROOM_ACTOR_TARGET, enc_lease.buf[0..len], 0, 0, .room_actor) catch |err| {
+        _ = delivery_queue_mod.actor_retry_drops.fetchAdd(1, .monotonic);
         log.warn("room actor enqueue to worker {d} failed: {}", .{ target_worker, err });
     };
+}
+
+/// Re-attempt actor envelopes this worker produced whose target ring was
+/// full; exhausted entries take their class fallback and are counted.
+pub fn drainActorRetries(self: *Server) void {
+    const ds = self.delivery_system orelse return;
+    ds.retry_lists[self.worker_id].drain(ds, self, muc_handler.noteActorRetryExhausted);
 }
 
 /// Get the number of workers (for room ownership computation).

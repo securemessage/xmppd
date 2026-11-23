@@ -866,9 +866,10 @@ pub fn handleSessionKickReply(self: *Server, rep: actor_message.SessionKickReply
 /// under the SM handoff sentinel.
 pub fn enqueueSmActor(self: *Server, target_worker: u16, msg: actor_message.Message) !void {
     const ds = self.delivery_system orelse return error.NoDeliverySystem;
-    var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
-    const len = actor_message.encode(&buf, msg) orelse return error.EncodeFailed;
-    try ds.deliver(target_worker, delivery_queue_mod.SM_ACTOR_TARGET, buf[0..len]);
+    var enc_lease = self.leaseByteScratch() orelse return error.OutOfMemory;
+    defer enc_lease.release();
+    const len = actor_message.encode(enc_lease.buf, msg) orelse return error.EncodeFailed;
+    try ds.deliverActor(self.worker_id, target_worker, delivery_queue_mod.SM_ACTOR_TARGET, enc_lease.buf[0..len], 0, 0, .sm_actor);
 }
 
 /// Append the JIDs of every MUC room the given session occupies into the

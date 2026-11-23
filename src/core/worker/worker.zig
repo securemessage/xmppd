@@ -1132,6 +1132,7 @@ pub const Server = struct {
                 if (ds.getQueue(self.worker_id).hasPending()) {
                     routing_deliver.drainDeliveryQueue(self, &changes);
                     _ = muc_actor.drainRoomMailboxes(self, &changes);
+                    muc_actor.drainActorRetries(self);
                     // Self-wake only for MPSC queue CAS race (producer reserved
                     // slot but hasn't stored ready=true yet). Room mailboxes
                     // don't need self-wake — they only grow from MPSC deliveries
@@ -1142,6 +1143,7 @@ pub const Server = struct {
                 } else {
                     // No MPSC pending, but drain room mailboxes opportunistically
                     _ = muc_actor.drainRoomMailboxes(self, &changes);
+                    muc_actor.drainActorRetries(self);
                 }
             }
 
@@ -2004,7 +2006,7 @@ pub const Server = struct {
                         // Carry this dispatch's token: the receiving worker holds
                         // under the same identity, so the store writes one row
                         // whichever worker reaches it first.
-                        ds.deliverDelivery(entry.worker_id, entry.token, m.stanza_xml, s2s_hold_token, s2s_archive_ts, .stanza) catch {
+                        ds.deliverDelivery(self.worker_id, entry.worker_id, entry.token, m.stanza_xml, s2s_hold_token, s2s_archive_ts, .normal) catch {
                             _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
                         };
                     }
@@ -2045,7 +2047,7 @@ pub const Server = struct {
                         const sender_session = self.sessionForEventToken(sentry.token) orelse continue;
                         fanout_mod.deliverToSession(sender_session, err_xml, sentry.token.index);
                     } else if (self.delivery_system) |ds| {
-                        ds.deliver(sentry.worker_id, sentry.token, err_xml) catch {};
+                        ds.deliver(self.worker_id, sentry.worker_id, sentry.token, err_xml) catch {};
                     }
                 }
                 log.info("S2S delivery failed: {s} → {s}: {s}", .{ m.from_jid, m.to_jid, m.error_type });
@@ -4529,13 +4531,14 @@ test "Server: R5 S2S cross-worker delivery drops are counted" {
     _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "mobile");
     sm.setPresenceAvailable("bob", "localhost", "mobile", true);
 
-    const stanza = try allocator.alloc(u8, 4200);
-    defer allocator.free(stanza);
-    const prefix = "<message from='carol@example.com/res' to='bob@localhost' id='drop' type='chat'><body>";
-    const suffix = "</body></message>";
-    @memcpy(stanza[0..prefix.len], prefix);
-    @memset(stanza[prefix.len .. stanza.len - suffix.len], 'x');
-    @memcpy(stanza[stanza.len - suffix.len ..], suffix);
+    // A full worker-1 ring is the drop trigger; one blob fills every slot.
+    const fill_blob = try delivery_sys.produceBlob(0, "fill");
+    for (0..delivery_queue_mod.QUEUE_SLOTS) |_| {
+        try delivery_sys.getQueue(1).enqueue(Token.init(7, 1, token_kinds.session), fill_blob);
+    }
+    fill_blob.release();
+
+    const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='drop' type='chat'><body>x</body></message>";
 
     const drops_before = delivery_queue_mod.cross_worker_drops.load(.monotonic);
     var change_buf: [64]posix.Kevent = undefined;

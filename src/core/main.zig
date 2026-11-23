@@ -486,7 +486,7 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
 
     if (ctx.muc_enabled) {
         const reg = ctx.allocator.create(RoomRegistry) catch return;
-        reg.* = RoomRegistry.init(ctx.allocator);
+        reg.initInPlace(ctx.allocator);
         server.room_registry = reg;
         server.room_store = ctx.room_store;
         server.muc_host = ctx.muc_host;

@@ -2182,7 +2182,7 @@ fn sendPepNotification(
                         noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ bound.local, bound.domain, entry.resource(), self_msg_lease.buf.len });
                         continue;
                     };
-                    ds.deliver(entry.worker_id, entry.token, notif_xml) catch |err| {
+                    ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, notif_xml, 0, 0, .pep) catch |err| {
                         noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
                     };
                 }
@@ -2274,7 +2274,7 @@ fn sendPepNotification(
                         noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ sub_local, sub_domain, entry.resource(), sub_msg_lease.buf.len });
                         continue;
                     };
-                    ds.deliver(entry.worker_id, entry.token, notif_xml) catch |err| {
+                    ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, notif_xml, 0, 0, .pep) catch |err| {
                         noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
                     };
                 }
@@ -2692,7 +2692,7 @@ pub fn pushRosterItem(
             if (!target.roster_interested) continue;
             fanout.deliverToSession(target, full_xml, entry.token.index);
         } else if (server.delivery_system) |ds| {
-            ds.deliver(entry.worker_id, entry.token, full_xml) catch |err| {
+            ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, full_xml, 0, 0, .roster_push) catch |err| {
                 noteCrossWorkerDrop("roster push to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
             };
         }
@@ -3112,7 +3112,12 @@ test "R5: a roster push to a full remote queue is counted" {
     _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "mobile");
 
     const queue = delivery_sys.getQueue(1);
-    for (0..delivery_queue.QUEUE_SLOTS) |_| try queue.enqueue(Token.init(1, 1, token_kinds.session), "fill");
+    var fill_budget = delivery_queue.BlobBudget{ .allocator = allocator, .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT };
+    for (0..delivery_queue.QUEUE_SLOTS) |_| {
+        const fb = try fill_budget.produce("fill");
+        try queue.enqueue(Token.init(1, 1, token_kinds.session), fb);
+        fb.release();
+    }
 
     const drops_before = delivery_queue.cross_worker_drops.load(.monotonic);
     var scratch: [16]posix.Kevent = undefined;
