@@ -253,6 +253,10 @@ pub const ClientStream = struct {
     /// The SM session id to attempt to resume ("" = no resume, fresh enable).
     /// The Session sets this from the previous session's `sm_id` on reconnect.
     resume_id: []const u8 = "",
+    /// The SM id whose <resume/> was rejected ("" = none). Kept apart from
+    /// resume_id so the post-failure bind + fresh enable cannot re-attempt
+    /// the dead id; consumed at .established (V19).
+    failed_sm_id: []const u8 = "",
     /// The most recent `<stream:features>` block (retained for the bind/session/SM
     /// decisions that follow it).
     feats: Features = .{},
@@ -492,10 +496,23 @@ pub const ClientStream = struct {
                     return .established;
                 },
                 .failed => |cond| {
-                    // SM not honoured; a client MAY proceed without it (XEP-0198).
+                    _ = cond;
                     self.sm_enabled = false;
                     self.sm_resumed = false;
-                    _ = cond;
+                    if (self.resume_id.len > 0) {
+                        // V19: a rejected <resume/> is not the end of
+                        // establishment. The resume ran before bind, so the
+                        // stream still has no bound JID: remember the dead
+                        // SM id, then bind and do a fresh enable.
+                        self.failed_sm_id = self.resume_id;
+                        self.resume_id = "";
+                        if (self.feats.bind) {
+                            self.state = .awaiting_bind_result;
+                            return .send_bind;
+                        }
+                        return self.afterBind();
+                    }
+                    // SM not honoured; a client MAY proceed without it (XEP-0198).
                     self.failure_reason = "sm-failed";
                     self.state = .active;
                     return .established;
@@ -713,6 +730,56 @@ test "client stream: SM resume when resume_id is set" {
     try std.testing.expect(b == .established);
     try std.testing.expect(s.sm_resumed);
     try std.testing.expectEqualStrings("prev-session-id", s.sm_id);
+}
+
+test "client stream: a rejected SM resume binds and does a fresh enable (V19)" {
+    var s = ClientStream{ .tls_required = false, .allow_plain = true }; // lab rig: no TLS
+    s.resume_id = "prev-session-id";
+    _ = s.openStream();
+    _ = s.feed(.{ .stream_header = .{ .id = "s1" } });
+    const mechs = [_][]const u8{"PLAIN"};
+    _ = s.feed(.{ .features = .{ .mechanisms = &mechs } });
+    _ = s.feed(.{ .sasl_success = "" });
+    _ = s.feed(.{ .stream_header = .{ .id = "s2" } });
+    const a = s.feed(.{ .features = .{ .bind = true, .stream_mgmt = true } });
+    try std.testing.expect(a == .send_sm_resume);
+
+    // <failed/> is not establishment: the resume ran pre-bind, so the
+    // stream has no bound JID yet; it binds, then does a fresh enable.
+    const b = s.feed(.{ .sm_result = .{ .failed = "item-not-found" } });
+    try std.testing.expect(b == .send_bind);
+    try std.testing.expectEqual(ClientState.awaiting_bind_result, s.state);
+    try std.testing.expectEqualStrings("prev-session-id", s.failed_sm_id);
+    try std.testing.expectEqualStrings("", s.resume_id);
+
+    const bound = Jid.parse("alice@example.com/phone") catch unreachable;
+    const c = s.feed(.{ .iq_result = .{ .id = "bind1", .bound_jid = bound } });
+    try std.testing.expect(c == .send_sm_enable);
+    const d = s.feed(.{ .sm_result = .{ .enabled = "fresh-id" } });
+    try std.testing.expect(d == .established);
+    try std.testing.expectEqual(ClientState.active, s.state);
+    try std.testing.expect(s.sm_enabled);
+    try std.testing.expectEqualStrings("fresh-id", s.sm_id);
+}
+
+test "client stream: a rejected fresh SM enable still establishes without SM" {
+    var s = ClientStream{ .tls_required = false, .allow_plain = true }; // lab rig: no TLS
+    _ = s.openStream();
+    _ = s.feed(.{ .stream_header = .{ .id = "s1" } });
+    const mechs = [_][]const u8{"PLAIN"};
+    _ = s.feed(.{ .features = .{ .mechanisms = &mechs } });
+    _ = s.feed(.{ .sasl_success = "" });
+    _ = s.feed(.{ .stream_header = .{ .id = "s2" } });
+    const a = s.feed(.{ .features = .{ .bind = true, .stream_mgmt = true } });
+    try std.testing.expect(a == .send_bind);
+    const bound = Jid.parse("alice@example.com/phone") catch unreachable;
+    const b = s.feed(.{ .iq_result = .{ .id = "bind1", .bound_jid = bound } });
+    try std.testing.expect(b == .send_sm_enable);
+    const c = s.feed(.{ .sm_result = .{ .failed = "service-unavailable" } });
+    try std.testing.expect(c == .established);
+    try std.testing.expectEqual(ClientState.active, s.state);
+    try std.testing.expect(!s.sm_enabled);
+    try std.testing.expectEqualStrings("", s.failed_sm_id);
 }
 
 test "client stream: session IQ between bind and SM" {
