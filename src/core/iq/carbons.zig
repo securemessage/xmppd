@@ -38,13 +38,15 @@ test "carbons: a phone with carbons off on another worker gets only the routed m
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
     w0.delivery_system = &delivery_sys;
 
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w1: Server = undefined;
+    try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
     w1.session_map = &sm;
@@ -53,17 +55,18 @@ test "carbons: a phone with carbons off on another worker gets only the routed m
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -103,7 +106,8 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -112,15 +116,16 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     const desk_fds = try makeSocketPair();
     defer posix.close(desk_fds[1]);
     const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.stream.state = .active;
     desk.stream.authenticated = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w0.sessions[5] = desk;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w1: Server = undefined;
+    try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
     w1.session_map = &sm;
@@ -129,18 +134,19 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -179,7 +185,8 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -188,15 +195,16 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     const desk_fds = try makeSocketPair();
     defer posix.close(desk_fds[1]);
     const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.stream.state = .active;
     desk.stream.authenticated = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w0.sessions[5] = desk;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w1: Server = undefined;
+    try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
     w1.session_map = &sm;
@@ -205,18 +213,19 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = false;
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -262,7 +271,8 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -272,14 +282,15 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     const desk_fds = try makeSocketPair();
     defer posix.close(desk_fds[1]);
     const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.offline_pending = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w0.sessions[5] = desk;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w1: Server = undefined;
+    try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
     w1.session_map = &sm;
@@ -289,17 +300,18 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.offline_pending = true;
     phone.carbons_enabled = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -351,13 +363,15 @@ test "carbons: a delivered resource gets no received copy on the same dispatch" 
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
     w0.delivery_system = &delivery_sys;
 
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w1: Server = undefined;
+    try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
     w1.session_map = &sm;
@@ -366,18 +380,19 @@ test "carbons: a delivered resource gets no received copy on the same dispatch" 
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -414,7 +429,8 @@ test "carbons: the local received-carbon path skips a resource that got the orig
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -423,18 +439,19 @@ test "carbons: the local received-carbon path skips a resource that got the orig
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     w0.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -468,7 +485,8 @@ test "carbons: a resource the delivery loop skipped still gets the received carb
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -476,31 +494,32 @@ test "carbons: a resource the delivery loop skipped still gets the received carb
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     phone.csi_active = false;
     w0.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const laptop_fds = try makeSocketPair();
     defer posix.close(laptop_fds[1]);
     const laptop = try allocator.create(Session);
-    laptop.* = Session.init(laptop_fds[0], 5, "localhost", false, allocator);
+    laptop.init(laptop_fds[0], 5, "localhost", false, allocator);
     laptop.stream.state = .active;
     laptop.stream.authenticated = true;
     laptop.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "laptop" };
     laptop.carbons_enabled = true;
     w0.sessions[5] = laptop;
-    _ = try sm.bind(0, 5, "bob", "localhost", "laptop");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "laptop");
     sm.setPresenceAvailable("bob", "localhost", "laptop", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -556,7 +575,8 @@ test "carbons: a nested private-looking payload does not suppress the carbon" {
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -564,31 +584,32 @@ test "carbons: a nested private-looking payload does not suppress the carbon" {
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     w0.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const watch_fds = try makeSocketPair();
     defer posix.close(watch_fds[1]);
     const watch = try allocator.create(Session);
-    watch.* = Session.init(watch_fds[0], 5, "localhost", false, allocator);
+    watch.init(watch_fds[0], 5, "localhost", false, allocator);
     watch.stream.state = .active;
     watch.stream.authenticated = true;
     watch.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "watch" };
     watch.carbons_enabled = true;
     w0.sessions[5] = watch;
-    _ = try sm.bind(0, 5, "bob", "localhost", "watch");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "watch");
     sm.setPresenceAvailable("bob", "localhost", "watch", true);
     sm.setPriority("bob", "localhost", "watch", -1);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -622,7 +643,8 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -631,15 +653,16 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     const desk_fds = try makeSocketPair();
     defer posix.close(desk_fds[1]);
     const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.stream.state = .active;
     desk.stream.authenticated = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w0.sessions[5] = desk;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w1: Server = undefined;
+    try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
     w1.session_map = &sm;
@@ -648,18 +671,19 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     phone.carbons_enabled = true;
     w1.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;

@@ -24,6 +24,8 @@
 
 const std = @import("std");
 
+const Token = @import("net_token").Token;
+const token_kinds = @import("token_kinds");
 const log = std.log.scoped(.message);
 
 // ============================================================================
@@ -36,7 +38,7 @@ pub const SessionBound = struct {
     domain: []const u8,
     resource: []const u8,
     worker_id: u16,
-    session_id: u32,
+    session_token: Token,
 };
 
 /// Session lifecycle: a session has been closed/disconnected.
@@ -45,7 +47,7 @@ pub const SessionClosed = struct {
     domain: []const u8,
     resource: []const u8,
     worker_id: u16,
-    session_id: u32,
+    session_token: Token,
 };
 
 /// Presence state change.
@@ -54,7 +56,7 @@ pub const PresenceEvent = struct {
     domain: []const u8,
     resource: []const u8,
     worker_id: u16,
-    session_id: u32,
+    session_token: Token,
 };
 
 /// A stanza (message or presence) to be routed.
@@ -78,8 +80,7 @@ pub const RoomEvent = struct {
     real_jid: []const u8,
     nick: []const u8,
     worker_id: u16,
-    session_id: u32,
-    generation: u32,
+    session_token: Token,
 };
 
 /// MUC groupchat message to fan out.
@@ -92,8 +93,8 @@ pub const RoomMessageEvent = struct {
 
 /// T177 MUC occupant migration: an SM-resumed session moved to another
 /// worker. Routed to the room's owning worker, which updates the canonical
-/// occupant record's (worker, session, generation) triple in place — no
-/// join presence fan-out, no new-member handling. Identity is the full JID.
+/// occupant record's (worker, token) address in place, with no join
+/// presence fan-out and no new-member handling. Identity is the full JID.
 pub const RoomOccupantMove = struct {
     room_jid: []const u8,
     real_jid: []const u8,
@@ -102,10 +103,8 @@ pub const RoomOccupantMove = struct {
     old_worker_id: u16,
     /// Resuming worker.
     new_worker_id: u16,
-    /// Session slot of the resumed connection on the resuming worker.
-    new_session_id: u32,
-    /// ABA generation from the resuming worker's SessionMap bind.
-    new_generation: u32,
+    /// Generational token of the resumed session on the resuming worker.
+    new_token: Token,
 };
 
 /// MUC disco query (routed to owning worker).
@@ -113,11 +112,10 @@ pub const DiscoRequest = struct {
     room_jid: []const u8,
     iq_id: []const u8,
     reply_to_worker: u16,
-    reply_to_session: u32,
-    /// ABA generation of the requesting session, captured on the originating
-    /// worker where that session is live (T173). The reply's ds.deliver()
-    /// validates it — a hardcoded 0 is silently dropped.
-    reply_to_generation: u32,
+    /// Generational token of the requesting session, captured on the
+    /// originating worker where that session is live (T173). The reply's
+    /// drain-side validation treats a stale token as "session gone".
+    reply_to_token: Token,
     /// Full JID of the querying session (for the 'to' attribute in the response).
     reply_to_jid: []const u8,
 };
@@ -142,11 +140,10 @@ pub const AdminAction = struct {
     new_role: []const u8,
     iq_id: []const u8,
     reply_to_worker: u16,
-    reply_to_session: u32,
-    /// ABA generation of the requesting session, captured on the originating
-    /// worker where that session is live (T173). The reply's ds.deliver()
-    /// validates it — a hardcoded 0 is silently dropped.
-    reply_to_generation: u32,
+    /// Generational token of the requesting session, captured on the
+    /// originating worker where that session is live (T173). The reply's
+    /// drain-side validation treats a stale token as "session gone".
+    reply_to_token: Token,
 };
 
 /// Room directory update broadcast (create/destroy) to all workers.
@@ -174,11 +171,10 @@ pub const MamQuery = struct {
     after_id: []const u8,
     before_id: []const u8,
     reply_to_worker: u16,
-    reply_to_session: u32,
-    /// ABA generation of the querying session, captured on the originating
-    /// worker where that session is live (T173). The reply's ds.deliver()
-    /// validates it — a hardcoded 0 is silently dropped.
-    reply_to_generation: u32,
+    /// Generational token of the querying session, captured on the
+    /// originating worker where that session is live (T173). The reply's
+    /// drain-side validation treats a stale token as "session gone".
+    reply_to_token: Token,
     reply_to_jid: []const u8,
 };
 
@@ -192,8 +188,8 @@ pub const SmResumeRequest = struct {
     h: u32,
     /// Worker holding the new connection.
     req_worker: u16,
-    /// Session slot on the requesting worker.
-    req_session: u32,
+    /// Generational token of the resuming session on the requesting worker.
+    req_token: Token,
     /// Per-session epoch captured at enqueue (ABA guard on slot reuse).
     req_epoch: u32,
     /// Authenticated identity of the new connection, validated against the
@@ -211,7 +207,7 @@ pub const SmResumeRequest = struct {
 /// <failed/> error condition to send the client.
 pub const SmResumeReply = struct {
     previd: []const u8,
-    req_session: u32,
+    req_token: Token,
     req_epoch: u32,
     status: []const u8,
 };
@@ -227,15 +223,15 @@ pub const SessionKickRequest = struct {
     resource: []const u8,
     /// Worker holding the new connection that wants to bind.
     req_worker: u16,
-    /// Session slot + per-session epoch on the requesting worker (ABA guard).
-    req_session: u32,
+    /// Session token + per-session epoch on the requesting worker (ABA guard).
+    req_token: Token,
     req_epoch: u32,
 };
 
 /// T154: owner (or previous owner) → requester. The binding, if it existed,
 /// is gone by the time this reply is drained; the requester retries its bind.
 pub const SessionKickReply = struct {
-    req_session: u32,
+    req_token: Token,
     req_epoch: u32,
 };
 
@@ -348,15 +344,14 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.domain) catch return null;
             writeStr(w, ev.resource) catch return null;
             writeU16(w, ev.worker_id) catch return null;
-            writeU32(w, ev.session_id) catch return null;
+            writeU64(w, ev.session_token.toUdata()) catch return null;
         },
         inline .room_join, .room_part, .shadow_join, .shadow_part => |ev| {
             writeStr(w, ev.room_jid) catch return null;
             writeStr(w, ev.real_jid) catch return null;
             writeStr(w, ev.nick) catch return null;
             writeU16(w, ev.worker_id) catch return null;
-            writeU32(w, ev.session_id) catch return null;
-            writeU32(w, ev.generation) catch return null;
+            writeU64(w, ev.session_token.toUdata()) catch return null;
         },
         .room_message => |ev| {
             writeStr(w, ev.room_jid) catch return null;
@@ -368,8 +363,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.room_jid) catch return null;
             writeStr(w, ev.iq_id) catch return null;
             writeU16(w, ev.reply_to_worker) catch return null;
-            writeU32(w, ev.reply_to_session) catch return null;
-            writeU32(w, ev.reply_to_generation) catch return null;
+            writeU64(w, ev.reply_to_token.toUdata()) catch return null;
             writeStr(w, ev.reply_to_jid) catch return null;
         },
         inline .message_received, .message_routed => |ev| {
@@ -387,8 +381,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.new_role) catch return null;
             writeStr(w, ev.iq_id) catch return null;
             writeU16(w, ev.reply_to_worker) catch return null;
-            writeU32(w, ev.reply_to_session) catch return null;
-            writeU32(w, ev.reply_to_generation) catch return null;
+            writeU64(w, ev.reply_to_token.toUdata()) catch return null;
         },
         .room_directory_update => |ev| {
             writeStr(w, ev.room_jid) catch return null;
@@ -406,8 +399,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.after_id) catch return null;
             writeStr(w, ev.before_id) catch return null;
             writeU16(w, ev.reply_to_worker) catch return null;
-            writeU32(w, ev.reply_to_session) catch return null;
-            writeU32(w, ev.reply_to_generation) catch return null;
+            writeU64(w, ev.reply_to_token.toUdata()) catch return null;
             writeStr(w, ev.reply_to_jid) catch return null;
         },
         .room_occupant_move => |ev| {
@@ -415,8 +407,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.real_jid) catch return null;
             writeU16(w, ev.old_worker_id) catch return null;
             writeU16(w, ev.new_worker_id) catch return null;
-            writeU32(w, ev.new_session_id) catch return null;
-            writeU32(w, ev.new_generation) catch return null;
+            writeU64(w, ev.new_token.toUdata()) catch return null;
         },
         .invalidate_subscription => |ev| {
             writeStr(w, ev.bare_jid) catch return null;
@@ -435,7 +426,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.previd) catch return null;
             writeU32(w, ev.h) catch return null;
             writeU16(w, ev.req_worker) catch return null;
-            writeU32(w, ev.req_session) catch return null;
+            writeU64(w, ev.req_token.toUdata()) catch return null;
             writeU32(w, ev.req_epoch) catch return null;
             writeStr(w, ev.auth_local) catch return null;
             writeStr(w, ev.auth_domain) catch return null;
@@ -443,7 +434,7 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
         },
         .sm_resume_reply => |ev| {
             writeStr(w, ev.previd) catch return null;
-            writeU32(w, ev.req_session) catch return null;
+            writeU64(w, ev.req_token.toUdata()) catch return null;
             writeU32(w, ev.req_epoch) catch return null;
             writeStr(w, ev.status) catch return null;
         },
@@ -452,11 +443,11 @@ pub fn encode(buf: []u8, msg: Message) ?usize {
             writeStr(w, ev.domain) catch return null;
             writeStr(w, ev.resource) catch return null;
             writeU16(w, ev.req_worker) catch return null;
-            writeU32(w, ev.req_session) catch return null;
+            writeU64(w, ev.req_token.toUdata()) catch return null;
             writeU32(w, ev.req_epoch) catch return null;
         },
         .session_kick_reply => |ev| {
-            writeU32(w, ev.req_session) catch return null;
+            writeU64(w, ev.req_token.toUdata()) catch return null;
             writeU32(w, ev.req_epoch) catch return null;
         },
     }
@@ -481,13 +472,13 @@ pub fn decode(data: []const u8) ?Message {
             const domain = readStr(data, &fbs) orelse return null;
             const resource = readStr(data, &fbs) orelse return null;
             const worker_id = readU16(r) orelse return null;
-            const session_id = readU32(r) orelse return null;
+            const session_token = Token.fromUdata(readU64(r) orelse return null);
             const ev = PresenceEvent{
                 .local = local,
                 .domain = domain,
                 .resource = resource,
                 .worker_id = worker_id,
-                .session_id = session_id,
+                .session_token = session_token,
             };
             return switch (tag_val) {
                 .session_bound => .{ .session_bound = .{
@@ -495,14 +486,14 @@ pub fn decode(data: []const u8) ?Message {
                     .domain = ev.domain,
                     .resource = ev.resource,
                     .worker_id = ev.worker_id,
-                    .session_id = ev.session_id,
+                    .session_token = ev.session_token,
                 } },
                 .session_closed => .{ .session_closed = .{
                     .local = ev.local,
                     .domain = ev.domain,
                     .resource = ev.resource,
                     .worker_id = ev.worker_id,
-                    .session_id = ev.session_id,
+                    .session_token = ev.session_token,
                 } },
                 .presence_available => .{ .presence_available = ev },
                 .presence_unavailable => .{ .presence_unavailable = ev },
@@ -514,15 +505,13 @@ pub fn decode(data: []const u8) ?Message {
             const real_jid = readStr(data, &fbs) orelse return null;
             const nick = readStr(data, &fbs) orelse return null;
             const worker_id = readU16(r) orelse return null;
-            const session_id = readU32(r) orelse return null;
-            const generation = readU32(r) orelse return null;
+            const session_token = Token.fromUdata(readU64(r) orelse return null);
             const ev = RoomEvent{
                 .room_jid = room_jid,
                 .real_jid = real_jid,
                 .nick = nick,
                 .worker_id = worker_id,
-                .session_id = session_id,
-                .generation = generation,
+                .session_token = session_token,
             };
             return switch (tag_val) {
                 .room_join => .{ .room_join = ev },
@@ -548,15 +537,13 @@ pub fn decode(data: []const u8) ?Message {
             const room_jid = readStr(data, &fbs) orelse return null;
             const iq_id = readStr(data, &fbs) orelse return null;
             const reply_to_worker = readU16(r) orelse return null;
-            const reply_to_session = readU32(r) orelse return null;
-            const reply_to_generation = readU32(r) orelse return null;
+            const reply_to_token = Token.fromUdata(readU64(r) orelse return null);
             const reply_to_jid = readStr(data, &fbs) orelse return null;
             const ev = DiscoRequest{
                 .room_jid = room_jid,
                 .iq_id = iq_id,
                 .reply_to_worker = reply_to_worker,
-                .reply_to_session = reply_to_session,
-                .reply_to_generation = reply_to_generation,
+                .reply_to_token = reply_to_token,
                 .reply_to_jid = reply_to_jid,
             };
             return switch (tag_val) {
@@ -594,8 +581,7 @@ pub fn decode(data: []const u8) ?Message {
             const new_role = readStr(data, &fbs) orelse return null;
             const iq_id = readStr(data, &fbs) orelse return null;
             const reply_to_worker = readU16(r) orelse return null;
-            const reply_to_session = readU32(r) orelse return null;
-            const reply_to_generation = readU32(r) orelse return null;
+            const reply_to_token = Token.fromUdata(readU64(r) orelse return null);
             return .{ .room_admin = .{
                 .room_jid = room_jid,
                 .actor_jid = actor_jid,
@@ -603,8 +589,7 @@ pub fn decode(data: []const u8) ?Message {
                 .new_role = new_role,
                 .iq_id = iq_id,
                 .reply_to_worker = reply_to_worker,
-                .reply_to_session = reply_to_session,
-                .reply_to_generation = reply_to_generation,
+                .reply_to_token = reply_to_token,
             } };
         },
         .room_directory_update => {
@@ -628,8 +613,7 @@ pub fn decode(data: []const u8) ?Message {
             const after_id = readStr(data, &fbs) orelse return null;
             const before_id = readStr(data, &fbs) orelse return null;
             const reply_to_worker = readU16(r) orelse return null;
-            const reply_to_session = readU32(r) orelse return null;
-            const reply_to_generation = readU32(r) orelse return null;
+            const reply_to_token = Token.fromUdata(readU64(r) orelse return null);
             const reply_to_jid = readStr(data, &fbs) orelse return null;
             return .{ .room_mam_query = .{
                 .room_jid = room_jid,
@@ -642,8 +626,7 @@ pub fn decode(data: []const u8) ?Message {
                 .after_id = after_id,
                 .before_id = before_id,
                 .reply_to_worker = reply_to_worker,
-                .reply_to_session = reply_to_session,
-                .reply_to_generation = reply_to_generation,
+                .reply_to_token = reply_to_token,
                 .reply_to_jid = reply_to_jid,
             } };
         },
@@ -656,15 +639,13 @@ pub fn decode(data: []const u8) ?Message {
             const real_jid = readStr(data, &fbs) orelse return null;
             const old_worker_id = readU16(r) orelse return null;
             const new_worker_id = readU16(r) orelse return null;
-            const new_session_id = readU32(r) orelse return null;
-            const new_generation = readU32(r) orelse return null;
+            const new_token = Token.fromUdata(readU64(r) orelse return null);
             return .{ .room_occupant_move = .{
                 .room_jid = room_jid,
                 .real_jid = real_jid,
                 .old_worker_id = old_worker_id,
                 .new_worker_id = new_worker_id,
-                .new_session_id = new_session_id,
-                .new_generation = new_generation,
+                .new_token = new_token,
             } };
         },
         .pep_published => {
@@ -691,7 +672,7 @@ pub fn decode(data: []const u8) ?Message {
             const previd = readStr(data, &fbs) orelse return null;
             const h = readU32(r) orelse return null;
             const req_worker = readU16(r) orelse return null;
-            const req_session = readU32(r) orelse return null;
+            const req_token = Token.fromUdata(readU64(r) orelse return null);
             const req_epoch = readU32(r) orelse return null;
             const auth_local = readStr(data, &fbs) orelse return null;
             const auth_domain = readStr(data, &fbs) orelse return null;
@@ -700,7 +681,7 @@ pub fn decode(data: []const u8) ?Message {
                 .previd = previd,
                 .h = h,
                 .req_worker = req_worker,
-                .req_session = req_session,
+                .req_token = req_token,
                 .req_epoch = req_epoch,
                 .auth_local = auth_local,
                 .auth_domain = auth_domain,
@@ -709,12 +690,12 @@ pub fn decode(data: []const u8) ?Message {
         },
         .sm_resume_reply => {
             const previd = readStr(data, &fbs) orelse return null;
-            const req_session = readU32(r) orelse return null;
+            const req_token = Token.fromUdata(readU64(r) orelse return null);
             const req_epoch = readU32(r) orelse return null;
             const status = readStr(data, &fbs) orelse return null;
             return .{ .sm_resume_reply = .{
                 .previd = previd,
-                .req_session = req_session,
+                .req_token = req_token,
                 .req_epoch = req_epoch,
                 .status = status,
             } };
@@ -724,22 +705,22 @@ pub fn decode(data: []const u8) ?Message {
             const domain = readStr(data, &fbs) orelse return null;
             const resource = readStr(data, &fbs) orelse return null;
             const req_worker = readU16(r) orelse return null;
-            const req_session = readU32(r) orelse return null;
+            const req_token = Token.fromUdata(readU64(r) orelse return null);
             const req_epoch = readU32(r) orelse return null;
             return .{ .session_kick_request = .{
                 .local = local,
                 .domain = domain,
                 .resource = resource,
                 .req_worker = req_worker,
-                .req_session = req_session,
+                .req_token = req_token,
                 .req_epoch = req_epoch,
             } };
         },
         .session_kick_reply => {
-            const req_session = readU32(r) orelse return null;
+            const req_token = Token.fromUdata(readU64(r) orelse return null);
             const req_epoch = readU32(r) orelse return null;
             return .{ .session_kick_reply = .{
-                .req_session = req_session,
+                .req_token = req_token,
                 .req_epoch = req_epoch,
             } };
         },
@@ -824,8 +805,7 @@ test "encode/decode: room_join round-trip" {
         .real_jid = "alice@example.com/Mobile",
         .nick = "alice",
         .worker_id = 2,
-        .session_id = 42,
-        .generation = 7,
+        .session_token = .{ .index = 42, .gen = 7, .kind = token_kinds.session },
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -838,8 +818,8 @@ test "encode/decode: room_join round-trip" {
             try std.testing.expectEqualStrings("alice@example.com/Mobile", ev.real_jid);
             try std.testing.expectEqualStrings("alice", ev.nick);
             try std.testing.expectEqual(@as(u16, 2), ev.worker_id);
-            try std.testing.expectEqual(@as(u32, 42), ev.session_id);
-            try std.testing.expectEqual(@as(u32, 7), ev.generation);
+            try std.testing.expectEqual(@as(u32, 42), ev.session_token.index);
+            try std.testing.expectEqual(@as(u24, 7), ev.session_token.gen);
         },
         else => return error.WrongTag,
     }
@@ -851,8 +831,7 @@ test "encode/decode: room_part round-trip" {
         .real_jid = "bob@example.com/Desktop",
         .nick = "bob",
         .worker_id = 0,
-        .session_id = 7,
-        .generation = 3,
+        .session_token = .{ .index = 7, .gen = 3, .kind = token_kinds.session },
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -890,7 +869,7 @@ test "encode/decode: session_bound round-trip" {
         .domain = "example.com",
         .resource = "Mobile",
         .worker_id = 1,
-        .session_id = 100,
+        .session_token = .{ .index = 100, .gen = 1, .kind = token_kinds.session },
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -903,7 +882,7 @@ test "encode/decode: session_bound round-trip" {
             try std.testing.expectEqualStrings("example.com", ev.domain);
             try std.testing.expectEqualStrings("Mobile", ev.resource);
             try std.testing.expectEqual(@as(u16, 1), ev.worker_id);
-            try std.testing.expectEqual(@as(u32, 100), ev.session_id);
+            try std.testing.expectEqual(@as(u32, 100), ev.session_token.index);
         },
         else => return error.WrongTag,
     }
@@ -915,7 +894,7 @@ test "encode/decode: session_closed round-trip" {
         .domain = "example.com",
         .resource = "Desktop",
         .worker_id = 3,
-        .session_id = 55,
+        .session_token = .{ .index = 55, .gen = 1, .kind = token_kinds.session },
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -931,7 +910,7 @@ test "encode/decode: presence_available round-trip" {
         .domain = "morante.dev",
         .resource = "Thunderbird",
         .worker_id = 0,
-        .session_id = 12,
+        .session_token = .{ .index = 12, .gen = 1, .kind = token_kinds.session },
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -953,8 +932,7 @@ test "encode/decode: disco_info round-trip" {
         .room_jid = "dev@conference.example.com",
         .iq_id = "disco-1",
         .reply_to_worker = 2,
-        .reply_to_session = 99,
-        .reply_to_generation = 7,
+        .reply_to_token = .{ .index = 99, .gen = 7, .kind = token_kinds.session },
         .reply_to_jid = "alice@example.com/Mobile",
     } };
 
@@ -967,8 +945,8 @@ test "encode/decode: disco_info round-trip" {
             try std.testing.expectEqualStrings("dev@conference.example.com", ev.room_jid);
             try std.testing.expectEqualStrings("disco-1", ev.iq_id);
             try std.testing.expectEqual(@as(u16, 2), ev.reply_to_worker);
-            try std.testing.expectEqual(@as(u32, 99), ev.reply_to_session);
-            try std.testing.expectEqual(@as(u32, 7), ev.reply_to_generation);
+            try std.testing.expectEqual(@as(u32, 99), ev.reply_to_token.index);
+            try std.testing.expectEqual(@as(u24, 7), ev.reply_to_token.gen);
             try std.testing.expectEqualStrings("alice@example.com/Mobile", ev.reply_to_jid);
         },
         else => return error.WrongTag,
@@ -1048,8 +1026,7 @@ test "encode: buffer too small returns null" {
         .real_jid = "alice@example.com/Mobile",
         .nick = "alice",
         .worker_id = 0,
-        .session_id = 1,
-        .generation = 0,
+        .session_token = .none,
     } };
 
     var tiny: [4]u8 = undefined;
@@ -1077,8 +1054,7 @@ test "tag method returns correct wire byte" {
         .real_jid = "",
         .nick = "",
         .worker_id = 0,
-        .session_id = 0,
-        .generation = 0,
+        .session_token = .none,
     } };
     try std.testing.expectEqual(@as(u8, 0x10), msg.tag());
 }
@@ -1089,8 +1065,7 @@ test "encode/decode: shadow_join round-trip" {
         .real_jid = "alice@example.com/Mobile",
         .nick = "alice",
         .worker_id = 1,
-        .session_id = 33,
-        .generation = 5,
+        .session_token = .{ .index = 33, .gen = 5, .kind = token_kinds.session },
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -1103,7 +1078,7 @@ test "encode/decode: shadow_join round-trip" {
             try std.testing.expectEqualStrings("alice@example.com/Mobile", ev.real_jid);
             try std.testing.expectEqualStrings("alice", ev.nick);
             try std.testing.expectEqual(@as(u16, 1), ev.worker_id);
-            try std.testing.expectEqual(@as(u32, 33), ev.session_id);
+            try std.testing.expectEqual(@as(u32, 33), ev.session_token.index);
         },
         else => return error.WrongTag,
     }
@@ -1115,8 +1090,7 @@ test "encode/decode: shadow_part round-trip" {
         .real_jid = "bob@example.com/Desktop",
         .nick = "bob",
         .worker_id = 2,
-        .session_id = 77,
-        .generation = 0,
+        .session_token = .{ .index = 77, .gen = 1, .kind = token_kinds.session },
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -1134,8 +1108,7 @@ test "encode/decode: room_admin round-trip" {
         .new_role = "none",
         .iq_id = "admin-1",
         .reply_to_worker = 0,
-        .reply_to_session = 5,
-        .reply_to_generation = 3,
+        .reply_to_token = .{ .index = 5, .gen = 3, .kind = token_kinds.session },
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -1150,8 +1123,8 @@ test "encode/decode: room_admin round-trip" {
             try std.testing.expectEqualStrings("none", ev.new_role);
             try std.testing.expectEqualStrings("admin-1", ev.iq_id);
             try std.testing.expectEqual(@as(u16, 0), ev.reply_to_worker);
-            try std.testing.expectEqual(@as(u32, 5), ev.reply_to_session);
-            try std.testing.expectEqual(@as(u32, 3), ev.reply_to_generation);
+            try std.testing.expectEqual(@as(u32, 5), ev.reply_to_token.index);
+            try std.testing.expectEqual(@as(u24, 3), ev.reply_to_token.gen);
         },
         else => return error.WrongTag,
     }
@@ -1198,7 +1171,7 @@ test "encode/decode: sm_resume_request round-trip" {
         .previd = "0001abcdef0123456789abcdef01234567",
         .h = 41,
         .req_worker = 3,
-        .req_session = 17,
+        .req_token = .{ .index = 17, .gen = 1, .kind = token_kinds.session },
         .req_epoch = 5,
         .auth_local = "alice",
         .auth_domain = "example.com",
@@ -1214,7 +1187,7 @@ test "encode/decode: sm_resume_request round-trip" {
             try std.testing.expectEqualStrings("0001abcdef0123456789abcdef01234567", ev.previd);
             try std.testing.expectEqual(@as(u32, 41), ev.h);
             try std.testing.expectEqual(@as(u16, 3), ev.req_worker);
-            try std.testing.expectEqual(@as(u32, 17), ev.req_session);
+            try std.testing.expectEqual(@as(u32, 17), ev.req_token.index);
             try std.testing.expectEqual(@as(u32, 5), ev.req_epoch);
             try std.testing.expectEqualStrings("alice", ev.auth_local);
             try std.testing.expectEqualStrings("example.com", ev.auth_domain);
@@ -1227,7 +1200,7 @@ test "encode/decode: sm_resume_request round-trip" {
 test "encode/decode: sm_resume_reply round-trip" {
     const msg = Message{ .sm_resume_reply = .{
         .previd = "0002abcdef0123456789abcdef01234567",
-        .req_session = 9,
+        .req_token = .{ .index = 9, .gen = 1, .kind = token_kinds.session },
         .req_epoch = 2,
         .status = "ok",
     } };
@@ -1239,7 +1212,7 @@ test "encode/decode: sm_resume_reply round-trip" {
     switch (decoded) {
         .sm_resume_reply => |ev| {
             try std.testing.expectEqualStrings("ok", ev.status);
-            try std.testing.expectEqual(@as(u32, 9), ev.req_session);
+            try std.testing.expectEqual(@as(u32, 9), ev.req_token.index);
             try std.testing.expectEqual(@as(u32, 2), ev.req_epoch);
         },
         else => return error.WrongTag,
@@ -1252,8 +1225,7 @@ test "encode/decode: room_occupant_move round-trip" {
         .real_jid = "alice@example.com/phone",
         .old_worker_id = 0,
         .new_worker_id = 3,
-        .new_session_id = 271,
-        .new_generation = 41,
+        .new_token = .{ .index = 271, .gen = 41, .kind = token_kinds.session },
     } };
 
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -1266,8 +1238,8 @@ test "encode/decode: room_occupant_move round-trip" {
             try std.testing.expectEqualStrings("alice@example.com/phone", ev.real_jid);
             try std.testing.expectEqual(@as(u16, 0), ev.old_worker_id);
             try std.testing.expectEqual(@as(u16, 3), ev.new_worker_id);
-            try std.testing.expectEqual(@as(u32, 271), ev.new_session_id);
-            try std.testing.expectEqual(@as(u32, 41), ev.new_generation);
+            try std.testing.expectEqual(@as(u32, 271), ev.new_token.index);
+            try std.testing.expectEqual(@as(u24, 41), ev.new_token.gen);
         },
         else => return error.WrongTag,
     }
@@ -1279,7 +1251,7 @@ test "encode/decode: session_kick round-trips" {
         .domain = "example.com",
         .resource = "phone",
         .req_worker = 2,
-        .req_session = 17,
+        .req_token = .{ .index = 17, .gen = 1, .kind = token_kinds.session },
         .req_epoch = 9,
     } };
     var buf: [MAX_ENCODED_SIZE]u8 = undefined;
@@ -1290,17 +1262,17 @@ test "encode/decode: session_kick round-trips" {
             try std.testing.expectEqualStrings("example.com", ev.domain);
             try std.testing.expectEqualStrings("phone", ev.resource);
             try std.testing.expectEqual(@as(u16, 2), ev.req_worker);
-            try std.testing.expectEqual(@as(u32, 17), ev.req_session);
+            try std.testing.expectEqual(@as(u32, 17), ev.req_token.index);
             try std.testing.expectEqual(@as(u32, 9), ev.req_epoch);
         },
         else => return error.WrongTag,
     }
 
-    const rep = Message{ .session_kick_reply = .{ .req_session = 17, .req_epoch = 9 } };
+    const rep = Message{ .session_kick_reply = .{ .req_token = .{ .index = 17, .gen = 1, .kind = token_kinds.session }, .req_epoch = 9 } };
     const len2 = encode(&buf, rep).?;
     switch (decode(buf[0..len2]).?) {
         .session_kick_reply => |ev| {
-            try std.testing.expectEqual(@as(u32, 17), ev.req_session);
+            try std.testing.expectEqual(@as(u32, 17), ev.req_token.index);
             try std.testing.expectEqual(@as(u32, 9), ev.req_epoch);
         },
         else => return error.WrongTag,
@@ -1319,8 +1291,7 @@ test "encode/decode: room_mam_query round-trip" {
         .after_id = "arc-1234",
         .before_id = "",
         .reply_to_worker = 1,
-        .reply_to_session = 42,
-        .reply_to_generation = 9,
+        .reply_to_token = .{ .index = 42, .gen = 9, .kind = token_kinds.session },
         .reply_to_jid = "alice@example.com/Mobile",
     } };
 
@@ -1338,8 +1309,8 @@ test "encode/decode: room_mam_query round-trip" {
             try std.testing.expectEqualStrings("arc-1234", ev.after_id);
             try std.testing.expectEqualStrings("", ev.before_id);
             try std.testing.expectEqual(@as(u16, 1), ev.reply_to_worker);
-            try std.testing.expectEqual(@as(u32, 42), ev.reply_to_session);
-            try std.testing.expectEqual(@as(u32, 9), ev.reply_to_generation);
+            try std.testing.expectEqual(@as(u32, 42), ev.reply_to_token.index);
+            try std.testing.expectEqual(@as(u24, 9), ev.reply_to_token.gen);
             try std.testing.expectEqualStrings("alice@example.com/Mobile", ev.reply_to_jid);
         },
         else => return error.WrongTag,

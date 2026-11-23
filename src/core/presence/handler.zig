@@ -551,7 +551,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
 
             // Retrieve the contact's stored presence inner XML (status/show/priority)
             const contact_inner = if (entry.worker_id == server.worker_id) blk: {
-                const contact_sess = server.sessions[entry.local_session_id] orelse break :blk @as([]const u8, "");
+                const contact_sess = server.sessionForEventToken(entry.token) orelse break :blk @as([]const u8, "");
                 break :blk contact_sess.last_presence_inner[0..contact_sess.last_presence_inner_len];
             } else @as([]const u8, "");
 
@@ -831,7 +831,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
         for (probe_entries[0..probe_count]) |pentry| {
             // Look up the contact's session to retrieve their stored presence inner XML.
             const contact_inner = if (pentry.worker_id == server.worker_id) blk: {
-                const contact_sess = server.sessions[pentry.local_session_id] orelse break :blk @as([]const u8, "");
+                const contact_sess = server.sessionForEventToken(pentry.token) orelse break :blk @as([]const u8, "");
                 break :blk contact_sess.last_presence_inner[0..contact_sess.last_presence_inner_len];
             } else @as([]const u8, "");
 
@@ -1204,13 +1204,13 @@ fn broadcastToOwnResources(
 
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
-            const target = server.sessions[entry.local_session_id] orelse continue;
+            const target = server.sessionForEventToken(entry.token) orelse continue;
             // stanza() handles the T153 detached case: it tracks for
             // resume replay and reports tracked_detached.
             if (target.stanza(presence_xml) == .failed_closed) continue;
             _ = target.conn.flushSend() catch {};
         } else if (server.delivery_system) |ds| {
-            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
+            ds.deliver(entry.worker_id, entry.token, presence_xml) catch {};
         }
     }
 }
@@ -1331,10 +1331,10 @@ pub fn dispatchDirectedPresenceToBareJid(
 
     for (entries[0..count]) |entry| {
         if (entry.worker_id == server.worker_id) {
-            const target = server.sessions[entry.local_session_id] orelse continue;
-            fanout.deliverToSession(target, presence_xml, entry.local_session_id);
+            const target = server.sessionForEventToken(entry.token) orelse continue;
+            fanout.deliverToSession(target, presence_xml, entry.token.index);
         } else if (server.delivery_system) |ds| {
-            ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, presence_xml) catch {};
+            ds.deliver(entry.worker_id, entry.token, presence_xml) catch {};
         }
     }
 }
@@ -1396,8 +1396,8 @@ fn deliverPresenceToSubscribers(
         // Local targets deliver inline.
         for (entries[0..count]) |entry| {
             if (entry.worker_id != server.worker_id) continue;
-            const target_session = server.sessions[entry.local_session_id] orelse continue;
-            fanout.deliverToSession(target_session, presence_xml, entry.local_session_id);
+            const target_session = server.sessionForEventToken(entry.token) orelse continue;
+            fanout.deliverToSession(target_session, presence_xml, entry.token.index);
         }
 
         // Remote targets: bucket by worker, wake each worker once.
@@ -1408,7 +1408,7 @@ fn deliverPresenceToSubscribers(
                 var pending = false;
                 for (entries[0..count]) |entry| {
                     if (entry.worker_id != w) continue;
-                    ds.enqueue(w, entry.local_session_id, entry.generation, presence_xml) catch continue;
+                    ds.enqueue(w, entry.token, presence_xml) catch continue;
                     pending = true;
                 }
                 if (pending) ds.wakeWorker(w);
@@ -1438,10 +1438,10 @@ pub fn deliverPresenceToTarget(
 
     for (entries[0..count]) |ent| {
         if (ent.worker_id == server.worker_id) {
-            const target_session = server.sessions[ent.local_session_id] orelse continue;
-            fanout.deliverToSession(target_session, presence_xml, ent.local_session_id);
+            const target_session = server.sessionForEventToken(ent.token) orelse continue;
+            fanout.deliverToSession(target_session, presence_xml, ent.token.index);
         } else if (server.delivery_system) |ds| {
-            ds.deliver(ent.worker_id, ent.local_session_id, ent.generation, presence_xml) catch {};
+            ds.deliver(ent.worker_id, ent.token, presence_xml) catch {};
         }
     }
 }
@@ -1450,14 +1450,15 @@ test "S4: subscription presence with an over-long to gets jid-malformed" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     server.sessions[0] = session;
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
     session.stream.authenticated_jid = session.stream.bound_jid;
@@ -1487,7 +1488,8 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -1509,7 +1511,7 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 1, server.server_host, false, allocator);
+    alice.init(alice_fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = alice;
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/desk") catch null;
     alice.stream.authenticated_jid = alice.stream.bound_jid;
@@ -1520,13 +1522,13 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 2, server.server_host, false, allocator);
+    bob.init(bob_fds[0], 2, server.server_host, false, allocator);
     server.sessions[2] = bob;
 
-    _ = try sm.bind(0, 1, "alice", "localhost", "desk");
-    _ = try sm.bind(0, 4, "alice", "localhost", "mobile");
-    _ = try sm.bind(0, 2, "bob", "localhost", "laptop");
-    _ = try sm.bind(0, 5, "bob", "localhost", "tablet");
+    _ = try sm.bind(0, server.sessionToken(1), "alice", "localhost", "desk");
+    _ = try sm.bind(0, server.sessionToken(4), "alice", "localhost", "mobile");
+    _ = try sm.bind(0, server.sessionToken(2), "bob", "localhost", "laptop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "tablet");
     for ([_]struct { []const u8, []const u8 }{
         .{ "alice", "desk" }, .{ "alice", "mobile" },
         .{ "bob", "laptop" }, .{ "bob", "tablet" },
@@ -1560,7 +1562,8 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
 test "S1: subscription presence escapes the owner bare JID" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -1580,7 +1583,7 @@ test "S1: subscription presence escapes the owner bare JID" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &owner_fds));
     defer posix.close(owner_fds[1]);
     const owner = try allocator.create(Session);
-    owner.* = Session.init(owner_fds[0], 1, server.server_host, false, allocator);
+    owner.init(owner_fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = owner;
     owner.stream.bound_jid = .{ .local = "o'wner", .domain = "localhost", .resource = "desk" };
     owner.stanza_to = "bob@localhost";
@@ -1589,9 +1592,9 @@ test "S1: subscription presence escapes the owner bare JID" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &bob_fds));
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 2, server.server_host, false, allocator);
+    bob.init(bob_fds[0], 2, server.server_host, false, allocator);
     server.sessions[2] = bob;
-    _ = try sm.bind(0, 2, "bob", "localhost", "laptop");
+    _ = try sm.bind(0, server.sessionToken(2), "bob", "localhost", "laptop");
     sm.setPresenceAvailable("bob", "localhost", "laptop", true);
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1610,7 +1613,8 @@ test "S1: subscription presence escapes the owner bare JID" {
 test "A62: pending-subscription delivery for a 256-byte bare JID" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -1638,7 +1642,7 @@ test "A62: pending-subscription delivery for a 256-byte bare JID" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, allocator);
+    session.init(fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = session;
     session.stream.bound_jid = .{ .local = local, .domain = "localhost", .resource = "res" };
 
@@ -1657,7 +1661,8 @@ test "A62: pending-subscription delivery for a 256-byte bare JID" {
 test "A62: oversized bare JIDs skip pending-subscription delivery" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -1673,7 +1678,7 @@ test "A62: oversized bare JIDs skip pending-subscription delivery" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 1, server.server_host, false, allocator);
+    session.init(fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1698,7 +1703,8 @@ test "A62: oversized bare JIDs skip pending-subscription delivery" {
 test "A62: block check sees a >256-byte recipient JID in full" {
     const posix = std.posix;
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var tmp = std.testing.tmpDir(.{});
@@ -1719,7 +1725,7 @@ test "A62: block check sees a >256-byte recipient JID in full" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &alice_fds));
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 1, server.server_host, false, allocator);
+    alice.init(alice_fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = alice;
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
 
@@ -1742,17 +1748,17 @@ test "A62: block check sees a >256-byte recipient JID in full" {
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &b_fds));
     defer posix.close(b_fds[1]);
     const bsess = try allocator.create(Session);
-    bsess.* = Session.init(b_fds[0], 2, server.server_host, false, allocator);
+    bsess.init(b_fds[0], 2, server.server_host, false, allocator);
     server.sessions[2] = bsess;
-    _ = try sm.bind(0, 2, recip_local, "localhost", "one");
+    _ = try sm.bind(0, server.sessionToken(2), recip_local, "localhost", "one");
 
     var o_fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &o_fds));
     defer posix.close(o_fds[1]);
     const osess = try allocator.create(Session);
-    osess.* = Session.init(o_fds[0], 3, server.server_host, false, allocator);
+    osess.init(o_fds[0], 3, server.server_host, false, allocator);
     server.sessions[3] = osess;
-    _ = try sm.bind(0, 3, open_local, "localhost", "two");
+    _ = try sm.bind(0, server.sessionToken(3), open_local, "localhost", "two");
 
     // The 300-byte recipient blocks alice; a truncated block key would miss.
     try bs.block(blocked_bare, "alice@localhost");

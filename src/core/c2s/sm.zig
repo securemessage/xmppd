@@ -32,6 +32,8 @@ const SessionEntry = session_map_mod.SessionEntry;
 
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
+const Token = delivery_queue_mod.Token;
+const token_kinds = @import("token_kinds");
 const offline_store_mod = @import("generic_offline_store");
 const GenericOfflineStore = offline_store_mod.GenericOfflineStore;
 const OfflinePointer = offline_store_mod.OfflinePointer;
@@ -264,7 +266,7 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
             if (!room.active) continue;
             for (&room.occupants) |*occ_slot| {
                 const occ = occ_slot.* orelse continue;
-                if (occ.worker_id == self.worker_id and occ.session_id == detached_id) {
+                if (occ.worker_id == self.worker_id and occ.token.index == detached_id) {
                     if (move_room_count >= move_rooms_buf.len) {
                         log.warn("SM resume: session occupies more than {d} rooms — remaining occupancies will not migrate", .{sm_handoff.MAX_BUNDLE_ROOMS});
                         break;
@@ -321,11 +323,11 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     session.last_presence_inner_len = detached.last_presence_inner_len;
 
     // Re-bind in session map: unbind old slot, bind new slot with same JID
-    var bound_generation: ?u32 = null;
+    var bound_token: ?Token = null;
     if (self.session_map) |sm| {
         _ = sm.unbind(detached_jid.local, detached_jid.domain, detached_jid.resource);
-        if (sm.bind(self.worker_id, @intCast(session.conn.id), detached_jid.local, detached_jid.domain, detached_jid.resource)) |gen| {
-            bound_generation = gen;
+        if (sm.bind(self.worker_id, self.sessionToken(session.conn.id), detached_jid.local, detached_jid.domain, detached_jid.resource)) |_| {
+            bound_token = self.sessionToken(session.conn.id);
         } else |err| {
             log.err("SM resume: session_map re-bind failed for {s}@{s}/{s}: {}", .{
                 detached_jid.local, detached_jid.domain, detached_jid.resource, err,
@@ -344,11 +346,9 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     self.allocator.destroy(detached);
     self.sessions[detached_id] = null;
 
-    // Return detached slot to free-list
-    if (self.free_count < self.free_ids.len) {
-        self.free_ids[self.free_count] = detached_id;
-        self.free_count += 1;
-    }
+    // Return the detached slot to the free-list; the generation bump
+    // retires every token minted for the detached session (ADR-4).
+    self.releaseSessionSlot(detached_id);
 
     // T177 occupant migration: replay the room moves before <resumed/> —
     // the detached slot was just destroyed, so every room record pointing
@@ -357,8 +357,8 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     // moves. Same-worker moves apply in place on the owning worker
     // (possibly remote); roomOwner == self applies synchronously.
     if (move_room_count > 0) {
-        if (bound_generation) |gen| {
-            replayOccupantMoves(self, session, move_rooms_buf[0..move_room_count], gen, self.worker_id);
+        if (bound_token) |tok| {
+            replayOccupantMoves(self, session, move_rooms_buf[0..move_room_count], tok, self.worker_id);
         } else {
             log.warn("connection {d} resumed with {d} MUC rooms but no session-map generation — occupant moves skipped", .{
                 session.conn.id, move_room_count,
@@ -429,7 +429,7 @@ pub fn startCrossWorkerResume(self: *Server, session: *Session, previd: []const 
         .previd = previd,
         .h = h_value,
         .req_worker = self.worker_id,
-        .req_session = @intCast(session.conn.id),
+        .req_token = self.sessionToken(session.conn.id),
         .req_epoch = session.sm_resume_epoch,
         .auth_local = auth_jid.local,
         .auth_domain = auth_jid.domain,
@@ -453,7 +453,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
             log.info("cross-worker SM resume handoff for {s} rejected: {s}", .{ r.previd, why });
             enqueueSmActor(server, r.req_worker, .{ .sm_resume_reply = .{
                 .previd = r.previd,
-                .req_session = r.req_session,
+                .req_token = r.req_token,
                 .req_epoch = r.req_epoch,
                 .status = status,
             } }) catch {};
@@ -571,7 +571,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
         sm_handoff.allocator.destroy(bundle);
         enqueueSmActor(self, req.req_worker, .{ .sm_resume_reply = .{
             .previd = req.previd,
-            .req_session = req.req_session,
+            .req_token = req.req_token,
             .req_epoch = req.req_epoch,
             .status = "item-not-found",
         } }) catch {};
@@ -593,10 +593,8 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
     detached.deinit();
     self.allocator.destroy(detached);
     self.sessions[detached_id] = null;
-    if (self.free_count < self.free_ids.len) {
-        self.free_ids[self.free_count] = detached_id;
-        self.free_count += 1;
-    }
+    // See the local-resume path: one release, one generation bump (ADR-4).
+    self.releaseSessionSlot(detached_id);
 
     // Breadcrumb: the SM-ID prefix still names THIS worker; a repeat
     // resume of the relocated session must find worker req.req_worker.
@@ -608,7 +606,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
 
     enqueueSmActor(self, req.req_worker, .{ .sm_resume_reply = .{
         .previd = req.previd,
-        .req_session = req.req_session,
+        .req_token = req.req_token,
         .req_epoch = req.req_epoch,
         .status = "ok",
     } }) catch |err| {
@@ -620,7 +618,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
 /// parked session, re-bind it in the session map, send <resumed/> and
 /// replay. The epoch check makes stale replies to a reused slot harmless.
 pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, changes: *ChangeList) void {
-    const session = self.sessions[rep.req_session] orelse {
+    const session = self.sessionForEventToken(rep.req_token) orelse {
         // Requesting connection is gone — drop any parked bundle.
         if (sm_handoff.take(rep.previd)) |orphan| sm_handoff.release(orphan);
         return;
@@ -708,10 +706,10 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
     @memcpy(session.last_presence_inner[0..bundle.last_presence.len], bundle.last_presence);
     session.last_presence_inner_len = bundle.last_presence.len;
 
-    var bound_generation: ?u32 = null;
+    var bound_token: ?Token = null;
     if (self.session_map) |sm| {
-        if (sm.bind(self.worker_id, @intCast(session.conn.id), bundle.username, self.server_host, bundle.resource)) |gen| {
-            bound_generation = gen;
+        if (sm.bind(self.worker_id, self.sessionToken(session.conn.id), bundle.username, self.server_host, bundle.resource)) |_| {
+            bound_token = self.sessionToken(session.conn.id);
         } else |err| {
             log.err("cross-worker SM resume: session_map bind failed for {s}@{s}/{s}: {}", .{
                 bundle.username, self.server_host, bundle.resource, err,
@@ -724,9 +722,9 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
     // has not been told yet, so its post-resume traffic is ordered after
     // the moves. Old worker identity comes from the SM-ID prefix.
     if (bundle.rooms.items.len > 0) {
-        if (bound_generation) |gen| {
+        if (bound_token) |tok| {
             const old_worker = sm_state.workerIdFromSmId(&bundle.previd) orelse self.worker_id;
-            replayOccupantMoves(self, session, bundle.rooms.items, gen, old_worker);
+            replayOccupantMoves(self, session, bundle.rooms.items, tok, old_worker);
         } else {
             log.warn("connection {d} resumed with {d} MUC rooms but no session-map generation — occupant moves skipped (client should MAM/rejoin)", .{
                 session.conn.id, bundle.rooms.items.len,
@@ -807,7 +805,7 @@ pub fn startSessionKick(self: *Server, session: *Session, local: []const u8, dom
         .domain = domain,
         .resource = resource,
         .req_worker = self.worker_id,
-        .req_session = @intCast(session.conn.id),
+        .req_token = self.sessionToken(session.conn.id),
         .req_epoch = session.bind_kick_epoch,
     } }) catch |err| {
         log.warn("session_kick to worker {d} failed to enqueue: {}", .{ owner, err });
@@ -827,8 +825,8 @@ pub fn handleSessionKickRequest(self: *Server, req: actor_message.SessionKickReq
     if (self.session_map) |sm| {
         if (sm.findByFullJid(req.local, req.domain, req.resource)) |entry| {
             if (entry.worker_id == self.worker_id) {
-                const old_id: usize = @intCast(entry.local_session_id);
-                if (self.sessions[old_id]) |old| {
+                const old_id: usize = entry.token.index;
+                if (self.sessionForEventToken(entry.token)) |old| {
                     log.warn("session {d} evicted: resource {s}@{s}/{s} taken by worker {d}", .{
                         old_id, req.local, req.domain, req.resource, req.req_worker,
                     });
@@ -844,7 +842,7 @@ pub fn handleSessionKickRequest(self: *Server, req: actor_message.SessionKickReq
     }
 
     enqueueSmActor(self, req.req_worker, .{ .session_kick_reply = .{
-        .req_session = req.req_session,
+        .req_token = req.req_token,
         .req_epoch = req.req_epoch,
     } }) catch |err| {
         log.warn("session_kick reply to worker {d} failed: {}", .{ req.req_worker, err });
@@ -853,10 +851,10 @@ pub fn handleSessionKickRequest(self: *Server, req: actor_message.SessionKickReq
 
 /// T154 step 3 — requesting worker. Epoch-guarded, then retry the bind.
 pub fn handleSessionKickReply(self: *Server, rep: actor_message.SessionKickReply, changes: *ChangeList) void {
-    const session = self.sessions[rep.req_session] orelse return;
+    const session = self.sessionForEventToken(rep.req_token) orelse return;
 
     if (!session.bind_kick_pending or session.bind_kick_epoch != rep.req_epoch) {
-        log.warn("stale session_kick reply for conn {d} ignored", .{rep.req_session});
+        log.warn("stale session_kick reply for conn {d} ignored", .{rep.req_token.index});
         return;
     }
     session.bind_kick_pending = false;
@@ -870,7 +868,7 @@ pub fn enqueueSmActor(self: *Server, target_worker: u16, msg: actor_message.Mess
     const ds = self.delivery_system orelse return error.NoDeliverySystem;
     var buf: [actor_message.MAX_ENCODED_SIZE]u8 = undefined;
     const len = actor_message.encode(&buf, msg) orelse return error.EncodeFailed;
-    try ds.deliver(target_worker, delivery_queue_mod.SM_ACTOR_SENTINEL, 0, buf[0..len]);
+    try ds.deliver(target_worker, delivery_queue_mod.SM_ACTOR_TARGET, buf[0..len]);
 }
 
 /// Append the JIDs of every MUC room the given session occupies into the
@@ -889,7 +887,7 @@ pub fn gatherSessionRooms(self: *Server, worker_id: u16, session_id: usize, bund
         if (!room.active) continue;
         for (&room.occupants) |*occ_slot| {
             const occ = occ_slot.* orelse continue;
-            if (occ.worker_id != worker_id or occ.session_id != session_id) continue;
+            if (occ.worker_id != worker_id or occ.token.index != session_id) continue;
             if (bundle.rooms.items.len >= sm_handoff.MAX_BUNDLE_ROOMS) return false;
             const copy = sm_handoff.allocator.dupe(u8, room.getJid()) catch return false;
             bundle.rooms.append(sm_handoff.allocator, copy) catch {
@@ -916,7 +914,7 @@ pub fn gatherSessionRooms(self: *Server, worker_id: u16, session_id: usize, bund
 /// If the resumed connection dies before or while these apply,
 /// destroySession's session_closed broadcast removes the occupant by
 /// full JID everywhere — no ghost occupancy.
-pub fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const []const u8, generation: u32, old_worker: u16) void {
+pub fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const []const u8, token: Token, old_worker: u16) void {
     const bound = session.stream.bound_jid orelse return;
     var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
     const real_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
@@ -930,8 +928,7 @@ pub fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const 
             .real_jid = real_jid,
             .old_worker_id = old_worker,
             .new_worker_id = self.worker_id,
-            .new_session_id = @intCast(session.conn.id),
-            .new_generation = generation,
+            .new_token = token,
         };
         const owner = room_registry_mod.roomOwner(room_jid, muc_actor.getWorkerCount(self));
         if (owner == self.worker_id) {
@@ -1089,9 +1086,15 @@ pub fn handleSmRequest(self: *Server, session: *Session, changes: *ChangeList) v
     _ = session.conn.flushSend() catch {};
 }
 
+/// Session-kind token for event fields in tests.
+fn st(index: u32, gen: u24) Token {
+    return .{ .index = index, .gen = gen, .kind = token_kinds.session };
+}
+
 test "S17: SM-ID map holds more than 64 detached sessions" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
     defer server.deinit();
 
     // 200 inserts: the old 64-entry table silently dropped everything past 64.
@@ -1113,7 +1116,8 @@ test "S17: SM-ID map holds more than 64 detached sessions" {
 
 test "S17: SM-ID map remove does not break later lookups" {
     const allocator = std.testing.allocator;
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 256);
     defer server.deinit();
 
     // Insert a batch, remove every third entry, then verify the rest are
@@ -1145,7 +1149,8 @@ test "S17: SM-ID map remove does not break later lookups" {
 
 test "Server: replaced-resource notice fits worst-case XML escaping" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -1173,16 +1178,14 @@ test "Server: replaced-resource notice fits worst-case XML escaping" {
         .real_jid = &first_jid,
         .nick = &nick,
         .worker_id = 1,
-        .session_id = 7,
-        .generation = 1,
+        .session_token = st(7, 1),
     }, &changes);
     muc_handler.processRemoteJoin(&server, .{
         .room_jid = &room_jid,
         .real_jid = &second_jid,
         .nick = &nick,
         .worker_id = 1,
-        .session_id = 9,
-        .generation = 2,
+        .session_token = st(9, 2),
     }, &changes);
 
     const NoticeCheck = struct {
@@ -1190,9 +1193,8 @@ test "Server: replaced-resource notice fits worst-case XML escaping" {
         len: usize = 0,
         complete: bool = false,
 
-        fn onDelivery(self: *@This(), session_id: u32, generation: u32, payload: []const u8) void {
-            _ = session_id;
-            _ = generation;
+        fn onDelivery(self: *@This(), target: Token, payload: []const u8) void {
+            _ = target;
             if (std.mem.indexOf(u8, payload, "type='unavailable'") == null) return;
             self.seen = true;
             self.len = payload.len;
@@ -1208,14 +1210,15 @@ test "Server: replaced-resource notice fits worst-case XML escaping" {
 }
 
 test "Server: S24 a h above the sent count fails the stream" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1251,14 +1254,15 @@ test "Server: S24 a h above the sent count fails the stream" {
 }
 
 test "Server: S24 malformed a h fails the stream" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1287,14 +1291,15 @@ test "Server: S24 malformed a h fails the stream" {
 }
 
 test "Server: S24 SM without resume rejects h above the sent count" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1330,14 +1335,15 @@ test "Server: S24 SM without resume rejects h above the sent count" {
 }
 
 test "Server: S24 a backwards or duplicate a h does not corrupt the accepted count" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
 
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1375,7 +1381,8 @@ test "Server: S24 a backwards or duplicate a h does not corrupt the accepted cou
 }
 
 test "Server: S24 backwards and too-high resume h fail without replay" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1385,7 +1392,7 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
     const det_fds = try makeSocketPair();
     defer posix.close(det_fds[1]);
     const detached = try std.testing.allocator.create(Session);
-    detached.* = Session.init(det_fds[0], 2, "localhost", false, std.testing.allocator);
+    detached.init(det_fds[0], 2, "localhost", false, std.testing.allocator);
     detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
     detached.sm_detached = true;
     detached.sm_detach_time = std.time.timestamp();
@@ -1407,7 +1414,7 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     const stream_open = "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
@@ -1455,7 +1462,8 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
 }
 
 test "Server: S24 cross-worker handoff carries last_h" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
     sm_handoff.resetForTesting();
 
@@ -1465,7 +1473,7 @@ test "Server: S24 cross-worker handoff carries last_h" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try std.testing.allocator.create(Session);
-    session.* = Session.init(fds[0], 1, "localhost", false, std.testing.allocator);
+    session.init(fds[0], 1, "localhost", false, std.testing.allocator);
     server.sessions[1] = session;
 
     var previd: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
@@ -1498,7 +1506,7 @@ test "Server: S24 cross-worker handoff carries last_h" {
 
     handleSmResumeReply(&server, .{
         .previd = &previd,
-        .req_session = 1,
+        .req_token = server.sessionToken(1),
         .req_epoch = 7,
         .status = "ok",
     }, &changes);
@@ -1531,7 +1539,7 @@ pub const CapturedResumeStatus = struct {
 pub fn captureSmResumeStatus(ds: *DeliverySystem, req_worker: u16, out: *CapturedResumeStatus) void {
     const Ctx = struct { dst: *CapturedResumeStatus };
     _ = ds.getQueue(req_worker).drain(Ctx{ .dst = out }, struct {
-        fn handle(c: Ctx, _: u32, _: u32, payload: []const u8) void {
+        fn handle(c: Ctx, _: Token, payload: []const u8) void {
             const msg = actor_message.decode(payload) orelse return;
             switch (msg) {
                 .sm_resume_reply => |r| {
@@ -1559,7 +1567,7 @@ pub fn makeDetachedForResume(
     fd: posix.fd_t,
 ) !*Session {
     const detached = try std.testing.allocator.create(Session);
-    detached.* = Session.init(fd, slot, "localhost", false, std.testing.allocator);
+    detached.init(fd, slot, "localhost", false, std.testing.allocator);
     detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
     detached.sm_detached = true;
     detached.sm_detach_time = std.time.timestamp();
@@ -1579,7 +1587,8 @@ pub fn makeDetachedForResume(
 }
 
 test "Server: S24 cross-worker resume validates the reported h before handoff" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
     server.worker_id = 1;
     var delivery_sys = try DeliverySystem.init(std.testing.allocator, 2);
@@ -1600,7 +1609,7 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
         .previd = previd,
         .h = 3,
         .req_worker = 1,
-        .req_session = 1,
+        .req_token = st(1, 1),
         .req_epoch = 0,
         .auth_local = "alice",
         .auth_domain = "localhost",
@@ -1620,7 +1629,7 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
         .previd = previd,
         .h = 100,
         .req_worker = 1,
-        .req_session = 1,
+        .req_token = st(1, 1),
         .req_epoch = 0,
         .auth_local = "alice",
         .auth_domain = "localhost",
@@ -1638,7 +1647,7 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
         .previd = previd,
         .h = 5,
         .req_worker = 1,
-        .req_session = 1,
+        .req_token = st(1, 1),
         .req_epoch = 0,
         .auth_local = "alice",
         .auth_domain = "localhost",
@@ -1655,7 +1664,8 @@ test "Server: S24 cross-worker resume validates the reported h before handoff" {
 }
 
 test "Re-review 7.4: the resume request carries the drain sequence into the bundle" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
     server.worker_id = 1;
     var delivery_sys = try DeliverySystem.init(std.testing.allocator, 2);
@@ -1675,7 +1685,7 @@ test "Re-review 7.4: the resume request carries the drain sequence into the bund
         .previd = previd,
         .h = 5,
         .req_worker = 1,
-        .req_session = 1,
+        .req_token = st(1, 1),
         .req_epoch = 0,
         .auth_local = "alice",
         .auth_domain = "localhost",
@@ -1691,7 +1701,8 @@ test "Re-review 7.4: the resume request carries the drain sequence into the bund
 }
 
 test "Server: S24 cross-worker resume rejects a wrapped h above the sent count" {
-    var server = try Server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
     server.worker_id = 1;
     var delivery_sys = try DeliverySystem.init(std.testing.allocator, 2);
@@ -1714,7 +1725,7 @@ test "Server: S24 cross-worker resume rejects a wrapped h above the sent count" 
         .previd = previd,
         .h = 3,
         .req_worker = 1,
-        .req_session = 1,
+        .req_token = st(1, 1),
         .req_epoch = 0,
         .auth_local = "alice",
         .auth_domain = "localhost",

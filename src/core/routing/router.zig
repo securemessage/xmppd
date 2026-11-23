@@ -23,6 +23,8 @@ const ChangeList = @import("../worker/loop.zig").ChangeList;
 const session_map_mod = @import("session_map");
 const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
+const Token = delivery_queue_mod.Token;
+const token_kinds = @import("token_kinds");
 const muc_handler = @import("../muc/handler.zig");
 const fanout = @import("../muc/fanout.zig");
 const metrics = @import("../worker/metrics.zig");
@@ -589,8 +591,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // each resource that accepts the stanza can join the delivered set.
     for (local_ids[0..target_count]) |ei| {
         const entry = entries_buf[ei];
-        const tid = entry.local_session_id;
-        const target_session = server.sessions[tid] orelse continue;
+        const tid = entry.token.index;
+        const target_session = server.sessionForEventToken(entry.token) orelse continue;
         if (is_typing_only and !target_session.csi_active) continue;
         const sent_data = built orelse {
             delivery_failed = true;
@@ -912,15 +914,15 @@ fn enqueueCrossThreadStanza(
 
     // Carry the dispatch identity so the receiving worker holds this message
     // under the same token every other holder uses.
-    ds.deliverDelivery(route.worker_id, route.local_session_id, route.generation, payload, hold_token, receipt_ts, .stanza) catch |err| {
-        noteCrossWorkerDrop("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.local_session_id, err });
+    ds.deliverDelivery(route.worker_id, route.token, payload, hold_token, receipt_ts, .stanza) catch |err| {
+        noteCrossWorkerDrop("cross-thread delivery failed to worker {d} session {d}: {}", .{ route.worker_id, route.token.index, err });
         return false;
     };
     return true;
 }
 
 fn dropOversize(inner_len: usize, route: SessionEntry) bool {
-    noteCrossWorkerDrop("cross-thread stanza exceeds {d}-byte delivery slot (inner {d} bytes) to worker {d} session {d} — routed to offline/bounce fallback (S14)", .{ delivery_queue_mod.MAX_PAYLOAD_SIZE, inner_len, route.worker_id, route.local_session_id });
+    noteCrossWorkerDrop("cross-thread stanza exceeds {d}-byte delivery slot (inner {d} bytes) to worker {d} session {d}: routed to offline/bounce fallback (S14)", .{ delivery_queue_mod.MAX_PAYLOAD_SIZE, inner_len, route.worker_id, route.token.index });
     return false;
 }
 
@@ -966,8 +968,7 @@ fn sendCarbons(
         var was_delivered = false;
         for (delivered) |t| {
             if (t.worker_id == entry.worker_id and
-                t.local_session_id == entry.local_session_id and
-                t.generation == entry.generation)
+                t.token.eql(entry.token))
             {
                 was_delivered = true;
                 break;
@@ -975,7 +976,7 @@ fn sendCarbons(
         }
         if (was_delivered) continue;
         if (entry.worker_id == server.worker_id) {
-            const target = server.sessions[entry.local_session_id] orelse continue;
+            const target = server.sessionForEventToken(entry.token) orelse continue;
             if (&target.conn == &sender_session.conn) continue;
             if (!target.carbons_enabled) continue;
 
@@ -1027,14 +1028,14 @@ fn sendCarbons(
                 cw.writeAll("></message>") catch break :stanza null;
                 break :stanza cfbs.getWritten();
             } orelse {
-                noteDrop("{s} carbon for session {d} exceeds {d} bytes; skipped", .{ carbon_type, entry.local_session_id, cbuf.len });
+                noteDrop("{s} carbon for session {d} exceeds {d} bytes; skipped", .{ carbon_type, entry.token.index, cbuf.len });
                 continue;
             };
-            fanout.deliverToSession(target, carbon_data, entry.local_session_id);
+            fanout.deliverToSession(target, carbon_data, entry.token.index);
         } else {
             // T89: Cross-thread carbon delivery via MPSC
             const ds = server.delivery_system orelse {
-                noteCrossWorkerDrop("{s} carbon for worker {d} session {d} not deliverable: no delivery system", .{ carbon_type, entry.worker_id, entry.local_session_id });
+                noteCrossWorkerDrop("{s} carbon for worker {d} session {d} not deliverable: no delivery system", .{ carbon_type, entry.worker_id, entry.token.index });
                 continue;
             };
 
@@ -1086,14 +1087,14 @@ fn sendCarbons(
                 cw.writeAll("></message>") catch break :stanza null;
                 break :stanza cfbs.getWritten();
             } orelse {
-                noteCrossWorkerDrop("{s} carbon for worker {d} session {d} exceeds {d} bytes; skipped", .{ carbon_type, entry.worker_id, entry.local_session_id, cbuf.len });
+                noteCrossWorkerDrop("{s} carbon for worker {d} session {d} exceeds {d} bytes; skipped", .{ carbon_type, entry.worker_id, entry.token.index, cbuf.len });
                 continue;
             };
 
             // The slot carries the carbon class so the receiving worker can
             // apply carbons_enabled and the live-only rules; this worker
             // cannot see them on the remote Session.
-            ds.deliverDelivery(entry.worker_id, entry.local_session_id, entry.generation, carbon_xml, 0, 0, .carbon) catch |err| {
+            ds.deliverDelivery(entry.worker_id, entry.token, carbon_xml, 0, 0, .carbon) catch |err| {
                 noteCrossWorkerDrop("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
             };
         }
@@ -1196,7 +1197,8 @@ fn writeServiceUnavailable(
 
 test "dispatchStanza: domain-only mixed-case 'to' stays local" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
@@ -1205,7 +1207,7 @@ test "dispatchStanza: domain-only mixed-case 'to' stays local" {
 
     const session = try allocator.create(Session);
     defer allocator.destroy(session);
-    session.* = Session.init(fds[0], 0, server.server_host, false, allocator);
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
     session.stanza_kind = .message;
@@ -1225,13 +1227,15 @@ test "dispatchStanza: domain-only mixed-case 'to' stays local" {
 
 test "R-385: an oversized queued iq result keeps the session and answers resource-constraint" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
     session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     session.iq_to = "localhost";
@@ -1262,13 +1266,15 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
 
 test "R-385: a full buffer on a deliverable stanza still flags overflow teardown" {
     const allocator = std.testing.allocator;
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
 
     var fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
     defer posix.close(fds[1]);
-    var session = Session.init(fds[0], 0, server.server_host, false, allocator);
+    var session: Session = undefined;
+    session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
     try std.testing.expect(session.conn.ensureWriteBuf());
@@ -1289,7 +1295,8 @@ test "Server: an over-long sender bare JID still delivers live" {
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1297,9 +1304,9 @@ test "Server: an over-long sender bare JID still delivers live" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     // The localpart parses, but local@domain overflows the 512-byte bare JID
@@ -1310,7 +1317,8 @@ test "Server: an over-long sender bare JID still delivers live" {
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = .{ .local = &long_local, .domain = "localhost", .resource = "mobile" };
     alice.stanza_kind = .message;
@@ -1348,7 +1356,8 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1356,17 +1365,18 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.stream.state = .active;
     bob.stream.authenticated = true;
     bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
     server.sessions[5] = bob;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desk");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desk");
     sm.setPresenceAvailable("bob", "localhost", "desk", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.state = .active;
     // The sender's full JID stays inside the 1 KiB form buffer but every byte
@@ -1409,7 +1419,8 @@ test "S14: failed cross-worker resource does not block local delivery" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1421,17 +1432,18 @@ test "S14: failed cross-worker resource does not block local delivery" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     server.sessions[5] = target;
 
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
-    _ = try sm.bind(1, 7, "bob", "localhost", "phone");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
+    _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -1483,7 +1495,8 @@ test "S14: oversize cross-worker stanza falls back to the offline store" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1494,12 +1507,13 @@ test "S14: oversize cross-worker stanza falls back to the offline store" {
     // bob's only resource lives on worker 1: the direct handoff is the
     // cross-thread enqueue, and the stanza exceeds the delivery slot, so
     // the fallback alone decides what happens to it.
-    _ = try sm.bind(1, 7, "bob", "localhost", "phone");
+    _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -1532,7 +1546,8 @@ test "S14: oversize cross-worker stanza with no offline store bounces" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1540,12 +1555,13 @@ test "S14: oversize cross-worker stanza with no offline store bounces" {
 
     // bob remote-only again, but no offline store: the bounce fallback
     // is the only path left.
-    _ = try sm.bind(1, 7, "bob", "localhost", "phone");
+    _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -1575,7 +1591,8 @@ test "Server: G4 a near-limit online stanza is bounced when delivery cannot queu
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1583,17 +1600,17 @@ test "Server: G4 a near-limit online stanza is bounced when delivery cannot queu
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.init(bob_fds[0], 5, "localhost", false, allocator);
     server.sessions[5] = bob;
     // Bound bob's outbox at the ring so the near-limit form cannot queue.
     bob.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     server.sessions[9] = alice;
     alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
     alice.stanza_kind = .message;
@@ -1635,7 +1652,8 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1646,28 +1664,29 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     const local_fds = try makeSocketPair();
     defer posix.close(local_fds[1]);
     const local = try allocator.create(Session);
-    local.* = Session.init(local_fds[0], 5, "localhost", false, allocator);
+    local.init(local_fds[0], 5, "localhost", false, allocator);
     local.stream.state = .active;
     local.stream.authenticated = true;
     local.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desk") catch null;
     server.sessions[5] = local;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desk");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desk");
     sm.setPresenceAvailable("bob", "localhost", "desk", true);
 
     const remote_fds = try makeSocketPair();
     defer posix.close(remote_fds[1]);
     const remote = try allocator.create(Session);
-    remote.* = Session.init(remote_fds[0], 6, "localhost", false, allocator);
+    remote.init(remote_fds[0], 6, "localhost", false, allocator);
     remote.stream.state = .active;
     remote.stream.authenticated = true;
     remote.stream.bound_jid = xmpp.Jid.parse("bob@localhost/phone") catch null;
     server.sessions[6] = remote;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, Token.init(6, 1, token_kinds.session), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -1692,7 +1711,7 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     var captured = struct {
         buf: [8192]u8 = undefined,
         len: usize = 0,
-        fn onDelivery(self: *@This(), _: u32, _: u32, payload: []const u8) void {
+        fn onDelivery(self: *@This(), _: Token, payload: []const u8) void {
             @memcpy(self.buf[0..payload.len], payload);
             self.len = payload.len;
         }

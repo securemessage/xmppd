@@ -10,6 +10,8 @@
 const std = @import("std");
 const room_store = @import("room_store");
 const room_mailbox_mod = @import("room_mailbox");
+pub const Token = @import("net_token").Token;
+const token_kinds = @import("token_kinds");
 const RoomConfig = room_store.RoomConfig;
 const Role = room_store.Role;
 const Affiliation = room_store.Affiliation;
@@ -86,9 +88,6 @@ pub fn loadPersistentRooms(reg: *RoomRegistry, store: anytype, worker_count: u16
 /// Maximum occupants per room.
 pub const MAX_OCCUPANTS = 128;
 
-/// Sentinel session_id for remote (S2S) occupants.
-pub const REMOTE_OCCUPANT: usize = std.math.maxInt(usize);
-
 /// Longest real JID an occupant record holds. Fan-out sizing has to assume
 /// the worst case, because one recipient over the limit fails the delivery.
 /// Matches the daemon's full-JID bound (router FULL_JID_MAX, not importable
@@ -109,16 +108,21 @@ pub const Occupant = struct {
     /// Bare JID of the real user (user@domain).
     bare_jid_buf: [MAX_BARE_JID]u8 = [_]u8{0} ** MAX_BARE_JID,
     bare_jid_len: u16 = 0,
-    /// Session ID (local index into Server.sessions). REMOTE_OCCUPANT for federated.
-    session_id: usize = 0,
+    /// Delivery address of the occupant's session on `worker_id` (ADR-4):
+    /// a session token, or kind `token_kinds.remote` for a federated
+    /// occupant with no local slot.
+    token: Token = .none,
     /// Worker thread that owns this session (for cross-thread fan-out routing).
     worker_id: u16 = 0,
-    /// Session generation (from SessionMap bind) for ABA-safe cross-thread delivery.
-    generation: u32 = 0,
     /// Current role (runtime, not persisted).
     role: Role = .participant,
     /// Current affiliation (may differ from stored if changed at runtime).
     affiliation: Affiliation = .none,
+
+    /// A remote (S2S) occupant has no session slot on any worker.
+    pub fn isRemote(self: *const Occupant) bool {
+        return self.token.kind == token_kinds.remote;
+    }
 
     pub fn getNick(self: *const Occupant) []const u8 {
         return self.nick_buf[0..self.nick_len];
@@ -226,7 +230,7 @@ pub const Room = struct {
     }
 
     /// Add an occupant to the room. Returns slot index or error.
-    pub fn addOccupant(self: *Room, nick: []const u8, real_jid: []const u8, bare_jid: []const u8, session_id: usize, worker_id: u16, generation: u32, role: Role, affiliation: Affiliation) !usize {
+    pub fn addOccupant(self: *Room, nick: []const u8, real_jid: []const u8, bare_jid: []const u8, token: Token, worker_id: u16, role: Role, affiliation: Affiliation) !usize {
         // Idempotent: if already present by JID, return existing slot
         if (self.findByRealJid(real_jid)) |existing_idx| return existing_idx;
 
@@ -247,9 +251,8 @@ pub const Room = struct {
                 occ.setNick(nick);
                 occ.setRealJid(real_jid);
                 occ.setBareJid(bare_jid);
-                occ.session_id = session_id;
+                occ.token = token;
                 occ.worker_id = worker_id;
-                occ.generation = generation;
                 occ.role = role;
                 occ.affiliation = affiliation;
                 slot.* = occ;
@@ -289,16 +292,15 @@ pub const Room = struct {
     /// occupant.real_jid_buf, so the old key is removed before the buffer is
     /// overwritten. Capacity is reserved first: on error.OutOfMemory nothing
     /// has changed.
-    pub fn retargetOccupant(self: *Room, index: usize, new_real_jid: []const u8, new_session: usize, new_worker: u16, new_generation: u32) error{OutOfMemory}!void {
+    pub fn retargetOccupant(self: *Room, index: usize, new_real_jid: []const u8, new_token: Token, new_worker: u16) error{OutOfMemory}!void {
         if (index >= MAX_OCCUPANTS) return;
         try self.jid_map.ensureUnusedCapacity(self.allocator, 1);
         const occ = &self.occupants[index].?;
         const old_worker = occ.worker_id;
         _ = self.jid_map.fetchRemove(occ.getRealJid());
         occ.setRealJid(new_real_jid);
-        occ.session_id = new_session;
+        occ.token = new_token;
         occ.worker_id = new_worker;
-        occ.generation = new_generation;
         self.jid_map.putAssumeCapacity(occ.getRealJid(), @intCast(index));
         std.debug.assert(new_worker < MAX_WORKERS);
         self.worker_mask.set(new_worker);
@@ -313,19 +315,18 @@ pub const Room = struct {
         return self.removeOccupant(idx);
     }
 
-    /// Move an occupant to another (worker, session, generation) — the
-    /// SM-resume migration (T177). The occupant's identity (nick, role,
-    /// affiliation, JIDs) is unchanged; only the delivery triple moves.
+    /// Move an occupant to another (worker, token) address: the SM-resume
+    /// migration (T177). The occupant's identity (nick, role, affiliation,
+    /// JIDs) is unchanged; only the delivery address moves.
     /// Returns the worker the record pointed at before the move, or null if
     /// the occupant is not present. Idempotent at the identity level: the
     /// recorded old worker is authoritative, the caller's hint ignored.
-    pub fn updateOccupantMove(self: *Room, real_jid: []const u8, new_worker: u16, new_session: usize, new_generation: u32) ?u16 {
+    pub fn updateOccupantMove(self: *Room, real_jid: []const u8, new_worker: u16, new_token: Token) ?u16 {
         const idx = self.findByRealJid(real_jid) orelse return null;
         const occ = &self.occupants[idx].?;
         const old_worker = occ.worker_id;
         occ.worker_id = new_worker;
-        occ.session_id = new_session;
-        occ.generation = new_generation;
+        occ.token = new_token;
         std.debug.assert(new_worker < MAX_WORKERS);
         self.worker_mask.set(new_worker);
         if (!self.hasOccupantOnWorker(old_worker)) {
@@ -526,6 +527,11 @@ pub const RoomRegistry = struct {
 // Tests
 // ============================================================================
 
+/// Session-kind token for occupant records in tests.
+fn st(index: u32, gen: u24) Token {
+    return .{ .index = index, .gen = gen, .kind = token_kinds.session };
+}
+
 test "RoomRegistry: create and find room" {
     var reg = RoomRegistry.init(std.testing.allocator);
     defer reg.deinit();
@@ -566,7 +572,7 @@ test "Room: add and find occupant" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    const idx = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, 0, .participant, .none);
+    const idx = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", st(5, 0), 0, .participant, .none);
     try std.testing.expectEqual(@as(usize, 0), idx);
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
 
@@ -585,8 +591,8 @@ test "Room: remove occupant" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, 0, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/desktop", "bob@localhost", 7, 0, 0, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", st(5, 0), 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/desktop", "bob@localhost", st(7, 0), 0, .participant, .none);
     try std.testing.expectEqual(@as(usize, 2), room.occupant_count);
 
     const removed = room.removeByRealJid("alice@localhost/mobile").?;
@@ -602,19 +608,19 @@ test "Room: updateOccupantMove swaps delivery triple and fixes worker_mask" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 5, 0, 7, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/d", "bob@localhost", 7, 0, 9, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(5, 7), 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/d", "bob@localhost", st(7, 9), 0, .participant, .none);
     try std.testing.expectEqual(@as(u64, 0b1), room.worker_mask.mask);
 
     // Move alice from (worker 0, slot 5, gen 7) to (worker 2, slot 41, gen 3)
-    const old = room.updateOccupantMove("alice@localhost/m", 2, 41, 3).?;
+    const old = room.updateOccupantMove("alice@localhost/m", 2, st(41, 3)).?;
     try std.testing.expectEqual(@as(u16, 0), old);
 
     const idx = room.findByRealJid("alice@localhost/m").?;
     const occ = room.occupants[idx].?;
     try std.testing.expectEqual(@as(u16, 2), occ.worker_id);
-    try std.testing.expectEqual(@as(usize, 41), occ.session_id);
-    try std.testing.expectEqual(@as(u32, 3), occ.generation);
+    try std.testing.expectEqual(@as(u32, 41), occ.token.index);
+    try std.testing.expectEqual(@as(u24, 3), occ.token.gen);
     // Identity fields untouched
     try std.testing.expectEqualStrings("alice", occ.getNick());
     try std.testing.expectEqualStrings("alice@localhost", occ.getBareJid());
@@ -631,19 +637,19 @@ test "Room: updateOccupantMove clears old worker bit when last local occupant le
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 5, 1, 7, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(5, 7), 1, .participant, .none);
     try std.testing.expectEqual(@as(u64, 0b10), room.worker_mask.mask);
 
-    const old = room.updateOccupantMove("alice@localhost/m", 3, 9, 11).?;
+    const old = room.updateOccupantMove("alice@localhost/m", 3, st(9, 11)).?;
     try std.testing.expectEqual(@as(u16, 1), old);
     try std.testing.expectEqual(@as(u64, 0b1000), room.worker_mask.mask);
 
     // Same-worker move (slot/gen churn on local SM resume) keeps the bit
-    _ = room.updateOccupantMove("alice@localhost/m", 3, 12, 13);
+    _ = room.updateOccupantMove("alice@localhost/m", 3, st(12, 13));
     try std.testing.expectEqual(@as(u64, 0b1000), room.worker_mask.mask);
 
     // Unknown occupant: null, mask untouched
-    try std.testing.expect(room.updateOccupantMove("ghost@localhost/x", 0, 1, 1) == null);
+    try std.testing.expect(room.updateOccupantMove("ghost@localhost/x", 0, st(1, 1)) == null);
     try std.testing.expectEqual(@as(u64, 0b1000), room.worker_mask.mask);
 }
 
@@ -653,11 +659,11 @@ test "Room: T256 retargetOccupant re-keys jid_map and fixes worker_mask" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    const idx = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, 7, .participant, .none);
+    const idx = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", st(5, 7), 0, .participant, .none);
     try std.testing.expectEqual(@as(u64, 0b1), room.worker_mask.mask);
 
     // The nick collapses onto a new resource on another worker.
-    try room.retargetOccupant(idx, "alice@localhost/desktop", 41, 2, 3);
+    try room.retargetOccupant(idx, "alice@localhost/desktop", st(41, 3), 2);
 
     // jid_map follows the new real JID; the old key is gone.
     try std.testing.expectEqual(idx, room.findByRealJid("alice@localhost/desktop").?);
@@ -665,8 +671,8 @@ test "Room: T256 retargetOccupant re-keys jid_map and fixes worker_mask" {
     try std.testing.expectEqualStrings("alice@localhost/desktop", room.occupants[idx].?.getRealJid());
     const occ = room.occupants[idx].?;
     try std.testing.expectEqual(@as(u16, 2), occ.worker_id);
-    try std.testing.expectEqual(@as(usize, 41), occ.session_id);
-    try std.testing.expectEqual(@as(u32, 3), occ.generation);
+    try std.testing.expectEqual(@as(u32, 41), occ.token.index);
+    try std.testing.expectEqual(@as(u24, 3), occ.token.gen);
     // Old worker's bit cleared (no other occupant there), new one set.
     try std.testing.expectEqual(@as(u64, 0b100), room.worker_mask.mask);
 
@@ -683,8 +689,8 @@ test "Room: retargetOccupant sets worker_mask bits past 16" {
     defer room.deinit();
     room.active = true;
 
-    const idx = try room.addOccupant("bob", "bob@localhost/a", "bob@localhost", 1, 0, 1, .participant, .none);
-    try room.retargetOccupant(idx, "bob@localhost/b", 2, 63, 2);
+    const idx = try room.addOccupant("bob", "bob@localhost/a", "bob@localhost", st(1, 1), 0, .participant, .none);
+    try room.retargetOccupant(idx, "bob@localhost/b", st(2, 2), 63);
 
     try std.testing.expectEqual(@as(u16, 63), room.occupants[idx].?.worker_id);
     try std.testing.expectEqual(@as(u64, 1) << 63, room.worker_mask.mask);
@@ -698,10 +704,10 @@ test "Room: retargetOccupant moves jid_map index to the new real JID" {
     room.active = true;
     room.setJid("firstroom@conference.localhost");
 
-    const idx = try room.addOccupant("daniel", "daniel@localhost/phone", "daniel@localhost", 2, 0, 2, .moderator, .owner);
+    const idx = try room.addOccupant("daniel", "daniel@localhost/phone", "daniel@localhost", st(2, 2), 0, .moderator, .owner);
 
     // Same-bare-JID takeover: phone to desktop
-    try room.retargetOccupant(idx, "daniel@localhost/desktop", 3, 0, 8);
+    try room.retargetOccupant(idx, "daniel@localhost/desktop", st(3, 8), 0);
 
     // New JID resolves; old JID is gone from the index
     const new_idx = room.findByRealJid("daniel@localhost/desktop").?;
@@ -712,8 +718,8 @@ test "Room: retargetOccupant moves jid_map index to the new real JID" {
 
     const occ = room.occupants[idx].?;
     try std.testing.expectEqualStrings("daniel@localhost/desktop", occ.getRealJid());
-    try std.testing.expectEqual(@as(usize, 3), occ.session_id);
-    try std.testing.expectEqual(@as(u32, 8), occ.generation);
+    try std.testing.expectEqual(@as(u32, 3), occ.token.index);
+    try std.testing.expectEqual(@as(u24, 8), occ.token.gen);
     try std.testing.expectEqual(Role.moderator, occ.role);
     try std.testing.expectEqual(Affiliation.owner, occ.affiliation);
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
@@ -730,9 +736,9 @@ test "Room: retargetOccupant twice in a row stays coherent" {
     defer room.deinit();
     room.active = true;
 
-    const idx = try room.addOccupant("daniel", "daniel@localhost/a", "daniel@localhost", 1, 0, 1, .participant, .none);
-    try room.retargetOccupant(idx, "daniel@localhost/b", 2, 0, 2);
-    try room.retargetOccupant(idx, "daniel@localhost/c", 3, 0, 3);
+    const idx = try room.addOccupant("daniel", "daniel@localhost/a", "daniel@localhost", st(1, 1), 0, .participant, .none);
+    try room.retargetOccupant(idx, "daniel@localhost/b", st(2, 2), 0);
+    try room.retargetOccupant(idx, "daniel@localhost/c", st(3, 3), 0);
 
     try std.testing.expect(room.findByRealJid("daniel@localhost/a") == null);
     try std.testing.expect(room.findByRealJid("daniel@localhost/b") == null);
@@ -751,7 +757,7 @@ fn fillToMapCapacity(room: *Room) !usize {
     while (first == null or room.jid_map.available > 0 or room.nick_map.available > 0) : (n += 1) {
         const nick = try std.fmt.bufPrint(&name_buf, "u{d}", .{n});
         const jid = try std.fmt.bufPrint(&jid_buf, "u{d}@localhost/r", .{n});
-        const idx = try room.addOccupant(nick, jid, jid[0 .. jid.len - 2], n, 0, 1, .participant, .none);
+        const idx = try room.addOccupant(nick, jid, jid[0 .. jid.len - 2], st(@intCast(n), 1), 0, .participant, .none);
         if (first == null) first = idx;
     }
     return first.?;
@@ -770,7 +776,7 @@ test "Room: retargetOccupant leaves the occupant indexed when the index cannot g
     const old = old_copy[0..old_jid.len];
 
     failing.fail_index = failing.alloc_index;
-    try std.testing.expectError(error.OutOfMemory, room.retargetOccupant(idx, "u0@localhost/new", 99, 0, 9));
+    try std.testing.expectError(error.OutOfMemory, room.retargetOccupant(idx, "u0@localhost/new", st(99, 9), 0));
 
     // Nothing changed: still reachable and removable by the old JID.
     try std.testing.expectEqual(idx, room.findByRealJid(old).?);
@@ -788,7 +794,7 @@ test "Room: addOccupant stores nothing when the index cannot grow" {
     const count = room.occupant_count;
 
     failing.fail_index = failing.alloc_index;
-    try std.testing.expectError(error.OutOfMemory, room.addOccupant("late", "late@localhost/r", "late@localhost", 500, 0, 1, .participant, .none));
+    try std.testing.expectError(error.OutOfMemory, room.addOccupant("late", "late@localhost/r", "late@localhost", st(500, 1), 0, .participant, .none));
     try std.testing.expectEqual(count, room.occupant_count);
     try std.testing.expect(room.findByNick("late") == null);
 }
@@ -800,7 +806,7 @@ test "RoomRegistry: removeOccupantBySessionId cleans transient rooms" {
     config.persistent = false; // transient
 
     const room = try reg.createRoom("temp@conference.localhost", config);
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .owner);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(3, 0), 0, .participant, .owner);
     try std.testing.expectEqual(@as(usize, 1), reg.count);
 
     const removed_count = reg.removeOccupantByRealJid("alice@localhost/m");
@@ -818,7 +824,7 @@ test "RoomRegistry: persistent room survives empty" {
     config.persistent = true;
 
     const room = try reg.createRoom("persist@conference.localhost", config);
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .owner);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(3, 0), 0, .participant, .owner);
 
     _ = reg.removeOccupantByRealJid("alice@localhost/m");
     // Persistent room stays
@@ -832,7 +838,7 @@ test "Room: nickname conflict" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 5, 0, 0, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(5, 0), 0, .participant, .none);
     // Same nick from different user — caller should check findByNick first
     try std.testing.expect(room.findByNick("alice") != null);
 }
@@ -844,10 +850,10 @@ test "Room: max occupants enforcement" {
     room.setJid("test@conference.localhost");
     room.config.max_occupants = 2;
 
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 0, 0, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 0, 0, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(1, 0), 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", st(2, 0), 0, .participant, .none);
     // Third occupant should be rejected
-    try std.testing.expectError(error.RoomFull, room.addOccupant("carol", "carol@localhost/m", "carol@localhost", 3, 0, 0, .participant, .none));
+    try std.testing.expectError(error.RoomFull, room.addOccupant("carol", "carol@localhost/m", "carol@localhost", st(3, 0), 0, .participant, .none));
     try std.testing.expectEqual(@as(usize, 2), room.occupant_count);
 }
 
@@ -857,8 +863,8 @@ test "Room: findByBareJid" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", 5, 0, 0, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/desktop", "bob@localhost", 7, 0, 0, .moderator, .admin);
+    _ = try room.addOccupant("alice", "alice@localhost/mobile", "alice@localhost", st(5, 0), 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/desktop", "bob@localhost", st(7, 0), 0, .moderator, .admin);
 
     try std.testing.expectEqual(@as(?usize, 0), room.findByBareJid("alice@localhost"));
     try std.testing.expectEqual(@as(?usize, 1), room.findByBareJid("bob@localhost"));
@@ -871,8 +877,8 @@ test "Room: occupant role and affiliation" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("owner", "alice@localhost/m", "alice@localhost", 1, 0, 0, .moderator, .owner);
-    _ = try room.addOccupant("guest", "bob@localhost/m", "bob@localhost", 2, 0, 0, .visitor, .none);
+    _ = try room.addOccupant("owner", "alice@localhost/m", "alice@localhost", st(1, 0), 0, .moderator, .owner);
+    _ = try room.addOccupant("guest", "bob@localhost/m", "bob@localhost", st(2, 0), 0, .visitor, .none);
 
     const owner = room.occupants[0].?;
     try std.testing.expectEqual(Role.moderator, owner.role);
@@ -890,8 +896,8 @@ test "Room: remove and re-add occupant reuses slot" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    const idx0 = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 0, 0, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 0, 0, .participant, .none);
+    const idx0 = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(1, 0), 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", st(2, 0), 0, .participant, .none);
     try std.testing.expectEqual(@as(usize, 0), idx0);
     try std.testing.expectEqual(@as(usize, 2), room.occupant_count);
 
@@ -900,7 +906,7 @@ test "Room: remove and re-add occupant reuses slot" {
     try std.testing.expectEqual(@as(usize, 1), room.occupant_count);
 
     // New occupant should reuse slot 0
-    const idx_carol = try room.addOccupant("carol", "carol@localhost/m", "carol@localhost", 3, 0, 0, .participant, .none);
+    const idx_carol = try room.addOccupant("carol", "carol@localhost/m", "carol@localhost", st(3, 0), 0, .participant, .none);
     try std.testing.expectEqual(@as(usize, 0), idx_carol);
     try std.testing.expectEqual(@as(usize, 2), room.occupant_count);
 }
@@ -935,9 +941,9 @@ test "RoomRegistry: removeOccupantByRealJid from multiple rooms" {
     const room2 = try reg.createRoom("room2@conference.localhost", .{ .persistent = false });
 
     // Same user in both rooms
-    _ = try room1.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .none);
-    _ = try room1.addOccupant("bob", "bob@localhost/m", "bob@localhost", 4, 0, 0, .participant, .none);
-    _ = try room2.addOccupant("alice", "alice@localhost/m", "alice@localhost", 3, 0, 0, .participant, .none);
+    _ = try room1.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(3, 0), 0, .participant, .none);
+    _ = try room1.addOccupant("bob", "bob@localhost/m", "bob@localhost", st(4, 0), 0, .participant, .none);
+    _ = try room2.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(3, 0), 0, .participant, .none);
 
     // Disconnect alice — removed from both rooms
     const removed_count = reg.removeOccupantByRealJid("alice@localhost/m");
@@ -959,14 +965,14 @@ test "Room: worker_mask set on add" {
     room.setJid("test@conference.localhost");
     try std.testing.expectEqual(@as(u64, 0), room.worker_mask.mask);
 
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 0, 0, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(1, 0), 0, .participant, .none);
     try std.testing.expectEqual(@as(u64, 0b0001), room.worker_mask.mask);
 
-    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 1, 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", st(2, 0), 1, .participant, .none);
     try std.testing.expectEqual(@as(u64, 0b0011), room.worker_mask.mask);
 
     // Same worker — bit already set
-    _ = try room.addOccupant("carol", "carol@localhost/m", "carol@localhost", 3, 0, 0, .participant, .none);
+    _ = try room.addOccupant("carol", "carol@localhost/m", "carol@localhost", st(3, 0), 0, .participant, .none);
     try std.testing.expectEqual(@as(u64, 0b0011), room.worker_mask.mask);
 }
 
@@ -976,9 +982,9 @@ test "Room: worker_mask cleared on remove when no occupants remain on worker" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 0, 0, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 1, 0, .participant, .none);
-    _ = try room.addOccupant("carol", "carol@localhost/m", "carol@localhost", 3, 0, 0, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(1, 0), 0, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", st(2, 0), 1, .participant, .none);
+    _ = try room.addOccupant("carol", "carol@localhost/m", "carol@localhost", st(3, 0), 0, .participant, .none);
     try std.testing.expectEqual(@as(u64, 0b0011), room.worker_mask.mask);
 
     // Remove alice (worker 0) — carol still on worker 0
@@ -1000,8 +1006,8 @@ test "Room: worker_mask handles worker_id 63 (S5)" {
     room.active = true;
     room.setJid("test@conference.localhost");
 
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, MAX_WORKERS - 1, 0, .participant, .none);
-    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", 2, 0, 0, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(1, 0), MAX_WORKERS - 1, .participant, .none);
+    _ = try room.addOccupant("bob", "bob@localhost/m", "bob@localhost", st(2, 0), 0, .participant, .none);
     try std.testing.expect(room.worker_mask.isSet(63));
     try std.testing.expect(room.worker_mask.isSet(0));
     try std.testing.expectEqual(@as(usize, 2), room.worker_mask.count());
@@ -1012,7 +1018,7 @@ test "Room: worker_mask handles worker_id 63 (S5)" {
     try std.testing.expect(room.worker_mask.isSet(0));
 
     // A move onto worker 63 sets the high bit without touching worker 0.
-    const old = room.updateOccupantMove("bob@localhost/m", 63, 9, 1).?;
+    const old = room.updateOccupantMove("bob@localhost/m", 63, st(9, 1)).?;
     try std.testing.expectEqual(@as(u16, 0), old);
     try std.testing.expect(room.worker_mask.isSet(63));
     try std.testing.expect(!room.worker_mask.isSet(0));
@@ -1025,7 +1031,7 @@ test "Room: hasOccupantOnWorker" {
     room.setJid("test@conference.localhost");
 
     try std.testing.expect(!room.hasOccupantOnWorker(0));
-    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", 1, 2, 0, .participant, .none);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", st(1, 0), 2, .participant, .none);
     try std.testing.expect(!room.hasOccupantOnWorker(0));
     try std.testing.expect(room.hasOccupantOnWorker(2));
 }

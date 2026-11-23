@@ -13,6 +13,8 @@ const xml = @import("xml");
 const sasl = @import("sasl");
 const session_map = @import("session_map");
 const delivery_queue = @import("delivery_queue");
+const Token = delivery_queue.Token;
+const token_kinds = @import("token_kinds");
 const ipc = @import("ipc_protocol");
 
 const GPA = std.heap.c_allocator;
@@ -108,7 +110,7 @@ fn benchMpscRing() !void {
     const payload = "stanza payload for the envelope ring benchmark, padded to one hundred and twenty eight bytes so it looks like a typical message..";
 
     const noop = struct {
-        fn on(_: void, _: u32, _: u32, _: []const u8) void {}
+        fn on(_: void, _: Token, _: []const u8) void {}
     }.on;
 
     var timer = try std.time.Timer.start();
@@ -118,7 +120,7 @@ fn benchMpscRing() !void {
         // One full ring per batch, like the worst fan-out drain.
         var enqueued: u32 = 0;
         while (enqueued < delivery_queue.QUEUE_SLOTS) : (enqueued += 1) {
-            queue.enqueue(0, 0, payload) catch break;
+            queue.enqueue(Token.init(0, 1, token_kinds.session), payload) catch break;
             ops += 1;
         }
         const drained = queue.drain(@as(void, {}), noop);
@@ -143,7 +145,7 @@ fn benchSessionMapLookup() !void {
     defer for (locals) |s| GPA.free(s);
     for (locals, 0..) |*slot, i| {
         slot.* = try std.fmt.allocPrint(GPA, "m2u-{d}", .{i});
-        _ = try map.bind(0, @intCast(i), slot.*, "localhost", "lab-1");
+        _ = try map.bind(0, Token.init(@intCast(i), 1, token_kinds.session), slot.*, "localhost", "lab-1");
     }
 
     const rounds = 200 * n_users;
