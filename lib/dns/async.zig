@@ -67,6 +67,9 @@ const STALE_RECHECK_MS: i64 = 30_000;
 /// The stale-serve log line is emitted at most once per window and
 /// owner name.
 const STALE_LOG_MS: i64 = 60_000;
+/// A burst of stale ICMP refusals warns once per window per resolver owner.
+const STALE_ICMP_WARN_THRESHOLD: usize = 8;
+const STALE_ICMP_WARN_WINDOW_MS: i64 = 60_000;
 /// Expiry-wheel granularity for stale-first eviction: one slot per
 /// second, more slots than the 300 s TTL ceiling so every cached
 /// expiry files into the wheel.
@@ -127,6 +130,73 @@ pub const RecordResult = struct {
 /// publishing "no such service on this domain" - distinct from the
 /// domain itself being missing (nxdomain).
 pub const Status = enum { resolved, nxdomain, service_unavailable, failed };
+
+/// Plain snapshot of one resolver owner's cumulative observability counters.
+/// The owner keeps writing plain integers on its packet path; only a cold
+/// dump or a request-end aggregation reads this snapshot.
+pub const Counters = struct {
+    stale_serves: u64 = 0,
+    evict_scans: u64 = 0,
+    too_many_jobs: u64 = 0,
+    malformed_replies: u64 = 0,
+    unmatched_replies: u64 = 0,
+    stale_icmp: u64 = 0,
+    kevent_errors: u64 = 0,
+    udp_errors: u64 = 0,
+
+    pub fn format(self: Counters, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print(
+            "stale_serves={d} evict_scans={d} too_many_jobs={d} " ++
+                "malformed_replies={d} unmatched_replies={d} stale_icmp={d} " ++
+                "kevent_errors={d} udp_errors={d}",
+            .{
+                self.stale_serves,      self.evict_scans, self.too_many_jobs, self.malformed_replies,
+                self.unmatched_replies, self.stale_icmp,  self.kevent_errors, self.udp_errors,
+            },
+        );
+    }
+};
+
+/// A named counter snapshot suitable for a daemon's SIGUSR1 log dump.
+pub const CounterDump = struct {
+    owner: []const u8,
+    counters: Counters,
+
+    pub fn format(self: CounterDump, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("{s} dns counters: {f}", .{ self.owner, self.counters });
+    }
+};
+
+/// Per-daemon totals for short-lived resolvers. Workers fold their local
+/// snapshots in once at request end; no atomic operation runs on DNS I/O.
+pub const AtomicCounters = struct {
+    values: [std.meta.fields(Counters).len]std.atomic.Value(u64) = @splat(.init(0)),
+
+    pub fn add(self: *AtomicCounters, delta: Counters) void {
+        inline for (std.meta.fields(Counters), 0..) |field, i| {
+            _ = self.values[i].fetchAdd(@field(delta, field.name), .monotonic);
+        }
+    }
+
+    /// Publish an owner's latest cumulative snapshot for lock-free readers.
+    pub fn store(self: *AtomicCounters, current: Counters) void {
+        inline for (std.meta.fields(Counters), 0..) |field, i| {
+            self.values[i].store(@field(current, field.name), .monotonic);
+        }
+    }
+
+    pub fn snapshot(self: *const AtomicCounters) Counters {
+        var out: Counters = .{};
+        inline for (std.meta.fields(Counters), 0..) |field, i| {
+            @field(out, field.name) = self.values[i].load(.monotonic);
+        }
+        return out;
+    }
+
+    pub fn counterDump(self: *const AtomicCounters, owner: []const u8) CounterDump {
+        return .{ .owner = owner, .counters = self.snapshot() };
+    }
+};
 
 pub const Cb = struct {
     ctx: ?*anyopaque,
@@ -385,6 +455,9 @@ pub const Resolver = struct {
     malformed_replies: usize = 0,
     unmatched_replies: usize = 0,
     stale_icmp: usize = 0,
+    stale_icmp_window_ms: i64 = std.math.minInt(i64),
+    stale_icmp_window_count: usize = 0,
+    stale_icmp_warns: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     /// Test seam: report every UDP send as failed (see sendUdp).
     fail_sends: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// Test seam: refuse the next N TCP connects synchronously (see
@@ -421,6 +494,28 @@ pub const Resolver = struct {
         // after init, ensureOpen only ever fails fast.
         r.loadResolvConf();
         return r;
+    }
+
+    pub fn counters(self: *const Resolver) Counters {
+        return .{
+            .stale_serves = @intCast(self.stale_serves),
+            .evict_scans = @intCast(self.evict_scans),
+            .too_many_jobs = @intCast(self.too_many_jobs),
+            .malformed_replies = @intCast(self.malformed_replies),
+            .unmatched_replies = @intCast(self.unmatched_replies),
+            .stale_icmp = @intCast(self.stale_icmp),
+            .kevent_errors = @intCast(self.kevent_errors),
+            .udp_errors = @intCast(self.udp_errors),
+        };
+    }
+
+    pub fn counterDump(self: *const Resolver, owner: []const u8) CounterDump {
+        return .{ .owner = owner, .counters = self.counters() };
+    }
+
+    /// Cold observability path: keep formatting out of the packet pump.
+    pub noinline fn dumpCounters(self: *const Resolver, owner: []const u8) void {
+        log.info("{f}", .{self.counterDump(owner)});
     }
 
     /// Read the configured resolv.conf into `server`; a missing or
@@ -961,6 +1056,24 @@ pub const Resolver = struct {
         return job;
     }
 
+    fn noteStaleIcmp(self: *Resolver) void {
+        self.stale_icmp += 1;
+        const now = self.now_ms();
+        const elapsed = now -| self.stale_icmp_window_ms;
+        if (self.stale_icmp_window_count == 0 or elapsed < 0 or
+            elapsed >= STALE_ICMP_WARN_WINDOW_MS)
+        {
+            self.stale_icmp_window_ms = now;
+            self.stale_icmp_window_count = 0;
+        }
+        self.stale_icmp_window_count += 1;
+        if (self.stale_icmp_window_count != STALE_ICMP_WARN_THRESHOLD) return;
+        log.warn("dns: {d} stale ICMP refusals in {d} ms (total {d})", .{
+            self.stale_icmp_window_count, STALE_ICMP_WARN_WINDOW_MS, self.stale_icmp,
+        });
+        if (builtin.is_test) self.stale_icmp_warns += 1;
+    }
+
     /// Connected-UDP send. An ICMP port-unreachable queued from an
     /// earlier datagram surfaces as ECONNREFUSED on a later send; that
     /// error belongs to the earlier packet, so it is consumed and the
@@ -977,7 +1090,7 @@ pub const Resolver = struct {
         while (true) {
             _ = rawSend(self.fd, pkt, 0) catch |err| switch (err) {
                 error.Refused => {
-                    self.stale_icmp += 1;
+                    self.noteStaleIcmp();
                     refused += 1;
                     if (refused >= STALE_ICMP_MAX) return error.SendFailed;
                     continue;
@@ -1665,7 +1778,7 @@ pub const Resolver = struct {
                 // A refusal queued by an earlier datagram is consumed,
                 // not charged to whichever job receives next.
                 error.Refused => {
-                    self.stale_icmp += 1;
+                    self.noteStaleIcmp();
                     continue;
                 },
                 else => {
@@ -7423,6 +7536,68 @@ test "dns-async: aborting a stale refresh stamps the recheck window (M10)" {
     var res2 = ctx2.raw.?;
     defer res2.deinitOn(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), r.stale_serves);
+}
+
+test "dns-async: the counter dump exports every resolver counter" {
+    // Goal: every observability field reaches the daemon-facing dump and
+    // request-local snapshots fold into per-daemon totals. Method: assign
+    // distinct values, format one owner dump, then aggregate it twice.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.stale_serves = 1;
+    r.evict_scans = 2;
+    r.too_many_jobs = 3;
+    r.malformed_replies = 4;
+    r.unmatched_replies = 5;
+    r.stale_icmp = 6;
+    r.kevent_errors = 7;
+    r.udp_errors = 8;
+
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writer.print("{f}", .{r.counterDump("unit")});
+    try std.testing.expectEqualStrings(
+        "unit dns counters: stale_serves=1 evict_scans=2 too_many_jobs=3 " ++
+            "malformed_replies=4 unmatched_replies=5 stale_icmp=6 " ++
+            "kevent_errors=7 udp_errors=8",
+        writer.buffered(),
+    );
+
+    var totals: AtomicCounters = .{};
+    totals.add(r.counters());
+    totals.add(r.counters());
+    var total_writer: std.Io.Writer = .fixed(&buf);
+    try total_writer.print("{f}", .{totals.counterDump("oidc")});
+    try std.testing.expectEqualStrings(
+        "oidc dns counters: stale_serves=2 evict_scans=4 too_many_jobs=6 " ++
+            "malformed_replies=8 unmatched_replies=10 stale_icmp=12 " ++
+            "kevent_errors=14 udp_errors=16",
+        total_writer.buffered(),
+    );
+}
+
+test "dns-async: stale ICMP warnings cross a threshold once per window" {
+    // Goal: a refusal burst warns without logging every refusal, and a new
+    // window can warn again. Method: drive the same accounting helper used
+    // by UDP send and receive with a controlled monotonic clock.
+    var r = Resolver.init(std.testing.allocator);
+    defer r.deinit();
+    r.now_ms = fakeNow;
+    fake_now = 2_000_000;
+
+    for (0..STALE_ICMP_WARN_THRESHOLD - 1) |_| r.noteStaleIcmp();
+    try std.testing.expectEqual(@as(usize, 0), r.stale_icmp_warns);
+    r.noteStaleIcmp();
+    try std.testing.expectEqual(@as(usize, 1), r.stale_icmp_warns);
+    for (0..2 * STALE_ICMP_WARN_THRESHOLD) |_| r.noteStaleIcmp();
+    try std.testing.expectEqual(@as(usize, 1), r.stale_icmp_warns);
+
+    fake_now += STALE_ICMP_WARN_WINDOW_MS;
+    r.noteStaleIcmp();
+    try std.testing.expectEqual(@as(usize, 1), r.stale_icmp_warns);
+    for (1..STALE_ICMP_WARN_THRESHOLD) |_| r.noteStaleIcmp();
+    try std.testing.expectEqual(@as(usize, 2), r.stale_icmp_warns);
+    try std.testing.expectEqual(@as(usize, 4 * STALE_ICMP_WARN_THRESHOLD), r.stale_icmp);
 }
 
 test "dns-async: the stale-serve log is rate-limited per owner (M16)" {

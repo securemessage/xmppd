@@ -64,6 +64,9 @@ pub const OidcConfig = struct {
     localpart_auto_suffix: bool = false,
     /// Domain to append to bare usernames for ROPC (e.g., "morante.dev" → alice@morante.dev).
     user_domain: ?[]const u8 = null,
+    /// Minimum milliseconds between kid-miss JWKS refetches after a
+    /// failed fetch ([oidc] jwks_min_refresh; 0 disables suppression).
+    jwks_min_refresh_ms: u64 = 60_000,
 };
 
 /// What the IdP decided about one credential.
@@ -180,10 +183,16 @@ pub const ExchangeOptions = struct {
     cancel_fd: posix.fd_t = -1,
 };
 
-/// Cached JWK key (supports RSA and EdDSA/OKP).
+/// Cached JWK key (supports RSA and EdDSA/OKP). `pkey` is the key
+/// material parsed once at refresh: the cache owns one reference, a
+/// worker borrows a second via EVP_PKEY_up_ref at lookup and frees it
+/// after verification. Null marks a key that failed to parse; it is
+/// unusable, not absent.
 const JwkKey = struct {
     kid: []const u8,
     kty: KeyType,
+    /// Parsed key material, one cache-owned reference (jwks_mutex).
+    pkey: ?*jwt.Pkey = null,
     // RSA fields
     n: []const u8 = "",
     e: []const u8 = "",
@@ -204,6 +213,10 @@ const JWKS_MAX_AGE_SECONDS: i64 = 3600;
 /// copied out under the lock.
 const KeyCopy = struct {
     kty: KeyType,
+    /// Worker's own reference on the cached key material; the caller
+    /// frees it with jwt.pkeyFree after verification. Always set by
+    /// findKeyLocked before .found leaves the lock.
+    pkey: *jwt.Pkey = undefined,
     /// base64url modulus; 1408 bytes covers an 8192-bit RSA key (1366
     /// chars) with headroom. Anything larger is unusable, see KeyLookup.
     n_buf: [1408]u8 = undefined,
@@ -241,6 +254,9 @@ const KeyLookup = union(enum) {
     /// The kid exists but a component exceeds the copy bound: an unusable
     /// cached key is a service problem, never a bad credential.
     oversize,
+    /// The kid exists but its key material failed to parse at refresh:
+    /// an IdP-side defect, reported like oversize.
+    unusable,
     absent,
 };
 
@@ -328,8 +344,8 @@ pub const OidcStore = struct {
 
     /// One shared HTTPS client for the daemon (T357/S8): the SSL_CTX and its
     /// parsed CA bundle cost is paid once, not per token/introspection/JWKS
-    /// request. Created by start() before the workers spawn; read-only
-    /// afterwards, so workers share it safely.
+    /// request. Created by start() before the workers spawn; its TLS
+    /// contexts stay read-only and its DNS totals use atomics.
     http_client: ?http.Client = null,
 
     /// Guards the JWKS cache below (keys, key_count, jwks_body,
@@ -346,6 +362,21 @@ pub const OidcStore = struct {
 
     /// Timestamp of last JWKS refresh, Unix seconds (jwks_mutex).
     jwks_last_refresh: i64 = 0,
+
+    /// Timestamp of the last failed JWKS fetch, Unix seconds
+    /// (jwks_mutex). A failed fetch opens the negative window: kid-miss
+    /// refetches are suppressed until jwks_min_refresh has passed, so a
+    /// dead IdP is not hammered by tokens carrying unknown kids.
+    jwks_last_failure: i64 = 0,
+
+    /// Daemon counters (read without the mutex like IdpPool's): failed
+    /// JWKS fetches and kid-miss refetches the negative window ate.
+    jwks_failures: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    jwks_suppressed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    /// Last time a suppression was logged, Unix seconds (jwks_mutex):
+    /// suppression warnings are rate-limited to one per minute.
+    jwks_suppress_log_last: i64 = 0,
 
     /// Set by the daemon only around the replay of a completed exchange:
     /// handleMessage then calls validatePassword/validateToken, which read
@@ -373,6 +404,7 @@ pub const OidcStore = struct {
 
     pub fn deinit(self: *OidcStore) void {
         if (self.http_client) |*cl| cl.deinit();
+        self.freeKeyPkeys();
         if (self.jwks_body) |body| {
             self.allocator.free(body);
             self.jwks_body = null;
@@ -380,11 +412,14 @@ pub const OidcStore = struct {
         self.key_count = 0;
     }
 
-    /// Create the shared HTTPS client. Called once before the IdP workers
-    /// start; afterwards http_client is only read.
+    /// Create the shared HTTPS client before the IdP workers start.
     pub fn start(self: *OidcStore) error{TlsInitFailed}!void {
         std.debug.assert(self.http_client == null);
         self.http_client = http.Client.init(self.config.ca_file) catch return error.TlsInitFailed;
+    }
+
+    pub fn dumpResolverCounters(self: *OidcStore) void {
+        if (self.http_client) |*client| client.dumpResolverCounters();
     }
 
     fn httpClient(self: *OidcStore) *http.Client {
@@ -631,9 +666,12 @@ pub const OidcStore = struct {
             },
         };
 
+        // Verify against the cached EVP_PKEY: the JWK was parsed into key
+        // material once at refresh, so a token verification never reparses.
+        defer jwt.pkeyFree(key.pkey);
         const sig_valid = switch (key.kty) {
-            .rsa => jwt.verifyRs256(&parsed, key.n(), key.e()),
-            .okp => jwt.verifyEdDSA(&parsed, key.x()),
+            .rsa => jwt.verifyRs256Pkey(&parsed, key.pkey),
+            .okp => jwt.verifyEdDSAPkey(&parsed, key.pkey),
         };
         if (!sig_valid) {
             log.info("JWT: signature verification failed for sub='{s}'", .{parsed.claims.sub});
@@ -941,7 +979,7 @@ pub const OidcStore = struct {
 
         switch (self.findKeyLocked(kid)) {
             .found => |k| return .{ .key = k },
-            .oversize => return .{ .failed = .unavailable },
+            .oversize, .unusable => return .{ .failed = .unavailable },
             .absent => {},
         }
         if (cache_stale) {
@@ -949,7 +987,22 @@ pub const OidcStore = struct {
             return .absent;
         }
 
-        // Kid miss on a fresh cache: the IdP may have rotated keys.
+        // Kid miss on a fresh cache: the IdP may have rotated keys. A
+        // recent fetch failure suppresses the refetch until
+        // jwks_min_refresh has passed; cached keys keep serving and the
+        // suppression is counted and rate-limited at warn.
+        const min_refresh_s: i64 = @intCast(self.config.jwks_min_refresh_ms / 1000);
+        if (now - self.jwks_last_failure < min_refresh_s) {
+            _ = self.jwks_suppressed.fetchAdd(1, .monotonic);
+            if (now - self.jwks_suppress_log_last >= 60) {
+                self.jwks_suppress_log_last = now;
+                log.warn(
+                    "JWKS: kid-miss refetch suppressed ({d}s after fetch failure, min {d}s)",
+                    .{ now - self.jwks_last_failure, min_refresh_s },
+                );
+            }
+            return .absent;
+        }
         self.refreshJwksLocked(options) catch |err| {
             return .{ .failed = switch (err) {
                 error.Timeout => .timed_out,
@@ -958,7 +1011,7 @@ pub const OidcStore = struct {
         };
         return switch (self.findKeyLocked(kid)) {
             .found => |k| .{ .key = k },
-            .oversize => .{ .failed = .unavailable },
+            .oversize, .unusable => .{ .failed = .unavailable },
             .absent => .absent,
         };
     }
@@ -995,6 +1048,10 @@ pub const OidcStore = struct {
                     copy.x_len = @intCast(k.x.len);
                 },
             }
+            // The worker gets its own reference on the cached key
+            // material; it frees it after verification.
+            const pk = k.pkey orelse return .unusable;
+            copy.pkey = jwt.pkeyUpRef(pk) orelse return .unusable;
             return .{ .found = copy };
         }
         return .absent;
@@ -1004,6 +1061,19 @@ pub const OidcStore = struct {
     /// jwks_mutex; the HTTP GET is serialized with every other refresh and
     /// bounded by the request deadline.
     fn refreshJwksLocked(self: *OidcStore, options: ExchangeOptions) JwksError!void {
+        // Every failure stamps and counts the negative window for the
+        // kid-miss path; a success clears it so rotation can be
+        // discovered again.
+        var ok = false;
+        defer {
+            if (ok) {
+                self.jwks_last_failure = 0;
+            } else {
+                self.jwks_last_failure = std.time.timestamp();
+                _ = self.jwks_failures.fetchAdd(1, .monotonic);
+            }
+        }
+
         log.info("refreshing JWKS from {s}", .{self.config.jwks_uri});
 
         var response = self.httpClient().get(
@@ -1031,7 +1101,10 @@ pub const OidcStore = struct {
         ) catch return JwksError.OutOfMemory;
         @memcpy(body_copy, response.body);
 
-        // Replace old JWKS body
+        // Replace the old key set and body together: cached pkeys die
+        // with the set that parsed them (in-flight verifications hold
+        // their own references).
+        self.freeKeyPkeys();
         if (self.jwks_body) |old| {
             self.allocator.free(old);
         }
@@ -1041,6 +1114,16 @@ pub const OidcStore = struct {
         // Parse keys from JWKS JSON
         self.key_count = 0;
         self.parseJwksKeys();
+        ok = true;
+    }
+
+    /// Release the cache's reference on every parsed key. Caller holds
+    /// jwks_mutex; keys' own refs stay with in-flight verifications.
+    fn freeKeyPkeys(self: *OidcStore) void {
+        for (self.keys[0..self.key_count]) |*k| {
+            jwt.pkeyFree(k.pkey);
+            k.pkey = null;
+        }
     }
 
     /// Parse JWKS JSON and extract key components (RSA and EdDSA/OKP).
@@ -1084,9 +1167,13 @@ pub const OidcStore = struct {
                 self.keys[self.key_count] = JwkKey{
                     .kid = kid_value,
                     .kty = .rsa,
+                    .pkey = jwt.pkeyFromRsa(n_value, e_value),
                     .n = n_value,
                     .e = e_value,
                 };
+                if (self.keys[self.key_count].pkey == null) {
+                    log.warn("JWKS: RSA key '{s}' failed to parse into a public key", .{kid_value});
+                }
                 self.key_count += 1;
             } else if (std.mem.eql(u8, kty_value, "OKP")) {
                 // EdDSA (Ed25519) key -- need x
@@ -1098,8 +1185,12 @@ pub const OidcStore = struct {
                 self.keys[self.key_count] = JwkKey{
                     .kid = kid_value,
                     .kty = .okp,
+                    .pkey = jwt.pkeyFromEd25519(x_value),
                     .x = x_value,
                 };
+                if (self.keys[self.key_count].pkey == null) {
+                    log.warn("JWKS: OKP key '{s}' failed to parse into a public key", .{kid_value});
+                }
                 self.key_count += 1;
             }
             // Skip unknown key types
@@ -1437,6 +1528,9 @@ pub const IdpPool = struct {
     }
 
     fn workerMain(self: *IdpPool) void {
+        // The keep-alive pool is threadlocal to this worker; release its
+        // parked fds so they do not outlive the thread.
+        defer http.drainIdlePool();
         while (true) {
             const entry = blk: {
                 self.job_mutex.lock();
@@ -1941,14 +2035,20 @@ test "OidcStore: an oversized JWKS key is unavailable, never a rejection" {
     }
     // The 8192-bit key fits the copy bound and is served normally.
     switch (store.signingKey("rsa8k", testOptions(5000))) {
-        .key => |k| try std.testing.expectEqual(@as(usize, 1366), k.n().len),
+        .key => |k| {
+            defer jwt.pkeyFree(k.pkey);
+            try std.testing.expectEqual(@as(usize, 1366), k.n().len);
+        },
         else => return error.ExpectedKey,
     }
 }
 
 fn fetchSigningKey(store: *OidcStore, kid: []const u8, hits: *std.atomic.Value(usize)) void {
     switch (store.signingKey(kid, testOptions(8000))) {
-        .key => _ = hits.fetchAdd(1, .monotonic),
+        .key => |k| {
+            jwt.pkeyFree(k.pkey);
+            _ = hits.fetchAdd(1, .monotonic);
+        },
         else => {},
     }
 }
@@ -1997,6 +2097,104 @@ test "OidcStore: concurrent kid misses fetch the JWKS once" {
     t2.join();
     try std.testing.expectEqual(@as(usize, 2), hits.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), fetches.load(.acquire));
+}
+
+test "OidcStore: a failed JWKS fetch suppresses refetch on kid-miss until the interval" {
+    const allocator = std.testing.allocator;
+    // jwks_uri points at a port nothing listens on, so every fetch
+    // attempt fails fast with a transport error. A suppressed lookup
+    // answers .absent while a real attempt answers .failed, which is
+    // the observable the revert check needs.
+    var store = testStore(allocator, .{ .jwks_uri = "https://localhost:1/certs" });
+    defer store.deinit();
+    try store.start();
+
+    // Seed one cached key and mark the cache fresh, so the lookup
+    // exercises the kid-miss path and "cached keys keep serving" is
+    // checkable.
+    store.jwks_body = try allocator.dupe(
+        u8,
+        "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"k1\",\"n\":\"AQAB\",\"e\":\"AQAB\"}]}",
+    );
+    store.jwks_last_refresh = std.time.timestamp();
+    store.parseJwksKeys();
+    try std.testing.expectEqual(@as(usize, 1), store.key_count);
+
+    // First kid miss fetches and fails; the failure is stamped.
+    switch (store.signingKey("k2", testOptions(5000))) {
+        .failed => {},
+        else => return error.ExpectedFailure,
+    }
+    try std.testing.expectEqual(@as(usize, 1), store.jwks_failures.load(.monotonic));
+
+    // Inside the negative window the same miss is answered absent with
+    // no second fetch, and the cached key still serves.
+    switch (store.signingKey("k2", testOptions(5000))) {
+        .absent => {},
+        else => return error.ExpectedAbsent,
+    }
+    try std.testing.expectEqual(@as(usize, 1), store.jwks_suppressed.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), store.jwks_failures.load(.monotonic));
+    switch (store.signingKey("k1", testOptions(5000))) {
+        .key => |k| jwt.pkeyFree(k.pkey),
+        else => return error.ExpectedKey,
+    }
+
+    // Once the interval has passed the next miss fetches again.
+    store.jwks_last_failure = std.time.timestamp() - 61;
+    switch (store.signingKey("k2", testOptions(5000))) {
+        .failed => {},
+        else => return error.ExpectedFailure,
+    }
+    try std.testing.expectEqual(@as(usize, 2), store.jwks_failures.load(.monotonic));
+}
+
+test "OidcStore: token verification reuses the cached EVP_PKEY" {
+    const allocator = std.testing.allocator;
+    var store = testStore(allocator, .{});
+    defer store.deinit();
+
+    // A cached RSA key parsed once at refresh; verification of any token
+    // carrying kid k1 must run on that EVP_PKEY, not a fresh parse.
+    store.jwks_body = try allocator.dupe(
+        u8,
+        "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"k1\",\"n\":\"AQAB\",\"e\":\"AQAB\"}]}",
+    ); // deinit frees it
+    store.jwks_last_refresh = std.time.timestamp();
+    jwt.pkey_parse_calls = 0;
+    store.parseJwksKeys();
+    try std.testing.expectEqual(@as(usize, 1), store.key_count);
+    const after_refresh = jwt.pkey_parse_calls;
+    try std.testing.expectEqual(@as(usize, 1), after_refresh);
+
+    // Well-formed RS256 token for kid k1: issuer, audience and lifetime
+    // all valid, so every checkJwt reaches signature verification on the
+    // cached key. The signature is junk, which is fine: the parse count
+    // is the oracle, not the verdict.
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    var hbuf: [128]u8 = undefined;
+    const h = enc.encode(&hbuf, "{\"alg\":\"RS256\",\"kid\":\"k1\"}");
+    var pbuf: [256]u8 = undefined;
+    const p = enc.encode(
+        &pbuf,
+        "{\"iss\":\"https://idp.example/\",\"aud\":\"xmppd\",\"sub\":\"alice\",\"exp\":9999999999}",
+    );
+    var tbuf: [512]u8 = undefined;
+    const token = try std.fmt.bufPrint(&tbuf, "{s}.{s}.dGVzdA", .{ h, p });
+
+    var out: Identity = .{};
+    try std.testing.expectEqual(
+        JwtCheck.invalid,
+        store.checkJwt(allocator, token, testOptions(5000), &out),
+    );
+    try std.testing.expectEqual(
+        JwtCheck.invalid,
+        store.checkJwt(allocator, token, testOptions(5000), &out),
+    );
+
+    // Two verifications ran and neither reparsed the JWK into an
+    // EVP_PKEY.
+    try std.testing.expectEqual(after_refresh, jwt.pkey_parse_calls);
 }
 
 test "OidcStore: replay returns identity, rejection and temporary failure" {
@@ -2634,6 +2832,212 @@ test "IdpPool: popping a completion releases the outstanding slot" {
     _ = try pool.put(cred);
     _ = try pool.put(cred);
     try std.testing.expectError(error.QueueFull, pool.put(cred));
+}
+
+/// One-shot TLS IdP that answers its first request with a keep-alive
+/// response (Content-Length, no Connection: close), then holds the conn
+/// and watches for peer EOF: peer_closed flips when the client's fd is
+/// closed, which proves a parked conn was released.
+fn serveKeepAliveWatchClose(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    body: []const u8,
+    port_out: *std.atomic.Value(u16),
+    peer_closed: *std.atomic.Value(bool),
+    stop: *std.atomic.Value(bool),
+) void {
+    serveKeepAliveWatchCloseInner(
+        cert_path,
+        key_path,
+        body,
+        port_out,
+        peer_closed,
+        stop,
+    ) catch |err| {
+        log.warn("keep-alive-watch fixture failed: {s}", .{@errorName(err)});
+    };
+}
+
+fn serveKeepAliveWatchCloseInner(
+    cert_path: [*:0]const u8,
+    key_path: [*:0]const u8,
+    body: []const u8,
+    port_out: *std.atomic.Value(u16),
+    peer_closed: *std.atomic.Value(bool),
+    stop: *std.atomic.Value(bool),
+) !void {
+    var ctx = try ssl.SslContext.initServer(cert_path, key_path);
+    defer ctx.deinit();
+    ctx.disableKtls();
+
+    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(listen_fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in));
+    try posix.listen(listen_fd, 4);
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try posix.getsockname(listen_fd, @ptrCast(&addr), &alen);
+    port_out.store(std.mem.bigToNative(u16, addr.port), .release);
+
+    const deadline = std.time.milliTimestamp() + 15000;
+    var conn_fd: posix.fd_t = -1;
+    defer if (conn_fd >= 0) posix.close(conn_fd);
+    var conn: ?ssl.SslConn = null;
+    defer if (conn) |*c2| {
+        c2.shutdown();
+        c2.deinit();
+    };
+
+    while (!stop.load(.acquire) and std.time.milliTimestamp() < deadline) {
+        var fds = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
+        if ((posix.poll(&fds, 250) catch break) <= 0) continue;
+        conn_fd = posix.accept(listen_fd, null, null, 0) catch {
+            continue;
+        };
+        conn = ssl.SslConn.init(ctx, conn_fd) catch {
+            posix.close(conn_fd);
+            conn_fd = -1;
+            continue;
+        };
+        var hs_done = false;
+        while (!hs_done and std.time.milliTimestamp() < deadline) {
+            const hs = conn.?.doHandshake() catch break;
+            hs_done = hs == .complete;
+        }
+        if (!hs_done) {
+            conn.?.shutdown();
+            conn.?.deinit();
+            conn = null;
+            posix.close(conn_fd);
+            conn_fd = -1;
+            continue;
+        }
+
+        // Consume the request head, then reply without Connection: close.
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len and std.time.milliTimestamp() < deadline) {
+            const rr = conn.?.read(buf[total..]) catch break;
+            switch (rr) {
+                .ok => |n| {
+                    if (n == 0) break;
+                    total += n;
+                    if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+                },
+                .want_read, .want_write => {},
+            }
+        }
+        var resp: [8192]u8 = undefined;
+        const out = try std.fmt.bufPrint(
+            &resp,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n" ++
+                "Content-Length: {d}\r\n\r\n{s}",
+            .{ body.len, body },
+        );
+        var sent: usize = 0;
+        while (sent < out.len and std.time.milliTimestamp() < deadline) {
+            const wr = conn.?.write(out[sent..]) catch break;
+            switch (wr) {
+                .ok => |n| sent += n,
+                .want_read, .want_write => {},
+            }
+        }
+
+        // Hold the conn: EOF means the client closed its parked fd.
+        while (!stop.load(.acquire) and std.time.milliTimestamp() < deadline) {
+            var fds2 = [_]posix.pollfd{.{ .fd = conn_fd, .events = posix.POLL.IN, .revents = 0 }};
+            if ((posix.poll(&fds2, 250) catch break) <= 0) continue;
+            const rr = conn.?.read(buf[0..]) catch {
+                peer_closed.store(true, .release);
+                return;
+            };
+            switch (rr) {
+                .ok => |n| {
+                    if (n == 0) {
+                        peer_closed.store(true, .release);
+                        return;
+                    }
+                },
+                .want_read, .want_write => {},
+            }
+        }
+        return;
+    }
+}
+
+test "IdpPool: worker exit closes the conns it parked" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try makeIdpTlsPaths(allocator, &tmp);
+    defer allocator.free(paths.cert);
+    defer allocator.free(paths.key);
+
+    var port = std.atomic.Value(u16).init(0);
+    var peer_closed = std.atomic.Value(bool).init(false);
+    var stop = std.atomic.Value(bool).init(false);
+    const th = try std.Thread.spawn(
+        .{},
+        serveKeepAliveWatchClose,
+        .{ paths.cert.ptr, paths.key.ptr, "{\"error\":\"invalid_grant\"}", &port, &peer_closed, &stop },
+    );
+    defer {
+        stop.store(true, .release);
+        th.join();
+    }
+    const dl = std.time.milliTimestamp() + 5000;
+    while (port.load(.acquire) == 0 and std.time.milliTimestamp() < dl) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(port.load(.acquire) != 0);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(
+        &url_buf,
+        "https://localhost:{d}/token",
+        .{port.load(.acquire)},
+    );
+    var store = testStore(allocator, .{ .token_endpoint = url, .ca_file = paths.cert });
+    defer store.deinit();
+    try store.start();
+
+    var pool = IdpPool{ .allocator = undefined, .store = undefined, .options = undefined };
+    try pool.start(allocator, &store, .{
+        .threads = 1,
+        .max_outstanding = 4,
+        .connect_timeout_ms = 1000,
+        .timeout_ms = 5000,
+    });
+    defer pool.stop();
+
+    const cred = Credential{ .password = .{ .username = "alice", .password = "pw" } };
+    _ = try pool.put(cred);
+    var done = false;
+    while (!done and std.time.milliTimestamp() < dl) {
+        pool.drainWake();
+        if (pool.popCompletion()) |job_in| {
+            var job = job_in;
+            IdpPool.releaseJob(&job);
+            done = true;
+        } else {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+    try std.testing.expect(done);
+
+    // The exchange parked the conn on the worker's threadlocal pool;
+    // exiting the worker must close it.
+    pool.stop();
+
+    const dl2 = std.time.milliTimestamp() + 3000;
+    while (!peer_closed.load(.acquire) and std.time.milliTimestamp() < dl2) {
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(peer_closed.load(.acquire));
 }
 
 test "IdpPool: put rejects at max_outstanding" {

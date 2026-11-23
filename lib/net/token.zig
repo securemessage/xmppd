@@ -24,6 +24,16 @@ pub const Token = packed struct(u64) {
         std.debug.assert(@sizeOf(@This()) == 8);
     }
 
+    /// Build a token from delivery-triple parts (slot index, generation,
+    /// kind) carried by pre-token wire fields. A part that does not fit its
+    /// field width can never name a live slot, so the result is `none`,
+    /// which validates nowhere.
+    pub fn init(index: usize, gen: u32, kind: u8) Token {
+        const idx = std.math.cast(u32, index) orelse return .none;
+        const g = std.math.cast(u24, gen) orelse return .none;
+        return .{ .index = idx, .gen = g, .kind = kind };
+    }
+
     pub fn toUdata(token: Token) usize {
         return @as(u64, @bitCast(token));
     }

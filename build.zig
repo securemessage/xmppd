@@ -232,6 +232,24 @@ pub fn build(b: *std.Build) void {
     });
     schema_mod.addImport("conf", conf_mod);
 
+    // Generational addressing (ADR-4): one module instance shared by every
+    // importer so the Token type is identical across them; a file may only
+    // live in one module per compilation, so nothing imports the file
+    // relatively.
+    const net_token_mod = b.createModule(.{
+        .root_source_file = b.path("lib/net/token.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // udata kind tags for kqueue registrations and delivery targets
+    // (ADR-4). Leaf file, one module instance for every importer.
+    const token_kinds_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/token_kinds.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const net_mod = b.createModule(.{
         .root_source_file = b.path("lib/net/net.zig"),
         .target = target,
@@ -239,6 +257,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     net_mod.addImport("ssl", ssl_mod);
+    net_mod.addImport("net_token", net_token_mod);
+    net_mod.addImport("token_kinds", token_kinds_mod);
 
     // The core daemons link the net graph through its conn unit rather
     // than the net.zig umbrella: net.zig file-imports frame.zig, whose
@@ -252,6 +272,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     net_conn_mod.addImport("ssl", ssl_mod);
+    net_conn_mod.addImport("net_token", net_token_mod);
+    net_conn_mod.addImport("token_kinds", token_kinds_mod);
 
     const xmpp_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
@@ -503,11 +525,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    net_bench_mod.addImport("net", b.createModule(.{
+    const net_bench_net_mod = b.createModule(.{
         .root_source_file = b.path("lib/net/net.zig"),
         .target = target,
         .optimize = .ReleaseFast,
-    }));
+    });
+    net_bench_net_mod.addImport("net_token", net_token_mod);
+    net_bench_net_mod.addImport("token_kinds", token_kinds_mod);
+    net_bench_mod.addImport("net", net_bench_net_mod);
     const net_bench = b.addExecutable(.{
         .name = "net-loop-bench",
         .root_module = net_bench_mod,
@@ -546,6 +571,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    event_loop_test_mod.addImport("net_token", net_token_mod);
+    event_loop_test_mod.addImport("token_kinds", token_kinds_mod);
 
     const event_loop_tests = b.addTest(.{
         .name = "event-loop-tests",
@@ -675,12 +702,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    session_map_mod_for_server.addImport("net_token", net_token_mod);
+    session_map_mod_for_server.addImport("token_kinds", token_kinds_mod);
     const delivery_queue_mod = b.createModule(.{
         .root_source_file = b.path("src/core/xworker/ring.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    delivery_queue_mod.addImport("net_token", net_token_mod);
+    delivery_queue_mod.addImport("token_kinds", token_kinds_mod);
     const server_op_backend_mod = createBackendMod(b, op_storage, target, optimize, server_backend_mod, lmdb_dep);
     // Zig forbids two modules sharing a root file in one compilation; reuse
     // the module when both stores select the same backend.
@@ -719,6 +750,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_last_activity_mod.addImport("backend", server_backend_mod);
+    server_test_mod.addImport("net_token", net_token_mod);
+    server_test_mod.addImport("token_kinds", token_kinds_mod);
     server_test_mod.addImport("xml", xml_mod);
     server_test_mod.addImport("xmpp", xmpp_mod);
     server_test_mod.addImport("sasl", sasl_mod);
@@ -756,6 +789,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_room_mailbox_mod.addImport("delivery_queue", delivery_queue_mod);
+    server_room_registry_mod.addImport("net_token", net_token_mod);
+    server_room_registry_mod.addImport("token_kinds", token_kinds_mod);
     server_room_registry_mod.addImport("room_store", server_room_store_mod);
     server_room_registry_mod.addImport("room_mailbox", server_room_mailbox_mod);
     server_test_mod.addImport("room_store", server_room_store_mod);
@@ -1008,6 +1043,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    session_map_test_mod.addImport("net_token", net_token_mod);
+    session_map_test_mod.addImport("token_kinds", token_kinds_mod);
 
     const session_map_tests = b.addTest(.{
         .name = "session-map-tests",
@@ -1024,6 +1061,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    delivery_queue_test_mod.addImport("net_token", net_token_mod);
+    delivery_queue_test_mod.addImport("token_kinds", token_kinds_mod);
 
     const delivery_queue_tests = b.addTest(.{
         .name = "delivery-queue-tests",
@@ -1157,6 +1196,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    s2s_event_loop_mod.addImport("net_token", net_token_mod);
+    s2s_event_loop_mod.addImport("token_kinds", token_kinds_mod);
 
     const s2s_main_test_mod = b.createModule(.{
         .root_source_file = b.path("src/s2s/main.zig"),
@@ -1382,6 +1423,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    room_registry_test_mod.addImport("net_token", net_token_mod);
+    room_registry_test_mod.addImport("token_kinds", token_kinds_mod);
     room_registry_test_mod.addImport("room_store", room_store_test_mod);
     room_registry_test_mod.addImport("room_mailbox", room_mailbox_test_mod);
 
@@ -1399,6 +1442,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    fanout_test_mod.addImport("net_token", net_token_mod);
+    fanout_test_mod.addImport("token_kinds", token_kinds_mod);
     fanout_test_mod.addImport("xml", xml_mod);
     fanout_test_mod.addImport("room_registry", room_registry_test_mod);
     fanout_test_mod.addImport("room_store", room_store_test_mod);
@@ -1435,6 +1480,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    message_test_mod.addImport("net_token", net_token_mod);
+    message_test_mod.addImport("token_kinds", token_kinds_mod);
 
     const message_tests = b.addTest(.{
         .name = "message-tests",
@@ -1597,6 +1644,9 @@ pub fn build(b: *std.Build) void {
     });
     http_mod.linkSystemLibrary("ssl", .{});
     http_mod.linkSystemLibrary("crypto", .{});
+    http_mod.addImport("dns_async", dns_async_mod);
+    http_mod.addImport("ssl", ssl_mod);
+    http_mod.addImport("wire", wire_mod);
 
     const http_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/http/client.zig"),
@@ -1606,6 +1656,9 @@ pub fn build(b: *std.Build) void {
     });
     http_test_mod.linkSystemLibrary("ssl", .{});
     http_test_mod.linkSystemLibrary("crypto", .{});
+    http_test_mod.addImport("dns_async", dns_async_mod);
+    http_test_mod.addImport("ssl", ssl_mod);
+    http_test_mod.addImport("wire", wire_mod);
 
     const http_tests = b.addTest(.{
         .name = "http-client-tests",
@@ -1678,6 +1731,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    core_mod.addImport("net_token", net_token_mod);
+    core_mod.addImport("token_kinds", token_kinds_mod);
     core_mod.addImport("xml", xml_mod);
     core_mod.addImport("xmpp", xmpp_mod);
     core_mod.addImport("sasl", sasl_mod);
@@ -1837,6 +1892,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    auth_event_loop_mod.addImport("net_token", net_token_mod);
+    auth_event_loop_mod.addImport("token_kinds", token_kinds_mod);
 
     const auth_runner_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/runner.zig"),
@@ -1964,6 +2021,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    oidc_event_loop_mod.addImport("net_token", net_token_mod);
+    oidc_event_loop_mod.addImport("token_kinds", token_kinds_mod);
 
     const oidc_runner_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/runner.zig"),
@@ -2048,6 +2107,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    s2s_event_loop_exe_mod.addImport("net_token", net_token_mod);
+    s2s_event_loop_exe_mod.addImport("token_kinds", token_kinds_mod);
 
     const s2s_main_mod = b.createModule(.{
         .root_source_file = b.path("src/s2s/main.zig"),
@@ -2313,8 +2374,15 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_core_tests.step);
     test_s2s_step.dependOn(&run_s2s_main_tests.step);
     test_auth_step.dependOn(&run_auth_main_tests.step);
+    test_auth_oidc_step.dependOn(&run_oidc_store_tests.step);
     test_auth_oidc_step.dependOn(&run_oidc_main_tests.step);
     test_schema_step.dependOn(&run_schema_tests.step);
+    const test_http_step = b.step("test-http", "Run only the HTTP client tests");
+    test_http_step.dependOn(&run_http_tests.step);
+    const test_dns_async_step = b.step("test-dns-async", "Run only the async resolver tests");
+    test_dns_async_step.dependOn(&run_dns_async_tests.step);
+    const test_xmppc_step = b.step("test-xmppc", "Run only the xmppc library tests");
+    test_xmppc_step.dependOn(&run_xmppc_tests.step);
     test_gen_docs_step.dependOn(&run_gen_docs_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
@@ -2373,11 +2441,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    bench_session_map_mod.addImport("net_token", net_token_mod);
+    bench_session_map_mod.addImport("token_kinds", token_kinds_mod);
     const bench_delivery_mod = b.createModule(.{
         .root_source_file = b.path("src/core/xworker/ring.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
+    bench_delivery_mod.addImport("net_token", net_token_mod);
+    bench_delivery_mod.addImport("token_kinds", token_kinds_mod);
     const bench_net_frame_mod = b.createModule(.{
         .root_source_file = b.path("lib/net/frame.zig"),
         .target = target,

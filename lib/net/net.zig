@@ -13,7 +13,7 @@ comptime {
     }
 }
 
-pub const Token = @import("token.zig").Token;
+pub const Token = @import("net_token").Token;
 pub const SlotMap = @import("slotmap.zig").SlotMap;
 pub const kevent = @import("kevent.zig");
 pub const loop = @import("loop.zig");

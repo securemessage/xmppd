@@ -10,6 +10,7 @@
 //! These can be added later if needed.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const c = @cImport({
@@ -128,53 +129,85 @@ pub fn parse(token: []const u8, buf: *DecodeBuffer) JwtError!Jwt {
     };
 }
 
-/// Verify an RS256 JWT signature against an RSA public key (n, e in base64url).
+/// An OpenSSL EVP_PKEY handle as callers see it. One reference lives in
+/// the JWKS cache; a worker takes its own reference with pkeyUpRef and
+/// releases it with pkeyFree, so a refresh can free the old set while
+/// verifications hold their refs.
+pub const Pkey = c.EVP_PKEY;
+
+/// Test seam: counts JWK-to-EVP_PKEY builds, proving verification never
+/// reparses key material.
+pub var pkey_parse_calls: usize = 0;
+
+/// Take an extra reference on `pkey` for the caller; null when the
+/// up-ref fails.
+pub fn pkeyUpRef(pkey: *Pkey) ?*Pkey {
+    return if (c.EVP_PKEY_up_ref(pkey) == 1) pkey else null;
+}
+
+/// Release one reference; the key dies on the last one. Null is a no-op.
+pub fn pkeyFree(pkey: ?*Pkey) void {
+    if (pkey) |p| c.EVP_PKEY_free(p);
+}
+
+/// Build an EVP_PKEY from JWK RSA components (n, e base64url). The
+/// caller owns the reference; null when the components do not decode or
+/// do not form an RSA public key. 1024 decoded bytes covers RSA moduli
+/// up to 8192 bits.
+pub fn pkeyFromRsa(n_b64: []const u8, e_b64: []const u8) ?*Pkey {
+    if (builtin.is_test) pkey_parse_calls += 1;
+
+    var n_buf: [1024]u8 = undefined;
+    const n_len = b64urlDecode(n_b64, &n_buf) orelse return null;
+
+    var e_buf: [16]u8 = undefined;
+    const e_len = b64urlDecode(e_b64, &e_buf) orelse return null;
+
+    const bn_n = c.BN_bin2bn(&n_buf, @intCast(n_len), null) orelse return null;
+    defer c.BN_free(bn_n);
+
+    const bn_e = c.BN_bin2bn(&e_buf, @intCast(e_len), null) orelse return null;
+    defer c.BN_free(bn_e);
+
+    const pkey_ctx = c.EVP_PKEY_CTX_new_id(c.EVP_PKEY_RSA, null) orelse return null;
+    defer c.EVP_PKEY_CTX_free(pkey_ctx);
+
+    if (c.EVP_PKEY_fromdata_init(pkey_ctx) != 1) return null;
+
+    const bld = c.OSSL_PARAM_BLD_new() orelse return null;
+    defer c.OSSL_PARAM_BLD_free(bld);
+
+    if (c.OSSL_PARAM_BLD_push_BN(bld, "n", bn_n) != 1) return null;
+    if (c.OSSL_PARAM_BLD_push_BN(bld, "e", bn_e) != 1) return null;
+
+    const params = c.OSSL_PARAM_BLD_to_param(bld) orelse return null;
+    defer c.OSSL_PARAM_free(params);
+
+    var pkey: ?*c.EVP_PKEY = null;
+    if (c.EVP_PKEY_fromdata(pkey_ctx, &pkey, c.EVP_PKEY_PUBLIC_KEY, params) != 1) return null;
+    return pkey;
+}
+
+/// Build an EVP_PKEY from a raw Ed25519 public key (x base64url, 32
+/// decoded bytes). The caller owns the reference.
+pub fn pkeyFromEd25519(x_b64: []const u8) ?*Pkey {
+    if (builtin.is_test) pkey_parse_calls += 1;
+
+    var key_buf: [64]u8 = undefined;
+    const key_len = b64urlDecode(x_b64, &key_buf) orelse return null;
+    if (key_len != 32) return null; // Ed25519 public keys are always 32 bytes
+
+    return c.EVP_PKEY_new_raw_public_key(c.EVP_PKEY_ED25519, null, &key_buf, 32);
+}
+
+/// Verify an RS256 JWT signature against an already-built public key.
 /// Returns true if signature is valid, false otherwise.
-pub fn verifyRs256(jwt: *const Jwt, n_b64: []const u8, e_b64: []const u8) bool {
-    // Decode signature from base64url. 1024 bytes covers RSA signatures
-    // up to 8192 bits, the same bound as the modulus below.
+pub fn verifyRs256Pkey(jwt: *const Jwt, pkey: *Pkey) bool {
+    // 1024 bytes covers RSA signatures up to 8192 bits.
     var sig_buf: [1024]u8 = undefined;
     const sig_len = b64urlDecode(jwt.signature_b64, &sig_buf) orelse return false;
     const signature = sig_buf[0..sig_len];
 
-    // Decode RSA modulus (n) and exponent (e). 1024 bytes of decoded
-    // modulus covers RSA keys up to 8192 bits.
-    var n_buf: [1024]u8 = undefined;
-    const n_len = b64urlDecode(n_b64, &n_buf) orelse return false;
-
-    var e_buf: [16]u8 = undefined;
-    const e_len = b64urlDecode(e_b64, &e_buf) orelse return false;
-
-    // Build RSA public key via OpenSSL BIGNUM + EVP_PKEY
-    const bn_n = c.BN_bin2bn(&n_buf, @intCast(n_len), null) orelse return false;
-    defer c.BN_free(bn_n);
-
-    const bn_e = c.BN_bin2bn(&e_buf, @intCast(e_len), null) orelse return false;
-    defer c.BN_free(bn_e);
-
-    // Create EVP_PKEY with RSA components
-    const pkey_ctx = c.EVP_PKEY_CTX_new_id(c.EVP_PKEY_RSA, null) orelse return false;
-    defer c.EVP_PKEY_CTX_free(pkey_ctx);
-
-    if (c.EVP_PKEY_fromdata_init(pkey_ctx) != 1) return false;
-
-    // Use OSSL_PARAM_BLD to set n and e
-    const bld = c.OSSL_PARAM_BLD_new() orelse return false;
-    defer c.OSSL_PARAM_BLD_free(bld);
-
-    if (c.OSSL_PARAM_BLD_push_BN(bld, "n", bn_n) != 1) return false;
-    if (c.OSSL_PARAM_BLD_push_BN(bld, "e", bn_e) != 1) return false;
-
-    const params = c.OSSL_PARAM_BLD_to_param(bld) orelse return false;
-    defer c.OSSL_PARAM_free(params);
-
-    var pkey: ?*c.EVP_PKEY = null;
-    if (c.EVP_PKEY_fromdata(pkey_ctx, &pkey, c.EVP_PKEY_PUBLIC_KEY, params) != 1) return false;
-    defer if (pkey) |p| c.EVP_PKEY_free(p);
-
-    if (pkey == null) return false;
-
-    // Verify signature: SHA-256 digest of signed_portion, verified against RSA signature
     const md_ctx = c.EVP_MD_CTX_new() orelse return false;
     defer c.EVP_MD_CTX_free(md_ctx);
 
@@ -189,37 +222,22 @@ pub fn verifyRs256(jwt: *const Jwt, n_b64: []const u8, e_b64: []const u8) bool {
     return verify_result == 1;
 }
 
-/// Verify an EdDSA (Ed25519) JWT signature against a raw public key (x in base64url).
-/// Returns true if signature is valid, false otherwise.
-pub fn verifyEdDSA(jwt_token: *const Jwt, x_b64: []const u8) bool {
-    // Decode signature from base64url (Ed25519 signatures are 64 bytes)
+/// Verify an EdDSA (Ed25519) JWT signature against an already-built
+/// public key. Returns true if signature is valid, false otherwise.
+pub fn verifyEdDSAPkey(jwt_token: *const Jwt, pkey: *Pkey) bool {
+    // Ed25519 signatures are always 64 bytes.
     var sig_buf: [128]u8 = undefined;
     const sig_len = b64urlDecode(jwt_token.signature_b64, &sig_buf) orelse return false;
-    if (sig_len != 64) return false; // Ed25519 signatures are always 64 bytes
+    if (sig_len != 64) return false;
     const signature = sig_buf[0..sig_len];
 
-    // Decode the raw Ed25519 public key (32 bytes)
-    var key_buf: [64]u8 = undefined;
-    const key_len = b64urlDecode(x_b64, &key_buf) orelse return false;
-    if (key_len != 32) return false; // Ed25519 public keys are always 32 bytes
-
-    // Create EVP_PKEY from raw Ed25519 public key
-    const pkey = c.EVP_PKEY_new_raw_public_key(
-        c.EVP_PKEY_ED25519,
-        null,
-        &key_buf,
-        32,
-    ) orelse return false;
-    defer c.EVP_PKEY_free(pkey);
-
-    // Ed25519 uses EVP_DigestVerify with NULL digest (pure signature scheme)
     const md_ctx = c.EVP_MD_CTX_new() orelse return false;
     defer c.EVP_MD_CTX_free(md_ctx);
 
-    // Init with NULL md -- Ed25519 doesn't use a separate hash
+    // Init with NULL md -- Ed25519 doesn't use a separate hash, and it
+    // uses the one-shot EVP_DigestVerify (not Update+Final).
     if (c.EVP_DigestVerifyInit(md_ctx, null, null, null, pkey) != 1) return false;
 
-    // Ed25519 uses the one-shot EVP_DigestVerify (not Update+Final)
     const verify_result = c.EVP_DigestVerify(
         md_ctx,
         signature.ptr,
@@ -228,6 +246,24 @@ pub fn verifyEdDSA(jwt_token: *const Jwt, x_b64: []const u8) bool {
         jwt_token.signed_portion.len,
     );
     return verify_result == 1;
+}
+
+/// Verify an RS256 JWT signature against an RSA public key (n, e in
+/// base64url). Builds a one-shot key: callers with a cached EVP_PKEY
+/// should use verifyRs256Pkey instead.
+pub fn verifyRs256(jwt: *const Jwt, n_b64: []const u8, e_b64: []const u8) bool {
+    const pkey = pkeyFromRsa(n_b64, e_b64) orelse return false;
+    defer c.EVP_PKEY_free(pkey);
+    return verifyRs256Pkey(jwt, pkey);
+}
+
+/// Verify an EdDSA (Ed25519) JWT signature against a raw public key (x
+/// in base64url). Builds a one-shot key: callers with a cached EVP_PKEY
+/// should use verifyEdDSAPkey instead.
+pub fn verifyEdDSA(jwt_token: *const Jwt, x_b64: []const u8) bool {
+    const pkey = pkeyFromEd25519(x_b64) orelse return false;
+    defer c.EVP_PKEY_free(pkey);
+    return verifyEdDSAPkey(jwt_token, pkey);
 }
 
 /// Validate token expiration. Returns error if expired.

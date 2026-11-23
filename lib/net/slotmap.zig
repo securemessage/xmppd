@@ -11,7 +11,7 @@
 //! callers must handle that (admission control), never grow silently.
 
 const std = @import("std");
-const Token = @import("token.zig").Token;
+const Token = @import("net_token").Token;
 
 pub fn SlotMap(comptime T: type) type {
     return struct {

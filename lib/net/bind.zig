@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const posix = std.posix;
-const Token = @import("token.zig").Token;
+const Token = @import("net_token").Token;
 const loop_mod = @import("loop.zig");
 const Loop = loop_mod.Loop;
 const Handle = loop_mod.Handle;

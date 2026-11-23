@@ -59,6 +59,9 @@ pub const Counters = struct {
     /// Cross-worker envelopes this worker produced (hooked from
     /// delivery_queue; see noteEnvelope).
     envelopes_xworker: Counter = .init(0),
+    /// Session slots retired at the u24 generation ceiling in
+    /// releaseSessionSlot: capacity lost permanently, never reissued.
+    slots_retired: Counter = .init(0),
     // Appendix C drop reasons counted at their central choke points.
     drop_send_buffer_full: Counter = .init(0),
     drop_send_alloc: Counter = .init(0),
@@ -143,8 +146,8 @@ pub noinline fn dump(worker_id: u16, ext: Externals) void {
         worker_id,         read(&c.stanzas_message), read(&c.stanzas_presence), read(&c.stanzas_iq),
         read(&c.bytes_in), read(&c.bytes_out),       read(&c.wakes),
     });
-    log.info("worker {d} loop: iterations={d} kevent events={d} changes={d} envelopes xworker={d}", .{
-        worker_id, read(&c.loop_iterations), read(&c.kevent_events), read(&c.kevent_changes), read(&c.envelopes_xworker),
+    log.info("worker {d} loop: iterations={d} kevent events={d} changes={d} envelopes xworker={d} slots_retired={d}", .{
+        worker_id, read(&c.loop_iterations), read(&c.kevent_events), read(&c.kevent_changes), read(&c.envelopes_xworker), read(&c.slots_retired),
     });
     log.info("worker {d} drops (App. C): send_buf_full={d} send_alloc={d} send_closed={d} changelist_full={d} no_route={d} ring_full={d} ring_payload={d} room_mailbox={d}", .{
         worker_id,                     read(&c.drop_send_buffer_full), read(&c.drop_send_alloc), read(&c.drop_send_closed),

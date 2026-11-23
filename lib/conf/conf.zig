@@ -1209,6 +1209,7 @@ const TestSections = struct {
         max_per_ip: u32 = 20,
         rate_limit: bool = true,
         import_avatar: bool = false,
+        jwks_min_refresh: Duration = .{ .ms = 60_000 },
     } = .{},
     master: struct {
         core_path: []const u8 = "xmppd-core",
@@ -1274,6 +1275,8 @@ const file_spec = [_]FieldSpec{
     .{ .section = "oidc", .field = "max_per_ip", .aliases = &.{"rate_max_per_ip"} },
     .{ .section = "oidc", .field = "rate_limit" },
     .{ .section = "oidc", .field = "import_avatar" },
+    .{ .section = "oidc", .field = "jwks_min_refresh",
+            .help = "minimum wait between JWKS refetches after a failed fetch" },
     .{ .section = "master", .field = "core_path" },
     .{ .section = "master", .field = "auth_path" },
     .{ .section = "master", .field = "s2s_path" },

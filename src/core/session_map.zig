@@ -16,10 +16,12 @@
 //! All locking is internal. Callers never see the lock. A `multi_worker` flag
 //! gates lock acquisition — in single-thread mode, no lock overhead at all.
 //!
-//! - Read (shared) lock: findByFullJid, findByBareJid, findAvailableByBareJid, getGeneration
+//! - Read (shared) lock: findByFullJid, findByBareJid, findAvailableByBareJid
 //! - Write (exclusive) lock: bind, unbind, setPresenceAvailable
 
 const std = @import("std");
+const token_kinds = @import("token_kinds");
+pub const Token = @import("net_token").Token;
 
 const log = std.log.scoped(.session_map);
 
@@ -34,8 +36,10 @@ pub const MAX_JID_OCTETS: usize = 2112;
 /// Result of a session lookup — contains routing information for cross-thread delivery.
 pub const SessionEntry = struct {
     worker_id: u16,
-    local_session_id: u32,
-    generation: u32,
+    /// Generational address of the session slot on `worker_id` (ADR-4).
+    /// The owning worker validates it against its slot generations with no
+    /// lock and no map scan; a stale token resolves to "session gone".
+    token: Token,
     presence_available: bool = false,
     priority: i8 = 0,
     resource_buf: [MAX_RESOURCE_LEN]u8 = undefined,
@@ -117,8 +121,6 @@ pub const SessionMap = struct {
     allocator: std.mem.Allocator,
     /// Per-account (bare JID) resource cap (T198).
     max_resources: usize,
-    /// Generation counter — incremented globally on every unbind for ABA protection.
-    next_generation: u32 = 1,
 
     pub fn init(allocator: std.mem.Allocator, multi_worker: bool, max_resources: usize) SessionMap {
         return .{
@@ -147,28 +149,25 @@ pub const SessionMap = struct {
         self.bare_map.deinit();
     }
 
-    /// Register a session after successful resource binding.
-    /// Returns the assigned generation, or error on failure.
+    /// Register a session after successful resource binding. `token` names
+    /// the session slot on `worker_id` as of this bind (ADR-4); the caller
+    /// mints it from its own slot generations.
     pub fn bind(
         self: *SessionMap,
         worker_id: u16,
-        local_session_id: u32,
+        token: Token,
         local: []const u8,
         domain: []const u8,
         resource: []const u8,
-    ) !u32 {
+    ) !void {
         if (self.multi_worker) self.lock.lock();
         defer if (self.multi_worker) self.lock.unlock();
-
-        const gen = self.next_generation;
-        self.next_generation +%= 1;
 
         if (resource.len > MAX_RESOURCE_LEN) return error.ResourceTooLong;
 
         var entry = SessionEntry{
             .worker_id = worker_id,
-            .local_session_id = local_session_id,
-            .generation = gen,
+            .token = token,
             .resource_len = @intCast(resource.len),
         };
         @memcpy(entry.resource_buf[0..resource.len], resource);
@@ -219,10 +218,8 @@ pub const SessionMap = struct {
         };
 
         log.info("bind {s}@{s}/{s} worker={d} session={d} gen={d}", .{
-            local, domain, resource, worker_id, local_session_id, gen,
+            local, domain, resource, worker_id, token.index, token.gen,
         });
-
-        return gen;
     }
 
     /// Unregister a session. Returns the entry that was removed, or null if not found.
@@ -253,7 +250,7 @@ pub const SessionMap = struct {
             // Find and remove the matching entry from the list
             var i: usize = 0;
             while (i < list.len) {
-                if (list.slice()[i].local_session_id == entry.local_session_id and
+                if (list.slice()[i].token.eql(entry.token) and
                     list.slice()[i].worker_id == entry.worker_id)
                 {
                     _ = list.orderedRemove(i);
@@ -270,7 +267,7 @@ pub const SessionMap = struct {
         }
 
         log.info("unbind {s}@{s}/{s} (was worker={d} session={d} gen={d})", .{
-            local, domain, resource, entry.worker_id, entry.local_session_id, entry.generation,
+            local, domain, resource, entry.worker_id, entry.token.index, entry.token.gen,
         });
 
         return entry;
@@ -405,10 +402,10 @@ pub const SessionMap = struct {
         const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return;
         if (self.bare_map.getPtr(bare_jid)) |list| {
             for (list.slice()) |*entry| {
-                // Match by full JID identity (worker + local_session_id)
+                // Match by full JID identity (worker + token)
                 if (self.full_map.get(full_jid)) |full_entry| {
                     if (entry.worker_id == full_entry.worker_id and
-                        entry.local_session_id == full_entry.local_session_id)
+                        entry.token.eql(full_entry.token))
                     {
                         entry.presence_available = available;
                     }
@@ -440,54 +437,13 @@ pub const SessionMap = struct {
             if (self.full_map.get(full_jid)) |full_entry| {
                 for (list.slice()) |*entry| {
                     if (entry.worker_id == full_entry.worker_id and
-                        entry.local_session_id == full_entry.local_session_id)
+                        entry.token.eql(full_entry.token))
                     {
                         entry.priority = prio;
                     }
                 }
             }
         }
-    }
-
-    /// Get the generation for a session by full JID. Returns null if not bound.
-    pub fn getGeneration(
-        self: *SessionMap,
-        local: []const u8,
-        domain: []const u8,
-        resource: []const u8,
-    ) ?u32 {
-        if (self.multi_worker) self.lock.lockShared();
-        defer if (self.multi_worker) self.lock.unlockShared();
-
-        var buf: [MAX_JID_OCTETS]u8 = undefined;
-        const full_jid = buildJidBuf(&buf, local, domain, resource) orelse return null;
-        const entry = self.full_map.get(full_jid) orelse return null;
-        return entry.generation;
-    }
-
-    /// Get the generation for a session by worker_id + local_session_id.
-    /// Used by the MPSC drain handler for ABA validation.
-    pub fn getGenerationById(
-        self: *SessionMap,
-        worker_id: u16,
-        local_session_id: u32,
-        generation: u32,
-    ) bool {
-        if (self.multi_worker) self.lock.lockShared();
-        defer if (self.multi_worker) self.lock.unlockShared();
-
-        // Scan full_map for a matching entry — this is rare (only called during MPSC drain)
-        var iter = self.full_map.iterator();
-        while (iter.next()) |kv| {
-            const e = kv.value_ptr.*;
-            if (e.worker_id == worker_id and
-                e.local_session_id == local_session_id and
-                e.generation == generation)
-            {
-                return true;
-            }
-        }
-        return false;
     }
 
     // ========================================================================
@@ -563,13 +519,12 @@ test "SessionMap: bind and findByFullJid" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
 
-    const gen = try map.bind(0, 5, "alice", "localhost", "mobile");
-    try std.testing.expect(gen > 0);
+    const tok = Token.init(5, 1, token_kinds.session);
+    try map.bind(0, tok, "alice", "localhost", "mobile");
 
     const entry = map.findByFullJid("alice", "localhost", "mobile").?;
     try std.testing.expectEqual(@as(u16, 0), entry.worker_id);
-    try std.testing.expectEqual(@as(u32, 5), entry.local_session_id);
-    try std.testing.expectEqual(gen, entry.generation);
+    try std.testing.expect(entry.token.eql(tok));
     try std.testing.expect(!entry.presence_available);
 }
 
@@ -577,11 +532,11 @@ test "SessionMap: unbind removes entry" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
 
-    _ = try map.bind(1, 3, "bob", "localhost", "desktop");
+    _ = try map.bind(1, Token.init(3, 1, token_kinds.session), "bob", "localhost", "desktop");
 
     const removed = map.unbind("bob", "localhost", "desktop").?;
     try std.testing.expectEqual(@as(u16, 1), removed.worker_id);
-    try std.testing.expectEqual(@as(u32, 3), removed.local_session_id);
+    try std.testing.expectEqual(@as(u32, 3), removed.token.index);
 
     try std.testing.expect(map.findByFullJid("bob", "localhost", "desktop") == null);
 }
@@ -590,9 +545,9 @@ test "SessionMap: findByBareJid multi-resource" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
 
-    _ = try map.bind(0, 1, "alice", "localhost", "mobile");
-    _ = try map.bind(1, 2, "alice", "localhost", "desktop");
-    _ = try map.bind(0, 3, "bob", "localhost", "laptop");
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
+    _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "localhost", "desktop");
+    _ = try map.bind(0, Token.init(3, 1, token_kinds.session), "bob", "localhost", "laptop");
 
     var buf: [8]SessionEntry = undefined;
     const count = map.findByBareJid("alice", "localhost", &buf);
@@ -603,8 +558,8 @@ test "SessionMap: findAvailableByBareJid" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
 
-    _ = try map.bind(0, 1, "alice", "localhost", "mobile");
-    _ = try map.bind(1, 2, "alice", "localhost", "desktop");
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
+    _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "localhost", "desktop");
 
     try std.testing.expect(!map.isAvailable("alice", "localhost"));
 
@@ -614,17 +569,17 @@ test "SessionMap: findAvailableByBareJid" {
     var buf: [8]SessionEntry = undefined;
     const count = map.findAvailableByBareJid("alice", "localhost", &buf);
     try std.testing.expectEqual(@as(usize, 1), count);
-    try std.testing.expectEqual(@as(u32, 1), buf[0].local_session_id);
+    try std.testing.expectEqual(@as(u32, 1), buf[0].token.index);
 }
 
 test "SessionMap: findAvailableByBareJidBatch resolves many JIDs in one hold" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
 
-    _ = try map.bind(0, 1, "alice", "localhost", "mobile");
-    _ = try map.bind(1, 2, "alice", "localhost", "desktop");
-    _ = try map.bind(0, 3, "bob", "localhost", "laptop");
-    _ = try map.bind(2, 4, "carol", "localhost", "web");
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
+    _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "localhost", "desktop");
+    _ = try map.bind(0, Token.init(3, 1, token_kinds.session), "bob", "localhost", "laptop");
+    _ = try map.bind(2, Token.init(4, 1, token_kinds.session), "carol", "localhost", "web");
 
     map.setPresenceAvailable("alice", "localhost", "mobile", true);
     map.setPresenceAvailable("alice", "localhost", "desktop", true);
@@ -674,7 +629,7 @@ test "SessionMap: S18 batch over 512 entries does not truncate at the resource c
         for (0..20) |r| {
             var res_buf: [16]u8 = undefined;
             const res = std.fmt.bufPrint(&res_buf, "res{d:0>2}", .{r}) catch unreachable;
-            _ = try map.bind(0, sid, local, "localhost", res);
+            _ = try map.bind(0, Token.init(sid, 1, token_kinds.session), local, "localhost", res);
             map.setPresenceAvailable(local, "localhost", res, true);
             sid += 1;
         }
@@ -695,18 +650,18 @@ test "SessionMap: duplicate bind fails" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
 
-    _ = try map.bind(0, 5, "alice", "localhost", "mobile");
-    try std.testing.expectError(error.AlreadyBound, map.bind(1, 6, "alice", "localhost", "mobile"));
+    _ = try map.bind(0, Token.init(5, 1, token_kinds.session), "alice", "localhost", "mobile");
+    try std.testing.expectError(error.AlreadyBound, map.bind(1, Token.init(6, 1, token_kinds.session), "alice", "localhost", "mobile"));
 }
 
 test "SessionMap: resource cap is configurable (T198)" {
     var map = SessionMap.init(std.testing.allocator, false, 3);
     defer map.deinit();
 
-    _ = try map.bind(0, 1, "u", "localhost", "a");
-    _ = try map.bind(0, 2, "u", "localhost", "b");
-    _ = try map.bind(0, 3, "u", "localhost", "c");
-    try std.testing.expectError(error.TooManyResources, map.bind(0, 4, "u", "localhost", "d"));
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "u", "localhost", "a");
+    _ = try map.bind(0, Token.init(2, 1, token_kinds.session), "u", "localhost", "b");
+    _ = try map.bind(0, Token.init(3, 1, token_kinds.session), "u", "localhost", "c");
+    try std.testing.expectError(error.TooManyResources, map.bind(0, Token.init(4, 1, token_kinds.session), "u", "localhost", "d"));
     // The failed bind must not leave a dangling full_map entry
     try std.testing.expect(map.findByFullJid("u", "localhost", "d") == null);
     // Cap messages come from the bare list staying consistent
@@ -715,7 +670,7 @@ test "SessionMap: resource cap is configurable (T198)" {
 
     // After eviction a new bind lands
     _ = map.unbind("u", "localhost", "a");
-    _ = try map.bind(0, 4, "u", "localhost", "d");
+    _ = try map.bind(0, Token.init(4, 1, token_kinds.session), "u", "localhost", "d");
     try std.testing.expectEqual(@as(usize, 3), map.findByBareJid("u", "localhost", &buf));
 }
 
@@ -727,7 +682,7 @@ test "SessionMap: default cap no longer hits the old inline-16 wall (T198)" {
     var i: usize = 0;
     while (i < 40) : (i += 1) {
         const res = std.fmt.bufPrint(&res_buf, "r{d}", .{i}) catch unreachable;
-        _ = try map.bind(0, @intCast(100 + i), "many", "localhost", res);
+        _ = try map.bind(0, Token.init(100 + i, 1, token_kinds.session), "many", "localhost", res);
     }
     var buf: [64]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 40), map.findByBareJid("many", "localhost", &buf));
@@ -750,22 +705,26 @@ test "SessionMap: unbind nonexistent returns null" {
     try std.testing.expect(map.unbind("alice", "localhost", "ghost") == null);
 }
 
-test "SessionMap: generation increments" {
+test "SessionMap: a re-bound slot stores the caller's fresh token" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
 
-    const gen1 = try map.bind(0, 1, "alice", "localhost", "mobile");
+    // Generations are minted by the owning worker, not the map: a slot
+    // freed and rebound arrives with a newer token.
+    const first = Token.init(1, 1, token_kinds.session);
+    try map.bind(0, first, "alice", "localhost", "mobile");
     _ = map.unbind("alice", "localhost", "mobile");
-    const gen2 = try map.bind(0, 1, "alice", "localhost", "mobile");
-    try std.testing.expect(gen2 > gen1);
+    const second = Token.init(1, 2, token_kinds.session);
+    try map.bind(0, second, "alice", "localhost", "mobile");
+    try std.testing.expect(map.findByFullJid("alice", "localhost", "mobile").?.token.eql(second));
 }
 
 test "SessionMap: bare_map cleaned on last unbind" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
 
-    _ = try map.bind(0, 1, "alice", "localhost", "mobile");
-    _ = try map.bind(1, 2, "alice", "localhost", "desktop");
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
+    _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "localhost", "desktop");
 
     var buf: [8]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "localhost", &buf));
@@ -781,9 +740,9 @@ test "SessionMap: T254 resource cap rejection keeps maps consistent" {
     var map = SessionMap.init(std.testing.allocator, false, 2);
     defer map.deinit();
 
-    _ = try map.bind(0, 1, "alice", "localhost", "a");
-    _ = try map.bind(0, 2, "alice", "localhost", "b");
-    try std.testing.expectError(error.TooManyResources, map.bind(0, 3, "alice", "localhost", "c"));
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "a");
+    _ = try map.bind(0, Token.init(2, 1, token_kinds.session), "alice", "localhost", "b");
+    try std.testing.expectError(error.TooManyResources, map.bind(0, Token.init(3, 1, token_kinds.session), "alice", "localhost", "c"));
 
     var buf: [4]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "localhost", &buf));
@@ -791,7 +750,7 @@ test "SessionMap: T254 resource cap rejection keeps maps consistent" {
 
     // The rejected bind consumed nothing: a freed slot is reusable.
     _ = map.unbind("alice", "localhost", "a");
-    _ = try map.bind(0, 4, "alice", "localhost", "c");
+    _ = try map.bind(0, Token.init(4, 1, token_kinds.session), "alice", "localhost", "c");
     try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "localhost", &buf));
 }
 
@@ -803,7 +762,7 @@ test "SessionMap: T254 OOM rollback at every bind allocation point" {
     while (fail_index < 32) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         var map = SessionMap.init(failing.allocator(), false, 0);
-        if (map.bind(0, 1, "alice", "localhost", "mobile")) |_| {
+        if (map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile")) |_| {
             map.deinit();
             break;
         } else |_| {
@@ -821,9 +780,9 @@ test "SessionMap: workers on different threads" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
 
-    _ = try map.bind(0, 1, "alice", "host", "mobile");
-    _ = try map.bind(1, 1, "bob", "host", "desktop");
-    _ = try map.bind(2, 1, "charlie", "host", "tablet");
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "host", "mobile");
+    _ = try map.bind(1, Token.init(1, 1, token_kinds.session), "bob", "host", "desktop");
+    _ = try map.bind(2, Token.init(1, 1, token_kinds.session), "charlie", "host", "tablet");
 
     const alice = map.findByFullJid("alice", "host", "mobile").?;
     try std.testing.expectEqual(@as(u16, 0), alice.worker_id);
@@ -835,25 +794,12 @@ test "SessionMap: workers on different threads" {
     try std.testing.expectEqual(@as(u16, 2), charlie.worker_id);
 }
 
-test "SessionMap: getGenerationById for ABA check" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
-    defer map.deinit();
-
-    const gen = try map.bind(0, 5, "alice", "host", "mobile");
-    try std.testing.expect(map.getGenerationById(0, 5, gen));
-    try std.testing.expect(!map.getGenerationById(0, 5, gen + 1)); // wrong gen
-    try std.testing.expect(!map.getGenerationById(1, 5, gen)); // wrong worker
-
-    _ = map.unbind("alice", "host", "mobile");
-    try std.testing.expect(!map.getGenerationById(0, 5, gen)); // unbound
-}
-
 test "SessionMap: resource stored in entry" {
     var map = SessionMap.init(std.testing.allocator, false, 0);
     defer map.deinit();
 
-    _ = try map.bind(0, 1, "alice", "host", "mobile");
-    _ = try map.bind(1, 2, "alice", "host", "desktop");
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "host", "mobile");
+    _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "host", "desktop");
     map.setPresenceAvailable("alice", "host", "mobile", true);
     map.setPresenceAvailable("alice", "host", "desktop", true);
 
@@ -879,7 +825,7 @@ test "SessionMap: a 320-octet localpart binds and resolves" {
 
     var local: [320]u8 = undefined;
     @memset(&local, 'n');
-    _ = try map.bind(0, 42, &local, "localhost", "res");
+    _ = try map.bind(0, Token.init(42, 1, token_kinds.session), &local, "localhost", "res");
     map.setPresenceAvailable(&local, "localhost", "res", true);
     const entry = map.findByFullJid(&local, "localhost", "res");
     try std.testing.expect(entry != null);

@@ -6,10 +6,14 @@
 //!
 //! ## Concurrency Model
 //!
-//! - **Producers** (any worker thread): reserve a slot via CAS on `tail`, memcpy payload,
-//!   then set `slot.ready.store(true, .release)` to publish.
+//! - **Producers** (any worker thread): serialize the payload once into a
+//!   refcounted `Blob` on their own worker's budget (ADR-3), reserve a slot
+//!   via CAS on `tail`, write the descriptor, then set
+//!   `slot.ready.store(true, .release)` to publish.
 //! - **Consumer** (owning worker): reads slots from `head` to `tail`, checking `ready`
-//!   flag before reading payload. Advances `head` after processing.
+//!   flag before reading the blob bytes. Releases the blob reference and
+//!   stores `head` (.release) after processing so producers see a
+//!   published cursor in the full check.
 //! - **Wakeup**: producer writes 1 byte to the target worker's pipe after
 //!   enqueue, but only on the `wake_pending` false->true edge (Q2). The
 //!   consumer clears the flag after draining pipe bytes and before the
@@ -18,17 +22,22 @@
 //!
 //! ## ABA Protection
 //!
-//! Each delivery carries `target_generation` from the shared registry at enqueue time.
-//! The consumer validates the generation still matches before delivering — if the
-//! session disconnected and the slot was reused, the stale delivery is silently dropped.
+//! Each delivery carries the target slot's `Token` (ADR-4) captured at
+//! enqueue time. The consumer validates kind, bounds and generation against
+//! its own slot table (no lock, no map scan) and a slot that was freed
+//! and reused makes the token stale, so the delivery is counted and dropped.
 
 const std = @import("std");
 const posix = std.posix;
+const token_kinds = @import("token_kinds");
+pub const Token = @import("net_token").Token;
 
 const log = std.log.scoped(.delivery_queue);
 
-/// Maximum stanza payload size per delivery slot.
-pub const MAX_PAYLOAD_SIZE = 4080;
+/// Maximum payload a single envelope may carry (ADR-3). Producer
+/// serialization buffers bound stanzas well below this; the cap exists so
+/// one dispatch can never consume a whole worker blob budget.
+pub const MAX_BLOB_SIZE: u32 = 128 * 1024;
 
 /// Cross-worker stanzas that could not be handed to the delivery system,
 /// most often because they exceeded the 4080-byte slot (S14). Atomic: every
@@ -57,25 +66,38 @@ pub var oversize_queue_drops = std.atomic.Value(u64).init(0);
 /// hottest cross-worker path carries no process-wide atomic.
 pub var ring_drops_full = std.atomic.Value(u64).init(0);
 pub var ring_drops_payload = std.atomic.Value(u64).init(0);
+/// Envelopes refused because the producing worker's blob budget was
+/// already committed to in-flight payloads (ADR-3 fail-closed bound).
+pub var blob_budget_denials = std.atomic.Value(u64).init(0);
 
-/// Sentinel value for target_session_id indicating a multicast delivery.
-/// When the consumer sees this, it interprets the payload as a MUC multicast
+/// Per-class full-ring outcomes (ADR-3 QueueFull table). Indexed by
+/// @intFromEnum(DeliveryClass); ring_drops_full keeps the total.
+pub var class_queue_full: [@typeInfo(DeliveryClass).@"enum".fields.len]std.atomic.Value(u64) =
+    .{std.atomic.Value(u64).init(0)} ** @typeInfo(DeliveryClass).@"enum".fields.len;
+
+/// Actor messages dropped after the bounded retry list filled or an
+/// entry exhausted its attempts. Includes produce-time refusals of
+/// actor-class deliveries.
+pub var actor_retry_drops = std.atomic.Value(u64).init(0);
+/// Actor messages that crossed the ring on a retry tick.
+pub var actor_retry_resends = std.atomic.Value(u64).init(0);
+
+/// Pseudo-targets: they address a broadcast or actor channel, never a
+/// session slot. The drain dispatches on token kind before any session
+/// validation; index and gen are always zero.
+/// Multicast delivery: the payload is a MUC multicast
 /// (room_jid + prefix + suffix) rather than a unicast stanza.
-///
-/// Safety: session IDs are array indices (0..max_sessions-1), not monotonic
-/// counters. max_sessions is validated at Server.init to be < MULTICAST_SENTINEL.
-pub const MULTICAST_SENTINEL: u32 = 0xFFFFFFFF;
+pub const MULTICAST_TARGET: Token = .{ .index = 0, .gen = 0, .kind = token_kinds.multicast };
 
-/// Sentinel value for target_session_id indicating a room actor message.
-/// When the consumer sees this, it decodes the payload as a message.zig-encoded
-/// actor message (JoinRequest, PartRequest, GroupchatMessage, etc.) and dispatches
+/// Room actor message: the payload is a message.zig-encoded
+/// actor message (JoinRequest, PartRequest, GroupchatMessage, etc.) dispatched
 /// to the local room shard for processing.
-pub const ROOM_ACTOR_SENTINEL: u32 = 0xFFFFFFFE;
+pub const ROOM_ACTOR_TARGET: Token = .{ .index = 0, .gen = 0, .kind = token_kinds.room_actor };
 
-/// Sentinel value for target_session_id indicating an SM resume handoff
-/// message (T177). Payload decodes as a message.zig sm_resume_request (on the
-/// owning worker) or sm_resume_reply (on the requesting worker).
-pub const SM_ACTOR_SENTINEL: u32 = 0xFFFFFFFD;
+/// SM resume handoff actor message (T177). The payload decodes as a
+/// message.zig sm_resume_request (on the owning worker) or
+/// sm_resume_reply (on the requesting worker).
+pub const SM_ACTOR_TARGET: Token = .{ .index = 0, .gen = 0, .kind = token_kinds.sm_actor };
 
 /// Number of slots per worker queue.
 pub const QUEUE_SLOTS: u32 = 256;
@@ -84,26 +106,118 @@ pub const QUEUE_SLOTS: u32 = 256;
 /// worker applies the class's per-session policy to a remote target exactly
 /// as the local path applies it, because session flags like carbons_enabled
 /// live on the consumer's Session and the producer cannot see them.
-pub const DeliveryKind = enum(u8) {
+pub const DeliveryClass = enum(u8) {
     /// A stanza under RFC 6121 delivery rules: it may be held behind a
     /// draining offline tail and it may be replayed on SM resume.
-    stanza = 0,
+    normal = 0,
     /// A XEP-0280 carbon copy: only a Carbons-enabled session receives it,
     /// and only live. A carbon is never held behind an offline tail, never
     /// stored and never bounced.
     carbon = 1,
+    /// A roster set push: only a resource that asked for roster pushes
+    /// receives it.
+    roster_push = 2,
+    /// A bodyless typing-only message: an inactive-CSI session skips it.
+    chatstate = 3,
+    /// A XEP-0163 PEP notification.
+    pep = 4,
+    /// A room-actor wire message under the ROOM_ACTOR_TARGET sentinel.
+    room_actor = 5,
+    /// An SM-resume actor wire message under the SM_ACTOR_TARGET sentinel.
+    sm_actor = 6,
+    /// A store-completion actor message; reserved for the C11 store path.
+    store_done = 7,
 };
 
-/// A single delivery slot in the MPSC ring buffer.
-pub const DeliverySlot = struct {
-    /// Target session ID (index into shared registry / Server.sessions).
-    target_session_id: u32 = 0,
-    /// Generation at enqueue time — verified by consumer for ABA protection.
-    target_generation: u32 = 0,
-    /// Length of the stanza payload in bytes.
-    payload_len: u16 = 0,
-    /// Delivery class the consumer applies to this slot.
-    kind: DeliveryKind = .stanza,
+/// A refcounted payload shared between ring slots, room mailboxes, SM
+/// replay queues and actor retry lists (ADR-3). One allocation: header
+/// followed by `len` payload bytes. The producing worker's `BlobBudget`
+/// bounds its in-flight bytes; the last release on any thread frees the
+/// allocation and returns the bytes to that budget.
+pub const Blob = struct {
+    /// Open references: ring slots, mailbox entries, SM entries, the
+    /// producer's own handle.
+    refs: std.atomic.Value(u32),
+    /// Owning budget: frees return their byte charge here.
+    budget: *BlobBudget,
+    /// Payload length in bytes.
+    len: u32,
+
+    /// Payload bytes, which live immediately after the header in the same
+    /// allocation. Never call after the last release.
+    pub fn bytes(self: *Blob) []u8 {
+        const raw: [*]u8 = @ptrCast(self);
+        return raw[@sizeOf(Blob) .. @sizeOf(Blob) + self.len];
+    }
+
+    /// Take another reference (a new slot, mailbox entry or queue node).
+    pub fn addRef(self: *Blob) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Drop a reference. The last one frees the allocation through the
+    /// home budget's allocator and returns the byte charge.
+    pub fn release(self: *Blob) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const budget = self.budget;
+        const size = @sizeOf(Blob) + self.len;
+        const raw: [*]align(@alignOf(Blob)) u8 = @ptrCast(@alignCast(self));
+        budget.allocator.free(raw[0..size]);
+        _ = budget.bytes_in_flight.fetchSub(size, .acq_rel);
+    }
+};
+
+/// Per-producing-worker bound on blob bytes in flight (ADR-3). A producer
+/// that would exceed `limit` fails with error.BlobBudget, which takes the
+/// same QueueFull policy path as a full ring. Freeing from a consumer
+/// thread is safe: the allocator is the process allocator and the counter
+/// is atomic.
+pub const BlobBudget = struct {
+    allocator: std.mem.Allocator,
+    limit: u64,
+    bytes_in_flight: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// Default per-worker in-flight cap (ADR-3).
+    pub const DEFAULT_LIMIT: u64 = 4 * 1024 * 1024;
+
+    /// Copy `payload` into a new refcounted blob; the caller owns the
+    /// initial reference. Fails closed on budget exhaustion, allocation
+    /// failure, or payloads over MAX_BLOB_SIZE.
+    pub fn produce(self: *BlobBudget, payload: []const u8) !*Blob {
+        if (payload.len > MAX_BLOB_SIZE) {
+            _ = ring_drops_payload.fetchAdd(1, .monotonic);
+            return error.PayloadTooLarge;
+        }
+        const size: usize = @sizeOf(Blob) + payload.len;
+        if (self.bytes_in_flight.fetchAdd(size, .acq_rel) + size > self.limit) {
+            _ = self.bytes_in_flight.fetchSub(size, .acq_rel);
+            _ = blob_budget_denials.fetchAdd(1, .monotonic);
+            return error.BlobBudget;
+        }
+        errdefer _ = self.bytes_in_flight.fetchSub(size, .acq_rel);
+
+        const raw = try self.allocator.alignedAlloc(u8, .fromByteUnits(@alignOf(Blob)), size);
+        const blob: *Blob = @ptrCast(raw.ptr);
+        blob.* = .{
+            .refs = std.atomic.Value(u32).init(1),
+            .budget = self,
+            .len = @intCast(payload.len),
+        };
+        @memcpy(raw.ptr[@sizeOf(Blob)..size], payload);
+        return blob;
+    }
+};
+
+/// A single delivery descriptor in the MPSC ring (ADR-3). The payload
+/// lives in a shared refcounted `Blob`; the slot owns one reference from
+/// publish to drain.
+pub const Envelope = struct {
+    /// Target slot address (ADR-4): a session token, or one of the
+    /// *_TARGET pseudo-targets dispatched on kind before validation.
+    target: Token = .none,
+    /// Payload blob; the slot's reference is released by the consumer
+    /// after the handler returns.
+    blob: ?*Blob = null,
     /// Dispatch identity minted by the producer (see offline_store.HoldToken).
     /// Carried in the slot so a consumer on another worker holds the message
     /// under the same identity, and two identical messages stay distinct.
@@ -113,77 +227,212 @@ pub const DeliverySlot = struct {
     /// held message with the time it was actually queued, not the time a
     /// possibly-busy worker got to it. Zero means untimed.
     receipt_ts: u64 = 0,
-    /// Set to true by producer AFTER payload memcpy is complete.
-    /// Consumer MUST check this before reading payload.
+    /// Payload length in bytes (== blob.len; kept in the descriptor so the
+    /// consumer need not touch blob cache lines to read it).
+    len: u32 = 0,
+    /// Delivery class the consumer applies to this slot.
+    class: DeliveryClass = .normal,
+    /// Set to true by producer AFTER the descriptor is written.
+    /// Consumer MUST check this before reading the slot.
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Serialized XMPP stanza bytes.
-    payload: [MAX_PAYLOAD_SIZE]u8 = undefined,
 };
 
 comptime {
-    // Zig reorders struct fields to minimize padding, so declaration order
-    // does not decide the layout: the header fields are
-    // 4 + 4 + 2 + 1 + 1 + 8 + 8 = 28 bytes in a 32-byte header with 4 bytes
-    // of tail padding. A manual filler field is what costs space: six bytes
-    // of _pad pushed the slot to 4112, an eight-byte slab per queue across
-    // every worker. Pin the header so any future field that does not fit
-    // the gaps fails here.
-    std.debug.assert(@sizeOf(DeliverySlot) == MAX_PAYLOAD_SIZE + 32); // 4112
+    std.debug.assert(@sizeOf(Envelope) <= 48);
 }
 
 /// Per-worker MPSC delivery queue (bounded ring buffer).
+/// Actor-class envelope parked on a producer's bounded retry list after
+/// its target ring refused it. The blob ref pins the payload for the
+/// whole retry window; nothing is copied.
+pub const ActorRetry = struct {
+    next: ?*ActorRetry = null,
+    target_worker: u16,
+    target: Token,
+    blob: *Blob,
+    hold_token: u64,
+    receipt_ts: u64,
+    attempts: u8 = 0,
+    class: DeliveryClass,
+};
+
+/// Per-producer bounded FIFO of refused actor envelopes. Producer-only:
+/// the owning worker appends and drains from its own thread, so no
+/// atomics beyond the ring's own.
+pub const ActorRetryList = struct {
+    pub const MAX: u16 = 64;
+    pub const ATTEMPTS: u8 = 8;
+    /// Re-enqueue attempts per drain tick.
+    pub const DRAIN_MAX: u16 = 32;
+
+    head: ?*ActorRetry = null,
+    tail: ?*ActorRetry = null,
+    count: u16 = 0,
+    allocator: std.mem.Allocator,
+
+    /// Take a reference on `blob` and append it for retry. Fails closed
+    /// with RetryListFull at MAX entries; the caller keeps its ref.
+    pub fn push(
+        self: *ActorRetryList,
+        target_worker: u16,
+        target: Token,
+        blob: *Blob,
+        hold_token: u64,
+        receipt_ts: u64,
+        class: DeliveryClass,
+    ) !void {
+        if (self.count >= MAX) {
+            _ = actor_retry_drops.fetchAdd(1, .monotonic);
+            return error.RetryListFull;
+        }
+        const e = self.allocator.create(ActorRetry) catch {
+            return error.OutOfMemory;
+        };
+        blob.addRef();
+        e.* = .{
+            .target_worker = target_worker,
+            .target = target,
+            .blob = blob,
+            .hold_token = hold_token,
+            .receipt_ts = receipt_ts,
+            .class = class,
+        };
+        if (self.tail) |t| t.next = e else self.head = e;
+        self.tail = e;
+        self.count += 1;
+    }
+
+    /// Re-attempt each pending entry once per tick. Entries that still
+    /// fail age one attempt; at ATTEMPTS the entry is removed, the class
+    /// fallback runs through `on_exhausted`, and the refs are released.
+    /// Single-threaded: called from the producing worker's drain tick.
+    pub fn drain(
+        self: *ActorRetryList,
+        ds: *DeliverySystem,
+        ctx: anytype,
+        on_exhausted: fn (@TypeOf(ctx), *const ActorRetry) void,
+    ) void {
+        var processed: u16 = 0;
+        var cur = self.head;
+        while (cur != null and processed < DRAIN_MAX) {
+            const e = cur.?;
+            cur = e.next;
+            if (e.target_worker >= ds.worker_count) {
+                self.unlink(e);
+                on_exhausted(ctx, e);
+                e.blob.release();
+                self.allocator.destroy(e);
+                continue;
+            }
+            ds.queues[e.target_worker].enqueueEnvelope(e.target, e.blob, e.hold_token, e.receipt_ts, e.class) catch {
+                e.attempts += 1;
+                if (e.attempts >= ATTEMPTS) {
+                    self.unlink(e);
+                    _ = actor_retry_drops.fetchAdd(1, .monotonic);
+                    on_exhausted(ctx, e);
+                    e.blob.release();
+                    self.allocator.destroy(e);
+                }
+                processed += 1;
+                continue;
+            };
+            ds.wakeWorker(e.target_worker);
+            _ = actor_retry_resends.fetchAdd(1, .monotonic);
+            self.unlink(e);
+            e.blob.release();
+            self.allocator.destroy(e);
+            processed += 1;
+        }
+    }
+
+    fn unlink(self: *ActorRetryList, e: *ActorRetry) void {
+        if (self.head == e) self.head = e.next;
+        if (self.tail == e) self.tail = null;
+        // Interior unlink: the list is drained in order so a non-head
+        // removal only happens on exhaustion; walk from head (count <= 64).
+        if (self.head != e) {
+            var cur = self.head;
+            while (cur) |c| {
+                if (c.next == e) {
+                    c.next = e.next;
+                    if (self.tail == e) self.tail = c;
+                    break;
+                }
+                cur = c.next;
+            }
+        }
+        e.next = null;
+        self.count -= 1;
+    }
+
+    /// Release every parked entry; called at DeliverySystem teardown.
+    pub fn deinit(self: *ActorRetryList) void {
+        var cur = self.head;
+        while (cur) |e| {
+            cur = e.next;
+            e.blob.release();
+            self.allocator.destroy(e);
+        }
+        self.* = undefined;
+    }
+};
+
 pub const MpscQueue = struct {
-    slots: [QUEUE_SLOTS]DeliverySlot = [_]DeliverySlot{.{}} ** QUEUE_SLOTS,
+    slots: [QUEUE_SLOTS]Envelope = [_]Envelope{.{}} ** QUEUE_SLOTS,
     /// Next write position — advanced by producers via CAS.
     tail: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// Next read position — advanced by consumer only (no atomics needed).
-    head: u32 = 0,
+    /// Next read position. Consumer-owned cursor, stored .release after
+    /// each drained slot so the producer full check reads a published
+    /// value (ADR-3).
+    head: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Dispatch identity of the slot the drain is currently handing to the
     /// handler. Consumer-only, valid for the duration of one handler call.
     current_slot_token: u64 = 0,
     /// Delivery class of the slot the drain is currently handing to the
     /// handler. Consumer-only, valid for the duration of one handler call.
-    current_slot_kind: DeliveryKind = .stanza,
+    current_slot_class: DeliveryClass = .normal,
+
+    /// The blob backing the payload the drain handler is currently
+    /// processing. Consumer-only, valid for the duration of one handler
+    /// call; a consumer that retains it MUST addRef (room mailboxes do).
+    current_slot_blob: ?*Blob = null,
     /// Producer receipt time of that same slot; 0 when untimed.
     current_slot_receipt_ts: u64 = 0,
 
     /// Attempt to enqueue a stanza for cross-thread delivery.
-    /// Called by any producer thread. Returns error.QueueFull if no slots available.
+    /// Called by any producer thread. Takes one reference of `blob` on
+    /// success; the caller keeps its own. Returns error.QueueFull if no
+    /// slots available.
     pub fn enqueue(
         self: *MpscQueue,
-        target_session_id: u32,
-        target_generation: u32,
-        payload: []const u8,
+        target: Token,
+        blob: *Blob,
     ) !void {
-        return self.enqueueDelivery(target_session_id, target_generation, payload, 0, 0, .stanza);
+        return self.enqueueEnvelope(target, blob, 0, 0, .normal);
     }
 
-    /// Enqueue a stanza with its dispatch identity, producer receipt time
+    /// Enqueue a delivery with its dispatch identity, producer receipt time
     /// and delivery class: a consumer on another worker holds the message
     /// under the same token, stamps a held copy with the queue time, and
     /// applies the class to the remote session as the local path would.
-    pub fn enqueueDelivery(
+    /// Takes one reference of `blob` on success; the caller keeps its own.
+    pub fn enqueueEnvelope(
         self: *MpscQueue,
-        target_session_id: u32,
-        target_generation: u32,
-        payload: []const u8,
+        target: Token,
+        blob: *Blob,
         hold_token: u64,
         receipt_ts: u64,
-        kind: DeliveryKind,
+        class: DeliveryClass,
     ) !void {
-        if (payload.len > MAX_PAYLOAD_SIZE) {
-            _ = ring_drops_payload.fetchAdd(1, .monotonic);
-            return error.PayloadTooLarge;
-        }
-
         // CAS loop to reserve a slot
         while (true) {
             const current_tail = self.tail.load(.acquire);
-            const current_head = self.head; // consumer-only field, safe to read
+            const current_head = self.head.load(.acquire);
 
             // Check if queue is full
             if (current_tail -% current_head >= QUEUE_SLOTS) {
                 _ = ring_drops_full.fetchAdd(1, .monotonic);
+                _ = class_queue_full[@intFromEnum(class)].fetchAdd(1, .monotonic);
                 return error.QueueFull;
             }
 
@@ -197,14 +446,15 @@ pub const MpscQueue = struct {
             const slot_idx = current_tail % QUEUE_SLOTS;
             const slot = &self.slots[slot_idx];
 
-            // Write payload (non-atomic — we own this slot until ready.store)
-            slot.target_session_id = target_session_id;
-            slot.target_generation = target_generation;
-            slot.payload_len = @intCast(payload.len);
+            // Write the descriptor (non-atomic; we own this slot until
+            // ready.store). The slot takes its own blob reference.
+            blob.addRef();
+            slot.target = target;
+            slot.blob = blob;
             slot.hold_token = hold_token;
             slot.receipt_ts = receipt_ts;
-            slot.kind = kind;
-            @memcpy(slot.payload[0..payload.len], payload);
+            slot.len = blob.len;
+            slot.class = class;
 
             // Publish: signal to consumer that this slot is fully written
             slot.ready.store(true, .release);
@@ -215,13 +465,14 @@ pub const MpscQueue = struct {
     /// Drain all ready slots from the queue.
     /// Called by the consumer (owning worker thread) only.
     /// Returns the number of slots processed.
-    /// Calls `handler` for each ready delivery with (session_id, generation, payload).
-    pub fn drain(self: *MpscQueue, ctx: anytype, handler: fn (@TypeOf(ctx), u32, u32, []const u8) void) u32 {
+    /// Calls `handler` for each ready delivery with (target token, payload).
+    pub fn drain(self: *MpscQueue, ctx: anytype, handler: fn (@TypeOf(ctx), Token, []const u8) void) u32 {
         var processed: u32 = 0;
         const current_tail = self.tail.load(.acquire);
+        var h = self.head.load(.acquire);
 
-        while (self.head != current_tail) {
-            const slot_idx = self.head % QUEUE_SLOTS;
+        while (h != current_tail) {
+            const slot_idx = h % QUEUE_SLOTS;
             const slot = &self.slots[slot_idx];
 
             // Check if this slot is fully written by the producer
@@ -233,18 +484,27 @@ pub const MpscQueue = struct {
             // Read the delivery. The `current_slot_*` fields are how a
             // handler learns this dispatch's identity, class and receipt
             // time without widening the handler signature.
+            const blob = slot.blob.?;
             self.current_slot_token = slot.hold_token;
-            self.current_slot_kind = slot.kind;
+            self.current_slot_class = slot.class;
             self.current_slot_receipt_ts = slot.receipt_ts;
-            handler(ctx, slot.target_session_id, slot.target_generation, slot.payload[0..slot.payload_len]);
+            self.current_slot_blob = blob;
+            handler(ctx, slot.target, blob.bytes());
             self.current_slot_token = 0;
-            self.current_slot_kind = .stanza;
+            self.current_slot_class = .normal;
             self.current_slot_receipt_ts = 0;
+            self.current_slot_blob = null;
             processed += 1;
 
-            // Reset the slot and advance head
+            // Retire the slot, then publish the advanced head. A producer
+            // cannot reuse this index until the full check sees head move
+            // past it, so the writes above and the blob release below
+            // cannot race the next descriptor.
+            slot.blob = null;
             slot.ready.store(false, .monotonic);
-            self.head +%= 1;
+            h +%= 1;
+            self.head.store(h, .release);
+            blob.release();
         }
 
         return processed;
@@ -252,7 +512,7 @@ pub const MpscQueue = struct {
 
     /// Check if the queue has pending work (without consuming).
     pub fn hasPending(self: *const MpscQueue) bool {
-        return self.head != self.tail.load(.acquire);
+        return self.head.load(.acquire) != self.tail.load(.acquire);
     }
 };
 
@@ -336,6 +596,14 @@ pub const DeliverySystem = struct {
     queues: []MpscQueue,
     pipes: []WakePipe,
     states: []WorkerState,
+    /// Per-worker blob budgets (producer side). `budgets[w]` bounds the
+    /// payload bytes worker `w` has in flight across every target ring,
+    /// room mailbox and replay queue (ADR-3).
+    budgets: []BlobBudget,
+
+    /// Per-producer bounded retry lists for actor-class envelopes
+    /// refused by a full target ring (ADR-3 QueueFull policy).
+    retry_lists: []ActorRetryList,
     worker_count: u16,
     allocator: std.mem.Allocator,
     /// Optional hook invoked once per accepted envelope (M1). The server
@@ -367,10 +635,22 @@ pub const DeliverySystem = struct {
         const states = try allocator.alloc(WorkerState, n);
         @memset(states, WorkerState{});
 
+        const budgets = try allocator.alloc(BlobBudget, n);
+        for (budgets) |*b| {
+            b.* = .{ .allocator = allocator, .limit = BlobBudget.DEFAULT_LIMIT };
+        }
+
+        const retry_lists = try allocator.alloc(ActorRetryList, n);
+        for (retry_lists) |*r| {
+            r.* = .{ .allocator = allocator };
+        }
+
         return .{
             .queues = queues,
             .pipes = pipes,
             .states = states,
+            .budgets = budgets,
+            .retry_lists = retry_lists,
             .worker_count = worker_count,
             .allocator = allocator,
         };
@@ -378,40 +658,62 @@ pub const DeliverySystem = struct {
 
     /// Clean up all resources.
     pub fn deinit(self: *DeliverySystem) void {
+        // Undrained slots still hold a blob reference; return them to
+        // their budgets before the queues are freed.
+        for (self.queues) |*q| {
+            for (&q.slots) |*slot| {
+                if (slot.blob) |b| {
+                    b.release();
+                    slot.blob = null;
+                }
+            }
+        }
         for (self.pipes) |*p| {
             p.deinit();
+        }
+        for (self.retry_lists) |*r| {
+            r.deinit();
         }
         self.allocator.free(self.queues);
         self.allocator.free(self.pipes);
         self.allocator.free(self.states);
+        self.allocator.free(self.budgets);
+        self.allocator.free(self.retry_lists);
         self.* = undefined;
+    }
+
+    /// Serialize `payload` into a refcounted blob charged to the producing
+    /// worker's budget. The caller owns the returned reference.
+    pub fn produceBlob(self: *DeliverySystem, producer_worker: u16, payload: []const u8) !*Blob {
+        if (producer_worker >= self.worker_count) return error.InvalidWorker;
+        return self.budgets[producer_worker].produce(payload);
     }
 
     /// Enqueue a stanza for delivery to a target worker.
     /// Handles coalesced signaling — only wakes the target if it's idle.
     pub fn deliver(
         self: *DeliverySystem,
+        producer_worker: u16,
         target_worker: u16,
-        target_session_id: u32,
-        target_generation: u32,
+        target: Token,
         payload: []const u8,
     ) !void {
-        return self.deliverDelivery(target_worker, target_session_id, target_generation, payload, 0, 0, .stanza);
+        return self.deliverDelivery(producer_worker, target_worker, target, payload, 0, 0, .normal);
     }
 
     /// Deliver a stanza with its dispatch identity, producer receipt time
     /// and delivery class, then wake the target worker.
     pub fn deliverDelivery(
         self: *DeliverySystem,
+        producer_worker: u16,
         target_worker: u16,
-        target_session_id: u32,
-        target_generation: u32,
+        target: Token,
         payload: []const u8,
         hold_token: u64,
         receipt_ts: u64,
-        kind: DeliveryKind,
+        class: DeliveryClass,
     ) !void {
-        try self.enqueueDelivery(target_worker, target_session_id, target_generation, payload, hold_token, receipt_ts, kind);
+        try self.enqueueDelivery(producer_worker, target_worker, target, payload, hold_token, receipt_ts, class);
 
         self.wakeWorker(target_worker);
     }
@@ -422,30 +724,87 @@ pub const DeliverySystem = struct {
     /// trailing wake is not.
     pub fn enqueue(
         self: *DeliverySystem,
+        producer_worker: u16,
         target_worker: u16,
-        target_session_id: u32,
-        target_generation: u32,
+        target: Token,
         payload: []const u8,
     ) !void {
-        return self.enqueueDelivery(target_worker, target_session_id, target_generation, payload, 0, 0, .stanza);
+        return self.enqueueDelivery(producer_worker, target_worker, target, payload, 0, 0, .normal);
     }
 
     /// Enqueue a delivery with its dispatch identity, producer receipt time
     /// and delivery class, without waking the target worker.
-    /// The caller MUST call wakeWorker() once after the batch.
+    /// The caller MUST call wakeWorker() once after the batch. The payload
+    /// is serialized into a blob charged to `producer_worker`'s budget; a
+    /// budget denial takes the same error path as a full ring.
     pub fn enqueueDelivery(
         self: *DeliverySystem,
+        producer_worker: u16,
         target_worker: u16,
-        target_session_id: u32,
-        target_generation: u32,
+        target: Token,
         payload: []const u8,
         hold_token: u64,
         receipt_ts: u64,
-        kind: DeliveryKind,
+        class: DeliveryClass,
     ) !void {
         if (target_worker >= self.worker_count) return error.InvalidWorker;
-        try self.queues[target_worker].enqueueDelivery(target_session_id, target_generation, payload, hold_token, receipt_ts, kind);
+        const blob = try self.produceBlob(producer_worker, payload);
+        defer blob.release();
+        try self.enqueueBlob(target_worker, target, blob, hold_token, receipt_ts, class);
+    }
+
+    /// Enqueue an already-produced blob into a target worker's ring
+    /// without waking it. The slot takes its own reference, so one blob
+    /// produced by a multicast producer is shared across every target.
+    /// The caller MUST call wakeWorker() once after the batch.
+    pub fn enqueueBlob(
+        self: *DeliverySystem,
+        target_worker: u16,
+        target: Token,
+        blob: *Blob,
+        hold_token: u64,
+        receipt_ts: u64,
+        class: DeliveryClass,
+    ) !void {
+        if (target_worker >= self.worker_count) return error.InvalidWorker;
+        try self.queues[target_worker].enqueueEnvelope(target, blob, hold_token, receipt_ts, class);
         if (self.envelope_hook) |h| h();
+    }
+
+    /// Enqueue a shared blob and wake the target worker.
+    pub fn deliverBlob(
+        self: *DeliverySystem,
+        target_worker: u16,
+        target: Token,
+        blob: *Blob,
+        hold_token: u64,
+        receipt_ts: u64,
+        class: DeliveryClass,
+    ) !void {
+        try self.enqueueBlob(target_worker, target, blob, hold_token, receipt_ts, class);
+        self.wakeWorker(target_worker);
+    }
+
+    /// Actor-class delivery with the ADR-3 QueueFull policy: a refused
+    /// enqueue parks on the producer's bounded retry list and is
+    /// re-attempted on the worker's drain tick. The policy counter
+    /// covers every refusal; nothing drops silently.
+    pub fn deliverActor(
+        self: *DeliverySystem,
+        producer_worker: u16,
+        target_worker: u16,
+        target: Token,
+        payload: []const u8,
+        hold_token: u64,
+        receipt_ts: u64,
+        class: DeliveryClass,
+    ) !void {
+        const blob = try self.produceBlob(producer_worker, payload);
+        defer blob.release();
+        self.deliverBlob(target_worker, target, blob, hold_token, receipt_ts, class) catch |err| switch (err) {
+            error.QueueFull => try self.retry_lists[producer_worker].push(target_worker, target, blob, hold_token, receipt_ts, class),
+            else => return err,
+        };
     }
 
     /// Wake a worker after one or more enqueue() calls (T130). Coalesced
@@ -502,43 +861,70 @@ pub const DeliverySystem = struct {
 // Tests
 // ============================================================================
 
+/// Test helper: every queue-level test charges blobs to this budget.
+/// A static keeps the budget alive for as long as any blob it produced;
+/// queue tests are single-threaded.
+var test_budget_store: ?BlobBudget = null;
+fn testBudget() *BlobBudget {
+    if (test_budget_store == null) {
+        test_budget_store = .{ .allocator = std.testing.allocator, .limit = BlobBudget.DEFAULT_LIMIT };
+    }
+    return &test_budget_store.?;
+}
+
+/// Produce a blob, hand one reference to `queue`, and drop the caller's.
+fn enqueuePayload(queue: *MpscQueue, target: Token, payload: []const u8) !void {
+    const blob = try testBudget().produce(payload);
+    defer blob.release();
+    try queue.enqueue(target, blob);
+}
+
 test "MpscQueue: basic enqueue and drain" {
     var queue = MpscQueue{};
     const payload = "hello world";
 
-    try queue.enqueue(42, 7, payload);
+    try enqueuePayload(&queue, Token.init(42, 7, token_kinds.session), payload);
 
     var received_id: u32 = 0;
-    var received_gen: u32 = 0;
-    var received_payload: []const u8 = "";
+    var received_gen: u24 = 0;
+    var received_buf: [64]u8 = undefined;
+    var received_len: usize = 0;
 
     const Ctx = struct {
         id: *u32,
-        gen: *u32,
-        pl: *[]const u8,
+        gen: *u24,
+        buf: *[64]u8,
+        len: *usize,
     };
-    const ctx = Ctx{ .id = &received_id, .gen = &received_gen, .pl = &received_payload };
+    const ctx = Ctx{ .id = &received_id, .gen = &received_gen, .buf = &received_buf, .len = &received_len };
 
     const handler = struct {
-        fn handle(c: Ctx, sid: u32, gen: u32, pl: []const u8) void {
-            c.id.* = sid;
-            c.gen.* = gen;
-            c.pl.* = pl;
+        fn handle(c: Ctx, target: Token, pl: []const u8) void {
+            c.id.* = target.index;
+            c.gen.* = target.gen;
+            // The payload slice dies with the slot's blob reference when
+            // the handler returns; copy while it is valid.
+            @memcpy(c.buf[0..pl.len], pl);
+            c.len.* = pl.len;
         }
     }.handle;
 
     const processed = queue.drain(ctx, handler);
     try std.testing.expectEqual(@as(u32, 1), processed);
     try std.testing.expectEqual(@as(u32, 42), received_id);
-    try std.testing.expectEqual(@as(u32, 7), received_gen);
-    try std.testing.expectEqualStrings("hello world", received_payload);
+    try std.testing.expectEqual(@as(u24, 7), received_gen);
+    try std.testing.expectEqualStrings("hello world", received_buf[0..received_len]);
 }
 
 test "MpscQueue: receipt timestamp reaches the drain handler" {
     var queue = MpscQueue{};
 
-    try queue.enqueueDelivery(42, 7, "timed", 0xdeadbeef, 12345, .stanza);
-    try queue.enqueue(43, 8, "untimed");
+    {
+        const blob = try testBudget().produce("timed");
+        defer blob.release();
+        try queue.enqueueEnvelope(Token.init(42, 7, token_kinds.session), blob, 0xdeadbeef, 12345, .normal);
+    }
+    try enqueuePayload(&queue, Token.init(43, 8, token_kinds.session), "untimed");
 
     const Ctx = struct {
         queue: *MpscQueue,
@@ -552,9 +938,7 @@ test "MpscQueue: receipt timestamp reaches the drain handler" {
     // Each slot reports its own receipt time; the field is back to zero
     // after the handler returns so an untimed slot inherits nothing.
     const handler = struct {
-        fn handle(c: Ctx, sid: u32, gen: u32, payload: []const u8) void {
-            _ = sid;
-            _ = gen;
+        fn handle(c: Ctx, _: Token, payload: []const u8) void {
             _ = payload;
             c.stamps[c.seen.*] = c.queue.current_slot_receipt_ts;
             c.seen.* += 1;
@@ -570,8 +954,12 @@ test "MpscQueue: receipt timestamp reaches the drain handler" {
 test "MpscQueue: hold token survives the round trip and is cleared after each slot" {
     var queue = MpscQueue{};
 
-    try queue.enqueueDelivery(42, 7, "tagged", 0xdeadbeef, 0, .stanza);
-    try queue.enqueue(43, 8, "untagged");
+    {
+        const blob = try testBudget().produce("tagged");
+        defer blob.release();
+        try queue.enqueueEnvelope(Token.init(42, 7, token_kinds.session), blob, 0xdeadbeef, 0, .normal);
+    }
+    try enqueuePayload(&queue, Token.init(43, 8, token_kinds.session), "untagged");
 
     const Ctx = struct {
         queue: *MpscQueue,
@@ -585,11 +973,9 @@ test "MpscQueue: hold token survives the round trip and is cleared after each sl
     // Each slot reports its own token, and the field is back to zero after the
     // handler returns so a later untagged slot cannot inherit the previous one.
     const handler = struct {
-        fn handle(c: Ctx, sid: u32, gen: u32, pl: []const u8) void {
-            _ = gen;
+        fn handle(c: Ctx, _: Token, pl: []const u8) void {
             _ = pl;
             c.tokens.*[c.seen.*] = c.queue.current_slot_token;
-            _ = sid;
             c.seen.* += 1;
         }
     }.handle;
@@ -606,33 +992,35 @@ test "MpscQueue: hold token survives the round trip and is cleared after each sl
 test "MpscQueue: delivery kind survives the round trip and is cleared after each slot" {
     var queue = MpscQueue{};
 
-    try queue.enqueueDelivery(42, 7, "carbon copy", 0, 0, .carbon);
-    try queue.enqueue(43, 8, "plain stanza");
+    {
+        const blob = try testBudget().produce("carbon copy");
+        defer blob.release();
+        try queue.enqueueEnvelope(Token.init(42, 7, token_kinds.session), blob, 0, 0, .carbon);
+    }
+    try enqueuePayload(&queue, Token.init(43, 8, token_kinds.session), "plain stanza");
 
     const Ctx = struct {
         queue: *MpscQueue,
-        kinds: *[2]DeliveryKind,
+        kinds: *[2]DeliveryClass,
         seen: *usize,
     };
-    var kinds = [_]DeliveryKind{ .stanza, .stanza };
+    var kinds = [_]DeliveryClass{ .normal, .normal };
     var seen: usize = 0;
     const ctx = Ctx{ .queue = &queue, .kinds = &kinds, .seen = &seen };
 
     const handler = struct {
-        fn handle(c: Ctx, sid: u32, gen: u32, pl: []const u8) void {
-            _ = sid;
-            _ = gen;
+        fn handle(c: Ctx, _: Token, pl: []const u8) void {
             _ = pl;
-            c.kinds.*[c.seen.*] = c.queue.current_slot_kind;
+            c.kinds.*[c.seen.*] = c.queue.current_slot_class;
             c.seen.* += 1;
         }
     }.handle;
 
     const processed = queue.drain(ctx, handler);
     try std.testing.expectEqual(@as(u32, 2), processed);
-    try std.testing.expectEqual(DeliveryKind.carbon, kinds[0]);
-    try std.testing.expectEqual(DeliveryKind.stanza, kinds[1]);
-    try std.testing.expectEqual(DeliveryKind.stanza, queue.current_slot_kind);
+    try std.testing.expectEqual(DeliveryClass.carbon, kinds[0]);
+    try std.testing.expectEqual(DeliveryClass.normal, kinds[1]);
+    try std.testing.expectEqual(DeliveryClass.normal, queue.current_slot_class);
 }
 
 test "MpscQueue: queue full" {
@@ -641,25 +1029,74 @@ test "MpscQueue: queue full" {
     // Fill the queue
     var i: u32 = 0;
     while (i < QUEUE_SLOTS) : (i += 1) {
-        try queue.enqueue(i, 0, "x");
+        try enqueuePayload(&queue, Token.init(i, 1, token_kinds.session), "x");
     }
 
     // Next enqueue should fail
-    try std.testing.expectError(error.QueueFull, queue.enqueue(999, 0, "overflow"));
+    try std.testing.expectError(error.QueueFull, enqueuePayload(&queue, Token.init(999, 1, token_kinds.session), "overflow"));
+
+    // Drain frees every slot reference the test published.
+    var freed: u32 = 0;
+    const Ctx = struct { count: *u32 };
+    const handler = struct {
+        fn handle(c: Ctx, _: Token, _: []const u8) void {
+            c.count.* += 1;
+        }
+    }.handle;
+    _ = queue.drain(Ctx{ .count = &freed }, handler);
+    try std.testing.expectEqual(QUEUE_SLOTS, freed);
 }
 
 test "MpscQueue: payload too large" {
-    var queue = MpscQueue{};
-    const big_payload = [_]u8{0} ** (MAX_PAYLOAD_SIZE + 1);
-    try std.testing.expectError(error.PayloadTooLarge, queue.enqueue(0, 0, &big_payload));
+    var budget = testBudget();
+    const big_payload = try std.testing.allocator.alloc(u8, MAX_BLOB_SIZE + 1);
+    defer std.testing.allocator.free(big_payload);
+    try std.testing.expectError(error.PayloadTooLarge, budget.produce(big_payload));
 }
 
 test "MpscQueue: hasPending" {
     var queue = MpscQueue{};
     try std.testing.expect(!queue.hasPending());
 
-    try queue.enqueue(1, 0, "test");
+    try enqueuePayload(&queue, Token.init(1, 1, token_kinds.session), "test");
     try std.testing.expect(queue.hasPending());
+
+    const handler = struct {
+        fn handle(_: usize, _: Token, _: []const u8) void {}
+    }.handle;
+    _ = queue.drain(@as(usize, 0), handler);
+    try std.testing.expect(!queue.hasPending());
+}
+
+test "Blob: a slot's reference outlives the producer's" {
+    var budget = BlobBudget{ .allocator = std.testing.allocator, .limit = BlobBudget.DEFAULT_LIMIT };
+    var queue = MpscQueue{};
+
+    const blob = try budget.produce("shared");
+    try queue.enqueue(Token.init(1, 1, token_kinds.session), blob);
+    // Producer drops its handle; the slot's reference keeps the payload.
+    blob.release();
+    try std.testing.expectEqual(@as(u32, 1), blob.refs.load(.acquire));
+
+    var seen: usize = 0;
+    const Ctx = struct { n: *usize };
+    const handler = struct {
+        fn handle(c: Ctx, _: Token, _: []const u8) void {
+            c.n.* += 1;
+        }
+    }.handle;
+    _ = queue.drain(Ctx{ .n = &seen }, handler);
+    try std.testing.expectEqual(@as(usize, 1), seen);
+    // The drain released the last reference: the byte charge went home.
+    try std.testing.expectEqual(@as(u64, 0), budget.bytes_in_flight.load(.acquire));
+}
+
+test "Blob: budget denial is counted and fail-closed" {
+    var budget = BlobBudget{ .allocator = std.testing.allocator, .limit = 8 };
+    const before = blob_budget_denials.load(.monotonic);
+    try std.testing.expectError(error.BlobBudget, budget.produce("0123456789"));
+    try std.testing.expectEqual(before + 1, blob_budget_denials.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), budget.bytes_in_flight.load(.acquire));
 }
 
 test "WakePipe: init and deinit" {
@@ -680,9 +1117,9 @@ test "DeliverySystem: a burst of deliveries costs one pipe byte (Q2)" {
     defer sys.deinit();
 
     var buf: [8]u8 = undefined;
-    try sys.deliver(1, 1, 1, "a");
-    try sys.deliver(1, 2, 1, "b");
-    try sys.deliver(1, 3, 1, "c");
+    try sys.deliver(0, 1, Token.init(1, 1, token_kinds.session), "a");
+    try sys.deliver(0, 1, Token.init(2, 1, token_kinds.session), "b");
+    try sys.deliver(0, 1, Token.init(3, 1, token_kinds.session), "c");
     try std.testing.expectEqual(@as(usize, 1), try posix.read(sys.getPipeReadFd(1), &buf));
     try std.testing.expectError(error.WouldBlock, posix.read(sys.getPipeReadFd(1), &buf));
 
@@ -691,7 +1128,7 @@ test "DeliverySystem: a burst of deliveries costs one pipe byte (Q2)" {
     try std.testing.expect(!sys.getState(1).wake_pending.load(.seq_cst));
 
     // A delivery after the clear writes a fresh byte.
-    try sys.deliver(1, 4, 1, "d");
+    try sys.deliver(0, 1, Token.init(4, 1, token_kinds.session), "d");
     try std.testing.expectEqual(@as(usize, 1), try posix.read(sys.getPipeReadFd(1), &buf));
 }
 
@@ -703,10 +1140,10 @@ test "DeliverySystem: a publish inside the clear-then-drain window still wakes" 
     var sys = try DeliverySystem.init(std.testing.allocator, 2);
     defer sys.deinit();
 
-    try sys.deliver(1, 1, 1, "first");
+    try sys.deliver(0, 1, Token.init(1, 1, token_kinds.session), "first");
     sys.drainPipe(1); // consumes the byte, clears wake_pending
 
-    try sys.deliver(1, 2, 1, "second");
+    try sys.deliver(0, 1, Token.init(2, 1, token_kinds.session), "second");
 
     // The second publish saw flag=false and wrote: pipe is readable again.
     var buf: [8]u8 = undefined;
@@ -716,7 +1153,7 @@ test "DeliverySystem: a publish inside the clear-then-drain window still wakes" 
     var count: u32 = 0;
     const ctx = Ctx{ .count = &count };
     const handler = struct {
-        fn handle(c: Ctx, _: u32, _: u32, _: []const u8) void {
+        fn handle(c: Ctx, _: Token, _: []const u8) void {
             c.count.* += 1;
         }
     }.handle;
@@ -746,9 +1183,9 @@ test "DeliverySystem: racing producers lose no wakeups" {
             while (i < n) : (i += 1) {
                 // QueueFull drops are legitimate backpressure; only slots
                 // that landed are owed a wake.
-                ds.deliverDelivery(1, 0, 0, "race", 0, 0, .stanza) catch |err| switch (err) {
+                ds.deliverDelivery(0, 1, Token.init(0, 0, token_kinds.session), "race", 0, 0, .normal) catch |err| switch (err) {
                     error.QueueFull => continue,
-                    error.InvalidWorker, error.PayloadTooLarge => unreachable,
+                    error.InvalidWorker, error.PayloadTooLarge, error.BlobBudget, error.OutOfMemory => unreachable,
                 };
                 _ = sent.fetchAdd(1, .release);
             }
@@ -778,7 +1215,7 @@ test "DeliverySystem: racing producers lose no wakeups" {
             const Ctx = struct { count: *usize };
             const ctx = Ctx{ .count = &consumed };
             const handler = struct {
-                fn handle(c: Ctx, _: u32, _: u32, _: []const u8) void {
+                fn handle(c: Ctx, _: Token, _: []const u8) void {
                     c.count.* += 1;
                 }
             }.handle;
@@ -806,7 +1243,7 @@ test "DeliverySystem: racing producers lose no wakeups" {
             const queue = ds.getQueue(1);
             var lost: usize = 0;
             if (queue.hasPending() and nev == 0 and !ds.getState(1).wake_pending.load(.seq_cst)) {
-                lost = queue.tail.load(.acquire) -% queue.head;
+                lost = queue.tail.load(.acquire) -% queue.head.load(.acquire);
             }
             ds.drainPipe(1);
             consumed += queue.drain(ctx, handler);
@@ -845,14 +1282,14 @@ test "DeliverySystem: deliver and drain" {
     defer sys.deinit();
 
     // Deliver to worker 1
-    try sys.deliver(1, 10, 3, "test stanza");
+    try sys.deliver(0, 1, Token.init(10, 3, token_kinds.session), "test stanza");
 
     // Drain worker 1's queue
     var received: bool = false;
     const Ctx = struct { flag: *bool };
     const ctx = Ctx{ .flag = &received };
     const handler = struct {
-        fn handle(c: Ctx, _: u32, _: u32, _: []const u8) void {
+        fn handle(c: Ctx, _: Token, _: []const u8) void {
             c.flag.* = true;
         }
     }.handle;
@@ -871,17 +1308,91 @@ test "DeliverySystem: coalesced signaling skips wake when active" {
 
     // Deliver — should NOT write to pipe (we can't easily verify this,
     // but at least verify it doesn't crash or block)
-    try sys.deliver(1, 5, 1, "coalesced");
+    try sys.deliver(0, 1, Token.init(5, 1, token_kinds.session), "coalesced");
 
     // Drain should still find the message
     const Ctx = struct { count: *u32 };
     var count: u32 = 0;
     const ctx = Ctx{ .count = &count };
     const handler = struct {
-        fn handle(c: Ctx, _: u32, _: u32, _: []const u8) void {
+        fn handle(c: Ctx, _: Token, _: []const u8) void {
             c.count.* += 1;
         }
     }.handle;
     _ = sys.getQueue(1).drain(ctx, handler);
     try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "delivery classes: a full ring counts every class's QueueFull" {
+    var queue = MpscQueue{};
+    const fill = try testBudget().produce("fill");
+    for (0..QUEUE_SLOTS) |_| try queue.enqueue(Token.init(1, 1, token_kinds.session), fill);
+    fill.release();
+
+    const blob = try testBudget().produce("x");
+    defer blob.release();
+    inline for (@typeInfo(DeliveryClass).@"enum".fields) |f| {
+        const class: DeliveryClass = @enumFromInt(f.value);
+        const before = class_queue_full[f.value].load(.monotonic);
+        try std.testing.expectError(error.QueueFull, queue.enqueueEnvelope(Token.init(1, 1, token_kinds.session), blob, 0, 0, class));
+        try std.testing.expectEqual(before + 1, class_queue_full[f.value].load(.monotonic));
+    }
+
+    // Release the slot refs the fills took.
+    const handler = struct {
+        fn handle(_: usize, _: Token, _: []const u8) void {}
+    }.handle;
+    _ = queue.drain(@as(usize, 0), handler);
+}
+
+test "actor retry list resends into a drained ring and exhausts with the class fallback" {
+    const allocator = std.testing.allocator;
+    var ds = try DeliverySystem.init(allocator, 2);
+    defer ds.deinit();
+
+    // Fill worker 1's ring so the actor delivery parks on the retry list.
+    const fill = try ds.produceBlob(0, "fill");
+    for (0..QUEUE_SLOTS) |_| try ds.getQueue(1).enqueue(Token.init(1, 1, token_kinds.session), fill);
+    fill.release();
+
+    try ds.deliverActor(0, 1, ROOM_ACTOR_TARGET, "actor-msg", 7, 99, .room_actor);
+    try std.testing.expectEqual(@as(u16, 1), ds.retry_lists[0].count);
+
+    const Exh = struct {
+        calls: u16 = 0,
+        last_class: DeliveryClass = .normal,
+        fn onExhausted(self: *@This(), e: *const ActorRetry) void {
+            self.calls += 1;
+            self.last_class = e.class;
+        }
+    };
+    var exh = Exh{};
+
+    // Free the ring, then one retry tick lands the parked envelope.
+    const handler = struct {
+        fn handle(_: usize, _: Token, _: []const u8) void {}
+    }.handle;
+    _ = ds.getQueue(1).drain(@as(usize, 0), handler);
+    const resends_before = actor_retry_resends.load(.monotonic);
+    ds.retry_lists[0].drain(&ds, &exh, Exh.onExhausted);
+    try std.testing.expectEqual(@as(u16, 0), ds.retry_lists[0].count);
+    try std.testing.expectEqual(resends_before + 1, actor_retry_resends.load(.monotonic));
+    try std.testing.expect(ds.getQueue(1).hasPending());
+    _ = ds.getQueue(1).drain(@as(usize, 0), handler);
+
+    // Refill, park another envelope, and let it exhaust its attempts.
+    const fill2 = try ds.produceBlob(0, "fill");
+    for (0..QUEUE_SLOTS) |_| try ds.getQueue(1).enqueue(Token.init(1, 1, token_kinds.session), fill2);
+    fill2.release();
+    try ds.deliverActor(0, 1, SM_ACTOR_TARGET, "sm-msg", 0, 0, .sm_actor);
+    const drops_before = actor_retry_drops.load(.monotonic);
+    var i: u8 = 0;
+    while (i < ActorRetryList.ATTEMPTS) : (i += 1) {
+        ds.retry_lists[0].drain(&ds, &exh, Exh.onExhausted);
+    }
+    try std.testing.expectEqual(@as(u16, 0), ds.retry_lists[0].count);
+    try std.testing.expectEqual(@as(u16, 1), exh.calls);
+    try std.testing.expectEqual(DeliveryClass.sm_actor, exh.last_class);
+    try std.testing.expectEqual(drops_before + 1, actor_retry_drops.load(.monotonic));
+    _ = ds.getQueue(1).drain(@as(usize, 0), handler);
 }

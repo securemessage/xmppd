@@ -6,6 +6,7 @@
 //! both the c2s dispatchStanza and the S2S dispatchS2sResponse entries.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const xml = @import("xml");
 const xmpp = @import("xmpp");
@@ -27,6 +28,8 @@ const SessionMap = session_map_mod.SessionMap;
 const SessionEntry = session_map_mod.SessionEntry;
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
+const Token = delivery_queue_mod.Token;
+const token_kinds = @import("token_kinds");
 const stanza_facts = @import("../stanza/facts.zig");
 const stanza_writer = @import("../stanza/writer.zig");
 const fanout_mod = @import("../muc/fanout.zig");
@@ -155,7 +158,7 @@ fn bounceCrossWorkerUnavailable(
     const stanza = fbs.getWritten();
 
     if (entry.worker_id == self.worker_id) {
-        const session = self.sessions[entry.local_session_id] orelse {
+        const session = self.sessionForEventToken(entry.token) orelse {
             log.warn("cross-worker bounce for {s} dropped: sender slot empty", .{sender_full});
             return;
         };
@@ -164,7 +167,7 @@ fn bounceCrossWorkerUnavailable(
             return;
         }
     } else if (self.delivery_system) |ds| {
-        ds.deliver(entry.worker_id, entry.local_session_id, entry.generation, stanza) catch {
+        ds.deliver(self.worker_id, entry.worker_id, entry.token, stanza) catch {
             _ = delivery_queue_mod.cross_worker_drops.fetchAdd(1, .monotonic);
             log.warn("cross-worker bounce for {s} dropped: delivery queue full", .{sender_full});
             return;
@@ -184,47 +187,52 @@ pub fn handleDeliveryWake(self: *Server, changes: *ChangeList) void {
     ds.drainPipe(self.worker_id);
     drainDeliveryQueue(self, changes);
     _ = muc_actor.drainRoomMailboxes(self, changes);
+    muc_actor.drainActorRetries(self);
 }
 
 /// Drain all pending deliveries from this worker's MPSC queue.
-/// Validates generation (ABA protection) before delivering to local sessions.
+/// Session tokens are validated against this worker's slot generations
+/// (ADR-4); a stale token is counted and dropped.
 pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
     const ds = self.delivery_system orelse return;
-    const sm = self.session_map orelse return;
     const queue = ds.getQueue(self.worker_id);
 
     const Ctx = struct {
         server: *Server,
         changes: *ChangeList,
-        session_map: *SessionMap,
         queue: *delivery_queue_mod.MpscQueue,
     };
-    const ctx = Ctx{ .server = self, .changes = changes, .session_map = sm, .queue = queue };
+    const ctx = Ctx{ .server = self, .changes = changes, .queue = queue };
 
     _ = queue.drain(ctx, struct {
-        fn handle(c: Ctx, local_session_id: u32, generation: u32, payload: []const u8) void {
-            // Multicast delivery: fan-out to all local occupants in a room
-            if (local_session_id == delivery_queue_mod.MULTICAST_SENTINEL) {
-                handleMulticastDelivery(c.server, payload, c.changes);
-                return;
+        fn handle(c: Ctx, target: Token, payload: []const u8) void {
+            switch (target.kind) {
+                // Multicast delivery: fan-out to all local occupants in a room
+                token_kinds.multicast => {
+                    handleMulticastDelivery(c.server, payload, c.changes);
+                    return;
+                },
+                // Room actor message: decode and dispatch to local room shard
+                token_kinds.room_actor => {
+                    muc_actor.handleRoomActorMessage(c.server, c.queue.current_slot_blob.?, c.changes);
+                    return;
+                },
+                // SM resume handoff actor message (T177)
+                token_kinds.sm_actor => {
+                    c2s_sm.handleSmActorMessage(c.server, payload, c.changes);
+                    return;
+                },
+                token_kinds.session => {},
+                else => {
+                    c.server.stale_token_skips += 1;
+                    return;
+                },
             }
 
-            // Room actor message: decode and dispatch to local room shard
-            if (local_session_id == delivery_queue_mod.ROOM_ACTOR_SENTINEL) {
-                muc_actor.handleRoomActorMessage(c.server, payload, c.changes);
-                return;
-            }
-
-            // SM resume handoff actor message (T177)
-            if (local_session_id == delivery_queue_mod.SM_ACTOR_SENTINEL) {
-                c2s_sm.handleSmActorMessage(c.server, payload, c.changes);
-                return;
-            }
-
-            // Unicast: ABA check then deliver to single session
-            if (!c.session_map.getGenerationById(c.server.worker_id, local_session_id, generation)) return;
-
-            const target_session = c.server.sessions[local_session_id] orelse return;
+            // Unicast: the slot generation check replaces the session-map
+            // scan. A token minted for a freed-then-reused slot fails here.
+            const target_session = c.server.sessionForEventToken(target) orelse return;
+            const local_session_id = target.index;
             const parts = stanza_facts.extractStanzaParts(payload);
             // XEP-0280 sections 2 and 7: a carbon copy reaches only a
             // Carbons-enabled resource, live or not at all. The producer
@@ -233,8 +241,14 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
             // which never holds) applies to a remote target: it is
             // never held behind a draining offline tail, never stored
             // and never bounced.
-            const is_carbon = c.queue.current_slot_kind == .carbon;
+            const class = c.queue.current_slot_class;
+            const is_carbon = class == .carbon;
             if (is_carbon and !target_session.carbons_enabled) return;
+            // The same per-session gates the local path applies (V14):
+            // typing-only messages skip inactive-CSI sessions and roster
+            // pushes skip resources that never asked for roster pushes.
+            if (class == .chatstate and !target_session.csi_active) return;
+            if (class == .roster_push and !target_session.roster_interested) return;
             // The hold check comes before the SM-detach check: a detached
             // session may still have an undrained offline tail, and a
             // message pushed into its replay queue would be replayed
@@ -302,24 +316,34 @@ fn handleMulticastDelivery(self: *Server, payload: []const u8, changes: *ChangeL
     for (&room.occupants) |*slot| {
         const occ = slot.* orelse continue;
         if (occ.worker_id != self.worker_id) continue;
-        if (occ.session_id == room_registry_mod.REMOTE_OCCUPANT) continue;
+        if (occ.isRemote()) continue;
 
-        const target_session = self.sessions[occ.session_id] orelse continue;
-        fanout_mod.deliverPrebuiltToSession(target_session, deliver_lease.buf, decoded.prefix, occ.getRealJid(), decoded.suffix, occ.session_id);
+        const target_session = self.sessionForEventToken(occ.token) orelse continue;
+        fanout_mod.deliverPrebuiltToSession(target_session, deliver_lease.buf, decoded.prefix, occ.getRealJid(), decoded.suffix, occ.token.index);
     }
 }
 
 /// Encode and enqueue a multicast delivery to each remote worker that has
 /// occupants in the given room. Iterates set bits in worker_mask, excluding self.
+/// The payload is serialized once into one refcounted blob that every
+/// target ring shares (ADR-3).
 pub fn deliverMulticastToWorkers(self: *Server, room: *const room_registry_mod.Room, prefix: []const u8, suffix: []const u8) void {
     const ds = self.delivery_system orelse return;
 
-    var mcast_buf: [delivery_queue_mod.MAX_PAYLOAD_SIZE]u8 = undefined;
-    const mcast_len = fanout_mod.encodeMulticastPayload(&mcast_buf, room.getJid(), prefix, suffix) orelse {
+    var mcast_lease = self.leaseByteScratch() orelse {
+        log.err("byte-scratch exhausted; multicast for room {s} dropped", .{room.getJid()});
+        return;
+    };
+    defer mcast_lease.release();
+    const mcast_len = fanout_mod.encodeMulticastPayload(mcast_lease.buf, room.getJid(), prefix, suffix) orelse {
         log.warn("multicast payload too large for room {s}", .{room.getJid()});
         return;
     };
-    const mcast_payload = mcast_buf[0..mcast_len];
+    const blob = ds.produceBlob(self.worker_id, mcast_lease.buf[0..mcast_len]) catch |err| {
+        log.warn("multicast blob for room {s} refused: {}", .{ room.getJid(), err });
+        return;
+    };
+    defer blob.release();
 
     // Iterate set bits in worker_mask, excluding self
     var mask = room.worker_mask;
@@ -327,9 +351,62 @@ pub fn deliverMulticastToWorkers(self: *Server, room: *const room_registry_mod.R
     var mask_it = mask.iterator(.{});
     while (mask_it.next()) |bit| {
         const wid: u16 = @intCast(bit);
-        ds.deliver(wid, delivery_queue_mod.MULTICAST_SENTINEL, 0, mcast_payload) catch |err| {
+        ds.deliverBlob(wid, delivery_queue_mod.MULTICAST_TARGET, blob, 0, 0, .normal) catch |err| {
             log.warn("multicast delivery failed to worker {d}: {}", .{ wid, err });
         };
+    }
+}
+
+test "multicast to N remote workers serializes the payload once" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 4);
+    defer delivery_sys.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    var room = room_registry_mod.Room.init(allocator);
+    defer room.deinit();
+    room.active = true;
+    room.setJid("test@conference.localhost");
+
+    // Occupants on workers 1, 2 and 3 plus a local one on worker 0.
+    _ = try room.addOccupant("local", "local@localhost/r", "local@localhost", server.sessionToken(1), 0, .participant, .none);
+    _ = try room.addOccupant("r1", "r1@localhost/r", "r1@localhost", Token.init(1, 1, token_kinds.session), 1, .participant, .none);
+    _ = try room.addOccupant("r2", "r2@localhost/r", "r2@localhost", Token.init(1, 1, token_kinds.session), 2, .participant, .none);
+    _ = try room.addOccupant("r3", "r3@localhost/r", "r3@localhost", Token.init(1, 1, token_kinds.session), 3, .participant, .none);
+
+    if (builtin.is_test) fanout_mod.encode_count.store(0, .monotonic);
+    deliverMulticastToWorkers(&server, &room, "<message from='test@conference.localhost' to='", "/x'><body>hi</body></message>");
+    try std.testing.expectEqual(@as(u32, 1), fanout_mod.encode_count.load(.monotonic));
+
+    // Each remote worker's ring carries exactly one envelope, all sharing
+    // the same blob; the local worker's ring is empty.
+    const Ctx = struct {
+        targets: u32 = 0,
+        payloads: u32 = 0,
+    };
+    var ctx = Ctx{};
+    const drain_one = struct {
+        fn drain_one(c: *Ctx, target: Token, payload: []const u8) void {
+            if (target.eql(delivery_queue_mod.MULTICAST_TARGET)) c.targets += 1;
+            if (payload.len > 0) c.payloads += 1;
+        }
+    }.drain_one;
+
+    try std.testing.expectEqual(@as(u32, 0), delivery_sys.queues[0].drain(&ctx, drain_one));
+    for (delivery_sys.queues[1..4]) |*q| {
+        ctx = .{};
+        try std.testing.expectEqual(@as(u32, 1), q.drain(&ctx, drain_one));
+        try std.testing.expectEqual(@as(u32, 1), ctx.targets);
+        try std.testing.expectEqual(@as(u32, 1), ctx.payloads);
     }
 }
 
@@ -343,7 +420,8 @@ test "cross-thread delivery: enqueue and drain" {
     defer delivery_sys.deinit();
 
     // Create a server that acts as worker 1 (the one draining)
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
     server.session_map = &sm;
@@ -354,20 +432,19 @@ test "cross-thread delivery: enqueue and drain" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 5, "localhost", false, allocator);
+    session.init(fds[0], 5, "localhost", false, allocator);
     server.sessions[5] = session;
 
-    // Bind in session map (local_session_id = 5, worker = 1)
-    const gen = try sm.bind(1, 5, "bob", "localhost", "desktop");
+    // Bind in session map (session slot = 5, worker = 1)
+    try sm.bind(1, server.sessionToken(5), "bob", "localhost", "desktop");
 
     // Simulate a cross-thread enqueue FROM worker 0 TO session 5 on worker 1
     const route = sm.findByFullJid("bob", "localhost", "desktop").?;
     try std.testing.expectEqual(@as(u16, 1), route.worker_id);
-    try std.testing.expectEqual(@as(u32, 5), route.local_session_id);
-    try std.testing.expectEqual(gen, route.generation);
+    try std.testing.expect(route.token.eql(server.sessionToken(5)));
 
     // Build a stanza and enqueue it (as if worker 0 is sending)
-    try delivery_sys.deliver(route.worker_id, route.local_session_id, route.generation, "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>cross-thread!</body></message>");
+    try delivery_sys.deliver(server.worker_id, route.worker_id, route.token, "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>cross-thread!</body></message>");
 
     // Worker 1 drains its queue
     var change_buf: [16]posix.Kevent = undefined;
@@ -389,6 +466,162 @@ test "cross-thread delivery: enqueue and drain" {
     try std.testing.expect(std.mem.indexOf(u8, received, "bob@localhost") != null);
 }
 
+test "V14: per-session filters apply to a remote target" {
+    const allocator = std.testing.allocator;
+
+    var sm = SessionMap.init(allocator, true, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    // The consuming worker; its Session carries the flags the filter reads.
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 1;
+    server.session_map = &sm;
+    server.delivery_system = &delivery_sys;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.init(fds[0], 5, "localhost", false, allocator);
+    server.sessions[5] = session;
+    try sm.bind(1, server.sessionToken(5), "bob", "localhost", "desktop");
+
+    const route = sm.findByFullJid("bob", "localhost", "desktop").?;
+    const chatstate = "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><composing xmlns='http://jabber.org/protocol/chatstates'/></message>";
+    const roster_push = "<iq type='set' to='bob@localhost/desktop' id='r1'><query xmlns='jabber:iq:roster'/></iq>";
+
+    var change_buf: [16]posix.Kevent = undefined;
+
+    // Inactive CSI suppresses a remote typing indicator, exactly as the
+    // local dispatch skips the session.
+    session.csi_active = false;
+    try delivery_sys.deliverDelivery(0, 1, route.token, chatstate, 0, 0, .chatstate);
+    var changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(!session.conn.hasPendingWrite());
+
+    // A resource that never asked for roster pushes does not get a remote
+    // one either.
+    try delivery_sys.deliverDelivery(0, 1, route.token, roster_push, 0, 0, .roster_push);
+    changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(!session.conn.hasPendingWrite());
+
+    // A session that never enabled carbons gets no remote copy.
+    session.carbons_enabled = false;
+    try delivery_sys.deliverDelivery(0, 1, route.token, "<message from='bob@localhost' to='bob@localhost/desktop' type='chat'><body>copy</body></message>", 0, 0, .carbon);
+    changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(!session.conn.hasPendingWrite());
+
+    // Positive control: the same envelope classes land when the flags allow.
+    session.csi_active = true;
+    try delivery_sys.deliverDelivery(0, 1, route.token, chatstate, 0, 0, .chatstate);
+    changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(session.conn.hasPendingWrite());
+}
+
+test "cross-thread delivery: a token minted for a freed-then-reused slot is dropped (ADR-4)" {
+    const allocator = std.testing.allocator;
+
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 1;
+    server.delivery_system = &delivery_sys;
+
+    // Slot 5 holds session A at generation 1; its token is minted now.
+    const fds_a = try makeSocketPair();
+    defer posix.close(fds_a[1]);
+    const session_a = try allocator.create(Session);
+    session_a.init(fds_a[0], 5, "localhost", false, allocator);
+    server.sessions[5] = session_a;
+    const stale = server.sessionToken(5);
+
+    // The slot is freed and a different session reuses it at generation 2.
+    server.sessions[5] = null;
+    server.releaseSessionSlot(5);
+    session_a.deinit();
+    allocator.destroy(session_a);
+    const fds_b = try makeSocketPair();
+    defer posix.close(fds_b[1]);
+    const session_b = try allocator.create(Session);
+    session_b.init(fds_b[0], 5, "localhost", false, allocator);
+    server.sessions[5] = session_b;
+    const fresh = server.sessionToken(5);
+    try std.testing.expectEqual(stale.index, fresh.index);
+    try std.testing.expect(fresh.gen > stale.gen);
+
+    // A delivery minted against generation 1 must not reach session B.
+    try delivery_sys.deliver(0, 1, stale, "<message type='chat'><body>stale!</body></message>");
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(!session_b.conn.hasPendingWrite());
+    try std.testing.expectEqual(@as(u64, 1), server.stale_token_skips);
+
+    // The generation-2 token still resolves: delivery reaches session B.
+    try delivery_sys.deliver(0, 1, fresh, "<message type='chat'><body>fresh!</body></message>");
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(session_b.conn.hasPendingWrite());
+}
+
+test "V13: shadow multicast to a freed-then-reused slot is not delivered (ADR-4)" {
+    const allocator = std.testing.allocator;
+
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 1;
+    server.delivery_system = &delivery_sys;
+
+    // The shadow room on this worker records an occupant addressed at
+    // session A in slot 5, generation 1.
+    var reg = room_registry_mod.RoomRegistry.init(allocator);
+    defer reg.deinit();
+    server.room_registry = &reg;
+    const room = try reg.createRoom("hall@conference.localhost", .{ .persistent = false });
+    const fds_a = try makeSocketPair();
+    defer posix.close(fds_a[1]);
+    const session_a = try allocator.create(Session);
+    session_a.init(fds_a[0], 5, "localhost", false, allocator);
+    server.sessions[5] = session_a;
+    const stale = server.sessionToken(5);
+    _ = try room.addOccupant("alice", "alice@localhost/m", "alice@localhost", stale, 1, .participant, .none);
+
+    // The slot is freed (generation bumps) and a new session reuses it.
+    server.sessions[5] = null;
+    server.releaseSessionSlot(5);
+    session_a.deinit();
+    allocator.destroy(session_a);
+    const fds_b = try makeSocketPair();
+    defer posix.close(fds_b[1]);
+    const session_b = try allocator.create(Session);
+    session_b.init(fds_b[0], 5, "localhost", false, allocator);
+    server.sessions[5] = session_b;
+
+    // A multicast arriving for the stale occupant record must not reach
+    // session B; the skip is counted like any other stale token.
+    var mcast_buf: [256]u8 = undefined;
+    const mcast_len = fanout_mod.encodeMulticastPayload(&mcast_buf, room.getJid(), "<message to='", "'/>") orelse unreachable;
+    try delivery_sys.deliver(0, 1, delivery_queue_mod.MULTICAST_TARGET, mcast_buf[0..mcast_len]);
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expect(!session_b.conn.hasPendingWrite());
+    try std.testing.expectEqual(@as(u64, 1), server.stale_token_skips);
+}
+
 test "S35: the cross-worker hold stamps the producer receipt time" {
     const allocator = std.testing.allocator;
 
@@ -406,7 +639,8 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.worker_id = 1;
     server.session_map = &sm;
@@ -419,18 +653,18 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
-    session.* = Session.init(fds[0], 5, "localhost", false, allocator);
+    session.init(fds[0], 5, "localhost", false, allocator);
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp.Jid{ .local = "bob", .domain = "localhost" };
     session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     session.offline_pending = true;
     server.sessions[5] = session;
-    const gen = try sm.bind(1, 5, "bob", "localhost", "desktop");
+    try sm.bind(1, server.sessionToken(5), "bob", "localhost", "desktop");
 
     // The producer tags the slot with its own receipt time; the hold on the
     // consuming worker must store that time, not the time the drain ran.
-    try delivery_sys.deliverDelivery(1, 5, gen, "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345, .stanza);
+    try delivery_sys.deliverDelivery(0, 1, server.sessionToken(5), "<message from='alice@localhost' to='bob@localhost' id='cw1'><body>held</body></message>", 42, 12345, .normal);
     drainDeliveryQueue(&server, &changes);
 
     session_lifecycle.drainOfflinePending(&server, session, &changes);
@@ -451,18 +685,19 @@ test "cross-thread delivery: generation mismatch drops stanza" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.init("localhost", "127.0.0.1", 0, allocator);
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
     server.delivery_system = &delivery_sys;
 
-    // Bind a session, get its generation, then unbind (simulating disconnect)
-    const gen = try sm.bind(0, 3, "alice", "localhost", "mobile");
+    // Bind a session, then unbind (simulating disconnect); a token minted
+    // for a different slot generation is stale on arrival.
+    try sm.bind(0, server.sessionToken(3), "alice", "localhost", "mobile");
     _ = sm.unbind("alice", "localhost", "mobile");
-
-    // Enqueue with the OLD generation (stale delivery)
-    try delivery_sys.deliver(0, 3, gen, "<message>stale</message>");
+    const stale = Token.init(3, server.slot_gen[3] + 1, token_kinds.session);
+    try delivery_sys.deliver(0, 0, stale, "<message>stale</message>");
 
     // Drain — should silently drop (generation mismatch)
     var change_buf: [16]posix.Kevent = undefined;
@@ -497,7 +732,8 @@ test "Server: S13 message held behind a draining offline tail" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -509,16 +745,17 @@ test "Server: S13 message held behind a draining offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.offline_pending = true;
     server.sessions[5] = target;
 
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -577,7 +814,8 @@ test "Re-review 6.8: the router holds a bare-JID message once per worker" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -588,16 +826,17 @@ test "Re-review 6.8: the router holds a bare-JID message once per worker" {
         const fds = try makeSocketPair();
         defer posix.close(fds[1]);
         const sess = try allocator.create(Session);
-        sess.* = Session.init(fds[0], r.id, "localhost", false, allocator);
+        sess.init(fds[0], r.id, "localhost", false, allocator);
         sess.offline_pending = true;
         server.sessions[r.id] = sess;
-        _ = try sm.bind(0, r.id, "bob", "localhost", r.res);
+        _ = try sm.bind(0, server.sessionToken(r.id), "bob", "localhost", r.res);
         sm.setPresenceAvailable("bob", "localhost", r.res, true);
     }
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -637,7 +876,8 @@ test "Re-review 6.8: the S2S hold asks the store once per worker" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -648,10 +888,10 @@ test "Re-review 6.8: the S2S hold asks the store once per worker" {
         const fds = try makeSocketPair();
         defer posix.close(fds[1]);
         const sess = try allocator.create(Session);
-        sess.* = Session.init(fds[0], r.id, "localhost", false, allocator);
+        sess.init(fds[0], r.id, "localhost", false, allocator);
         sess.offline_pending = true;
         server.sessions[r.id] = sess;
-        _ = try sm.bind(0, r.id, "bob", "localhost", r.res);
+        _ = try sm.bind(0, server.sessionToken(r.id), "bob", "localhost", r.res);
         sm.setPresenceAvailable("bob", "localhost", r.res, true);
     }
 
@@ -683,7 +923,8 @@ test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -693,15 +934,15 @@ test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     const entry = sm.findByFullJid("bob", "localhost", "desktop") orelse return error.MissingSession;
 
     const payload = "<message from='alice@localhost/mobile' to='bob@localhost' id='q1' type='chat'><body>queued</body></message>";
-    try delivery_sys.deliver(0, 5, entry.generation, payload);
+    try delivery_sys.deliver(0, 0, entry.token, payload);
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
     drainDeliveryQueue(&server, &changes);
@@ -734,7 +975,8 @@ test "Server: G3 inbound S2S delivery parks behind a draining offline tail" {
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -743,11 +985,11 @@ test "Server: G3 inbound S2S delivery parks behind a draining offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     const payload = "<message from='carol@example.com/res' to='bob@localhost' id='s1' type='chat'><body>federated-tail</body></message>";
@@ -787,7 +1029,8 @@ test "Server: G3 type normal parks behind a draining offline tail" {
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -796,16 +1039,17 @@ test "Server: G3 type normal parks behind a draining offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -861,7 +1105,8 @@ test "Server: H4 a cross-worker message lands behind an existing offline tail" {
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -876,14 +1121,14 @@ test "Server: H4 a cross-worker message lands behind an existing offline tail" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.offline_pending = true;
     server.sessions[5] = target;
-    const gen = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
 
     const live = "<message from='alice@localhost/mobile' to='bob@localhost' id='live-1' type='chat'><body>live</body></message>";
-    try delivery_sys.deliver(0, 5, gen, live);
+    try delivery_sys.deliver(0, 0, server.sessionToken(5), live);
 
     var change_buf: [32]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -952,7 +1197,8 @@ test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1025,7 +1271,8 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1036,9 +1283,9 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
-    alice.* = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     server.sessions[9] = alice;
-    _ = try sm.bind(0, 9, "alice", "localhost", "mobile");
+    _ = try sm.bind(0, server.sessionToken(9), "alice", "localhost", "mobile");
     const alice_bound = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
     alice.stream.bound_jid = alice_bound;
 
@@ -1046,14 +1293,14 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.offline_pending = true;
     bob.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
     server.sessions[5] = bob;
-    const bob_gen = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
 
     const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' id='h2-1' type='chat'><body>hi</body></message>";
-    try delivery_sys.deliver(0, 5, bob_gen, stanza);
+    try delivery_sys.deliver(0, 0, server.sessionToken(5), stanza);
 
     const bounces_before = delivery_queue_mod.offline_hold_bounces.load(.monotonic);
     var change_buf: [32]posix.Kevent = undefined;
@@ -1089,7 +1336,8 @@ test "Server: H2 a cross-worker hold failure bounces across workers" {
     defer delivery_sys.deinit();
 
     // Worker 1 drains bob's queue; alice lives on worker 0.
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
     server.session_map = &sm;
@@ -1098,16 +1346,16 @@ test "Server: H2 a cross-worker hold failure bounces across workers" {
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.offline_pending = true;
     bob.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
     server.sessions[5] = bob;
-    const bob_gen = try sm.bind(1, 5, "bob", "localhost", "desktop");
+    try sm.bind(1, server.sessionToken(5), "bob", "localhost", "desktop");
 
-    _ = try sm.bind(0, 9, "alice", "localhost", "mobile");
+    _ = try sm.bind(0, server.sessionToken(9), "alice", "localhost", "mobile");
 
     const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' id='h2-2' type='chat'><body>hi</body></message>";
-    try delivery_sys.deliver(1, 5, bob_gen, stanza);
+    try delivery_sys.deliver(0, 1, server.sessionToken(5), stanza);
 
     var change_buf: [32]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -1123,20 +1371,22 @@ test "Server: H2 a cross-worker hold failure bounces across workers" {
     const Seen = struct {
         count: usize = 0,
         session_id: u32 = 0,
-        payload: []const u8 = "",
+        unavailable: bool = false,
+        id_echo: bool = false,
 
-        fn handle(self: *@This(), id: u32, _: u32, payload: []const u8) void {
+        fn handle(self: *@This(), target: Token, payload: []const u8) void {
             self.count += 1;
-            self.session_id = id;
-            self.payload = payload;
+            self.session_id = target.index;
+            if (std.mem.indexOf(u8, payload, "service-unavailable") != null) self.unavailable = true;
+            if (std.mem.indexOf(u8, payload, "id='h2-2'") != null) self.id_echo = true;
         }
     };
     var seen = Seen{};
     _ = delivery_sys.getQueue(0).drain(&seen, Seen.handle);
     try std.testing.expectEqual(@as(usize, 1), seen.count);
     try std.testing.expectEqual(@as(u32, 9), seen.session_id);
-    try std.testing.expect(std.mem.indexOf(u8, seen.payload, "service-unavailable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen.payload, "id='h2-2'") != null);
+    try std.testing.expect(seen.unavailable);
+    try std.testing.expect(seen.id_echo);
 }
 
 // H3: a detached session can still have an undrained offline tail. A live
@@ -1158,7 +1408,8 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1168,7 +1419,7 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(fds[0], 5, "localhost", false, allocator);
+    target.init(fds[0], 5, "localhost", false, allocator);
     target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     target.sm_detached = true;
     target.sm_resume_enabled = true;
@@ -1184,10 +1435,10 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     server.sessions[5] = target;
     server.detached_count = 1;
     c2s_sm.smIdMapInsert(&server, &target.sm_id, 5);
-    const bob_gen = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
 
     const payload = "<message from='alice@localhost/mobile' to='bob@localhost' id='h3-1' type='chat'><body>live</body></message>";
-    try delivery_sys.deliver(0, 5, bob_gen, payload);
+    try delivery_sys.deliver(0, 0, server.sessionToken(5), payload);
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -1236,7 +1487,8 @@ test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1252,10 +1504,10 @@ test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
-    bob.* = Session.init(bob_fds[0], 5, "localhost", false, allocator);
+    bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.offline_pending = true;
     server.sessions[5] = bob;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     var i: usize = 0;
@@ -1333,7 +1585,8 @@ test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1407,7 +1660,8 @@ test "Server: E2b an unstorable inbound S2S stanza bounces but an error stanza d
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1503,7 +1757,8 @@ test "Server: G7 an inbound id with an entity is escaped once in the bounce" {
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1564,7 +1819,8 @@ test "Server: G7 a storage error on the offline hold still bounces" {
     var listener = try TestIpcListener.init(sock_path);
     defer listener.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1624,7 +1880,8 @@ test "Server: S13 hold at quota bounces instead of dropping silently" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1645,16 +1902,17 @@ test "Server: S13 hold at quota bounces instead of dropping silently" {
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
-    target.* = Session.init(target_fds[0], 5, "localhost", false, allocator);
+    target.init(target_fds[0], 5, "localhost", false, allocator);
     target.offline_pending = true;
     server.sessions[5] = target;
 
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -1711,7 +1969,8 @@ test "N1: two draining resources hold a bare-JID message once" {
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1721,26 +1980,27 @@ test "N1: two draining resources hold a bare-JID message once" {
     const desktop_fds = try makeSocketPair();
     defer posix.close(desktop_fds[1]);
     const desktop = try allocator.create(Session);
-    desktop.* = Session.init(desktop_fds[0], 5, "localhost", false, allocator);
+    desktop.init(desktop_fds[0], 5, "localhost", false, allocator);
     desktop.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
     desktop.offline_pending = true;
     server.sessions[5] = desktop;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.bound_jid = xmpp.Jid.parse("bob@localhost/phone") catch unreachable;
     phone.offline_pending = true;
     server.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(0, server.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
     alice.stanza_kind = .message;
@@ -1793,7 +2053,8 @@ test "N1: two identical stanza-less messages to a draining bare JID are two rows
 
     var sm = SessionMap.init(allocator, true, 0);
     defer sm.deinit();
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
     server.session_map = &sm;
@@ -1802,16 +2063,17 @@ test "N1: two identical stanza-less messages to a draining bare JID are two rows
     const desktop_fds = try makeSocketPair();
     defer posix.close(desktop_fds[1]);
     const desktop = try allocator.create(Session);
-    desktop.* = Session.init(desktop_fds[0], 5, "localhost", false, allocator);
+    desktop.init(desktop_fds[0], 5, "localhost", false, allocator);
     desktop.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
     desktop.offline_pending = true;
     server.sessions[5] = desktop;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 9, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
     alice.stanza_kind = .message;
@@ -1861,7 +2123,8 @@ test "c2s: one routed message to two draining workers holds one row" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w1: Server = undefined;
+    try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
     w1.session_map = &sm;
@@ -1871,14 +2134,15 @@ test "c2s: one routed message to two draining workers holds one row" {
     const desk_fds = try makeSocketPair();
     defer posix.close(desk_fds[1]);
     const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.offline_pending = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w1.sessions[5] = desk;
-    _ = try sm.bind(1, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(1, w1.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -1888,16 +2152,17 @@ test "c2s: one routed message to two draining workers holds one row" {
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.offline_pending = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     w0.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const alice_fds = try makeSocketPair();
     defer posix.close(alice_fds[1]);
-    var alice = Session.init(alice_fds[0], 7, "localhost", false, allocator);
+    var alice: Session = undefined;
+    alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
     alice.stanza_kind = .message;
@@ -1952,7 +2217,8 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     defer delivery_sys.deinit();
 
     // Worker 1 receives the stanza and owns the first resource of the bare JID.
-    var w1 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w1: Server = undefined;
+    try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
     w1.session_map = &sm;
@@ -1962,15 +2228,16 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     const desk_fds = try makeSocketPair();
     defer posix.close(desk_fds[1]);
     const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.offline_pending = true;
     desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
     w1.sessions[5] = desk;
-    _ = try sm.bind(1, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(1, w1.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
 
     // Worker 0 owns the second resource, so the second target is remote.
-    var w0 = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var w0: Server = undefined;
+    try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
     w0.session_map = &sm;
@@ -1980,11 +2247,11 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.offline_pending = true;
     phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
     w0.sessions[6] = phone;
-    _ = try sm.bind(0, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
 
     const stanza = "<message from='carol@example.com/res' to='bob@localhost' id='h1' type='chat'><body>cross</body></message>";
@@ -2020,7 +2287,8 @@ test "N1: two workers draining one bare JID hold a message once" {
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
 
-    var server = try Server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.session_map = &sm;
     server.delivery_system = &delivery_sys;
@@ -2031,19 +2299,19 @@ test "N1: two workers draining one bare JID hold a message once" {
     const desk_fds = try makeSocketPair();
     defer posix.close(desk_fds[1]);
     const desk = try allocator.create(Session);
-    desk.* = Session.init(desk_fds[0], 5, "localhost", false, allocator);
+    desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.offline_pending = true;
     server.sessions[5] = desk;
-    _ = try sm.bind(0, 5, "bob", "localhost", "desktop");
+    _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
 
     server.worker_id = 1;
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
-    phone.* = Session.init(phone_fds[0], 6, "localhost", false, allocator);
+    phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.offline_pending = true;
     server.sessions[6] = phone;
-    _ = try sm.bind(1, 6, "bob", "localhost", "phone");
+    _ = try sm.bind(1, server.sessionToken(6), "bob", "localhost", "phone");
 
     const stanza = "<message from='alice@localhost/mobile' to='bob@localhost' type='chat' id='n1-2'><body>cross</body></message>";
     const ts: u64 = 1700000000;
