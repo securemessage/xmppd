@@ -136,8 +136,17 @@
   ignored), and unknown arguments to core, s2s or xmppctl are startup
   errors instead of silent warnings or a mistaken command. `xmppctl`
   gained `-c`/`--config` and `--help`, and its storage default follows
-  the shared `[server] db_path` default `/var/db/xmppd/users.db` (was
-  `/var/db/xmppd`). See doc/UPGRADING.md.
+  the shared `[server] db_path` default `/var/db/xmppd`. See
+  doc/UPGRADING.md.
+
+- **Both auth daemons share the strict configuration loader.** The master
+  forwards the same sealed `--conf-fd` to `xmppd-auth` and
+  `xmppd-auth-oidc` and no longer places resolved values on their argv.
+  Precedence is default < file < forwarded < CLI, the old
+  `[oidc] rate_max_*` spellings remain aliases, and both `--help` outputs
+  are generated from the schema. Bad auth values are now startup errors
+  with `file:line` diagnostics instead of silent defaults or clamps. An
+  unset `[oidc] socket` inherits `[auth] socket`. See doc/UPGRADING.md.
 
 ### Fixed
 

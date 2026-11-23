@@ -40,7 +40,8 @@ const IdpPool = oidc.IdpPool;
 const AuthHandler = handler_mod.AuthHandler(OidcStore);
 const protocol = @import("ipc_protocol");
 const runner_mod = @import("runner");
-const config_mod = @import("config");
+const conf = @import("conf");
+const schema = @import("schema");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
 const policy_mod = @import("policy");
@@ -71,96 +72,95 @@ const log = std.log.scoped(.xmppd_auth_oidc);
 const max_inflight_per_account: usize = 4;
 const max_inflight_per_ip: usize = 16;
 
+const default_config_path = "/usr/local/etc/xmppd/xmppd.conf";
+
+fn helpRequested(argv: []const []const u8) bool {
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+    }
+    return false;
+}
+
+/// Standalone OIDC keeps its historical default file. A supervised child
+/// with only --conf-fd needs no file, and generated --help never requires
+/// the host's default file to exist.
+fn oidcConfigPath(argv: []const []const u8) ?[]const u8 {
+    if (schema.configPathArg(argv)) |path| return path;
+    if (schema.confFdArg(argv) != null or helpRequested(argv)) return null;
+    return default_config_path;
+}
+
+noinline fn loadOidcConfig(loaded: *schema.OidcLoader, gpa: Allocator, argv: []const []const u8, diag: *conf.Diag) conf.Error!void {
+    loaded.* = schema.OidcLoader.init(gpa);
+    errdefer loaded.deinit();
+    try loaded.loadInto(.{
+        .conf_fd = schema.confFdArg(argv),
+        .path = oidcConfigPath(argv),
+        .args = argv,
+    }, diag);
+}
+
 pub fn main() !void {
     var root = root_allocator.Root.init();
     defer root.deinit();
     const allocator = root.allocator();
 
-    // Parse arguments
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
+    _ = args.next();
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    while (args.next()) |arg| try argv.append(allocator, arg);
 
-    var socket_path: []const u8 = "/var/run/xmppd/auth.sock";
-    var config_path: []const u8 = "/usr/local/etc/xmppd/xmppd.conf";
-    var db_path: []const u8 = "/var/db/xmppd";
-    var map_size_mb: usize = 8192; // OpenOptions.map_size default (S9)
-
-    _ = args.next(); // Skip argv[0]
-
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
-            config_path = args.next() orelse {
-                log.err("--config requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--db")) {
-            db_path = args.next() orelse {
-                log.err("--db requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--socket")) {
-            socket_path = args.next() orelse {
-                log.err("--socket requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            printUsage();
-            return;
-        } else {
-            log.warn("unknown argument: {s}", .{arg});
-        }
+    const Cfg = struct {
+        diag: conf.Diag,
+        loader: schema.OidcLoader,
+    };
+    const cfg = try allocator.create(Cfg);
+    cfg.diag = .{};
+    loadOidcConfig(&cfg.loader, allocator, argv.items, &cfg.diag) catch |err| {
+        log.err("{f}", .{&cfg.diag});
+        allocator.destroy(cfg);
+        return err;
+    };
+    defer {
+        cfg.loader.deinit();
+        allocator.destroy(cfg);
     }
-
-    // Parse config file
-    var cfg = config_mod.parse(allocator, config_path) catch |err| {
-        log.err("failed to read config file '{s}': {}", .{ config_path, err });
-        return error.InvalidArgs;
-    };
-    defer cfg.deinit();
-
-    // Read [oidc] section
-    const issuer = cfg.get("oidc", "issuer") orelse {
-        log.err("missing required config: [oidc] issuer", .{});
-        return error.InvalidArgs;
-    };
-    const client_id = cfg.get("oidc", "client_id") orelse {
-        log.err("missing required config: [oidc] client_id", .{});
-        return error.InvalidArgs;
-    };
-    const client_secret = cfg.get("oidc", "client_secret") orelse {
-        log.err("missing required config: [oidc] client_secret", .{});
-        return error.InvalidArgs;
-    };
-    const token_endpoint = cfg.get("oidc", "token_endpoint") orelse {
-        log.err("missing required config: [oidc] token_endpoint", .{});
-        return error.InvalidArgs;
-    };
-    const jwks_uri = cfg.get("oidc", "jwks_uri") orelse {
-        log.err("missing required config: [oidc] jwks_uri", .{});
-        return error.InvalidArgs;
-    };
-    const ca_file = cfg.get("oidc", "ca_file");
-    const introspection_endpoint = cfg.get("oidc", "introspection_endpoint");
-    const user_domain = cfg.get("oidc", "user_domain");
-    const localpart_claim = cfg.get("oidc", "localpart_claim") orelse "preferred_username";
-    const localpart_claim_prefix = cfg.get("oidc", "localpart_claim_prefix") orelse "";
-    const localpart_auto_suffix = if (cfg.get("oidc", "localpart_auto_suffix")) |v| std.mem.eql(u8, v, "true") else false;
-
-    // Override socket path from config if present
-    if (cfg.get("oidc", "socket")) |s| {
-        socket_path = s;
+    const v = &cfg.loader.values;
+    if (v.meta.help) {
+        try printUsage(allocator);
+        return;
     }
-    // Same db resolution as xmppd-auth: [server] db_path when not overridden.
-    if (std.mem.eql(u8, db_path, "/var/db/xmppd")) {
-        if (cfg.get("server", "db_path")) |v| db_path = v;
-    }
-    if (cfg.get("server", "lmdb_map_size_mb")) |v| {
-        map_size_mb = std.fmt.parseInt(usize, v, 10) catch map_size_mb;
-    }
+    try requireOidcConfig(v);
 
-    const pool_options = parsePoolOptions(&cfg) catch {
-        return error.InvalidArgs;
+    const config_path = oidcConfigPath(argv.items);
+    const pool_options = parsePoolOptions(&cfg.loader, config_path, &cfg.diag) catch |err| {
+        log.err("{f}", .{&cfg.diag});
+        return err;
     };
+    const lockout_duration = schema.validateOidcRate(&cfg.loader, config_path, &cfg.diag) catch |err| {
+        log.err("{f}", .{&cfg.diag});
+        return err;
+    };
+    const map_size_bytes = schema.mapSizeBytes(&cfg.loader, config_path, &cfg.diag) catch |err| {
+        log.err("{f}", .{&cfg.diag});
+        return err;
+    };
+    const issuer = v.oidc.issuer;
+    const client_id = v.oidc.client_id;
+    const client_secret = v.oidc.client_secret;
+    const token_endpoint = v.oidc.token_endpoint;
+    const jwks_uri = v.oidc.jwks_uri;
+    const ca_file: ?[]const u8 = if (v.oidc.ca_file.len != 0) v.oidc.ca_file else null;
+    const introspection_endpoint: ?[]const u8 = if (v.oidc.introspection_endpoint.len != 0) v.oidc.introspection_endpoint else null;
+    const user_domain: ?[]const u8 = if (v.oidc.user_domain.len != 0) v.oidc.user_domain else null;
+    const localpart_claim = v.oidc.localpart_claim;
+    const localpart_claim_prefix = v.oidc.localpart_claim_prefix;
+    const localpart_auto_suffix = v.oidc.localpart_auto_suffix;
+    const socket_path = schema.oidcSocket(v);
+    const db_path = v.server.db_path;
+    const rate_cfg = resolveOidcRateConfig(&cfg.loader, lockout_duration);
 
     log.info("xmppd-auth-oidc starting", .{});
     log.info("  issuer: {s}", .{issuer});
@@ -196,10 +196,8 @@ pub fn main() !void {
         return error.TlsInitFailed;
     };
 
-    // Initialize rate limiter. This daemon reads the same [auth] keys
-    // xmppd-auth reads; the old [oidc] rate_max_* spellings stay as
-    // aliases (ADR-9).
-    const rate_cfg = resolveOidcRateConfig(&cfg);
+    // The shared [auth] policy and old [oidc] aliases resolve before
+    // the limiter is built; invalid values have already refused startup.
     var rate_limiter = try RateLimiter.init(allocator, rate_cfg.policy);
     defer rate_limiter.deinit();
 
@@ -240,7 +238,7 @@ pub fn main() !void {
         OpBackendType,
         allocator,
         auth_path,
-        map_size_mb * 1024 * 1024,
+        map_size_bytes,
         &lock_backend,
     ) catch |err| {
         log.err("lock store open failed for {s}, refusing to start: {}", .{ auth_path, err });
@@ -265,7 +263,7 @@ pub fn main() !void {
         return err;
     };
     var binding_backend = openReadWriteProvisioned(OpBackendType, auth_path, .{
-        .map_size = map_size_mb * 1024 * 1024,
+        .map_size = map_size_bytes,
     }) catch |err| {
         log.err("OIDC binding store open failed for {s}, refusing to start: {}", .{ auth_path, err });
         return err;
@@ -309,50 +307,37 @@ pub fn main() !void {
     log.info("xmppd-auth-oidc shutdown complete", .{});
 }
 
-/// Parse a config integer and reject values outside [min, max].
-fn parseBounded(comptime T: type, value: []const u8, min: T, max: T) ?T {
-    const n = std.fmt.parseInt(T, value, 10) catch return null;
-    if (n < min or n > max) return null;
-    return n;
+fn requireOidcConfig(v: *const schema.Sections) error{InvalidArgs}!void {
+    inline for ([_][]const u8{ "issuer", "client_id", "client_secret", "token_endpoint", "jwks_uri" }) |field| {
+        if (@field(v.oidc, field).len == 0) {
+            log.err("missing required config: [oidc] {s}", .{field});
+            return error.InvalidArgs;
+        }
+    }
 }
 
-/// IdP worker pool configuration: parsed strictly, an invalid value
-/// refuses to start rather than silently falling back.
-fn parsePoolOptions(cfg: *const config_mod.Config) error{InvalidArgs}!IdpPool.Options {
-    var options = IdpPool.Options{
-        .threads = 8,
-        .max_outstanding = 256,
-        .connect_timeout_ms = 3000,
-        .timeout_ms = 10000,
+/// IdP worker pool configuration is typed by the loader; these bounds keep
+/// the pool's own clamps from hiding an invalid configured value.
+fn parsePoolOptions(loader: *const schema.OidcLoader, path: ?[]const u8, diag: *conf.Diag) error{BadValue}!IdpPool.Options {
+    const v = &loader.values.oidc;
+    if (v.idp_threads == 0 or v.idp_threads > IdpPool.max_threads) {
+        return schema.failField(loader, path, diag, "oidc", "idp_threads", "want 1..32");
+    }
+    if (v.idp_max_outstanding == 0 or v.idp_max_outstanding > 4096) {
+        return schema.failField(loader, path, diag, "oidc", "idp_max_outstanding", "want 1..4096");
+    }
+    if (v.idp_connect_timeout_ms < 100 or v.idp_connect_timeout_ms > 60000) {
+        return schema.failField(loader, path, diag, "oidc", "idp_connect_timeout_ms", "want 100..60000");
+    }
+    if (v.idp_timeout_ms < v.idp_connect_timeout_ms or v.idp_timeout_ms > 120000) {
+        return schema.failField(loader, path, diag, "oidc", "idp_timeout_ms", "want connect timeout..120000");
+    }
+    return .{
+        .threads = v.idp_threads,
+        .max_outstanding = v.idp_max_outstanding,
+        .connect_timeout_ms = v.idp_connect_timeout_ms,
+        .timeout_ms = v.idp_timeout_ms,
     };
-    if (cfg.get("oidc", "idp_threads")) |v| {
-        options.threads = parseBounded(u8, v, 1, IdpPool.max_threads) orelse {
-            log.warn("invalid [oidc] idp_threads '{s}' (want 1..{d})", .{ v, IdpPool.max_threads });
-            return error.InvalidArgs;
-        };
-    }
-    if (cfg.get("oidc", "idp_max_outstanding")) |v| {
-        options.max_outstanding = parseBounded(u16, v, 1, 4096) orelse {
-            log.warn("invalid [oidc] idp_max_outstanding '{s}' (want 1..4096)", .{v});
-            return error.InvalidArgs;
-        };
-    }
-    if (cfg.get("oidc", "idp_connect_timeout_ms")) |v| {
-        options.connect_timeout_ms = parseBounded(u32, v, 100, 60000) orelse {
-            log.warn("invalid [oidc] idp_connect_timeout_ms '{s}' (want 100..60000)", .{v});
-            return error.InvalidArgs;
-        };
-    }
-    if (cfg.get("oidc", "idp_timeout_ms")) |v| {
-        options.timeout_ms = parseBounded(u32, v, options.connect_timeout_ms, 120000) orelse {
-            log.warn(
-                "invalid [oidc] idp_timeout_ms '{s}' (want {d}..120000)",
-                .{ v, options.connect_timeout_ms },
-            );
-            return error.InvalidArgs;
-        };
-    }
-    return options;
 }
 
 /// Resolved rate-limit config: the policy plus the enable flag.
@@ -361,46 +346,28 @@ const OidcRateConfig = struct {
     enabled: bool,
 };
 
-/// The OIDC daemon reads the same [auth] rate-limit keys xmppd-auth
-/// reads so one config section sizes both daemons; the old
-/// [oidc] rate_max_* spellings stay as aliases (ADR-9) and [auth] wins
-/// when both are present.
-fn resolveOidcRateConfig(cfg: *const config_mod.Config) OidcRateConfig {
-    const defaults = RatePolicy{};
-    var policy = defaults;
-    if (configRateValue(cfg, "max_per_account", "rate_max_per_account")) |v| {
-        policy.max_per_account = std.fmt.parseInt(u32, v, 10) catch defaults.max_per_account;
-    }
-    if (configRateValue(cfg, "max_per_ip", "rate_max_per_ip")) |v| {
-        policy.max_per_ip = std.fmt.parseInt(u32, v, 10) catch defaults.max_per_ip;
-    }
-    if (cfg.get("auth", "window_seconds")) |v| {
-        policy.window_seconds = std.fmt.parseInt(u32, v, 10) catch defaults.window_seconds;
-    }
-    if (cfg.get("auth", "lockout_duration")) |v| {
-        policy.lockout_duration = std.fmt.parseInt(u32, v, 10) catch defaults.lockout_duration;
-    }
-    if (cfg.get("auth", "lockout_threshold")) |v| {
-        policy.lockout_threshold = std.fmt.parseInt(u16, v, 10) catch defaults.lockout_threshold;
-    }
-    if (cfg.get("auth", "ip_lockout_threshold")) |v| {
-        policy.ip_lockout_threshold = std.fmt.parseInt(u16, v, 10) catch defaults.ip_lockout_threshold;
-    }
-    var enabled = true;
-    if (cfg.get("auth", "rate_limit")) |v| {
-        if (std.mem.eql(u8, v, "false")) enabled = false;
-    }
-    // The old [oidc] spelling is honored too.
-    if (cfg.get("oidc", "rate_limit")) |v| {
-        if (std.mem.eql(u8, v, "false")) enabled = false;
-    }
-    return .{ .policy = policy, .enabled = enabled };
+/// Equal file sources prefer the shared auth key. Equal forwarded sources
+/// use the master's normalized OIDC view. Otherwise the higher source wins.
+fn useAuthRateValue(loader: *const schema.OidcLoader, comptime field: []const u8) bool {
+    const auth_source = loader.provenanceOf("auth", field);
+    const oidc_source = loader.provenanceOf("oidc", field);
+    if (auth_source == oidc_source) return auth_source != .forwarded;
+    return @intFromEnum(auth_source) > @intFromEnum(oidc_source);
 }
 
-/// The shared [auth] key first, then the old [oidc] alias.
-fn configRateValue(cfg: *const config_mod.Config, auth_key: []const u8, oidc_key: []const u8) ?[]const u8 {
-    if (cfg.get("auth", auth_key)) |v| return v;
-    return cfg.get("oidc", oidc_key);
+fn resolveOidcRateConfig(loader: *const schema.OidcLoader, lockout_duration: u32) OidcRateConfig {
+    const v = &loader.values;
+    return .{
+        .policy = .{
+            .max_per_account = if (useAuthRateValue(loader, "max_per_account")) v.auth.max_per_account else v.oidc.max_per_account,
+            .max_per_ip = if (useAuthRateValue(loader, "max_per_ip")) v.auth.max_per_ip else v.oidc.max_per_ip,
+            .window_seconds = v.auth.window_seconds,
+            .lockout_duration = lockout_duration,
+            .lockout_threshold = v.auth.lockout_threshold,
+            .ip_lockout_threshold = v.auth.ip_lockout_threshold,
+        },
+        .enabled = v.auth.rate_limit and v.oidc.rate_limit,
+    };
 }
 
 /// An auth_request parked while its IdP exchange runs on a pool worker.
@@ -886,42 +853,83 @@ fn openProbe(comptime Backend: type, path: []const u8) !?Backend {
     };
 }
 
-fn printUsage() void {
-    const usage =
-        \\Usage: xmppd-auth-oidc [OPTIONS]
-        \\
-        \\Options:
-        \\  --config PATH     Config file path (default: /usr/local/etc/xmppd/xmppd.conf)
-        \\  --socket PATH     IPC socket path (default: /var/run/xmppd/auth.sock)
-        \\  --help, -h        Show this help
-        \\
-        \\Required config [oidc] section:
-        \\  issuer            OIDC issuer URL
-        \\  client_id         OAuth2 client ID
-        \\  client_secret     OAuth2 client secret
-        \\  token_endpoint    Token endpoint URL (for ROPC)
-        \\  jwks_uri          JWKS endpoint URL
-        \\
-        \\Optional config [oidc] section:
-        \\  ca_file           CA bundle path (default: system)
-        \\  socket            Override IPC socket path
-        \\  rate_max_per_account  Alias for [auth] max_per_account
-        \\  rate_max_per_ip       Alias for [auth] max_per_ip
-        \\  rate_limit            Alias for [auth] rate_limit
-        \\  idp_threads           IdP worker threads (default: 8, range 1..32)
-        \\  idp_max_outstanding   Max queued+running IdP exchanges (default: 256, range 1..4096)
-        \\  idp_connect_timeout_ms  Connect+handshake budget (default: 3000, range 100..60000)
-        \\  idp_timeout_ms          Whole-exchange deadline (default: 10000, <= 120000)
-        \\
-    ;
-    var buf: [0]u8 = .{};
+fn printUsage(allocator: Allocator) std.Io.Writer.Error!void {
+    var gen = schema.OidcLoader.init(allocator);
+    defer gen.deinit();
+    var buf: [4096]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
-    stdout.interface.writeAll(usage) catch {};
+    try stdout.interface.writeAll("Usage: xmppd-auth-oidc [OPTIONS]\n\n");
+    try gen.writeHelp(&stdout.interface);
+    try stdout.interface.flush();
 }
 
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "OIDC startup: bad file rate values fail with file and line" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "max_per_account = nope", "max_per_ip = 65536" }) |setting| {
+        const file = try tmp.dir.createFile("bad.ini", .{ .truncate = true });
+        try file.writeAll(
+            \\[oidc]
+            \\issuer = https://idp.test/
+            \\client_id = xmppd
+            \\client_secret = secret
+            \\token_endpoint = https://idp.test/token
+            \\jwks_uri = https://idp.test/jwks
+            \\
+        );
+        try file.writeAll(setting);
+        try file.writeAll("\n");
+        file.close();
+        const path = try tmp.dir.realpathAlloc(allocator, "bad.ini");
+        defer allocator.free(path);
+
+        const result = try std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "zig-out/bin/xmppd-auth-oidc", "--config", path },
+            .max_output_bytes = 64 * 1024,
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .Exited => |code| try std.testing.expect(code != 0),
+            else => return error.TestUnexpectedResult,
+        }
+        const location = try std.fmt.allocPrint(allocator, "{s}:7:", .{path});
+        defer allocator.free(location);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, location) != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "invalid value") != null or
+            std.mem.indexOf(u8, result.stderr, "exceeds 65535") != null);
+    }
+}
+
+test "OIDC startup: generated help lists every schema CLI spelling without a config file" {
+    const allocator = std.testing.allocator;
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "zig-out/bin/xmppd-auth-oidc", "--help" },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestUnexpectedResult,
+    }
+    inline for (schema.oidc_cli) |spec| {
+        var buf: [128]u8 = undefined;
+        const option = try std.fmt.bufPrint(&buf, "--{s}", .{spec.name});
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, option) != null);
+        for (spec.aliases) |alias| {
+            const short = try std.fmt.bufPrint(&buf, "-{s}", .{alias});
+            try std.testing.expect(std.mem.indexOf(u8, result.stdout, short) != null);
+        }
+    }
+}
 
 const c = @cImport({
     @cInclude("openssl/ssl.h");
@@ -1037,9 +1045,17 @@ test "pool options reject out-of-range values" {
     for (bad) |kv| {
         const path = try writeTmpConfig(allocator, &tmp, kv);
         defer allocator.free(path);
-        var cfg = try config_mod.parse(allocator, path);
-        defer cfg.deinit();
-        try std.testing.expectError(error.InvalidArgs, parsePoolOptions(&cfg));
+        const expected_line: u32 = if (std.mem.indexOfScalar(u8, kv, '\n') != null) 3 else 2;
+        var diag: conf.Diag = .{};
+        var loader: schema.OidcLoader = undefined;
+        loadOidcConfig(&loader, allocator, &.{ "--config", path }, &diag) catch |err| {
+            try std.testing.expectEqual(error.BadValue, err);
+            try std.testing.expectEqual(expected_line, diag.line);
+            continue;
+        };
+        defer loader.deinit();
+        try std.testing.expectError(error.BadValue, parsePoolOptions(&loader, path, &diag));
+        try std.testing.expectEqual(expected_line, diag.line);
     }
 
     // In-range values parse through; absent keys keep the defaults.
@@ -1050,9 +1066,11 @@ test "pool options reject out-of-range values" {
             "idp_connect_timeout_ms = 1500\nidp_timeout_ms = 2000",
     );
     defer allocator.free(path);
-    var cfg = try config_mod.parse(allocator, path);
-    defer cfg.deinit();
-    const opts = try parsePoolOptions(&cfg);
+    var diag: conf.Diag = .{};
+    var loader: schema.OidcLoader = undefined;
+    try loadOidcConfig(&loader, allocator, &.{ "--config", path }, &diag);
+    defer loader.deinit();
+    const opts = try parsePoolOptions(&loader, path, &diag);
     try std.testing.expectEqual(@as(u8, 16), opts.threads);
     try std.testing.expectEqual(@as(u16, 64), opts.max_outstanding);
     try std.testing.expectEqual(@as(u32, 1500), opts.connect_timeout_ms);
@@ -2732,9 +2750,12 @@ test "rate config reads the shared [auth] keys with the old [oidc] spellings as 
             "ip_lockout_threshold = 11\nrate_limit = true\n",
     );
     defer allocator.free(path);
-    var cfg = try config_mod.parse(allocator, path);
-    defer cfg.deinit();
-    const r = resolveOidcRateConfig(&cfg);
+    var diag: conf.Diag = .{};
+    var loader: schema.OidcLoader = undefined;
+    try loadOidcConfig(&loader, allocator, &.{ "--config", path }, &diag);
+    defer loader.deinit();
+    const lockout = try schema.validateOidcRate(&loader, path, &diag);
+    const r = resolveOidcRateConfig(&loader, lockout);
     try std.testing.expectEqual(@as(u32, 7), r.policy.max_per_account);
     try std.testing.expectEqual(@as(u32, 9), r.policy.max_per_ip);
     try std.testing.expectEqual(@as(u32, 30), r.policy.window_seconds);
@@ -2750,9 +2771,11 @@ test "rate config reads the shared [auth] keys with the old [oidc] spellings as 
         "rate_max_per_account = 42\nrate_max_per_ip = 77\nrate_limit = false\n",
     );
     defer allocator.free(path2);
-    var cfg2 = try config_mod.parse(allocator, path2);
-    defer cfg2.deinit();
-    const r2 = resolveOidcRateConfig(&cfg2);
+    var loader2: schema.OidcLoader = undefined;
+    try loadOidcConfig(&loader2, allocator, &.{ "--config", path2 }, &diag);
+    defer loader2.deinit();
+    const lockout2 = try schema.validateOidcRate(&loader2, path2, &diag);
+    const r2 = resolveOidcRateConfig(&loader2, lockout2);
     try std.testing.expectEqual(@as(u32, 42), r2.policy.max_per_account);
     try std.testing.expectEqual(@as(u32, 77), r2.policy.max_per_ip);
     try std.testing.expect(!r2.enabled);
@@ -2763,20 +2786,80 @@ test "rate config treats an out-of-range lockout threshold as a bad value" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Both thresholds are u16: 70000 fails to parse, so the defaults apply
-    // like any other bad value instead of tripping a cast check.
     const path = try writeTmpConfig(
         allocator,
         &tmp,
         "[auth]\nlockout_threshold = 70000\nip_lockout_threshold = 70000\n",
     );
     defer allocator.free(path);
-    var cfg = try config_mod.parse(allocator, path);
-    defer cfg.deinit();
-    const r = resolveOidcRateConfig(&cfg);
-    const defaults = RatePolicy{};
-    try std.testing.expectEqual(defaults.lockout_threshold, r.policy.lockout_threshold);
-    try std.testing.expectEqual(defaults.ip_lockout_threshold, r.policy.ip_lockout_threshold);
+    var diag: conf.Diag = .{};
+    var loader: schema.OidcLoader = undefined;
+    try std.testing.expectError(
+        error.BadValue,
+        loadOidcConfig(&loader, allocator, &.{ "--config", path }, &diag),
+    );
+    try std.testing.expectEqual(@as(u32, 3), diag.line);
+}
+
+test "OIDC forwarded values beat the file and lose to CLI flags" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeTmpConfig(allocator, &tmp, "socket = /file/oidc.sock\n[server]\ndb_path = /file/db\n");
+    defer allocator.free(path);
+    const blob = "--server.db_path=/fwd/db\n--oidc.socket=/fwd/oidc.sock\n";
+    var diag: conf.Diag = .{};
+
+    var forwarded = try schema.OidcLoader.load(allocator, .{
+        .path = path,
+        .conf_fd = (try conf.ConfFd.create(blob)).fd,
+    }, &diag);
+    defer forwarded.deinit();
+    try std.testing.expectEqualStrings("/fwd/db", forwarded.values.server.db_path);
+    try std.testing.expectEqualStrings("/fwd/oidc.sock", schema.oidcSocket(&forwarded.values));
+
+    var cli = try schema.OidcLoader.load(allocator, .{
+        .path = path,
+        .conf_fd = (try conf.ConfFd.create(blob)).fd,
+        .args = &.{ "--db", "/cli/db", "--socket", "/cli.sock" },
+    }, &diag);
+    defer cli.deinit();
+    try std.testing.expectEqualStrings("/cli/db", cli.values.server.db_path);
+    try std.testing.expectEqualStrings("/cli.sock", schema.oidcSocket(&cli.values));
+}
+
+test "OIDC aliases and shared auth maxima survive master forwarding" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeTmpConfig(allocator, &tmp, "rate_max_per_account = 42\nrate_max_per_ip = 77\n");
+    defer allocator.free(path);
+    var diag: conf.Diag = .{};
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var parent: schema.MasterLoader = undefined;
+    parent = try schema.MasterLoader.load(allocator, .{ .path = path }, &diag);
+    defer parent.deinit();
+    schema.normalizeForwardedOidcRates(&parent);
+    const alias_blob = try parent.forwardBlob(arena.allocator(), &diag);
+    var alias_child = try schema.OidcLoader.load(allocator, .{ .conf_fd = (try conf.ConfFd.create(alias_blob)).fd }, &diag);
+    defer alias_child.deinit();
+    const alias_seconds = try schema.validateOidcRate(&alias_child, null, &diag);
+    const aliases = resolveOidcRateConfig(&alias_child, alias_seconds);
+    try std.testing.expectEqual(@as(u32, 42), aliases.policy.max_per_account);
+    try std.testing.expectEqual(@as(u32, 77), aliases.policy.max_per_ip);
+
+    var shared = try schema.MasterLoader.load(allocator, .{ .path = path, .args = &.{"--auth.max_per_account=7"} }, &diag);
+    defer shared.deinit();
+    schema.normalizeForwardedOidcRates(&shared);
+    const shared_blob = try shared.forwardBlob(arena.allocator(), &diag);
+    var shared_child = try schema.OidcLoader.load(allocator, .{ .conf_fd = (try conf.ConfFd.create(shared_blob)).fd }, &diag);
+    defer shared_child.deinit();
+    const shared_seconds = try schema.validateOidcRate(&shared_child, null, &diag);
+    const resolved = resolveOidcRateConfig(&shared_child, shared_seconds);
+    try std.testing.expectEqual(@as(u32, 7), resolved.policy.max_per_account);
+    try std.testing.expectEqual(@as(u32, 77), resolved.policy.max_per_ip);
 }
 
 /// Which IPC lane the fixture's single client occupies.
