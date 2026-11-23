@@ -1607,6 +1607,9 @@ pub fn build(b: *std.Build) void {
     });
     http_mod.linkSystemLibrary("ssl", .{});
     http_mod.linkSystemLibrary("crypto", .{});
+    http_mod.addImport("dns_async", dns_async_mod);
+    http_mod.addImport("ssl", ssl_mod);
+    http_mod.addImport("wire", wire_mod);
 
     const http_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/http/client.zig"),
@@ -1616,6 +1619,9 @@ pub fn build(b: *std.Build) void {
     });
     http_test_mod.linkSystemLibrary("ssl", .{});
     http_test_mod.linkSystemLibrary("crypto", .{});
+    http_test_mod.addImport("dns_async", dns_async_mod);
+    http_test_mod.addImport("ssl", ssl_mod);
+    http_test_mod.addImport("wire", wire_mod);
 
     const http_tests = b.addTest(.{
         .name = "http-client-tests",
@@ -2330,8 +2336,13 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_core_tests.step);
     test_s2s_step.dependOn(&run_s2s_main_tests.step);
     test_auth_step.dependOn(&run_auth_main_tests.step);
+    test_auth_oidc_step.dependOn(&run_oidc_store_tests.step);
     test_auth_oidc_step.dependOn(&run_oidc_main_tests.step);
     test_schema_step.dependOn(&run_schema_tests.step);
+    const test_http_step = b.step("test-http", "Run only the HTTP client tests");
+    test_http_step.dependOn(&run_http_tests.step);
+    const test_dns_async_step = b.step("test-dns-async", "Run only the async resolver tests");
+    test_dns_async_step.dependOn(&run_dns_async_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
     // A green test suite must also prove every install artifact compiles.
