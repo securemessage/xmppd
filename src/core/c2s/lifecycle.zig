@@ -508,8 +508,8 @@ pub noinline fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void
 }
 
 /// A session's unacked queue parked for a chunked section-5 drain
-/// (T-265C5A0E). The queue object moves here whole — entries, blob
-/// references and all — so the session can be freed while the batch
+/// (T-265C5A0E). The queue object moves here whole: entries, blob
+/// references and all. The session can be freed while the batch
 /// tail finishes the store and bounce work in bounded pieces.
 pub const SmDrain = struct {
     next: ?*SmDrain = null,

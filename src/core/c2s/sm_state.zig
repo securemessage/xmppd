@@ -214,8 +214,8 @@ pub const SmUnackedQueue = struct {
     }
 
     /// Detach-time retention move (T-265C5A0E): transfer every retained
-    /// blob's charge onto `budget` — the worker's dedicated SM retention
-    /// budget — and mark the queue detached so later pushes charge there
+    /// blob's charge onto `budget`, the worker's dedicated SM retention
+    /// budget, and mark the queue detached so later pushes charge there
     /// too. A detached queue may hold blobs from several producers; each
     /// charge moves individually. Returns false on the first refusal,
     /// leaving earlier transfers in place: the caller then fails the
