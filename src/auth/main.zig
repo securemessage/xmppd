@@ -270,6 +270,10 @@ const AuthHooks = struct {
         AuthHooks.log.info("received SIGHUP (LMDB -- no reload needed)", .{});
     }
 
+    pub fn onSigusr1(self: *AuthHooks) void {
+        _ = self;
+    }
+
     /// T121: send a finished crypto job's reply to its IPC client. The
     /// slot generation both validates the client is still the connection
     /// that asked and prevents a stale reply reaching an unrelated

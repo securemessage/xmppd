@@ -606,6 +606,10 @@ pub const Daemon = struct {
         Daemon.log.info("received SIGHUP (no-op for OIDC backend)", .{});
     }
 
+    pub fn onSigusr1(self: *Daemon) void {
+        self.store.dumpResolverCounters();
+    }
+
     /// Intercept a PLAIN or OAUTHBEARER auth_request: run the handler's own
     /// admission in its own order so the attempt is charged exactly once
     /// before the IdP is asked, bound in-flight work, and queue the

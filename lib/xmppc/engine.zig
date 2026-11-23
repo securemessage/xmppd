@@ -35,9 +35,10 @@ const Session = @import("session.zig").Session;
 const SessionConfig = @import("session.zig").SessionConfig;
 const Event = @import("session.zig").Event;
 const Transport = @import("transport.zig").Transport;
-const Resolver = @import("dns_async").Resolver;
-const Resolution = @import("dns_async").Resolution;
-const DnsStatus = @import("dns_async").Status;
+const dns_async = @import("dns_async");
+const Resolver = dns_async.Resolver;
+const Resolution = dns_async.Resolution;
+const DnsStatus = dns_async.Status;
 const wire = @import("wire");
 
 const log = std.log.scoped(.xmppc);
@@ -205,6 +206,21 @@ pub const Engine = struct {
         self.stats.wakes_read.store(0, .monotonic);
     }
 
+    /// Publish from the engine thread after resolver activity, or from a
+    /// quiesced test. The packet path itself only touches plain counters.
+    fn publishResolverCounters(self: *Engine) void {
+        if (self.resolver) |*resolver| self.resolver_public.store(resolver.counters());
+    }
+
+    pub fn resolverCounterDump(self: *const Engine) dns_async.CounterDump {
+        return self.resolver_public.counterDump("xmppc");
+    }
+
+    /// Safe from consumer threads: reads the last engine publication.
+    pub noinline fn dumpResolverCounters(self: *const Engine) void {
+        log.info("{f}", .{self.resolverCounterDump()});
+    }
+
     pub fn noteFail(self: *Engine) void {
         _ = self.stats.sessions_failed.fetchAdd(1, .monotonic);
     }
@@ -296,6 +312,9 @@ pub const Engine = struct {
     resolver: ?Resolver = null,
     /// Set once the resolver's kqueue fd is registered on this loop.
     resolver_watch_armed: bool = false,
+    /// Latest engine-thread snapshot, published after each resolver call or
+    /// event batch so consumer threads can dump it without racing the owner.
+    resolver_public: dns_async.AtomicCounters = .{},
 
     tls_ctx: ?ssl.SslContext = null,
     /// PKIX-verifying client context (lazy): system CA store, per-connection
@@ -525,7 +544,10 @@ pub const Engine = struct {
             self.thread = null;
         }
         self.stopAll();
-        if (self.resolver) |*r| r.deinit();
+        if (self.resolver) |*r| {
+            self.publishResolverCounters();
+            r.deinit();
+        }
         // Stop the crypto worker, then reclaim its buffers (all on this
         // thread: the worker is joined before any free happens).
         self.crypto_mutex.lock();
@@ -1028,6 +1050,7 @@ pub const Engine = struct {
         // the engine's resolver (built at init). Nothing blocks.
         self.resolver.?.setCallback(.{ .ctx = self, .fun = onDnsResult });
         s.phase = .resolving;
+        defer self.publishResolverCounters();
         self.resolver.?.resolve(s.host, .client, s.port, h.encode(), s.tls_policy == .dane_first) catch {
             s.fail(self.allocator, "resolve-error");
             return;
@@ -1287,7 +1310,10 @@ pub const Engine = struct {
         for (evbuf[0..n]) |ev| {
             if (ev.udata == WAKE_UDATA) continue;
             if (ev.udata == DNS_UDATA) {
-                if (self.resolver) |*r| r.step(0);
+                if (self.resolver) |*r| {
+                    r.step(0);
+                    self.publishResolverCounters();
+                }
                 continue;
             }
             // Consumer timer window: dispatch the callback and consume the
@@ -1544,6 +1570,47 @@ test "engine: the resolver is built at init, never on the loop" {
     var eng = try Engine.init(alloc);
     defer eng.deinit();
     try std.testing.expect(eng.resolver != null);
+}
+
+test "engine: resolver counters reach the xmppc dump after a lookup" {
+    // Goal: a hostname launch publishes every resolver counter for consumer
+    // readers without exposing the engine-owned plain fields. Method: seed
+    // the resolver, run the real launch path, and format the public dump.
+    const alloc = std.testing.allocator;
+    var eng = try Engine.init(alloc);
+    defer eng.deinit();
+    eng.resolver.?.setServer(try std.net.Address.parseIp("127.0.0.1", 9));
+    eng.resolver.?.stale_serves = 1;
+    eng.resolver.?.evict_scans = 2;
+    eng.resolver.?.too_many_jobs = 3;
+    eng.resolver.?.malformed_replies = 4;
+    eng.resolver.?.unmatched_replies = 5;
+    eng.resolver.?.stale_icmp = 6;
+    eng.resolver.?.kevent_errors = 7;
+    eng.resolver.?.udp_errors = 8;
+
+    const h = try eng.prepareSession(.{
+        .domain = "probe.test",
+        .user = "u",
+        .password = "p",
+        .host = "publish.test",
+        .port = 5222,
+    });
+    eng.launchSession(h);
+    defer {
+        eng.sessionAt(h).?.fail(alloc, "test-done");
+        eng.reapDead();
+    }
+
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writer.print("{f}", .{eng.resolverCounterDump()});
+    try std.testing.expectEqualStrings(
+        "xmppc dns counters: stale_serves=1 evict_scans=2 too_many_jobs=3 " ++
+            "malformed_replies=4 unmatched_replies=5 stale_icmp=6 " ++
+            "kevent_errors=7 udp_errors=8",
+        writer.buffered(),
+    );
 }
 
 test "engine: the resolver watch registers its kqueue, not a tick" {

@@ -242,6 +242,14 @@ pub const S2sDaemon = struct {
         }
     }
 
+    fn resolverCounterDump(self: *const S2sDaemon) dns_async.CounterDump {
+        return self.resolver.counterDump("s2s");
+    }
+
+    noinline fn dumpResolverCounters(self: *const S2sDaemon) void {
+        log.info("{f}", .{self.resolverCounterDump()});
+    }
+
     pub fn deinit(self: *S2sDaemon) void {
         // Close all inbound sessions and their readers
         for (&self.inbound, &self.readers) |*slot, *reader_slot| {
@@ -1273,6 +1281,7 @@ pub fn main() !void {
     // Register signals (automatically blocked from default delivery)
     try loop.addSignal(posix.SIG.TERM);
     try loop.addSignal(posix.SIG.INT);
+    try loop.addSignal(posix.SIG.USR1);
 
     log.info("xmppd-s2s event loop started", .{});
 
@@ -1300,6 +1309,8 @@ pub fn main() !void {
                     if (s.signo == posix.SIG.TERM or s.signo == posix.SIG.INT) {
                         log.info("received signal {d}, shutting down", .{s.signo});
                         daemon.stop();
+                    } else if (s.signo == posix.SIG.USR1) {
+                        daemon.dumpResolverCounters();
                     }
                 },
                 .fd_readable => |e| {
@@ -4071,6 +4082,33 @@ test "S2sDaemon: init and deinit" {
     try std.testing.expectEqual(@as(usize, 0), daemon.pool.count());
     try std.testing.expectEqual(@as(usize, 0), daemon.inboundCount());
     try std.testing.expect(daemon.running);
+}
+
+test "S2sDaemon: resolver counters reach the SIGUSR1 dump format" {
+    // Goal: the s2s dump includes every counter from its owned resolver.
+    // Method: seed distinct values and format the same CounterDump used by
+    // the production SIGUSR1 handler.
+    const alloc = std.testing.allocator;
+    var daemon = try S2sDaemon.init(alloc, "a.example");
+    defer daemon.deinit();
+    daemon.resolver.stale_serves = 1;
+    daemon.resolver.evict_scans = 2;
+    daemon.resolver.too_many_jobs = 3;
+    daemon.resolver.malformed_replies = 4;
+    daemon.resolver.unmatched_replies = 5;
+    daemon.resolver.stale_icmp = 6;
+    daemon.resolver.kevent_errors = 7;
+    daemon.resolver.udp_errors = 8;
+
+    var buf: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writer.print("{f}", .{daemon.resolverCounterDump()});
+    try std.testing.expectEqualStrings(
+        "s2s dns counters: stale_serves=1 evict_scans=2 too_many_jobs=3 " ++
+            "malformed_replies=4 unmatched_replies=5 stale_icmp=6 " ++
+            "kevent_errors=7 udp_errors=8",
+        writer.buffered(),
+    );
 }
 
 test "S2sDaemon: listen on high port" {

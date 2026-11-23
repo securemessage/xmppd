@@ -2343,6 +2343,8 @@ pub fn build(b: *std.Build) void {
     test_http_step.dependOn(&run_http_tests.step);
     const test_dns_async_step = b.step("test-dns-async", "Run only the async resolver tests");
     test_dns_async_step.dependOn(&run_dns_async_tests.step);
+    const test_xmppc_step = b.step("test-xmppc", "Run only the xmppc library tests");
+    test_xmppc_step.dependOn(&run_xmppc_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
     // A green test suite must also prove every install artifact compiles.
