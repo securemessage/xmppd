@@ -53,6 +53,18 @@ pub var offline_hold_bounces = std.atomic.Value(u64).init(0);
 /// connection write even unstamped. Dropping keeps one oversized row from
 /// parking the user's whole queue.
 pub var offline_drain_drops = std.atomic.Value(u64).init(0);
+
+/// C11/T430: per-outcome counts of the XEP-0198 section-5 drain that runs
+/// on teardown of a session with an unacked queue. stored + bounced +
+/// dropped + bounce_failed partitions every drained stanza, so a counter
+/// total below the queue length means a silent loss. sm_offline_refused
+/// counts store refusals that then took the bounce path (it is a subset,
+/// not a fifth outcome).
+pub var sm_unacked_stored = std.atomic.Value(u64).init(0);
+pub var sm_unacked_bounced = std.atomic.Value(u64).init(0);
+pub var sm_unacked_dropped = std.atomic.Value(u64).init(0);
+pub var sm_unacked_bounce_failed = std.atomic.Value(u64).init(0);
+pub var sm_offline_refused = std.atomic.Value(u64).init(0);
 /// Stanzas queueSend refused because they can never fit the write buffer,
 /// counted apart from the slow-reader overflow teardown. The session stays
 /// up; iq results are answered with resource-constraint instead.

@@ -44,6 +44,12 @@ pub const Externals = struct {
     offline_not_stored: u64 = 0,
     offline_hold_bounces: u64 = 0,
     offline_drain_drops: u64 = 0,
+    /// C11 SM unacked drain outcomes (T430).
+    sm_unacked_stored: u64 = 0,
+    sm_unacked_bounced: u64 = 0,
+    sm_unacked_dropped: u64 = 0,
+    sm_unacked_bounce_failed: u64 = 0,
+    sm_offline_refused: u64 = 0,
 };
 
 pub const Counters = struct {
@@ -166,6 +172,10 @@ pub noinline fn dump(worker_id: u16, ext: Externals) void {
     });
     log.info("worker {d} scram: exchange_pool_full={d} stale_evictions={d}", .{
         worker_id, read(&c.scram_exchange_full), read(&c.scram_stale),
+    });
+    log.info("worker {d} sm unacked drain: stored={d} bounced={d} dropped={d} bounce_failed={d} offline_refused={d}", .{
+        worker_id,              ext.sm_unacked_stored,        ext.sm_unacked_bounced,
+        ext.sm_unacked_dropped, ext.sm_unacked_bounce_failed, ext.sm_offline_refused,
     });
     var buf: [HIST_BUCKETS * 24]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);

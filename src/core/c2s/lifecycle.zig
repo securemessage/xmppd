@@ -26,6 +26,8 @@ const muc_handler = @import("../muc/handler.zig");
 const presence_handler = @import("../presence/handler.zig");
 const lastact_store = @import("last_activity_store");
 const router = @import("../routing/router.zig");
+const routing_deliver = @import("../routing/deliver.zig");
+const stanza_writer = @import("../stanza/writer.zig");
 const connection_mod = @import("../connection.zig");
 const delivery_queue_mod = @import("delivery_queue");
 
@@ -494,43 +496,139 @@ pub noinline fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void
     }
 }
 
-/// ADR-2 fail-closed drain: on teardown of a session with an SM unacked
-/// queue, offer each pending `<message>` stanza to the recipient's offline
-/// store so an over-cap session loses nothing the client never
-/// acknowledged. Only `<message>` qualifies (RFC 6121): type='error' and
-/// type='groupchat' are never stored, presence and iq are skipped. Store
-/// failures count against offline_drain_drops. C11 builds the full
-/// XEP-0198 section 5 policy on this path; C2 only drains.
+/// XEP-0198 section-5 drain (C11): on teardown of a session with an SM
+/// unacked queue, every stanza reaches exactly one counted outcome so
+/// nothing is lost silently (T430; this closes the #81 counted-but-lost
+/// gap where an offline refusal vanished). `<message>` (not error or
+/// groupchat) is offered to the recipient's offline store; a refusal then
+/// bounces like any other non-message. IQ, presence and refused messages
+/// bounce service-unavailable to the stanza's sender through the session
+/// map (local) or the S2S daemon (remote). type='error', type='result' and
+/// groupchat stanzas are counted drops: RFC 6120 forbids an error for an
+/// error, and a groupchat bounce would target a room JID.
 fn drainUnackedToOffline(server: *Server, session: *Session) void {
-    const store = server.offline orelse return;
     const queue = session.sm_unacked orelse return;
-    if (session.stream.bound_jid == null) return;
-    const recipient = session.stream.boundBare();
+    if (session.stream.bound_jid == null) {
+        // The recipient cannot be named without a bound JID; count every
+        // stanza as a drop so the teardown still loses nothing silently.
+        var lost: u64 = 0;
+        var lost_iter = queue.getUnacked();
+        while (lost_iter.next()) |_| lost += 1;
+        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(lost, .monotonic);
+        noteDrop("session {d} unacked drain: {d} stanzas counted as drops (no bound JID)", .{ session.conn.id, lost });
+        return;
+    }
+    var recipient_buf: [router.BARE_JID_MAX]u8 = undefined;
+    const bound_bare = session.stream.boundBare();
+    if (bound_bare.len > recipient_buf.len) {
+        var lost: u64 = 0;
+        var lost_iter = queue.getUnacked();
+        while (lost_iter.next()) |_| lost += 1;
+        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(lost, .monotonic);
+        noteDrop("session {d} unacked drain: {d} stanzas counted as drops (bare JID exceeds {d} bytes)", .{ session.conn.id, lost, router.BARE_JID_MAX });
+        return;
+    }
+    @memcpy(recipient_buf[0..bound_bare.len], bound_bare);
+    const recipient = recipient_buf[0..bound_bare.len];
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
     var iter = queue.getUnacked();
     while (iter.next()) |blob| {
-        const stanza = blob.bytes();
-        const head_end = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
-        const head = stanza[0..head_end];
-        if (head.len < 8 or !std.mem.eql(u8, head[0..8], "<message")) continue;
-        if (head.len > 8 and head[8] != ' ' and head[8] != '/') continue;
-        if (c2s_session.headAttr(head, "type")) |stanza_type| {
-            if (std.mem.eql(u8, stanza_type, "error") or std.mem.eql(u8, stanza_type, "groupchat")) continue;
-        }
-        const stored = store.storeHeldPointer(
-            recipient,
-            c2s_session.headAttr(head, "from") orelse "",
-            c2s_session.headAttr(head, "id") orelse "offline",
-            now,
-            stanza,
-        ) catch {
-            _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
-            continue;
-        };
-        if (!stored) {
-            _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
+        drainOneUnacked(server, blob.bytes(), recipient, now);
+    }
+}
+
+/// Per-stanza section-5 outcome for drainUnackedToOffline. Counters live in
+/// delivery_queue (module globals, cold teardown path).
+fn drainOneUnacked(server: *Server, stanza: []const u8, recipient: []const u8, now: u64) void {
+    const head_end = std.mem.indexOfScalar(u8, stanza, '>') orelse {
+        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+        return;
+    };
+    const head = stanza[0..head_end];
+    var tag_end: usize = 1;
+    while (tag_end < head.len and head[tag_end] != ' ' and head[tag_end] != '/') : (tag_end += 1) {}
+    const tag_name = head[1..tag_end];
+    const stanza_type = c2s_session.headAttr(head, "type");
+
+    // RFC 6120: never send an error for an error or a result.
+    if (stanza_type) |t| {
+        if (std.mem.eql(u8, t, "error") or std.mem.eql(u8, t, "result")) {
+            _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+            return;
         }
     }
+
+    if (std.mem.eql(u8, tag_name, "message")) {
+        if (stanza_type) |t| {
+            // A groupchat bounce would target the room, not a sender.
+            if (std.mem.eql(u8, t, "groupchat")) {
+                _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+        const stored = if (server.offline) |store|
+            store.storeHeldPointer(
+                recipient,
+                c2s_session.headAttr(head, "from") orelse "",
+                c2s_session.headAttr(head, "id") orelse "offline",
+                now,
+                stanza,
+            ) catch false
+        else
+            false;
+        if (stored) {
+            _ = delivery_queue_mod.sm_unacked_stored.fetchAdd(1, .monotonic);
+            return;
+        }
+        // A refusal (quota, missing store, store error) still reaches the
+        // sender as an error instead of vanishing.
+        _ = delivery_queue_mod.sm_offline_refused.fetchAdd(1, .monotonic);
+    }
+
+    if (bounceUnackedStanza(server, recipient, head, tag_name)) {
+        _ = delivery_queue_mod.sm_unacked_bounced.fetchAdd(1, .monotonic);
+    } else {
+        _ = delivery_queue_mod.sm_unacked_bounce_failed.fetchAdd(1, .monotonic);
+    }
+}
+
+/// Bounce one unacked stanza service-unavailable to its sender. The 'from'
+/// attribute arrives entity-encoded; it decodes before the JID parse.
+/// A local full JID routes through the session map (same worker writes to
+/// the session directly, another worker through the delivery MPSC); a
+/// remote domain goes to the S2S daemon. False on every unroutable sender:
+/// missing or bare 'from', undecodable attribute, unparsable JID, session
+/// gone, delivery refusal, no S2S daemon.
+fn bounceUnackedStanza(server: *Server, recipient: []const u8, head: []const u8, tag_name: []const u8) bool {
+    const from_wire = c2s_session.headAttr(head, "from") orelse return false;
+    const stanza_id = c2s_session.headAttr(head, "id") orelse "";
+
+    var sender_buf: [512]u8 = undefined;
+    var sender_fbs = std.io.fixedBufferStream(&sender_buf);
+    xml.decodeWrite(sender_fbs.writer(), from_wire) catch return false;
+    const sender_full = sender_fbs.getWritten();
+    const sender = xmpp.Jid.parse(sender_full) catch return false;
+    if (sender.resource.len == 0) return false;
+
+    if (!std.mem.eql(u8, sender.domain, server.server_host)) {
+        return routing_deliver.sendS2sError(server, sender_full, recipient, tag_name, stanza_id);
+    }
+
+    const sm = server.session_map orelse return false;
+    const entry = sm.findByFullJid(sender.local, sender.domain, sender.resource) orelse return false;
+
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    stanza_writer.writeCrossWorkerError(fbs.writer(), tag_name, recipient, sender_full, stanza_id) catch return false;
+    const bounce = fbs.getWritten();
+
+    if (entry.worker_id == server.worker_id) {
+        const target = server.sessionForEventToken(entry.token) orelse return false;
+        return target.stanza(bounce) != .failed_closed;
+    }
+    const ds = server.delivery_system orelse return false;
+    ds.deliver(server.worker_id, entry.worker_id, entry.token, bounce) catch return false;
+    return true;
 }
 
 /// Sweep detached sessions that have exceeded the resume timeout.
@@ -2881,4 +2979,193 @@ test "T316: a repeated destroySession is a counted no-op" {
     destroySession(&server, server.sessions.len, session, &changes);
     try std.testing.expectEqual(free_count_after, server.free_count);
     try std.testing.expectEqual(@as(u64, 2), server.double_destroy_skips);
+}
+
+// C11 regression tests: every unacked stanza reaches a counted outcome:
+// stored offline, bounced, or a counted drop. Never a silent loss (T430).
+
+fn makeDetachedWithStanzas(
+    server: *Server,
+    id: usize,
+    local: []const u8,
+    bound_full_jid: []const u8,
+    sm_id: []const u8,
+    stanzas: []const []const u8,
+) !*Session {
+    const session = try makeAuthenticatedSession(server, id, local);
+    // bound_full_jid must outlive the session (Jid fields slice it):
+    // callers pass string literals, never a stack buffer.
+    session.stream.bound_jid = xmpp_lib.Jid.parse(bound_full_jid) catch null;
+    session.sm_resume_enabled = true;
+    session.sm_detached = true;
+    session.sm_detach_time = std.time.timestamp();
+    session.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    @memcpy(&session.sm_id, sm_id[0..sm_state.SM_ID_HEX_LEN]);
+    server.detached_count += 1;
+    c2s_sm.smIdMapInsert(server, &session.sm_id, id);
+    server.sm_expiry.insert(session, session.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
+    const queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(server.smBlobBudget());
+    for (stanzas) |s| _ = queue.push(s);
+    session.sm_unacked = queue;
+    server.free_count -= 1;
+    return session;
+}
+
+test "C11: expiry drain stores messages offline and bounces IQs" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, false, 0);
+    defer sm.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.session_map = &sm;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // Live sender bound in the session map on this worker.
+    const bob = try makeAuthenticatedSession(&server, 3, "bob");
+    bob.stream.bound_jid = xmpp_lib.Jid.parse("bob@localhost/res") catch null;
+    try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
+    server.free_count -= 1;
+
+    const detached = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "0011223344556677889900aabbccddeeff", &.{
+        "<message from='bob@localhost/res' to='alice@localhost' id='m1' type='chat'><body>hi</body></message>",
+        "<iq from='bob@localhost/res' to='alice@localhost' id='iq1' type='get'><ping/></iq>",
+    });
+
+    const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
+    const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
+    destroySession(&server, 2, detached, &changes);
+
+    // The message reached the offline store; the IQ bounced to its sender.
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("alice@localhost"));
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_stored.load(.monotonic) - stored0);
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0);
+    const pending = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "id='iq1'") != null);
+
+    bob.sm_resume_enabled = false;
+    destroySession(&server, 3, bob, &changes);
+}
+
+test "C11: offline-quota refusal bounces the message to its sender" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, false, 0);
+    defer sm.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.session_map = &sm;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const bob = try makeAuthenticatedSession(&server, 3, "bob");
+    bob.stream.bound_jid = xmpp_lib.Jid.parse("bob@localhost/res") catch null;
+    try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
+    server.free_count -= 1;
+
+    // Fill alice's offline queue to the store's per-user cap so the unacked
+    // message is refused (the #81 counted-but-lost case).
+    var fill: usize = 0;
+    while (try offline_store.storeHeldPointer("alice@localhost", "carol@localhost/res", "seed", 1000, "<message/>")) : (fill += 1) {}
+    try std.testing.expect(fill > 0);
+
+    const detached = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "11223344556677889900aabbccddee00", &.{
+        "<message from='bob@localhost/res' to='alice@localhost' id='m2' type='chat'><body>hi</body></message>",
+    });
+
+    const refused0 = delivery_queue_mod.sm_offline_refused.load(.monotonic);
+    const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
+    const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
+    destroySession(&server, 2, detached, &changes);
+
+    // Refusal counted, then the bounce reached the sender: nothing lost.
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_offline_refused.load(.monotonic) - refused0);
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0);
+    try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+    const pending = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "id='m2'") != null);
+
+    bob.sm_resume_enabled = false;
+    destroySession(&server, 3, bob, &changes);
+}
+
+test "C11: error, result and groupchat unacked stanzas drop counted, never bounced" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, false, 0);
+    defer sm.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.session_map = &sm;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const bob = try makeAuthenticatedSession(&server, 3, "bob");
+    bob.stream.bound_jid = xmpp_lib.Jid.parse("bob@localhost/res") catch null;
+    try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
+    server.free_count -= 1;
+
+    const detached = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "223344556677889900aabbccddee0011", &.{
+        "<message from='bob@localhost/res' to='alice@localhost' id='e1' type='error'><error/></message>",
+        "<iq from='bob@localhost/res' to='alice@localhost' id='r1' type='result'/>",
+        "<message from='bob@localhost/res' to='room@conference.localhost' id='g1' type='groupchat'><body>hi</body></message>",
+    });
+
+    const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
+    const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
+    const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
+    destroySession(&server, 2, detached, &changes);
+
+    try std.testing.expectEqual(@as(u64, 3), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+    try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0);
+    try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_stored.load(.monotonic) - stored0);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
+    const pending = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "service-unavailable") == null);
+
+    bob.sm_resume_enabled = false;
+    destroySession(&server, 3, bob, &changes);
 }

@@ -1212,6 +1212,11 @@ pub const Server = struct {
             .offline_not_stored = delivery_queue_mod.offline_not_stored.load(.monotonic),
             .offline_hold_bounces = delivery_queue_mod.offline_hold_bounces.load(.monotonic),
             .offline_drain_drops = delivery_queue_mod.offline_drain_drops.load(.monotonic),
+            .sm_unacked_stored = delivery_queue_mod.sm_unacked_stored.load(.monotonic),
+            .sm_unacked_bounced = delivery_queue_mod.sm_unacked_bounced.load(.monotonic),
+            .sm_unacked_dropped = delivery_queue_mod.sm_unacked_dropped.load(.monotonic),
+            .sm_unacked_bounce_failed = delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic),
+            .sm_offline_refused = delivery_queue_mod.sm_offline_refused.load(.monotonic),
         });
     }
 
