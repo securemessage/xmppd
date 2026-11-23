@@ -113,6 +113,41 @@
   `migrate-precis` to absorb every row written under an old spelling in the
   meantime.
 
+- **The master validates its configuration file strictly.** An unknown
+  section or key, a bad value or a malformed line is a startup error
+  printed with `file:line` and the master exits non-zero; v0.9.0 ignored
+  or silently defaulted these. Pre-flight check before restarting:
+  `xmppd -c <conf> --help` exits 0 and prints the generated option list
+  when the file parses, or the same `file:line` diagnostic with a
+  non-zero exit when it does not. Two file keys also changed meaning:
+  `[s2s] enabled = false` now suppresses the s2s child (v0.9.0 read only
+  `--no-s2s`; the file key was ignored), and `[core] workers` accepts a
+  number or `auto`; any other value is a startup error (v0.9.0 treated
+  it as `auto`). See doc/UPGRADING.md.
+
+- **core, s2s and xmppctl share the strict configuration loader.** The
+  master serializes the resolved configuration once into a sealed fd
+  that `xmppd-core` and `xmppd-s2s` inherit as `--conf-fd`, so a file
+  key or a master CLI override reaches them exactly once; their argv now
+  carries only the listen-fd remap slots and the conf fd itself, and on
+  SIGHUP the fd is rebuilt before the signal is forwarded. Three fixes
+  ride along: core honors `[tls] cert`/`key` from the file (previously
+  ignored), `xmppd-s2s --config` is honored (previously consumed and
+  ignored), and unknown arguments to core, s2s or xmppctl are startup
+  errors instead of silent warnings or a mistaken command. `xmppctl`
+  gained `-c`/`--config` and `--help`, and its storage default follows
+  the shared `[server] db_path` default `/var/db/xmppd`. See
+  doc/UPGRADING.md.
+
+- **Both auth daemons share the strict configuration loader.** The master
+  forwards the same sealed `--conf-fd` to `xmppd-auth` and
+  `xmppd-auth-oidc` and no longer places resolved values on their argv.
+  Precedence is default < file < forwarded < CLI, the old
+  `[oidc] rate_max_*` spellings remain aliases, and both `--help` outputs
+  are generated from the schema. Bad auth values are now startup errors
+  with `file:line` diagnostics instead of silent defaults or clamps. An
+  unset `[oidc] socket` inherits `[auth] socket`. See doc/UPGRADING.md.
+
 ### Fixed
 
 - S33 disco/caps: removed the `http://jabber.org/protocol/pubsub#subscribe`

@@ -222,6 +222,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ADR-9 shared schema: one Sections struct and field table every
+    // daemon loads through lib/conf (the file grammar is shared; each
+    // daemon keeps its own CLI table).
+    const schema_mod = b.createModule(.{
+        .root_source_file = b.path("src/config/schema.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    schema_mod.addImport("conf", conf_mod);
+
     // Generational addressing (ADR-4): one module instance shared by every
     // importer so the Token type is identical across them; a file may only
     // live in one module per compilation, so nothing imports the file
@@ -347,6 +357,11 @@ pub fn build(b: *std.Build) void {
         .root_module = conf_mod,
     });
 
+    const schema_tests = b.addTest(.{
+        .name = "schema-tests",
+        .root_module = schema_mod,
+    });
+
     const net_tests = b.addTest(.{
         .name = "net-tests",
         .root_module = net_mod,
@@ -455,6 +470,7 @@ pub fn build(b: *std.Build) void {
 
     const run_xml_tests = b.addRunArtifact(xml_tests);
     const run_conf_tests = b.addRunArtifact(conf_tests);
+    const run_schema_tests = b.addRunArtifact(schema_tests);
     const run_net_tests = b.addRunArtifact(net_tests);
     const run_xml_writer_tests = b.addRunArtifact(xml_writer_tests);
 
@@ -1200,6 +1216,8 @@ pub fn build(b: *std.Build) void {
     s2s_main_test_mod.addImport("xmpp", xmpp_mod);
     s2s_main_test_mod.addImport("test_support", test_support_mod);
     s2s_main_test_mod.addImport("root_allocator", root_allocator_mod);
+    s2s_main_test_mod.addImport("conf", conf_mod);
+    s2s_main_test_mod.addImport("schema", schema_mod);
     s2s_main_test_mod.linkSystemLibrary("ssl", .{});
     s2s_main_test_mod.linkSystemLibrary("crypto", .{});
 
@@ -1564,13 +1582,7 @@ pub fn build(b: *std.Build) void {
 
     const run_supervisor_tests = b.addRunArtifact(supervisor_tests);
 
-    // --- Config module (shared by all daemons) ---
-
-    const config_mod = b.createModule(.{
-        .root_source_file = b.path("src/config/parser.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // --- Legacy config parser tests ---
 
     const config_test_mod = b.createModule(.{
         .root_source_file = b.path("src/config/parser.zig"),
@@ -1704,7 +1716,8 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("room_mailbox", server_room_mailbox_mod);
     core_mod.addImport("block_store", server_block_store_mod);
     core_mod.addImport("pep_store", server_pep_store_mod);
-    core_mod.addImport("config", config_mod);
+    core_mod.addImport("conf", conf_mod);
+    core_mod.addImport("schema", schema_mod);
     core_mod.addImport("xmppd_log", xmppd_log_mod);
     core_mod.addImport("build_options", build_options_mod);
     core_mod.addImport("root_allocator", root_allocator_mod);
@@ -1724,7 +1737,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     master_mod.addImport("net", net_mod);
-    master_mod.addImport("config", config_mod);
+    master_mod.addImport("conf", conf_mod);
+    master_mod.addImport("schema", schema_mod);
     master_mod.addImport("xmppd_log", xmppd_log_mod);
     master_mod.addImport("build_options", build_options_mod);
     master_mod.addImport("root_allocator", root_allocator_mod);
@@ -1742,6 +1756,13 @@ pub fn build(b: *std.Build) void {
     });
     master_tests.root_module.link_libc = true;
     const run_master_tests = b.addRunArtifact(master_tests);
+
+    // xmppd-core tests (same module instance; Zig forbids re-rooting)
+    const core_tests = b.addTest(.{
+        .name = "core-tests",
+        .root_module = core_mod,
+    });
+    const run_core_tests = b.addRunArtifact(core_tests);
 
     // xmppd-auth: the authentication daemon
     const auth_ipc_protocol_mod = b.createModule(.{
@@ -1858,7 +1879,8 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("invite_store", auth_invite_store_mod);
     auth_mod.addImport("op_backend", auth_op_backend_mod);
     auth_mod.addImport("event_loop", auth_event_loop_mod);
-    auth_mod.addImport("config", config_mod);
+    auth_mod.addImport("conf", conf_mod);
+    auth_mod.addImport("schema", schema_mod);
     auth_mod.addImport("backend", auth_backend_mod);
     auth_mod.addImport("runner", auth_runner_mod);
     auth_mod.addImport("xmppd_log", xmppd_log_mod);
@@ -1984,7 +2006,8 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("policy", oidc_policy_mod);
     oidc_main_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_main_mod.addImport("event_loop", oidc_event_loop_mod);
-    oidc_main_mod.addImport("config", config_mod);
+    oidc_main_mod.addImport("conf", conf_mod);
+    oidc_main_mod.addImport("schema", schema_mod);
     oidc_main_mod.addImport("lock_store", auth_lock_store_mod);
     oidc_main_mod.addImport("op_backend", auth_op_backend_mod);
     oidc_main_mod.addImport("archive_backend", auth_archive_backend_mod);
@@ -2018,6 +2041,8 @@ pub fn build(b: *std.Build) void {
         .root_module = oidc_main_mod,
     });
     const run_oidc_main_tests = b.addRunArtifact(oidc_main_tests);
+    // Startup tests spawn the installed OIDC binary, never a stale artifact.
+    run_oidc_main_tests.step.dependOn(b.getInstallStep());
 
     // xmppd-s2s: the S2S federation daemon
     const s2s_ipc_protocol_mod = b.createModule(.{
@@ -2058,6 +2083,8 @@ pub fn build(b: *std.Build) void {
     s2s_main_mod.addImport("xmpp", xmpp_mod);
     s2s_main_mod.addImport("xmppd_log", xmppd_log_mod);
     s2s_main_mod.addImport("root_allocator", root_allocator_mod);
+    s2s_main_mod.addImport("conf", conf_mod);
+    s2s_main_mod.addImport("schema", schema_mod);
     s2s_main_mod.linkSystemLibrary("ssl", .{});
     s2s_main_mod.linkSystemLibrary("crypto", .{});
 
@@ -2154,6 +2181,8 @@ pub fn build(b: *std.Build) void {
     ctl_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     ctl_mod.addImport("xmppd_log", xmppd_log_mod);
     ctl_mod.addImport("root_allocator", root_allocator_mod);
+    ctl_mod.addImport("conf", conf_mod);
+    ctl_mod.addImport("schema", schema_mod);
 
     const ctl_exe = b.addExecutable(.{
         .name = "xmppctl",
@@ -2181,6 +2210,8 @@ pub fn build(b: *std.Build) void {
     ctl_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     ctl_test_mod.addImport("xmppd_log", xmppd_log_mod);
     ctl_test_mod.addImport("root_allocator", root_allocator_mod);
+    ctl_test_mod.addImport("conf", conf_mod);
+    ctl_test_mod.addImport("schema", schema_mod);
 
     const ctl_tests = b.addTest(.{
         .name = "xmppctl-tests",
@@ -2291,12 +2322,23 @@ pub fn build(b: *std.Build) void {
     const test_master_step = b.step("test-master", "Run only the master supervisor tests");
     test_master_step.dependOn(&run_master_tests.step);
     test_master_step.dependOn(&run_supervisor_tests.step);
+    const test_core_step = b.step("test-core", "Run only the core daemon tests");
+    const test_s2s_step = b.step("test-s2s", "Run only the s2s daemon tests");
+    const test_auth_step = b.step("test-auth", "Run only the auth daemon startup tests");
+    const test_auth_oidc_step = b.step("test-auth-oidc", "Run only the OIDC auth daemon tests");
+    const test_schema_step = b.step("test-schema", "Run only the shared configuration schema tests");
+    test_core_step.dependOn(&run_core_tests.step);
+    test_s2s_step.dependOn(&run_s2s_main_tests.step);
+    test_auth_step.dependOn(&run_auth_main_tests.step);
+    test_auth_oidc_step.dependOn(&run_oidc_main_tests.step);
+    test_schema_step.dependOn(&run_schema_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
     // A green test suite must also prove every install artifact compiles.
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_xml_tests.step);
     test_step.dependOn(&run_conf_tests.step);
+    test_step.dependOn(&run_schema_tests.step);
     test_step.dependOn(&run_net_tests.step);
     test_step.dependOn(&run_xml_writer_tests.step);
     test_step.dependOn(&run_xmpp_tests.step);
@@ -2389,6 +2431,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ctl_tests.step);
     test_step.dependOn(&run_supervisor_tests.step);
     test_step.dependOn(&run_master_tests.step);
+    test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_roster_store_tests.step);
     test_step.dependOn(&run_session_map_tests.step);
     test_step.dependOn(&run_delivery_queue_tests.step);

@@ -33,6 +33,8 @@ const oidc_ids = @import("oidc_identity_store");
 const BindingStore = oidc_ids.Store(OpBackendType);
 const ipc_protocol = @import("ipc_protocol");
 const precis = @import("precis_username");
+const conf = @import("conf");
+const schema = @import("schema");
 
 threadlocal var ctl_precis_scratch: precis.Scratch = undefined;
 const backend_mod = @import("backend");
@@ -46,81 +48,57 @@ pub fn main() !void {
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
-
-    var db_path: []const u8 = "/var/db/xmppd";
-    var auth_socket: []const u8 = "/var/run/xmppd/auth.sock";
-    var cli_password: ?[]const u8 = null;
-    var password_file: ?[]const u8 = null;
-    var apply = false;
-    var raw = false;
-    var run_dir: []const u8 = "/var/run/xmppd";
-    var rename_old: ?[]const u8 = null;
-    var rename_new: ?[]const u8 = null;
-    var hosted_domains: std.ArrayListUnmanaged([]const u8) = .{};
-    defer hosted_domains.deinit(allocator);
-
     _ = args.next(); // Skip argv[0]
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    while (args.next()) |arg| try argv.append(allocator, arg);
 
-    // Check for global options first
-    var remaining_args: std.ArrayListUnmanaged([]const u8) = .{};
-    defer remaining_args.deinit(allocator);
+    // --rename OLD NEW and the repeatable --hosted-domain do not fit the
+    // CLI table (two values, a list), so they are lifted out of argv
+    // first; the loader sees only schema options and the positionals.
+    var prescanned = try prescanCtlArgv(allocator, argv.items);
+    defer prescanned.deinit(allocator);
+    const rename_old = prescanned.rename_old;
+    const rename_new = prescanned.rename_new;
+    const hosted_domains = prescanned.hosted_domains.items;
 
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--db")) {
-            db_path = args.next() orelse {
-                printErr("--db requires a value\n");
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--auth-socket")) {
-            auth_socket = args.next() orelse {
-                printErr("--auth-socket requires a value\n");
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--password")) {
-            cli_password = args.next() orelse {
-                printErr("--password requires a value\n");
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--password-file")) {
-            password_file = args.next() orelse {
-                printErr("--password-file requires a value\n");
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--apply")) {
-            apply = true;
-        } else if (std.mem.eql(u8, arg, "--raw")) {
-            raw = true;
-        } else if (std.mem.eql(u8, arg, "--run-dir")) {
-            run_dir = args.next() orelse {
-                printErr("--run-dir requires a value\n");
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--hosted-domain")) {
-            const domain = args.next() orelse {
-                printErr("--hosted-domain requires a value\n");
-                return error.InvalidArgs;
-            };
-            try hosted_domains.append(allocator, domain);
-        } else if (std.mem.eql(u8, arg, "--rename")) {
-            rename_old = args.next() orelse {
-                printErr("--rename requires an old and a new localpart\n");
-                return error.InvalidArgs;
-            };
-            rename_new = args.next() orelse {
-                printErr("--rename requires an old and a new localpart\n");
-                return error.InvalidArgs;
-            };
-        } else {
-            try remaining_args.append(allocator, arg);
-        }
+    // Configuration: lib/conf applies default < file < CLI (ADR-9).
+    // xmppctl has no master and no --conf-fd; --config is prescanned so
+    // the file loads before the CLI applies. Unknown options, unknown
+    // file keys and bad values are startup errors with the Diag.
+    var diag: conf.Diag = .{};
+    var loaded = loadCtlConfig(allocator, prescanned.args.items, &diag) catch |err| {
+        log.err("{f}", .{&diag});
+        return err;
+    };
+    defer loaded.deinit();
+    const v = &loaded.values;
+
+    if (v.meta.help) {
+        var buf: [4096]u8 = undefined;
+        var stdout = std.fs.File.stdout().writer(&buf);
+        try writeUsage(&stdout.interface);
+        try stdout.interface.flush();
+        return;
     }
 
-    if (remaining_args.items.len == 0) {
-        printUsage();
+    const db_path = v.server.db_path;
+    const auth_socket = v.auth.socket;
+    const cli_password: ?[]const u8 = if (loaded.provenanceOf("ctl", "password") == .cli) v.ctl.password else null;
+    const password_file: ?[]const u8 = if (loaded.provenanceOf("ctl", "password_file") == .cli) v.ctl.password_file else null;
+    const apply = v.ctl.apply;
+    const raw = v.ctl.raw;
+    const run_dir = v.master.run_dir;
+    const pos = loaded.positionals();
+
+    if (pos.len == 0) {
+        var err_buf: [0]u8 = .{};
+        var stderr = std.fs.File.stderr().writer(&err_buf);
+        try writeUsage(&stderr.interface);
         return error.InvalidArgs;
     }
 
-    const command = remaining_args.items[0];
+    const command = pos[0];
 
     const is_db_write = std.mem.eql(u8, command, "adduser") or
         std.mem.eql(u8, command, "deluser") or
@@ -134,37 +112,33 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, command, "migrate-precis")) {
-        const forced: ?migrate_precis.ForcedRename = if (rename_old != null and rename_new != null)
-            .{ .old_localpart = rename_old.?, .new_localpart = rename_new.? }
+        const forced: ?migrate_precis.ForcedRename = if (rename_old) |old|
+            .{ .old_localpart = old, .new_localpart = rename_new.? }
         else
             null;
-        if ((rename_old == null) != (rename_new == null)) {
-            printErr("--rename requires an old and a new localpart\n");
-            return error.InvalidArgs;
-        }
-        return runMigratePrecis(allocator, db_path, run_dir, apply, hosted_domains.items, forced);
+        return runMigratePrecis(allocator, db_path, run_dir, apply, hosted_domains, forced);
     }
 
     if (std.mem.eql(u8, command, "migrate-archive")) {
-        return runMigrateArchive(allocator, db_path, run_dir, apply, hosted_domains.items);
+        return runMigrateArchive(allocator, db_path, run_dir, apply, hosted_domains);
     }
 
     if (raw and std.mem.eql(u8, command, "deluser")) {
-        if (remaining_args.items.len < 2) {
+        if (pos.len < 2) {
             printErr("deluser --raw requires an exact stored key\n");
             return error.InvalidArgs;
         }
-        if (hosted_domains.items.len == 0) {
+        if (hosted_domains.len == 0) {
             printErr("deluser --raw requires at least one --hosted-domain\n");
             return error.InvalidArgs;
         }
-        return runDeleteRaw(allocator, db_path, run_dir, hosted_domains.items, remaining_args.items[1]);
+        return runDeleteRaw(allocator, db_path, run_dir, hosted_domains, pos[1]);
     }
 
     // Try IPC to running auth daemon first for adduser/deluser/passwd.
     // This is required for RocksDB (exclusive lock) and preferred for all backends.
     if (!raw and (std.mem.eql(u8, command, "adduser") or std.mem.eql(u8, command, "deluser") or std.mem.eql(u8, command, "passwd"))) {
-        if (tryIpcCommand(allocator, command, remaining_args.items, auth_socket, cli_password, password_file)) {
+        if (tryIpcCommand(allocator, command, pos, auth_socket, cli_password, password_file)) {
             return; // IPC succeeded
         }
         // Fall through to direct DB access
@@ -187,11 +161,11 @@ pub fn main() !void {
     var binding_store = BindingStore.init(&backend);
 
     if (std.mem.eql(u8, command, "adduser")) {
-        if (remaining_args.items.len < 2) {
+        if (pos.len < 2) {
             printErr("adduser requires a JID argument\n");
             return error.InvalidArgs;
         }
-        const jid = remaining_args.items[1];
+        const jid = pos[1];
         const username = extractLocal(jid);
 
         // Resolve password: --password > --password-file > interactive prompt
@@ -251,11 +225,11 @@ pub fn main() !void {
         printOut(" created.\n");
         signalAuthDaemon();
     } else if (std.mem.eql(u8, command, "deluser")) {
-        if (remaining_args.items.len < 2) {
+        if (pos.len < 2) {
             printErr("deluser requires a JID argument\n");
             return error.InvalidArgs;
         }
-        const jid = remaining_args.items[1];
+        const jid = pos[1];
         const username = extractLocal(jid);
 
         removeUserCanonical(&store, allocator, username) catch |err| {
@@ -271,11 +245,11 @@ pub fn main() !void {
         printOut(" removed.\n");
         signalAuthDaemon();
     } else if (std.mem.eql(u8, command, "passwd")) {
-        if (remaining_args.items.len < 2) {
+        if (pos.len < 2) {
             printErr("passwd requires a JID argument\n");
             return error.InvalidArgs;
         }
-        const jid = remaining_args.items[1];
+        const jid = pos[1];
         const username = extractLocal(jid);
 
         var pass_buf: [256]u8 = undefined;
@@ -315,11 +289,11 @@ pub fn main() !void {
             }
         }
     } else if (std.mem.eql(u8, command, "lock")) {
-        if (remaining_args.items.len < 2) {
+        if (pos.len < 2) {
             printErr("lock requires a JID argument\n");
             return error.InvalidArgs;
         }
-        const jid = remaining_args.items[1];
+        const jid = pos[1];
         const username = extractLocal(jid);
 
         lock_store.lock(username, .permanent) catch |err| {
@@ -331,11 +305,11 @@ pub fn main() !void {
         printOut(" locked.\n");
         signalAuthDaemon();
     } else if (std.mem.eql(u8, command, "unlock")) {
-        if (remaining_args.items.len < 2) {
+        if (pos.len < 2) {
             printErr("unlock requires a JID argument\n");
             return error.InvalidArgs;
         }
-        const jid = remaining_args.items[1];
+        const jid = pos[1];
         const username = extractLocal(jid);
 
         lock_store.unlock(allocator, username) catch |err| {
@@ -347,35 +321,21 @@ pub fn main() !void {
         printOut(" unlocked.\n");
         signalAuthDaemon();
     } else if (std.mem.eql(u8, command, "invite")) {
-        if (remaining_args.items.len < 2) {
+        if (pos.len < 2) {
             printErr("invite requires a subcommand: create, list, revoke\n");
             return error.InvalidArgs;
         }
-        const subcmd = remaining_args.items[1];
+        const subcmd = pos[1];
 
         if (std.mem.eql(u8, subcmd, "create")) {
-            // Parse --max-uses and --expires from remaining args
-            var max_uses: u16 = 1;
-            var expires: u32 = 0;
-            var i: usize = 2;
-            while (i < remaining_args.items.len) : (i += 1) {
-                const a = remaining_args.items[i];
-                if (std.mem.eql(u8, a, "--max-uses") and i + 1 < remaining_args.items.len) {
-                    i += 1;
-                    max_uses = std.fmt.parseInt(u16, remaining_args.items[i], 10) catch {
-                        printErr("--max-uses requires a number\n");
-                        return error.InvalidArgs;
-                    };
-                } else if (std.mem.eql(u8, a, "--expires") and i + 1 < remaining_args.items.len) {
-                    i += 1;
-                    const hours = std.fmt.parseInt(u32, remaining_args.items[i], 10) catch {
-                        printErr("--expires requires hours as a number\n");
-                        return error.InvalidArgs;
-                    };
-                    const now: u32 = @intCast(@as(u64, @bitCast(std.time.timestamp())) & 0xFFFFFFFF);
-                    expires = now + hours * 3600;
-                }
-            }
+            // --max-uses and --expires are schema options now; an explicit
+            // --expires keeps the old absolute-deadline semantics and no
+            // flag means no expiry.
+            const max_uses = v.ctl.max_uses;
+            const expires: u32 = if (loaded.provenanceOf("ctl", "expires_hours") == .cli) blk: {
+                const now: u32 = @intCast(@as(u64, @bitCast(std.time.timestamp())) & 0xFFFFFFFF);
+                break :blk now + v.ctl.expires_hours * 3600;
+            } else 0;
 
             var code_buf: [16]u8 = undefined;
             const code = invite_store_mod.generateCode(&code_buf);
@@ -402,11 +362,11 @@ pub fn main() !void {
                 }
             }
         } else if (std.mem.eql(u8, subcmd, "revoke")) {
-            if (remaining_args.items.len < 3) {
+            if (pos.len < 3) {
                 printErr("invite revoke requires a code argument\n");
                 return error.InvalidArgs;
             }
-            const code = remaining_args.items[2];
+            const code = pos[2];
             invite_store.revoke(allocator, code) catch |err| {
                 printErr("failed to revoke invite\n");
                 return err;
@@ -419,16 +379,16 @@ pub fn main() !void {
             return error.InvalidArgs;
         }
     } else if (std.mem.eql(u8, command, "oidc-link")) {
-        if (remaining_args.items.len < 4) {
+        if (pos.len < 4) {
             printErr("oidc-link requires: <localpart> <issuer> <subject>\n");
             return error.InvalidArgs;
         }
-        const lp = prepareAccountName(remaining_args.items[1]) catch {
+        const lp = prepareAccountName(pos[1]) catch {
             printErr("invalid localpart\n");
             return error.InvalidAccountName;
         };
-        const iss = remaining_args.items[2];
-        const sub = remaining_args.items[3];
+        const iss = pos[2];
+        const sub = pos[3];
         const claimed = binding_store.bind(allocator, iss, sub, lp, .operator, std.time.timestamp(), null) catch |err| {
             printErr("oidc-link failed\n");
             return err;
@@ -450,11 +410,11 @@ pub fn main() !void {
             .local_account, .unclaimed_data => unreachable,
         }
     } else if (std.mem.eql(u8, command, "oidc-unlink")) {
-        if (remaining_args.items.len < 2) {
+        if (pos.len < 2) {
             printErr("oidc-unlink requires a localpart\n");
             return error.InvalidArgs;
         }
-        const lp = prepareAccountName(remaining_args.items[1]) catch {
+        const lp = prepareAccountName(pos[1]) catch {
             printErr("invalid localpart\n");
             return error.InvalidAccountName;
         };
@@ -476,11 +436,11 @@ pub fn main() !void {
         try printOidcBindings(&it, &stdout.interface);
         try stdout.interface.flush();
     } else if (std.mem.eql(u8, command, "oidc-link-import")) {
-        if (remaining_args.items.len < 2) {
+        if (pos.len < 2) {
             printErr("oidc-link-import requires a file\n");
             return error.InvalidArgs;
         }
-        const content = std.fs.cwd().readFileAlloc(allocator, remaining_args.items[1], 16 * 1024 * 1024) catch |err| {
+        const content = std.fs.cwd().readFileAlloc(allocator, pos[1], 16 * 1024 * 1024) catch |err| {
             printErr("cannot read import file\n");
             return err;
         };
@@ -539,7 +499,9 @@ pub fn main() !void {
         printErr("unknown command: ");
         printErr(command);
         printErr("\n");
-        printUsage();
+        var err_buf: [0]u8 = .{};
+        var stderr = std.fs.File.stderr().writer(&err_buf);
+        try writeUsage(&stderr.interface);
         return error.InvalidArgs;
     }
 }
@@ -1283,8 +1245,86 @@ fn writeAll(fd: posix.fd_t, data: []const u8) !void {
     }
 }
 
-fn printUsage() void {
-    printErr(
+/// The arguments the loader does not see: --rename OLD NEW and the
+/// repeatable --hosted-domain, plus the filtered argv it does see.
+const PrescannedArgv = struct {
+    args: std.ArrayList([]const u8),
+    hosted_domains: std.ArrayList([]const u8),
+    rename_old: ?[]const u8 = null,
+    rename_new: ?[]const u8 = null,
+
+    fn deinit(self: *PrescannedArgv, allocator: std.mem.Allocator) void {
+        self.args.deinit(allocator);
+        self.hosted_domains.deinit(allocator);
+    }
+};
+
+/// Value-taking option spellings ctl accepts, so the pre-scan can skip
+/// their values: a password or path that happens to spell --rename or
+/// --hosted-domain stays a value. Mirrors the ctl_cli table.
+fn ctlOptionTakesValue(arg: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
+    const names = [_][]const u8{
+        "--db",      "--auth-socket", "--password", "--password-file",
+        "--run-dir", "--max-uses",    "--expires",  "--config",
+        "-c",
+    };
+    for (names) |n| if (std.mem.eql(u8, arg, n)) return true;
+    return false;
+}
+
+/// Lifts --rename OLD NEW and repeatable --hosted-domain D out of argv
+/// before the loader runs: a two-value option and a list do not fit the
+/// CLI table. Every other argument keeps its place so the loader can
+/// diagnose unknown spellings itself.
+fn prescanCtlArgv(allocator: std.mem.Allocator, argv: []const []const u8) !PrescannedArgv {
+    var out = PrescannedArgv{ .args = .empty, .hosted_domains = .empty };
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--rename")) {
+            if (i + 2 >= argv.len) {
+                printErr("--rename requires an old and a new localpart\n");
+                return error.InvalidArgs;
+            }
+            out.rename_old = argv[i + 1];
+            out.rename_new = argv[i + 2];
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--hosted-domain")) {
+            if (i + 1 >= argv.len) {
+                printErr("--hosted-domain requires a value\n");
+                return error.InvalidArgs;
+            }
+            try out.hosted_domains.append(allocator, argv[i + 1]);
+            i += 1;
+            continue;
+        }
+        try out.args.append(allocator, arg);
+        if (ctlOptionTakesValue(arg) and i + 1 < argv.len) {
+            i += 1;
+            try out.args.append(allocator, argv[i]);
+        }
+    }
+    return out;
+}
+
+/// Loads the xmppctl configuration through the shared loader (ADR-9).
+/// xmppctl has no master and no --conf-fd: a --config file is read
+/// directly and precedence is default < file < CLI.
+fn loadCtlConfig(gpa: std.mem.Allocator, argv: []const []const u8, diag: *conf.Diag) conf.Error!schema.CtlLoader {
+    return schema.CtlLoader.load(gpa, .{
+        .path = schema.configPathArg(argv),
+        .args = argv,
+    }, diag);
+}
+
+/// The bespoke command grammar; the loader's generated option help does
+/// not cover subcommands, so usage stays handwritten.
+fn writeUsage(w: *std.Io.Writer) !void {
+    try w.writeAll(
         \\Usage: xmppctl [--db PATH] [--auth-socket PATH] COMMAND [ARGS]
         \\
         \\Commands:
@@ -1311,15 +1351,19 @@ fn printUsage() void {
         \\  oidc-link-import F    Link localparts from a file (LP ISS SUB per line)
         \\
         \\Options:
-        \\  --db PATH           Storage directory (default: /var/db/xmppd)
+        \\  --db PATH           Storage directory (default: /var/db/xmppd/users.db)
         \\  --auth-socket PATH  Auth daemon IPC socket (default: /var/run/xmppd/auth.sock)
         \\  --password PASS     Provide password on command line (non-interactive)
         \\  --password-file F   Read password from file (first line, trailing newline stripped)
         \\  --apply             Apply migrate-precis/migrate-archive ops (default is a dry run)
         \\  --raw               deluser: exact source localpart; requires --hosted-domain
         \\  --run-dir PATH      Daemon pid-file directory (default: /var/run/xmppd)
+        \\  --max-uses N        invite create: maximum uses (default 1)
+        \\  --expires HOURS     invite create: hours until expiry
         \\  --hosted-domain D   Hosted account domain; repeat for each domain
         \\  --rename OLD NEW    migrate-precis: explicitly rename one localpart
+        \\  -c, --config FILE   Read the shared config file
+        \\  -h, --help          Show this help
         \\
     );
 }
@@ -1564,4 +1608,75 @@ test "oidc-unclaimed: an unscannable namespace is reported and fails the audit" 
         cmdOidcUnclaimed(allocator, &store, &open_fail, "/nonexistent-xmppd-db", &cmd_errw),
     );
     try std.testing.expect(std.mem.indexOf(u8, cmd_errw.buffered(), "users") != null);
+}
+
+test "ctl pre-scan lifts --rename and --hosted-domain, loader sees the rest" {
+    const allocator = std.testing.allocator;
+    var p = try prescanCtlArgv(allocator, &.{
+        "migrate-precis", "--hosted-domain", "a.example",
+        "--apply",        "--rename",        "old",
+        "new",            "--hosted-domain", "b.example",
+    });
+    defer p.deinit(allocator);
+    try std.testing.expectEqualStrings("old", p.rename_old.?);
+    try std.testing.expectEqualStrings("new", p.rename_new.?);
+    try std.testing.expectEqualDeep(&[_][]const u8{ "a.example", "b.example" }, p.hosted_domains.items);
+
+    var diag: conf.Diag = .{};
+    var l = try loadCtlConfig(allocator, p.args.items, &diag);
+    defer l.deinit();
+    try std.testing.expectEqualStrings("migrate-precis", l.positionals()[0]);
+    try std.testing.expect(l.values.ctl.apply);
+}
+
+test "ctl pre-scan keeps a value that spells a lifted option" {
+    // Goal: "--password --rename" means the password is the literal text
+    // --rename, exactly as the old sequential parser read it; lifting it
+    // would both drop the password and misparse the option.
+    const allocator = std.testing.allocator;
+    var p = try prescanCtlArgv(allocator, &.{ "adduser", "a@x", "--password", "--rename" });
+    defer p.deinit(allocator);
+    try std.testing.expect(p.rename_old == null);
+
+    var diag: conf.Diag = .{};
+    var l = try loadCtlConfig(allocator, p.args.items, &diag);
+    defer l.deinit();
+    try std.testing.expectEqualStrings("--rename", l.values.ctl.password);
+    try std.testing.expectEqual(@as(usize, 2), l.positionals().len);
+}
+
+test "ctl load rejects an unknown option instead of making it the command" {
+    var diag: conf.Diag = .{};
+    try std.testing.expectError(
+        error.UnknownArgument,
+        loadCtlConfig(std.testing.allocator, &.{ "--bogus", "listusers" }, &diag),
+    );
+}
+
+test "ctl --config loads file values and rejects an unknown key at file:line" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("ctl.ini", .{});
+    try f.writeAll("[server]\ndb_path = /file/db\nbogus_key = 1\n");
+    f.close();
+    var path_buf: [4096]u8 = undefined;
+    const path = try tmp.dir.realpath("ctl.ini", &path_buf);
+
+    var diag: conf.Diag = .{};
+    try std.testing.expectError(
+        error.UnknownKey,
+        loadCtlConfig(allocator, &.{ "--config", path, "listusers" }, &diag),
+    );
+    try std.testing.expectEqual(@as(u32, 3), diag.line);
+
+    const g = try tmp.dir.createFile("ok.ini", .{});
+    try g.writeAll("[server]\ndb_path = /file/db\n");
+    g.close();
+    const ok_path = try tmp.dir.realpath("ok.ini", &path_buf);
+    var diag2: conf.Diag = .{};
+    var l = try loadCtlConfig(allocator, &.{ "-c", ok_path, "listusers" }, &diag2);
+    defer l.deinit();
+    try std.testing.expectEqualStrings("/file/db", l.values.server.db_path);
+    try std.testing.expectEqual(.file, l.provenanceOf("server", "db_path"));
 }

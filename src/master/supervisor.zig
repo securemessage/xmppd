@@ -128,7 +128,7 @@ pub const Supervisor = struct {
     /// no fixed scratch base), then moved into place with dup2 (closes the
     /// target atomically before copying).
     pub fn applyFdPass(self: *Supervisor) void {
-        const scratch_max = 64; // Supervisor.pass_fds has no more entries than MAX_WORKERS
+        const scratch_max = 65; // MAX_WORKERS listeners plus the forwarded-config fd
         var scratch: [scratch_max]i32 = @splat(-1);
         const n = @min(self.pass_fds.len, scratch_max);
         // Phase 1: park sources ABOVE the target zone (min = 3+n) so nothing

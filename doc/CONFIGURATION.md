@@ -1,8 +1,14 @@
 # xmppd Configuration
 
-All configuration lives in a single INI file (default: `/usr/local/etc/xmppd/xmppd.conf`).
-CLI flags override config file values. Sensible defaults allow running without a config file
-in development mode.
+All configuration lives in a single INI file shared by every daemon, selected
+with `--config PATH` (`-c`). `xmppd-auth-oidc` defaults to
+`/usr/local/etc/xmppd/xmppd.conf` when `--config` is absent. Precedence is
+default < file < CLI, tracked per field, with the master's resolved values
+forwarded to its children in between (see "Config forwarding" below). An
+unknown section or key, a bad value, or a malformed line is a startup error
+that names the file and line; defaults live only in the schema
+(`src/config/schema.zig`), so `xmppd --help` is the authoritative option
+list.
 
 ## Sections
 
@@ -10,19 +16,22 @@ in development mode.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `hostname` | (required) | XMPP domain (e.g., `example.com`) |
-| `bind_address` | `0.0.0.0` | Listen address |
+| `hostname` | `localhost` | XMPP domain (e.g., `example.com`) |
+| `bind_address` | `0.0.0.0` | Listen address literal (C2S; also S2S unless `s2s.bind_address` is set) |
 | `c2s_port` | `5222` | Client-to-server port |
-| `user` | (none) | Drop privileges to this user (children only) |
-| `db_path` | `/var/db/xmppd` | Database directory |
-| `log_file` | (none) | Log file path (stderr if unset) |
+| `db_path` | `/var/db/xmppd` | Storage base directory; the master also creates `auth/`, `op/`, `archive/` subdirectories under it |
+| `lmdb_map_size_mb` | `8192` | LMDB map size in MiB |
+| `user` | (none) | Unprivileged user the master's children run as (required when the master runs as root) |
+| `log_file` | `/var/log/xmppd/xmppd.log` | Log file path (used with `--background`) |
+| `pidfile` | `/var/run/xmppd/xmppd.pid` | PID file path |
 
 ### [tls]
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `cert` | (required) | TLS certificate path (PEM, full chain) |
-| `key` | (required) | TLS private key path (PEM) |
+| `cert` | (none) | TLS certificate path (PEM, full chain) |
+| `key` | (none) | TLS private key path (PEM) |
+| `enabled` | `true` | Enable STARTTLS |
 
 ### [core]
 
@@ -30,6 +39,9 @@ in development mode.
 |-----|---------|-------------|
 | `max_sessions` | `4096` | Maximum concurrent C2S sessions |
 | `fan_out_batch_size` | `32` | MUC fan-out yield threshold |
+| `max_resources_per_account` | `256` | Maximum resources per account |
+| `workers` | `auto` | Worker threads (`auto` = CPU count) |
+| `log_level` | `info` | Log verbosity (`debug`, `info`, `warn`, `err`) |
 
 ### [auth]
 
@@ -37,14 +49,25 @@ in development mode.
 |-----|---------|-------------|
 | `socket` | `/var/run/xmppd/auth.sock` | IPC socket path |
 | `rate_limit` | `true` | Authentication rate limiting master switch; `false` disables it entirely (testing/benchmarks only) |
-| `max_per_account` | `60` | Max auth attempts per account per window |
-| `max_per_ip` | `200` | Max auth attempts per IP per window |
+| `max_per_account` | `60` | Max auth attempts per account per window (alias `rate_max_per_account`) |
+| `max_per_ip` | `200` | Max auth attempts per IP per window (alias `rate_max_per_ip`) |
 | `window_seconds` | `120` | Rate window size |
-| `lockout_duration` | `300` | Temporary lockout length in seconds |
+| `lockout_duration` | `5m` | Temporary lockout (`300`, `300s` and `5m` are equivalent) |
 | `lockout_threshold` | `10` | Consecutive account failures before temporary lockout |
 | `ip_lockout_threshold` | `20` | Consecutive IP failures before that address is temporarily locked |
+| `users_scan_limit` | `100000` | Startup users scan bound |
+| `crypto_threads` | `4` | Password hash threads (`0` disables the pool and derives inline) |
 | `registration` | `false` | In-band registration (XEP-0077) |
 | `require_invite` | `true` | Require invitation code for registration |
+
+### [s2s]
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `socket` | `/var/run/xmppd/s2s.sock` | IPC socket path |
+| `port` | `5269` | S2S listening port |
+| `enabled` | `true` | Enable s2s federation |
+| `bind_address` | (follows `server.bind_address`) | S2S listen address literal |
 
 ### [muc]
 
@@ -56,9 +79,12 @@ in development mode.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `core_path` | `/usr/local/libexec/xmppd/xmppd-core` | Core binary path |
-| `auth_path` | `/usr/local/libexec/xmppd/xmppd-auth` | Auth binary path (or `xmppd-auth-oidc`) |
-| `s2s_path` | `/usr/local/libexec/xmppd/xmppd-s2s` | S2S federation binary path |
+| `core_path` | `xmppd-core` | Core binary path |
+| `auth_path` | `xmppd-auth` | Auth binary path (or `xmppd-auth-oidc`) |
+| `s2s_path` | `xmppd-s2s` | S2S federation binary path |
+
+`run_dir` and `background` are CLI-only: a `[master]` file key naming either
+is an unknown-key error.
 
 ### [oidc] (when using xmppd-auth-oidc)
 
@@ -72,7 +98,15 @@ in development mode.
 | `introspection_endpoint` | no | RFC 7662 introspection (for opaque tokens) |
 | `ca_file` | no | CA bundle path for IdP TLS verification |
 | `user_domain` | no | Domain appended to bare usernames for ROPC (e.g., `morante.dev`) |
+| `socket` | no | OIDC-specific IPC socket override; when unset, inherits `[auth] socket` (default `/var/run/xmppd/auth.sock`) |
+| `max_per_account` | no | Max requests per account (default `60`, alias `rate_max_per_account`) |
+| `max_per_ip` | no | Max requests per IP (default `200`, alias `rate_max_per_ip`) |
+| `rate_limit` | no | Rate limiting switch (default `true`) |
 | `import_avatar` | no | Import IdP `picture` claim into vCard on first login (`true`/`false`, default `false`) |
+| `idp_threads` | no | IdP HTTP client threads (default `8`) |
+| `idp_max_outstanding` | no | Max in-flight IdP requests (default `256`) |
+| `idp_connect_timeout_ms` | no | IdP connect timeout (default `3000`) |
+| `idp_timeout_ms` | no | IdP request timeout (default `10000`) |
 | `localpart_claim` | no | Claim supplying the first-login localpart suggestion: `preferred_username` (default), `email`, `sub`, or empty string to disable auto-provisioning |
 | `localpart_claim_prefix` | no | Prefix stripped from the suggestion claim before PRECIS preparation (e.g., `user:` for identity-oidc handle-form subjects) |
 | `localpart_auto_suffix` | no | When the suggested localpart is taken, try `lp-2` .. `lp-99` (`true`/`false`, default `false`: a taken suggestion is refused, never silently suffixed) |
@@ -157,14 +191,80 @@ ca_file = /usr/local/etc/xmppd/ca-bundle.pem
 
 ## CLI Flags
 
-All binaries accept `--config PATH` to specify the config file location.
-The master additionally accepts:
+All binaries accept `--config PATH` (`-c`) to specify the config file
+location. `xmppd --help` prints the generated list below; it is produced
+from the schema, so it cannot drift from what the parser accepts:
 
-- `--background` / `-b` - daemonize (fork + setsid)
-- `--help` / `-h` - usage
+```
+  --host <HOST>           XMPP server hostname
+  --port <PORT>           c2s listen port
+  --bind <BIND>           c2s/s2s listen address literal
+  --cert <CERT>           TLS certificate file (PEM)
+  --key <KEY>             TLS private key file (PEM)
+  --core-path <CORE-PATH> path to xmppd-core
+  --auth-path <AUTH-PATH> path to xmppd-auth
+  --s2s-path <S2S-PATH>   path to xmppd-s2s
+  --no-s2s                disable s2s federation
+  --auth-socket <AUTH-SOCKET> auth IPC socket path
+  --db <DB>               user database path
+  --config, -c <CONFIG>   config file path (passed to children)
+  --log-file <LOG-FILE>   log file path (--background)
+  --run-dir <RUN-DIR>     runtime dir for pid files
+  --background, -b        daemonize (fork, detach from terminal)
+  --version, -v           print version and exit
+  --help, -h              show this help
+```
+
+### Auth daemon options
+
+`xmppd-auth --help` and `xmppd-auth-oidc --help` are also generated from
+the schema. `xmppd-auth` accepts:
+
+- `-c`, `--config PATH`
+- `--db PATH`
+- `--socket PATH`
+- `--max-auth-per-account N`
+- `--max-auth-per-ip N`
+- `--auth-window SECONDS`
+- `--lockout-duration DURATION` (a bare number is seconds)
+- `--lockout-threshold N`
+- `--ip-lockout-threshold N`
+- `--no-rate-limit`
+- `--enable-registration`
+- `--no-require-invite`
+- `--users-scan-limit N`
+- `--conf-fd N` (the master's inherited sealed config slot)
+- `-h`, `--help`
+
+`xmppd-auth-oidc` accepts `-c`/`--config PATH`, `--db PATH`,
+`--socket PATH`, `--conf-fd N`, and `-h`/`--help`. Without `--config`
+or `--conf-fd`, it reads `/usr/local/etc/xmppd/xmppd.conf`.
+
+Unknown arguments, unknown file keys, malformed lines, non-numeric values,
+and values outside the consuming daemon's bounds are startup errors with a
+`file:line` diagnostic when they came from a file. Rate maxima above 65535,
+a zero rate window, and a lockout that is not a whole number of seconds are
+errors rather than values to clamp or replace with defaults.
+
+## Config forwarding
+
+The master forwards the *resolved* values to every child. After loading
+the file and its own CLI it serializes the effective fields once into a
+sealed in-memory fd that `xmppd-auth` (either backend), `xmppd-core`, and
+`xmppd-s2s` inherit through the supervisor's `pass_fds` remap, named on
+their argv as `--conf-fd N`. Their precedence is therefore
+default < file < forwarded < CLI: a file key or a master CLI flag
+(`xmppd -c xmppd.conf --host x.test`) reaches every child exactly once,
+and a child-side CLI flag still wins for a manual run. Child argv carries
+only fd remap slots (`--listen-fd` where applicable and `--conf-fd`). A
+child started by hand without `--conf-fd` reads `--config` directly. On
+SIGHUP the master rebuilds the fd from the reloaded configuration before
+forwarding the signal, so a respawned child sees the new values; no
+supervised child re-reads the file.
 
 `xmppctl` accepts:
-- `--db PATH` - database directory
+- `-c`, `--config PATH` - read the shared config file
+- `--db PATH` - database directory (default: the shared `[server] db_path`)
 - `--auth-socket PATH` - auth daemon IPC socket (tries IPC first, falls back to direct DB)
 - `--password VALUE` - non-interactive password
 - `--password-file PATH` - read password from file
