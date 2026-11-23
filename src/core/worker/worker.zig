@@ -1379,7 +1379,7 @@ pub const Server = struct {
     /// any live arm is deleted. Called once per iteration tail, so repeated
     /// mutations inside a batch collapse to a single stage. A stage lost
     /// to a full batch leaves sm_expiry_pending set and the next iteration
-    /// retries — the arm is owed, never dropped silently.
+    /// retries: the arm is owed, never dropped silently.
     fn armSmExpiry(self: *Server, changes: *ChangeList) void {
         if (self.sm_expiry.nextDeadline()) |deadline| {
             if (self.sm_expiry_armed and self.sm_expiry_armed_deadline == deadline) {
@@ -5858,7 +5858,7 @@ test "Server: scram_stale evicts the cached params and fails soft" {
 }
 
 // C11: the expiry wheel's arm is a single one-shot timer at the earliest
-// deadline — never a periodic sweep, never per-session timers.
+// deadline: never a periodic sweep, never per-session timers.
 test "Server: C11 SM expiry stages exactly one one-shot timer at the wheel deadline" {
     var server: Server = undefined;
     try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
