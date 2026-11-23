@@ -33,7 +33,10 @@ const net = @import("net");
 const runtime_mod = @import("runtime.zig");
 const Runtime = runtime_mod.Runtime;
 const ChildCtl = runtime_mod.ChildCtl;
-const config_mod = @import("config");
+const conf = @import("conf");
+const schema = @import("schema");
+const Allocator = std.mem.Allocator;
+const MasterLoader = schema.MasterLoader;
 
 const log = std.log.scoped(.xmppd);
 
@@ -50,189 +53,58 @@ pub fn main() !void {
     defer root.deinit();
     const allocator = root.allocator();
 
-    // Parse command-line arguments
+    // Configuration: lib/conf applies default < file < CLI and records
+    // provenance. The config path is scanned out of argv first because
+    // the file must load before the CLI applies. An unknown argument,
+    // unknown file key, or bad value is a startup error with the Diag.
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
+    _ = args.next(); // argv[0]
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    while (args.next()) |arg| try argv.append(allocator, arg);
 
-    var host: []const u8 = "localhost";
-    var port: []const u8 = "5222";
-    var bind_address: []const u8 = "0.0.0.0";
-    var s2s_bind_address: ?[]const u8 = null;
-    var cert_path: ?[]const u8 = null;
-    var key_path: ?[]const u8 = null;
-    var core_path: []const u8 = "xmppd-core";
-    var auth_path: []const u8 = "xmppd-auth";
-    var s2s_path: []const u8 = "xmppd-s2s";
-    var auth_socket: []const u8 = "/var/run/xmppd/auth.sock";
-    var s2s_socket: []const u8 = "/var/run/xmppd/s2s.sock";
-    var s2s_port: []const u8 = "5269";
-    var s2s_enabled: bool = true;
-    var db_path: []const u8 = "/var/db/xmppd/users.db";
-    var config_path: ?[]const u8 = null;
-    var muc_host_cfg: ?[]const u8 = null;
-    var run_user: ?[]const u8 = null;
-    var log_file: []const u8 = "/var/log/xmppd/xmppd.log";
-    var run_dir: []const u8 = "/var/run/xmppd";
-    var daemonize: bool = false;
-    var workers: u16 = 0; // 0 = auto-detect CPU count
+    var diag: conf.Diag = .{};
+    var loaded = MasterLoader.load(allocator, .{
+        .path = configPathArg(argv.items),
+        .args = argv.items,
+    }, &diag) catch |err| {
+        log.err("{f}", .{diag});
+        return err;
+    };
+    defer loaded.deinit();
+    const v = &loaded.values;
 
-    // Skip argv[0]
-    _ = args.next();
-
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--host")) {
-            host = args.next() orelse {
-                log.err("--host requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--port")) {
-            port = args.next() orelse {
-                log.err("--port requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--bind")) {
-            bind_address = args.next() orelse {
-                log.err("--bind requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--cert")) {
-            cert_path = args.next() orelse {
-                log.err("--cert requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--key")) {
-            key_path = args.next() orelse {
-                log.err("--key requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--core-path")) {
-            core_path = args.next() orelse {
-                log.err("--core-path requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--auth-path")) {
-            auth_path = args.next() orelse {
-                log.err("--auth-path requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--s2s-path")) {
-            s2s_path = args.next() orelse {
-                log.err("--s2s-path requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--no-s2s")) {
-            s2s_enabled = false;
-        } else if (std.mem.eql(u8, arg, "--auth-socket")) {
-            auth_socket = args.next() orelse {
-                log.err("--auth-socket requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--db")) {
-            db_path = args.next() orelse {
-                log.err("--db requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
-            config_path = args.next() orelse {
-                log.err("--config requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--log-file")) {
-            log_file = args.next() orelse {
-                log.err("--log-file requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--run-dir")) {
-            run_dir = args.next() orelse {
-                log.err("--run-dir requires a value", .{});
-                return error.InvalidArgs;
-            };
-        } else if (std.mem.eql(u8, arg, "--background") or std.mem.eql(u8, arg, "-b")) {
-            daemonize = true;
-        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            printVersion();
-            return;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            printUsage();
-            return;
-        } else {
-            log.warn("unknown argument: {s}", .{arg});
-        }
+    if (v.meta.version) {
+        printVersion();
+        return;
+    }
+    if (v.meta.help) {
+        try printUsage(allocator);
+        return;
     }
 
-    // Apply config file defaults (CLI flags take precedence)
-    var cfg: ?config_mod.Config = null;
-    if (config_path) |cp| {
-        cfg = config_mod.parse(allocator, cp) catch |err| {
-            log.err("failed to read config file '{s}': {}", .{ cp, err });
-            return error.InvalidArgs;
-        };
-        const c = &cfg.?;
-
-        // [server] section
-        if (std.mem.eql(u8, host, "localhost")) {
-            if (c.get("server", "hostname")) |v| host = v;
-        }
-        if (std.mem.eql(u8, port, "5222")) {
-            if (c.get("server", "c2s_port")) |v| port = v;
-        }
-        if (std.mem.eql(u8, bind_address, "0.0.0.0")) {
-            if (c.get("server", "bind_address")) |v| bind_address = v;
-        }
-        if (std.mem.eql(u8, db_path, "/var/db/xmppd/users.db")) {
-            if (c.get("server", "db_path")) |v| db_path = v;
-        }
-        if (run_user == null) {
-            if (c.get("server", "user")) |v| run_user = v;
-        }
-        if (std.mem.eql(u8, log_file, "/var/log/xmppd/xmppd.log")) {
-            if (c.get("server", "log_file")) |v| log_file = v;
-        }
-
-        // [tls] section
-        if (cert_path == null) {
-            if (c.get("tls", "cert")) |v| cert_path = v;
-        }
-        if (key_path == null) {
-            if (c.get("tls", "key")) |v| key_path = v;
-        }
-
-        // [auth] section
-        if (std.mem.eql(u8, auth_socket, "/var/run/xmppd/auth.sock")) {
-            if (c.get("auth", "socket")) |v| auth_socket = v;
-        }
-
-        // [s2s] section
-        if (std.mem.eql(u8, s2s_socket, "/var/run/xmppd/s2s.sock")) {
-            if (c.get("s2s", "socket")) |v| s2s_socket = v;
-        }
-        if (std.mem.eql(u8, s2s_port, "5269")) {
-            if (c.get("s2s", "port")) |v| s2s_port = v;
-        }
-        if (c.get("s2s", "bind_address")) |v| s2s_bind_address = v;
-
-        // [muc] section (s2s federation to= served-host check)
-        if (c.get("muc", "host")) |v| muc_host_cfg = v;
-
-        // [core] section — workers
-        if (workers == 0) {
-            if (c.get("core", "workers")) |v| {
-                workers = std.fmt.parseInt(u16, v, 10) catch 0;
-            }
-        }
-
-        // [master] section
-        if (std.mem.eql(u8, core_path, "xmppd-core")) {
-            if (c.get("master", "core_path")) |v| core_path = v;
-        }
-        if (std.mem.eql(u8, auth_path, "xmppd-auth")) {
-            if (c.get("master", "auth_path")) |v| auth_path = v;
-        }
-        if (std.mem.eql(u8, s2s_path, "xmppd-s2s")) {
-            if (c.get("master", "s2s_path")) |v| s2s_path = v;
-        }
-    }
-    defer if (cfg) |*c| c.deinit();
+    const host = v.server.hostname;
+    const bind_address = v.server.bind_address;
+    const s2s_bind_address: ?[]const u8 =
+        if (v.s2s.bind_address.len != 0) v.s2s.bind_address else null;
+    const cert_path: ?[]const u8 = if (v.tls.cert.len != 0) v.tls.cert else null;
+    const key_path: ?[]const u8 = if (v.tls.key.len != 0) v.tls.key else null;
+    const core_path = v.master.core_path;
+    const auth_path = v.master.auth_path;
+    const s2s_path = v.master.s2s_path;
+    const auth_socket = v.auth.socket;
+    const s2s_socket = v.s2s.socket;
+    const s2s_enabled = v.s2s.enabled;
+    const db_path = v.server.db_path;
+    const run_user: ?[]const u8 = if (v.server.user.len != 0) v.server.user else null;
+    const log_file = v.server.log_file;
+    const run_dir = v.master.run_dir;
+    const daemonize = v.master.background;
+    var workers: u16 = switch (v.core.workers) {
+        .kw => 0, // auto: resolved to the CPU count below
+        .num => |n| n,
+    };
 
     // Resolve the unprivileged user for child processes. A root master
     // without a run user would start every child as root, and a run user
@@ -286,7 +158,7 @@ pub fn main() !void {
         if (log_fd.handle > 2) log_fd.close();
     }
 
-    log.info("xmppd master starting, host={s} port={s}", .{ host, port });
+    log.info("xmppd master starting, host={s} port={d}", .{ host, v.server.c2s_port });
 
     // --- Single-instance enforcement via PID file lock ---
     var pidfile_path_buf: [4096]u8 = undefined;
@@ -372,25 +244,23 @@ pub fn main() !void {
     var c2s_fd_count: u16 = 0;
     var s2s_listen_fd: posix.fd_t = -1;
     {
-        const c2s_port_num = std.fmt.parseInt(u16, port, 10) catch 5222;
         var i: u16 = 0;
         while (i < workers) : (i += 1) {
-            c2s_listen_fds[i] = bindC2s(bind_address, c2s_port_num) catch |err| {
-                log.err("failed to bind C2S {s}:{s} (socket {d}): {}", .{ bind_address, port, i, err });
+            c2s_listen_fds[i] = bindC2s(bind_address, v.server.c2s_port) catch |err| {
+                log.err("failed to bind C2S {s}:{d} (socket {d}): {}", .{ bind_address, v.server.c2s_port, i, err });
                 return error.BindFailed;
             };
             c2s_fd_count += 1;
         }
-        log.info("bound {d} C2S listener sockets on {s}:{s} (SO_REUSEPORT_LB)", .{ c2s_fd_count, bind_address, port });
+        log.info("bound {d} C2S listener sockets on {s}:{d} (SO_REUSEPORT_LB)", .{ c2s_fd_count, bind_address, v.server.c2s_port });
     }
     if (s2s_enabled) {
-        const s2s_port_num = std.fmt.parseInt(u16, s2s_port, 10) catch 5269;
         const s2s_addr = s2s_bind_address orelse bind_address;
-        s2s_listen_fd = bindS2s(s2s_addr, s2s_port_num) catch |err| {
-            log.err("failed to bind S2S {s}:{s}: {}", .{ s2s_addr, s2s_port, err });
+        s2s_listen_fd = bindS2s(s2s_addr, v.s2s.port) catch |err| {
+            log.err("failed to bind S2S {s}:{d}: {}", .{ s2s_addr, v.s2s.port, err });
             return error.BindFailed;
         };
-        log.info("bound S2S listener fd={d} {s}:{s}", .{ s2s_listen_fd, s2s_addr, s2s_port });
+        log.info("bound S2S listener fd={d} {s}:{d}", .{ s2s_listen_fd, s2s_addr, v.s2s.port });
     }
     defer {
         var i: u16 = 0;
@@ -417,113 +287,23 @@ pub fn main() !void {
     const c2s_fd_str = c2s_fd_str_buf[0..c2s_fd_str_len];
     const s2s_fd_str = "3"; // the single remapped s2s listener slot
 
-    // Build child argv: pass --config, --db, --socket to auth, s2s, and core children
-    var auth_args_buf: [6][]const u8 = undefined;
-    var auth_argc: usize = 0;
-    if (config_path) |cp| {
-        auth_args_buf[auth_argc] = "--config";
-        auth_argc += 1;
-        auth_args_buf[auth_argc] = cp;
-        auth_argc += 1;
-    }
-    // All auth backends get --db: xmppd-auth uses it for credentials AND
-    // locks; xmppd-auth-oidc reads only the shared lock table (S3:
-    // without it the OIDC daemon opened a fresh store and found nothing).
-    auth_args_buf[auth_argc] = "--db";
-    auth_argc += 1;
-    auth_args_buf[auth_argc] = db_path;
-    auth_argc += 1;
-    auth_args_buf[auth_argc] = "--socket";
-    auth_argc += 1;
-    auth_args_buf[auth_argc] = auth_socket;
-    auth_argc += 1;
-
-    var s2s_args_buf: [16][]const u8 = undefined;
-    var s2s_argc: usize = 0;
-    if (config_path) |cp| {
-        s2s_args_buf[s2s_argc] = "--config";
-        s2s_argc += 1;
-        s2s_args_buf[s2s_argc] = cp;
-        s2s_argc += 1;
-    }
-    s2s_args_buf[s2s_argc] = "--host";
-    s2s_argc += 1;
-    s2s_args_buf[s2s_argc] = host;
-    s2s_argc += 1;
-    s2s_args_buf[s2s_argc] = "--port";
-    s2s_argc += 1;
-    s2s_args_buf[s2s_argc] = s2s_port;
-    s2s_argc += 1;
-    s2s_args_buf[s2s_argc] = "--core-socket";
-    s2s_argc += 1;
-    s2s_args_buf[s2s_argc] = s2s_socket;
-    s2s_argc += 1;
-    // Served MUC host for the s2s to= check; defaults to conference.<host>.
-    var muc_host_buf: [512]u8 = undefined;
-    const muc_host: []const u8 = muc_host_cfg orelse
-        (std.fmt.bufPrint(&muc_host_buf, "conference.{s}", .{host}) catch "conference");
-    s2s_args_buf[s2s_argc] = "--muc-host";
-    s2s_argc += 1;
-    s2s_args_buf[s2s_argc] = muc_host;
-    s2s_argc += 1;
-    if (cert_path) |cp| {
-        s2s_args_buf[s2s_argc] = "--cert";
-        s2s_argc += 1;
-        s2s_args_buf[s2s_argc] = cp;
-        s2s_argc += 1;
-    }
-    if (key_path) |kp| {
-        s2s_args_buf[s2s_argc] = "--key";
-        s2s_argc += 1;
-        s2s_args_buf[s2s_argc] = kp;
-        s2s_argc += 1;
-    }
-    if (s2s_listen_fd >= 0) {
-        s2s_args_buf[s2s_argc] = "--listen-fd";
-        s2s_argc += 1;
-        s2s_args_buf[s2s_argc] = s2s_fd_str;
-        s2s_argc += 1;
-    }
-
-    var core_args_buf: [14][]const u8 = undefined;
-    var core_argc: usize = 0;
-    if (config_path) |cp| {
-        core_args_buf[core_argc] = "--config";
-        core_argc += 1;
-        core_args_buf[core_argc] = cp;
-        core_argc += 1;
-    }
-    core_args_buf[core_argc] = "--auth-socket";
-    core_argc += 1;
-    core_args_buf[core_argc] = auth_socket;
-    core_argc += 1;
-    if (s2s_enabled) {
-        core_args_buf[core_argc] = "--s2s-socket";
-        core_argc += 1;
-        core_args_buf[core_argc] = s2s_socket;
-        core_argc += 1;
-    }
-    core_args_buf[core_argc] = "--listen-fd";
-    core_argc += 1;
-    core_args_buf[core_argc] = c2s_fd_str;
-    core_argc += 1;
-    if (cert_path) |cp| {
-        core_args_buf[core_argc] = "--cert";
-        core_argc += 1;
-        core_args_buf[core_argc] = cp;
-        core_argc += 1;
-    }
-    if (key_path) |kp| {
-        core_args_buf[core_argc] = "--key";
-        core_argc += 1;
-        core_args_buf[core_argc] = kp;
-        core_argc += 1;
-    }
+    // Resolved values go to every child that takes them: --config keeps
+    // the shared file for daemon-private keys, while --host/--db and the
+    // rest forward the resolved value so a master CLI override wins in
+    // the child too (ADR-9). Part 2 (X4) replaces this argv forwarding
+    // with the sealed conf fd once children load lib/conf.
+    var argv_arena = std.heap.ArenaAllocator.init(allocator);
+    defer argv_arena.deinit();
+    const child_argv = try buildChildArgv(argv_arena.allocator(), v, .{
+        .s2s_listen = s2s_listen_fd >= 0,
+        .c2s_fd_str = c2s_fd_str,
+        .s2s_fd_str = s2s_fd_str,
+    });
 
     // Initialize supervisors for all children
-    var auth_sup = try initSupervisor(auth_path, auth_args_buf[0..auth_argc], child_uid, child_gid, euid);
-    var s2s_sup = try initSupervisor(s2s_path, s2s_args_buf[0..s2s_argc], child_uid, child_gid, euid);
-    var core_sup = try initSupervisor(core_path, core_args_buf[0..core_argc], child_uid, child_gid, euid);
+    var auth_sup = try initSupervisor(auth_path, child_argv.auth, child_uid, child_gid, euid);
+    var s2s_sup = try initSupervisor(s2s_path, child_argv.s2s, child_uid, child_gid, euid);
+    var core_sup = try initSupervisor(core_path, child_argv.core, child_uid, child_gid, euid);
 
     // Per-child fd contract (S7): core gets the C2S listeners, s2s the S2S
     // listener, auth nothing; everything else in the master's table closes.
@@ -640,34 +420,106 @@ fn decideRunUserWith(username: ?[]const u8, euid: posix.uid_t, lookup: RunUserLo
     return ids;
 }
 
-
-fn printUsage() void {
-    const usage =
-        \\Usage: xmppd [OPTIONS]
-        \\
-        \\Options:
-        \\  --host HOST        XMPP server hostname (default: localhost)
-        \\  --port PORT        STARTTLS port (default: 5222)
-        \\  --bind ADDR        c2s/s2s listen address literal (default: 0.0.0.0)
-        \\  --cert PATH        TLS certificate file (PEM)
-        \\  --key PATH         TLS private key file (PEM)
-        \\  --core-path PATH   Path to xmppd-core binary (default: xmppd-core)
-        \\  --auth-path PATH   Path to xmppd-auth binary (default: xmppd-auth)
-        \\  --s2s-path PATH    Path to xmppd-s2s binary (default: xmppd-s2s)
-        \\  --no-s2s           Disable S2S federation
-        \\  --auth-socket PATH IPC socket path (default: /var/run/xmppd/auth.sock)
-        \\  --db PATH          User database path (default: /var/db/xmppd/users.db)
-        \\  --config PATH, -c  Config file path (passed to children)
-        \\  --log-file PATH    Log file path (default: /var/log/xmppd/xmppd.log)
-        \\  --run-dir PATH     Runtime dir for PID files (default: /var/run/xmppd)
-        \\  --background, -b   Daemonize (fork, detach from terminal)
-        \\  --version, -v      Print version and exit
-        \\  --help, -h         Show this help
-        \\
-    ;
-    var buf: [0]u8 = .{};
+/// --help is generated from the schema: every master_cli spelling plus
+/// the shared file keys and their defaults. A fresh loader is used so
+/// the defaults shown come from the schema initializers, not the
+/// resolved values of this run.
+fn printUsage(allocator: Allocator) std.Io.Writer.Error!void {
+    var gen = MasterLoader.init(allocator);
+    defer gen.deinit();
+    var buf: [4096]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&buf);
-    stdout.interface.writeAll(usage) catch {};
+    try writeUsage(&stdout.interface, &gen);
+    try stdout.interface.flush();
+}
+
+fn writeUsage(w: *std.Io.Writer, gen: *const MasterLoader) std.Io.Writer.Error!void {
+    try w.writeAll("Usage: xmppd [OPTIONS]\n\n");
+    try gen.writeHelp(w);
+}
+
+/// The config file path the argv carries, in every accepted spelling
+/// (--config, -c, and the = forms). Returns null past "--" and when the
+/// option has no value; the loader diagnoses those cases itself.
+fn configPathArg(argv: []const []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--")) return null;
+        if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+            if (i + 1 < argv.len) return argv[i + 1];
+            return null;
+        }
+        const rest = if (std.mem.startsWith(u8, arg, "--"))
+            arg[2..]
+        else if (arg.len > 1 and arg[0] == '-')
+            arg[1..]
+        else
+            continue;
+        const eq = std.mem.indexOfScalar(u8, rest, '=') orelse continue;
+        const name = rest[0..eq];
+        if (std.mem.eql(u8, name, "config") or std.mem.eql(u8, name, "c")) {
+            return rest[eq + 1 ..];
+        }
+    }
+    return null;
+}
+
+/// The argv each child is spawned with. Slices borrow the loaded values
+/// and arena: they must outlive the children's spawn, not their exec.
+const ChildArgv = struct {
+    auth: []const []const u8,
+    s2s: []const []const u8,
+    core: []const []const u8,
+};
+
+fn buildChildArgv(arena: Allocator, v: *const schema.Sections, rt: struct {
+    /// s2s gets --listen-fd only when the master bound its listener.
+    s2s_listen: bool,
+    /// Remapped fd slots for the C2S listeners, comma-separated.
+    c2s_fd_str: []const u8,
+    /// The single remapped s2s listener slot.
+    s2s_fd_str: []const u8,
+}) error{OutOfMemory}!ChildArgv {
+    const config_path: ?[]const u8 =
+        if (v.meta.config_path.len != 0) v.meta.config_path else null;
+    const cert_path: ?[]const u8 = if (v.tls.cert.len != 0) v.tls.cert else null;
+    const key_path: ?[]const u8 = if (v.tls.key.len != 0) v.tls.key else null;
+
+    var auth = std.ArrayList([]const u8).empty;
+    if (config_path) |cp| try auth.appendSlice(arena, &.{ "--config", cp });
+    // All auth backends get --db: xmppd-auth uses it for credentials AND
+    // locks; xmppd-auth-oidc reads only the shared lock table (S3:
+    // without it the OIDC daemon opened a fresh store and found nothing).
+    try auth.appendSlice(arena, &.{ "--db", v.server.db_path, "--socket", v.auth.socket });
+
+    var s2s = std.ArrayList([]const u8).empty;
+    if (config_path) |cp| try s2s.appendSlice(arena, &.{ "--config", cp });
+    const s2s_port = try std.fmt.allocPrint(arena, "{d}", .{v.s2s.port});
+    // Served MUC host for the s2s to= check; defaults to conference.<host>.
+    const muc_host = if (v.muc.host.len != 0) v.muc.host else try std.fmt.allocPrint(arena, "conference.{s}", .{v.server.hostname});
+    try s2s.appendSlice(arena, &.{ "--host", v.server.hostname, "--port", s2s_port, "--core-socket", v.s2s.socket, "--muc-host", muc_host });
+    if (cert_path) |cp| try s2s.appendSlice(arena, &.{ "--cert", cp });
+    if (key_path) |kp| try s2s.appendSlice(arena, &.{ "--key", kp });
+    if (rt.s2s_listen) try s2s.appendSlice(arena, &.{ "--listen-fd", rt.s2s_fd_str });
+
+    var core = std.ArrayList([]const u8).empty;
+    if (config_path) |cp| try core.appendSlice(arena, &.{ "--config", cp });
+    // Core takes --host and --db too (ADR-9): they used to come only from
+    // the file, so a master CLI override never reached core.
+    try core.appendSlice(arena, &.{ "--host", v.server.hostname, "--db", v.server.db_path, "--auth-socket", v.auth.socket });
+    if (v.s2s.enabled) {
+        try core.appendSlice(arena, &.{ "--s2s-socket", v.s2s.socket });
+    }
+    try core.appendSlice(arena, &.{ "--listen-fd", rt.c2s_fd_str });
+    if (cert_path) |cp| try core.appendSlice(arena, &.{ "--cert", cp });
+    if (key_path) |kp| try core.appendSlice(arena, &.{ "--key", kp });
+
+    return .{
+        .auth = try auth.toOwnedSlice(arena),
+        .s2s = try s2s.toOwnedSlice(arena),
+        .core = try core.toOwnedSlice(arena),
+    };
 }
 
 fn printVersion() void {
@@ -812,4 +664,256 @@ test "bindC2s/bindS2s honor the address literal, including IPv6" {
     // The old helper ignored its address argument: a DNS name must be
     // rejected, not resolved.
     try std.testing.expectError(error.InvalidAddress, bindC2s("example.invalid", 0));
+}
+
+// ============================================================================
+// lib/conf loading tests (X4 part 1, ADR-9)
+// ============================================================================
+
+/// Writes `content` to a temp file and returns its absolute path in `buf`.
+fn writeTempConfig(dir: *std.fs.Dir, name: []const u8, content: []const u8, buf: []u8) ![]const u8 {
+    const f = try dir.createFile(name, .{});
+    defer f.close();
+    try f.writeAll(content);
+    return try dir.realpath(name, buf);
+}
+
+test "master config: precedence default < file < CLI with provenance" {
+    // Goal: a CLI flag wins over the file, the file wins over the
+    // schema default, and each field's provenance says where it landed.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "t.ini",
+        \\[server]
+        \\hostname = file.test
+        \\c2s_port = 6000
+        \\
+    , &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try MasterLoader.load(std.testing.allocator, .{
+        .path = path,
+        .args = &.{ "--port", "6001" },
+    }, &diag);
+    defer l.deinit();
+
+    try std.testing.expectEqual(@as(u16, 6001), l.values.server.c2s_port);
+    try std.testing.expectEqual(.cli, l.provenanceOf("server", "c2s_port"));
+    try std.testing.expectEqualStrings("file.test", l.values.server.hostname);
+    try std.testing.expectEqual(.file, l.provenanceOf("server", "hostname"));
+    try std.testing.expectEqual(@as(u32, 2), l.lineOf("server", "hostname"));
+    try std.testing.expectEqualStrings("/var/db/xmppd/users.db", l.values.server.db_path);
+    try std.testing.expectEqual(.default, l.provenanceOf("server", "db_path"));
+}
+
+test "master config: the shared file parses keys belonging to other daemons" {
+    // Goal: the one file serves every daemon; the master accepts sections
+    // and keys it does not consume itself (auth, oidc, ctl-free grammar)
+    // instead of erroring on another daemon's configuration.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "shared.ini",
+        \\[server]
+        \\hostname = shared.test
+        \\lmdb_map_size_mb = 16384
+        \\[auth]
+        \\rate_max_per_account = 7
+        \\ip_lockout_threshold = 30
+        \\users_scan_limit = 5000
+        \\[oidc]
+        \\issuer = https://idp.example
+        \\idp_threads = 4
+        \\idp_timeout_ms = 8000
+        \\localpart_claim = email
+        \\localpart_auto_suffix = true
+        \\[core]
+        \\max_sessions = 8192
+        \\workers = auto
+        \\
+    , &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try MasterLoader.load(std.testing.allocator, .{ .path = path }, &diag);
+    defer l.deinit();
+
+    try std.testing.expectEqualStrings("shared.test", l.values.server.hostname);
+    try std.testing.expectEqual(@as(usize, 16384), l.values.server.lmdb_map_size_mb);
+    try std.testing.expectEqual(@as(u32, 7), l.values.auth.max_per_account);
+    try std.testing.expectEqual(@as(u16, 30), l.values.auth.ip_lockout_threshold);
+    try std.testing.expectEqual(@as(usize, 5000), l.values.auth.users_scan_limit);
+    try std.testing.expectEqualStrings("https://idp.example", l.values.oidc.issuer);
+    try std.testing.expectEqual(@as(u8, 4), l.values.oidc.idp_threads);
+    try std.testing.expectEqual(@as(u32, 8000), l.values.oidc.idp_timeout_ms);
+    try std.testing.expect(l.values.oidc.localpart_auto_suffix);
+    try std.testing.expectEqual(@as(usize, 8192), l.values.core.max_sessions);
+    switch (l.values.core.workers) {
+        .kw => |k| try std.testing.expectEqual(.auto, k),
+        .num => return error.TestUnexpectedResult,
+    }
+}
+
+test "master config: an unknown key fails with file:line in the diag" {
+    // Goal: a misspelled or foreign key is a startup error naming the
+    // file and line, never a silent skip.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "bad.ini", "[server]\nhostname = ok.test\nhostnam = typo.test\n", &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = MasterLoader.init(std.testing.allocator);
+    defer l.deinit();
+    try std.testing.expectError(error.UnknownKey, l.loadFile(path, &diag));
+    try std.testing.expectEqual(@as(u32, 3), diag.line);
+    try std.testing.expectEqualStrings("hostnam", diag.key);
+    try std.testing.expect(std.mem.indexOf(u8, diag.path, "bad.ini") != null);
+}
+
+test "master config: a bad value fails with the key and value in the diag" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "badval.ini", "[server]\nc2s_port = notaport\n", &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = MasterLoader.init(std.testing.allocator);
+    defer l.deinit();
+    try std.testing.expectError(error.BadValue, l.loadFile(path, &diag));
+    try std.testing.expectEqual(@as(u32, 2), diag.line);
+    try std.testing.expectEqualStrings("c2s_port", diag.key);
+    try std.testing.expectEqualStrings("notaport", diag.value);
+}
+
+test "master --help lists every CLI spelling from the schema" {
+    // Goal: usage is generated, so every master_cli name and alias must
+    // appear; a hand-written string could silently miss a spelling.
+    var gen = MasterLoader.init(std.testing.allocator);
+    defer gen.deinit();
+
+    var buf: [16384]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeUsage(&w, &gen);
+    const help = w.buffered();
+
+    inline for (schema.master_cli) |c| {
+        try std.testing.expect(std.mem.indexOf(u8, help, "--" ++ c.name) != null);
+        inline for (c.aliases) |a| {
+            try std.testing.expect(std.mem.indexOf(u8, help, ", -" ++ a) != null);
+        }
+    }
+    inline for (schema.file_spec) |f| {
+        if (!f.in_file) continue;
+        const key = if (f.key.len != 0) f.key else f.field;
+        try std.testing.expect(std.mem.indexOf(u8, help, key) != null);
+    }
+}
+
+test "master config: --config path is scanned from argv in every spelling" {
+    try std.testing.expectEqualStrings("a.ini", configPathArg(&.{ "--config", "a.ini" }).?);
+    try std.testing.expectEqualStrings("b.ini", configPathArg(&.{ "-c", "b.ini" }).?);
+    try std.testing.expectEqualStrings("c.ini", configPathArg(&.{"--config=c.ini"}).?);
+    try std.testing.expectEqualStrings("d.ini", configPathArg(&.{"-c=d.ini"}).?);
+    try std.testing.expect(configPathArg(&.{ "--", "--config", "x.ini" }) == null);
+    try std.testing.expect(configPathArg(&.{ "--host", "h.test" }) == null);
+    // No value: the loader reports the missing value itself.
+    try std.testing.expect(configPathArg(&.{"--config"}) == null);
+}
+
+/// The value argv carries for a two-token option; null when absent.
+fn argvValue(argv: []const []const u8, opt: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + 1 < argv.len) : (i += 1) {
+        if (std.mem.eql(u8, argv[i], opt)) return argv[i + 1];
+    }
+    return null;
+}
+
+test "master child argv: resolved --host and --db reach every child that takes them" {
+    // Goal: `xmppd -c conf --host X` gives X to core AND s2s (ADR-9:
+    // before this fix core read the file's hostname and got A while s2s
+    // got X). Same for --db on auth AND core.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "conf.ini", "[server]\nhostname = file-host.test\ndb_path = /file/db\n", &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try MasterLoader.load(std.testing.allocator, .{
+        .path = path,
+        .args = &.{ "--host", "cli-host.test", "--db", "/cli/db", "--config", "conf.ini" },
+    }, &diag);
+    defer l.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const argv = try buildChildArgv(arena.allocator(), &l.values, .{
+        .s2s_listen = true,
+        .c2s_fd_str = "3,4",
+        .s2s_fd_str = "3",
+    });
+
+    try std.testing.expectEqualStrings("cli-host.test", argvValue(argv.s2s, "--host").?);
+    try std.testing.expectEqualStrings("cli-host.test", argvValue(argv.core, "--host").?);
+    try std.testing.expectEqualStrings("/cli/db", argvValue(argv.auth, "--db").?);
+    try std.testing.expectEqualStrings("/cli/db", argvValue(argv.core, "--db").?);
+    try std.testing.expectEqualStrings("conf.ini", argvValue(argv.s2s, "--config").?);
+    try std.testing.expectEqualStrings("conf.ini", argvValue(argv.core, "--config").?);
+    try std.testing.expectEqualStrings("conf.ini", argvValue(argv.auth, "--config").?);
+    try std.testing.expectEqualStrings("3", argvValue(argv.s2s, "--listen-fd").?);
+    try std.testing.expectEqualStrings("3,4", argvValue(argv.core, "--listen-fd").?);
+    // The resolved MUC host derives from the CLI hostname, not the file's.
+    try std.testing.expectEqualStrings("conference.cli-host.test", argvValue(argv.s2s, "--muc-host").?);
+}
+
+test "master child argv: file values resolve without a CLI override" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "conf.ini", "[server]\nhostname = file-host.test\ndb_path = /file/db\n" ++
+        "[s2s]\nport = 5270\nsocket = /run/s2s.sock\n" ++
+        "[muc]\nhost = muc.file.test\n", &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try MasterLoader.load(std.testing.allocator, .{
+        .path = path,
+        .args = &.{ "--config", "conf.ini" },
+    }, &diag);
+    defer l.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const argv = try buildChildArgv(arena.allocator(), &l.values, .{
+        .s2s_listen = false,
+        .c2s_fd_str = "3",
+        .s2s_fd_str = "3",
+    });
+
+    try std.testing.expectEqualStrings("file-host.test", argvValue(argv.s2s, "--host").?);
+    try std.testing.expectEqualStrings("file-host.test", argvValue(argv.core, "--host").?);
+    try std.testing.expectEqualStrings("/file/db", argvValue(argv.auth, "--db").?);
+    try std.testing.expectEqualStrings("5270", argvValue(argv.s2s, "--port").?);
+    try std.testing.expectEqualStrings("muc.file.test", argvValue(argv.s2s, "--muc-host").?);
+    // No listener bound: s2s carries no --listen-fd.
+    try std.testing.expect(argvValue(argv.s2s, "--listen-fd") == null);
+    try std.testing.expectEqualStrings("/run/s2s.sock", argvValue(argv.s2s, "--core-socket").?);
+}
+
+test "master child argv: --no-s2s drops the s2s socket from core" {
+    var diag: conf.Diag = .{};
+    var l = try MasterLoader.load(std.testing.allocator, .{
+        .args = &.{"--no-s2s"},
+    }, &diag);
+    defer l.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const argv = try buildChildArgv(arena.allocator(), &l.values, .{
+        .s2s_listen = false,
+        .c2s_fd_str = "3",
+        .s2s_fd_str = "3",
+    });
+    try std.testing.expect(argvValue(argv.core, "--s2s-socket") == null);
+    try std.testing.expectEqualStrings("localhost", argvValue(argv.core, "--host").?);
 }

@@ -1525,6 +1525,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ADR-9 shared schema: one Sections struct and field table every
+    // daemon loads through lib/conf (the file grammar is shared; each
+    // daemon keeps its own CLI table).
+    const schema_mod = b.createModule(.{
+        .root_source_file = b.path("src/config/schema.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    schema_mod.addImport("conf", conf_mod);
+
     const config_test_mod = b.createModule(.{
         .root_source_file = b.path("src/config/parser.zig"),
         .target = target,
@@ -1675,7 +1685,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     master_mod.addImport("net", net_mod);
-    master_mod.addImport("config", config_mod);
+    master_mod.addImport("conf", conf_mod);
+    master_mod.addImport("schema", schema_mod);
     master_mod.addImport("xmppd_log", xmppd_log_mod);
     master_mod.addImport("build_options", build_options_mod);
     master_mod.addImport("root_allocator", root_allocator_mod);
