@@ -125,6 +125,20 @@
   number or `auto`; any other value is a startup error (v0.9.0 treated
   it as `auto`). See doc/UPGRADING.md.
 
+- **core, s2s and xmppctl share the strict configuration loader.** The
+  master serializes the resolved configuration once into a sealed fd
+  that `xmppd-core` and `xmppd-s2s` inherit as `--conf-fd`, so a file
+  key or a master CLI override reaches them exactly once; their argv now
+  carries only the listen-fd remap slots and the conf fd itself, and on
+  SIGHUP the fd is rebuilt before the signal is forwarded. Three fixes
+  ride along: core honors `[tls] cert`/`key` from the file (previously
+  ignored), `xmppd-s2s --config` is honored (previously consumed and
+  ignored), and unknown arguments to core, s2s or xmppctl are startup
+  errors instead of silent warnings or a mistaken command. `xmppctl`
+  gained `-c`/`--config` and `--help`, and its storage default follows
+  the shared `[server] db_path` default `/var/db/xmppd/users.db` (was
+  `/var/db/xmppd`). See doc/UPGRADING.md.
+
 ### Fixed
 
 - S33 disco/caps: removed the `http://jabber.org/protocol/pubsub#subscribe`

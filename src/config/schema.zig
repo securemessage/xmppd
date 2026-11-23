@@ -13,20 +13,26 @@
 //! another.
 //!
 //! Consumption map for the master:
-//!   server.hostname    -> --host forwarded to core and s2s
+//!   server.hostname    -> forwarded to core and s2s through the ConfFd
 //!   server.c2s_port    -> privileged C2S binds
 //!   server.bind_address-> C2S and S2S binds (s2s.bind_address overrides)
-//!   server.db_path     -> --db forwarded to auth and core, plus subdirs
+//!   server.db_path     -> forwarded to auth and core, plus subdirs
 //!   server.user        -> unprivileged run user for children
 //!   server.log_file    -> stderr target under --background
-//!   tls.cert/key       -> --cert/--key forwarded to s2s and core
+//!   tls.cert/key       -> forwarded to s2s and core
 //!   auth.socket        -> auth --socket, core --auth-socket, readiness
 //!   s2s.socket         -> s2s --core-socket, core --s2s-socket, readiness
-//!   s2s.port/enabled   -> s2s --port and whether the child spawns
-//!   muc.host           -> s2s --muc-host (empty: conference.{hostname})
+//!   s2s.port/enabled   -> forwarded s2s port and whether the child spawns
+//!   muc.host           -> forwarded (empty: conference.{hostname} in child)
 //!   core.workers       -> C2S listener count (auto: CPU count)
 //!   master.*_path      -> child executable paths
 //!   master.run_dir, master.background, meta.* -> CLI only (in_file=false)
+//!
+//! The master serializes the resolved values once into a sealed ConfFd
+//! passed to core and s2s on a remapped slot named by --conf-fd. Their
+//! argv then carries only the CLI-only fields the schema cannot forward:
+//! the inherited listen fds and the conf fd slot itself. xmppctl has no
+//! master: it reads its --config file through the same loader.
 
 const std = @import("std");
 const conf = @import("conf");
@@ -67,6 +73,8 @@ pub const Sections = struct {
         enabled: bool = true,
         /// Empty follows server.bind_address.
         bind_address: []const u8 = "",
+        /// Remap slot of the inherited s2s listener; -1 means none.
+        listen_fd: i32 = -1,
     } = .{},
     muc: struct {
         /// Empty resolves to conference.{server.hostname} when forwarded.
@@ -114,11 +122,15 @@ pub const Sections = struct {
         password_file: []const u8 = "",
         max_uses: u16 = 1,
         expires_hours: u32 = 0,
+        apply: bool = false,
+        raw: bool = false,
     } = .{},
     meta: struct {
         config_path: []const u8 = "",
         help: bool = false,
         version: bool = false,
+        /// Remap slot of the inherited sealed config blob; -1 none.
+        conf_fd: i32 = -1,
     } = .{},
 };
 
@@ -152,6 +164,7 @@ pub const file_spec = [_]conf.FieldSpec{
     .{ .section = "s2s", .field = "port", .help = "s2s listen port" },
     .{ .section = "s2s", .field = "enabled", .help = "enable s2s" },
     .{ .section = "s2s", .field = "bind_address", .help = "s2s listen address literal" },
+    .{ .section = "s2s", .field = "listen_fd", .in_file = false, .help = "inherited listen fd" },
     .{ .section = "muc", .field = "host", .help = "MUC service host" },
     .{ .section = "core", .field = "max_sessions", .help = "session cap" },
     .{ .section = "core", .field = "fan_out_batch_size", .help = "fan-out batch" },
@@ -188,9 +201,12 @@ pub const file_spec = [_]conf.FieldSpec{
     .{ .section = "ctl", .field = "password_file", .in_file = false },
     .{ .section = "ctl", .field = "max_uses", .in_file = false },
     .{ .section = "ctl", .field = "expires_hours", .in_file = false },
+    .{ .section = "ctl", .field = "apply", .in_file = false },
+    .{ .section = "ctl", .field = "raw", .in_file = false },
     .{ .section = "meta", .field = "config_path", .in_file = false },
     .{ .section = "meta", .field = "help", .in_file = false },
     .{ .section = "meta", .field = "version", .in_file = false },
+    .{ .section = "meta", .field = "conf_fd", .in_file = false },
 };
 
 /// Every CLI spelling the master accepts today.
@@ -216,3 +232,259 @@ pub const master_cli = [_]conf.CliSpec{
 
 /// The master's loader: shared file schema plus the master CLI table.
 pub const MasterLoader = conf.Loader(Sections, &file_spec, &master_cli, .{});
+
+/// Every CLI spelling xmppd-core accepts. Dev-mode spellings (--address,
+/// --bind, --port) and the supervised ones (--listen-fd, --conf-fd) share
+/// the table; the forwarded blob covers every file key.
+pub const core_cli = [_]conf.CliSpec{
+    .{ .name = "host", .target = "server.hostname", .help = "XMPP server hostname" },
+    .{ .name = "address", .target = "server.bind_address", .aliases = &.{"bind"}, .help = "bind address literal (dev mode)" },
+    .{ .name = "port", .target = "server.c2s_port", .help = "c2s listen port (dev mode)" },
+    .{ .name = "cert", .target = "tls.cert", .help = "TLS certificate file (PEM)" },
+    .{ .name = "key", .target = "tls.key", .help = "TLS private key file (PEM)" },
+    .{ .name = "auth-socket", .target = "auth.socket", .help = "auth IPC socket path" },
+    .{ .name = "s2s-socket", .target = "s2s.socket", .help = "s2s IPC socket path" },
+    .{ .name = "listen-fd", .target = "core.listen_fd", .help = "inherited listen fd list (comma-separated)" },
+    .{ .name = "db", .target = "server.db_path", .help = "user database path" },
+    .{ .name = "muc-host", .target = "muc.host", .help = "MUC service host" },
+    .{ .name = "no-tls", .target = "tls.enabled", .flag = false, .help = "disable STARTTLS" },
+    .{ .name = "config", .target = "meta.config_path", .aliases = &.{"c"}, .help = "config file path" },
+    .{ .name = "conf-fd", .target = "meta.conf_fd", .help = "inherited sealed config fd" },
+    .{ .name = "help", .target = "meta.help", .flag = true, .aliases = &.{"h"}, .help = "show this help" },
+};
+
+/// Every CLI spelling xmppd-s2s accepts. --config is honored: the shared
+/// file feeds the s2s fields the same way the forwarded blob does.
+pub const s2s_cli = [_]conf.CliSpec{
+    .{ .name = "host", .target = "server.hostname", .help = "XMPP server hostname" },
+    .{ .name = "address", .target = "s2s.bind_address", .aliases = &.{"bind"}, .help = "s2s listen address literal" },
+    .{ .name = "port", .target = "s2s.port", .help = "s2s listen port" },
+    .{ .name = "core-socket", .target = "s2s.socket", .help = "core IPC socket path" },
+    .{ .name = "cert", .target = "tls.cert", .help = "TLS certificate file (PEM)" },
+    .{ .name = "key", .target = "tls.key", .help = "TLS private key file (PEM)" },
+    .{ .name = "muc-host", .target = "muc.host", .help = "MUC service host" },
+    .{ .name = "listen-fd", .target = "s2s.listen_fd", .help = "inherited s2s listen fd" },
+    .{ .name = "config", .target = "meta.config_path", .aliases = &.{"c"}, .help = "config file path" },
+    .{ .name = "conf-fd", .target = "meta.conf_fd", .help = "inherited sealed config fd" },
+    .{ .name = "help", .target = "meta.help", .flag = true, .aliases = &.{"h"}, .help = "show this help" },
+};
+
+/// Every CLI spelling xmppctl accepts. Subcommand positionals are
+/// collected through the loader (positional_cap); --rename and the
+/// repeatable --hosted-domain are pre-scanned by ctl itself because they
+/// take two values or a list the schema cannot express.
+pub const ctl_cli = [_]conf.CliSpec{
+    .{ .name = "db", .target = "server.db_path", .help = "storage directory" },
+    .{ .name = "auth-socket", .target = "auth.socket", .help = "auth daemon IPC socket" },
+    .{ .name = "password", .target = "ctl.password", .help = "provide password non-interactively" },
+    .{ .name = "password-file", .target = "ctl.password_file", .help = "read password from file" },
+    .{ .name = "apply", .target = "ctl.apply", .flag = true, .help = "apply migration ops (default dry run)" },
+    .{ .name = "raw", .target = "ctl.raw", .flag = true, .help = "deluser: exact source localpart" },
+    .{ .name = "run-dir", .target = "master.run_dir", .help = "daemon pid-file directory" },
+    .{ .name = "max-uses", .target = "ctl.max_uses", .help = "invite create: max uses" },
+    .{ .name = "expires", .target = "ctl.expires_hours", .help = "invite create: hours until expiry" },
+    .{ .name = "config", .target = "meta.config_path", .aliases = &.{"c"}, .help = "config file path" },
+    .{ .name = "help", .target = "meta.help", .flag = true, .aliases = &.{"h"}, .help = "show this help" },
+};
+
+pub const CoreLoader = conf.Loader(Sections, &file_spec, &core_cli, .{});
+pub const S2sLoader = conf.Loader(Sections, &file_spec, &s2s_cli, .{});
+/// ctl collects its subcommand and arguments as positionals.
+pub const CtlLoader = conf.Loader(Sections, &file_spec, &ctl_cli, .{ .positional_cap = 16 });
+
+/// The config file path the argv carries, in every accepted spelling
+/// (--config, -c, and the = forms). Returns null past "--" and when the
+/// option has no value; the loader diagnoses those cases itself.
+pub fn configPathArg(argv: []const []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--")) return null;
+        if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+            if (i + 1 < argv.len) return argv[i + 1];
+            return null;
+        }
+        const rest = if (std.mem.startsWith(u8, arg, "--"))
+            arg[2..]
+        else if (arg.len > 1 and arg[0] == '-')
+            arg[1..]
+        else
+            continue;
+        const eq = std.mem.indexOfScalar(u8, rest, '=') orelse continue;
+        const name = rest[0..eq];
+        if (std.mem.eql(u8, name, "config") or std.mem.eql(u8, name, "c")) {
+            return rest[eq + 1 ..];
+        }
+    }
+    return null;
+}
+
+/// The --conf-fd slot the argv carries, in every accepted spelling. The
+/// loader needs the fd before applyArgs runs, so each child pre-scans
+/// just like the config path. A missing or non-numeric value returns
+/// null: applyArgs diagnoses it as a bad or missing value itself.
+pub fn confFdArg(argv: []const []const u8) ?i32 {
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--")) return null;
+        var value: ?[]const u8 = null;
+        if (std.mem.eql(u8, arg, "--conf-fd")) {
+            if (i + 1 < argv.len) value = argv[i + 1];
+        } else if (std.mem.startsWith(u8, arg, "--conf-fd=")) {
+            value = arg["--conf-fd=".len..];
+        } else {
+            continue;
+        }
+        const v = value orelse return null;
+        return std.fmt.parseInt(i32, v, 10) catch null;
+    }
+    return null;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+fn writeTempConfig(dir: *std.fs.Dir, name: []const u8, content: []const u8, buf: []u8) ![]const u8 {
+    const f = try dir.createFile(name, .{});
+    defer f.close();
+    try f.writeAll(content);
+    return try dir.realpath(name, buf);
+}
+
+test "child config: forwarded beats the file and loses to the child CLI flag" {
+    // Goal: precedence default < file < forwarded < CLI holds inside a
+    // child; provenance records the forwarded source, so a master CLI
+    // override wins in the child exactly once (ADR-9).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "child.ini",
+        \\[server]
+        \\hostname = file.test
+        \\db_path = /file/db
+        \\
+    , &path_buf);
+
+    const blob = "--server.hostname=fwd.test\n--server.db_path=/fwd/db\n";
+    const cf = try conf.ConfFd.create(blob);
+
+    var diag: conf.Diag = .{};
+    var l = try CoreLoader.load(testing.allocator, .{
+        .path = path,
+        .conf_fd = cf.fd,
+        .args = &.{ "--host", "cli.test" },
+    }, &diag);
+    defer l.deinit();
+
+    try testing.expectEqualStrings("cli.test", l.values.server.hostname);
+    try testing.expectEqual(.cli, l.provenanceOf("server", "hostname"));
+    try testing.expectEqualStrings("/fwd/db", l.values.server.db_path);
+    try testing.expectEqual(.forwarded, l.provenanceOf("server", "db_path"));
+}
+
+test "core reads the [tls] cert and key from the file" {
+    // Goal: the ADR-9 gap is closed: file [tls] values land typed in the
+    // shared sections instead of being skipped (the legacy core never
+    // read them, so a file-only TLS config silently ran without TLS).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "tls.ini",
+        \\[tls]
+        \\cert = /etc/xmppd/server.pem
+        \\key = /etc/xmppd/server.key
+        \\
+    , &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try CoreLoader.load(testing.allocator, .{ .path = path }, &diag);
+    defer l.deinit();
+
+    try testing.expectEqualStrings("/etc/xmppd/server.pem", l.values.tls.cert);
+    try testing.expectEqualStrings("/etc/xmppd/server.key", l.values.tls.key);
+    try testing.expectEqual(.file, l.provenanceOf("tls", "cert"));
+    try testing.expect(l.values.tls.enabled);
+}
+
+test "s2s honors --config: file values reach the s2s fields" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "s2s.ini",
+        \\[s2s]
+        \\port = 5270
+        \\socket = /run/x2.sock
+        \\bind_address = 10.0.0.9
+        \\[muc]
+        \\host = muc.test
+        \\
+    , &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try S2sLoader.load(testing.allocator, .{
+        .path = configPathArg(&.{ "--config", path }),
+        .args = &.{ "--config", path },
+    }, &diag);
+    defer l.deinit();
+
+    try testing.expectEqual(@as(u16, 5270), l.values.s2s.port);
+    try testing.expectEqualStrings("/run/x2.sock", l.values.s2s.socket);
+    try testing.expectEqualStrings("10.0.0.9", l.values.s2s.bind_address);
+    try testing.expectEqualStrings("muc.test", l.values.muc.host);
+    try testing.expectEqual(.file, l.provenanceOf("s2s", "port"));
+}
+
+test "xmppctl rejects an unknown file key with file:line in the diag" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "bad.ini", "[server]\ndb_path = /db\nhostnam = typo\n", &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = CtlLoader.init(testing.allocator);
+    defer l.deinit();
+    try testing.expectError(error.UnknownKey, l.loadFile(path, &diag));
+    try testing.expectEqual(@as(u32, 3), diag.line);
+    try testing.expectEqualStrings("hostnam", diag.key);
+}
+
+test "a child without --conf-fd still loads its --config file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [4096]u8 = undefined;
+    const path = try writeTempConfig(&tmp.dir, "plain.ini", "[server]\nhostname = plain.test\n", &path_buf);
+
+    var diag: conf.Diag = .{};
+    var l = try CoreLoader.load(testing.allocator, .{ .path = path }, &diag);
+    defer l.deinit();
+
+    try testing.expectEqualStrings("plain.test", l.values.server.hostname);
+    try testing.expectEqual(.file, l.provenanceOf("server", "hostname"));
+}
+
+test "ctl collects the subcommand and args as positionals, options anywhere" {
+    var diag: conf.Diag = .{};
+    var l = try CtlLoader.load(testing.allocator, .{
+        .args = &.{ "adduser", "alice@x.test", "--password", "pw", "--db", "/db" },
+    }, &diag);
+    defer l.deinit();
+
+    const pos = l.positionals();
+    try testing.expectEqual(@as(usize, 2), pos.len);
+    try testing.expectEqualStrings("adduser", pos[0]);
+    try testing.expectEqualStrings("alice@x.test", pos[1]);
+    try testing.expectEqualStrings("pw", l.values.ctl.password);
+    try testing.expectEqualStrings("/db", l.values.server.db_path);
+    try testing.expectEqual(.cli, l.provenanceOf("ctl", "password"));
+}
+
+test "ctl rejects an unknown argument instead of silently dropping it" {
+    var diag: conf.Diag = .{};
+    var l = CtlLoader.init(testing.allocator);
+    defer l.deinit();
+    try testing.expectError(error.UnknownArgument, l.applyArgs(&.{"--bogus"}, &diag));
+}

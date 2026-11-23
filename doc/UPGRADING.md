@@ -82,3 +82,36 @@ parses and every key is known. Exit status 1 with a `file:line`
 diagnostic on stderr names the first problem; fix it and rerun. `--help`
 prints and exits before any child is spawned, so the check is safe
 against a running install.
+
+## 0.9.0 -> 0.9.1: shared loader for core, s2s and xmppctl
+
+`xmppd-core`, `xmppd-s2s` and `xmppctl` now load configuration through
+the same strict loader as the master. Supervised core and s2s children
+no longer receive resolved values on their argv: the master serializes
+the resolved configuration once into a sealed in-memory fd passed as
+`--conf-fd N`, so file keys and master CLI overrides reach a child
+exactly once. Their argv now carries only what the file grammar cannot
+express: the inherited listen-fd remap slots and the conf-fd slot
+itself. On SIGHUP the master rebuilds the fd before forwarding the
+signal; children never re-read the file. A core or s2s started by hand
+without `--conf-fd` reads its `--config` file directly, with precedence
+default < file < CLI, exactly as a supervised child does with the
+forwarded values in between.
+
+Behavior changes that ride along:
+
+- `xmppd-core` honors `[tls] cert` and `[tls] key` from the file;
+  v0.9.0's core ignored the file's TLS keys and only `--cert`/`--key`
+  reached it.
+- `xmppd-s2s --config PATH` is honored; v0.9.0 consumed the flag and
+  ignored the file. Unknown s2s arguments changed from a logged warning
+  to a startup error.
+- `xmppctl` accepts `-c`/`--config` and reads the shared file, so
+  `[server] db_path` and `[auth] socket` apply to it. Unknown options are startup errors (v0.9.0 treated an
+  unrecognized argument as the command name), `--max-uses` and
+  `--expires` are ordinary options accepted in any position instead of
+  only after `invite create`, unknown arguments to `invite create` are
+  errors instead of being ignored, and `--help` prints usage and exits
+  0. Without `--db` or a config file, the storage directory default
+  follows the shared `[server] db_path` default
+  `/var/db/xmppd/users.db` (was `/var/db/xmppd`).

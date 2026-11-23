@@ -162,7 +162,9 @@ pub const Diag = struct {
         self.detail = into(&self.detail_buf, self.detail);
     }
 
-    pub fn format(self: Diag, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    // self is taken by pointer: Diag carries about 5 KiB of copy buffers,
+    // so a by-value format would place a full copy in every caller's frame.
+    pub fn format(self: *const Diag, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.line != 0) {
             try w.print("{s}:{d}: ", .{ self.path, self.line });
         } else if (self.path.len != 0) {
@@ -616,6 +618,15 @@ pub fn Loader(
         pub fn load(gpa: Allocator, opts: LoadOpts, diag: *Diag) Error!Self {
             var self = Self.init(gpa);
             errdefer self.deinit();
+            try self.loadInto(opts, diag);
+            return self;
+        }
+
+        /// Same load as load() but into an already-initialized self, for
+        /// callers that own the storage (for example a heap allocation
+        /// when the loader is too large for a long-lived stack frame). On
+        /// error the caller still owns self and must deinit it.
+        pub fn loadInto(self: *Self, opts: LoadOpts, diag: *Diag) Error!void {
             // The fd is consumed first so it is closed even when the
             // file fails to load; values still apply file < forwarded <
             // CLI. The blob lives in the load arena because forwarded
@@ -627,7 +638,6 @@ pub fn Loader(
             if (opts.path) |p| try self.loadFile(p, diag);
             if (blob) |b| try self.applyForwarded(b, diag);
             try self.applyArgs(opts.args, diag);
-            return self;
         }
 
         /// Field index of a "section.field" reference, resolved comptime.

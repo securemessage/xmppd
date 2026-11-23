@@ -137,6 +137,13 @@ pub const ChildCtl = struct {
     sup: *Supervisor,
 };
 
+/// A callback the runtime invokes on SIGHUP before forwarding; set as
+/// Runtime.hup_hook.
+pub const HupHook = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque) void,
+};
+
 /// Escalation deadlines; the fields exist so tests can tighten them.
 pub const Limits = struct {
     /// Grace between the SIGTERM broadcast and SIGKILL escalation.
@@ -207,6 +214,10 @@ pub const Runtime = struct {
     /// A SIGHUP arrived while the child in waiting_ready was starting;
     /// it is delivered when that child's readiness byte arrives.
     hup_deferred: bool = false,
+    /// Runs on SIGHUP before the signal is forwarded to children; the
+    /// master reloads the forwarded config blob here so a respawned
+    /// child reads fresh values.
+    hup_hook: ?HupHook = null,
     /// Next child the startup sequence spawns.
     pending: usize = 0,
     /// Child whose readiness byte the sequence waits on, if any.
@@ -829,8 +840,10 @@ pub const Runtime = struct {
     /// Forward HUP to every live child that handles it (forward_hup). A
     /// child still awaiting readiness may not have installed its handler
     /// yet, so its copy is held and delivered when its readiness byte
-    /// arrives.
+    /// arrives. The hook runs first so a reload lands before any child
+    /// reacts to the signal.
     fn forwardHup(self: *Runtime) void {
+        if (self.hup_hook) |h| h.run(h.ctx);
         log.info("received SIGHUP, forwarding to children that reload on it", .{});
         for (self.children, 0..) |*ctl, i| {
             if (!ctl.forward_hup) continue;
@@ -1938,6 +1951,32 @@ test "Runtime: SIGHUP during startup reaches ready children now and the gated ch
     try testing.expect(!rt.start_failed);
     try testing.expect(!rt.hup_deferred);
     try testing.expect(try readableWithin(hup_b[0], 2_000));
+}
+
+const HupProbe = struct {
+    calls: usize = 0,
+    fn run(ctx: *anyopaque) void {
+        const self: *HupProbe = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+    }
+};
+
+test "Runtime: the hup hook runs on each forwarded SIGHUP, never on TERM" {
+    // Goal: the master reloads its forwarded config on SIGHUP through
+    // this hook; it must fire on every HUP the runtime would forward
+    // and on no other signal.
+    var no_children = [_]ChildCtl{};
+    var rt = try Runtime.init(testing.allocator, no_children[0..], "/nonexistent", test_limits);
+    defer rt.deinit();
+    var probe: HupProbe = .{};
+    rt.hup_hook = .{ .ctx = &probe, .run = HupProbe.run };
+
+    rt.onSignal(.{ .signo = posix.SIG.HUP, .count = 1 });
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    rt.onSignal(.{ .signo = posix.SIG.HUP, .count = 1 });
+    try testing.expectEqual(@as(usize, 2), probe.calls);
+    rt.onSignal(.{ .signo = posix.SIG.TERM, .count = 1 });
+    try testing.expectEqual(@as(usize, 2), probe.calls);
 }
 
 test "Runtime: a readiness byte after TERM spawns nothing and drops the gate" {
