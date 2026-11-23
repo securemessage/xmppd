@@ -373,6 +373,17 @@ fn detachSession(server: *Server, id: usize, session: *Session, changes: *Change
     server.sm_expiry.insert(session, session.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
     server.sm_expiry_pending = true;
 
+    // T-265C5A0E: retained unacked blobs stop charging their producers'
+    // ring budgets here; the worker's dedicated SM retention budget
+    // carries the resume tail instead. A full retention budget cannot
+    // hold the queue, so the session is flagged for the batch-end reap:
+    // destruction parks it for the chunked counted drain.
+    if (session.sm_unacked) |queue| {
+        if (!queue.retainOn(server.smRetentionBudget())) {
+            session.sm_overflow = true;
+        }
+    }
+
     // Remove from kqueue and close the fd. Purge instead of staging deletes:
     // close(2) drops the knotes, and a staged delete/add for this number
     // could otherwise land on a connection that reuses the fd this same
@@ -411,7 +422,7 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
     // queue; its messages go to offline storage rather than vanishing
     // (ADR-2). Live-session overflow reaps drain in reapOutboundOverflow.
     if (session.sm_detached) {
-        drainUnackedToOffline(server, session);
+        parkUnackedDrain(server, session);
     }
 
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
@@ -471,7 +482,7 @@ fn recordLastOffline(roster: anytype, bare_jid: []const u8) void {
 /// Detached sessions are destroyed; a later resume fails with item-not-found
 /// and the client performs a full bind and MAM catch-up.
 /// Called once per event batch from the worker event loop.
-/// noinline: the teardown chains (destroySession, drainUnackedToOffline)
+/// noinline: the teardown chains (destroySession, parkUnackedDrain)
 /// are cold paths and must stay out of the Server.run frame.
 pub noinline fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
     for (server.sessions, 0..) |slot, i| {
@@ -490,55 +501,145 @@ pub noinline fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void
             // ADR-2 fail-closed policy: the unacked queue is authoritative
             // for what the client never acknowledged; its messages go to
             // offline storage instead of dying with the session.
-            drainUnackedToOffline(server, session);
+            parkUnackedDrain(server, session);
             forceCloseSession(server, i, changes);
         }
     }
 }
 
-/// XEP-0198 section-5 drain (C11): on teardown of a session with an SM
-/// unacked queue, every stanza reaches exactly one counted outcome so
-/// nothing is lost silently (T430; this closes the #81 counted-but-lost
-/// gap where an offline refusal vanished). `<message>` (not error or
-/// groupchat) is offered to the recipient's offline store; a refusal then
-/// bounces like any other non-message. IQ, presence and refused messages
-/// bounce service-unavailable to the stanza's sender through the session
-/// map (local) or the S2S daemon (remote). type='error', type='result' and
-/// groupchat stanzas are counted drops: RFC 6120 forbids an error for an
-/// error, and a groupchat bounce would target a room JID.
-pub fn drainUnackedToOffline(server: *Server, session: *Session) void {
+/// A session's unacked queue parked for a chunked section-5 drain
+/// (T-265C5A0E). The queue object moves here whole — entries, blob
+/// references and all — so the session can be freed while the batch
+/// tail finishes the store and bounce work in bounded pieces.
+pub const SmDrain = struct {
+    next: ?*SmDrain = null,
+    /// The session's own unacked queue object; drained entries are
+    /// nulled and released as the cursor advances.
+    queue: *sm_state.SmUnackedQueue,
+    /// Next entry index (0..queue.count, relative to queue.head) to drain.
+    pos: u32 = 0,
+    /// Bare JID the queue's stanzas were bound for; 0 means every entry
+    /// counts as a drop (no bound JID to store under or bounce from).
+    recipient_len: u16 = 0,
+    recipient: [router.BARE_JID_MAX]u8 = undefined,
+};
+
+/// Per-iteration bound on unacked stanzas drained across all parked
+/// queues (T-265C5A0E). Each drained stanza costs at most one store
+/// attempt plus one bounce; the chunk keeps a mass expiry or a teardown
+/// burst from stalling a whole event batch.
+pub const SM_DRAIN_CHUNK: u32 = 32;
+
+/// XEP-0198 section-5 drain (C11, chunked by T-265C5A0E): on teardown of
+/// a session with an SM unacked queue, every stanza reaches exactly one
+/// counted outcome so nothing is lost silently (T430; this closes the
+/// #81 counted-but-lost gap where an offline refusal vanished).
+/// `<message>` (not error or groupchat) is offered to the recipient's
+/// offline store; a refusal then bounces like any other non-message. IQ,
+/// presence and refused messages bounce service-unavailable to the
+/// stanza's sender through the session map (local) or the S2S daemon
+/// (remote). type='error', type='result' and groupchat stanzas are
+/// counted drops: RFC 6120 forbids an error for an error, and a
+/// groupchat bounce would target a room JID.
+///
+/// The queue is parked on the worker's drain list and the per-stanza
+/// work runs in drainSmUnackedTick at the batch tail, SM_DRAIN_CHUNK
+/// stanzas per iteration, so the drain never monopolizes one kevent
+/// batch. A drain-node allocation failure falls back to an inline drain
+/// so the OOM path still loses nothing silently.
+pub fn parkUnackedDrain(server: *Server, session: *Session) void {
     const queue = session.sm_unacked orelse return;
-    if (session.stream.bound_jid == null) {
-        // The recipient cannot be named without a bound JID; count every
-        // stanza as a drop so the teardown still loses nothing silently.
-        var lost: u64 = 0;
-        var lost_iter = queue.getUnacked();
-        while (lost_iter.next()) |_| lost += 1;
-        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(lost, .monotonic);
-        noteDrop("session {d} unacked drain: {d} stanzas counted as drops (no bound JID)", .{ session.conn.id, lost });
-        return;
-    }
+    session.sm_unacked = null; // the drain node owns it from here
+
     var recipient_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bound_bare = session.stream.boundBare();
-    if (bound_bare.len > recipient_buf.len) {
-        var lost: u64 = 0;
-        var lost_iter = queue.getUnacked();
-        while (lost_iter.next()) |_| lost += 1;
-        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(lost, .monotonic);
-        noteDrop("session {d} unacked drain: {d} stanzas counted as drops (bare JID exceeds {d} bytes)", .{ session.conn.id, lost, router.BARE_JID_MAX });
-        return;
+    var recipient_len: u16 = 0;
+    if (session.stream.bound_jid != null) {
+        const bound_bare = session.stream.boundBare();
+        if (bound_bare.len <= recipient_buf.len) {
+            @memcpy(recipient_buf[0..bound_bare.len], bound_bare);
+            recipient_len = @intCast(bound_bare.len);
+        } else {
+            noteDrop("session {d} unacked drain: bare JID exceeds {d} bytes; {d} stanzas count as drops", .{ session.conn.id, router.BARE_JID_MAX, queue.count });
+        }
+    } else if (queue.count > 0) {
+        noteDrop("session {d} unacked drain: {d} stanzas count as drops (no bound JID)", .{ session.conn.id, queue.count });
     }
-    @memcpy(recipient_buf[0..bound_bare.len], bound_bare);
-    const recipient = recipient_buf[0..bound_bare.len];
+
+    const node = server.allocator.create(SmDrain) catch {
+        // No memory for the parking node: drain inline so no stanza
+        // escapes a counted outcome. Bounded by UNACKED_CAPACITY; the
+        // OOM cold path may stall once.
+        drainQueueNow(server, queue, recipient_buf[0..recipient_len]);
+        queue.deinit();
+        server.allocator.destroy(queue);
+        return;
+    };
+    node.* = .{
+        .queue = queue,
+        .recipient_len = recipient_len,
+        .recipient = recipient_buf,
+    };
+    if (server.sm_drain_tail) |tail| {
+        tail.next = node;
+    } else {
+        server.sm_drain_head = node;
+    }
+    server.sm_drain_tail = node;
+}
+
+/// Batch-tail continuation for parked unacked drains (T-265C5A0E):
+/// SM_DRAIN_CHUNK stanzas at most leave the queues per call and
+/// leftovers re-drive the loop through the self-wake knote, so the work
+/// lands across ordinary iterations instead of one kevent batch. Called
+/// once per event-loop iteration next to reapOutboundOverflow.
+pub fn drainSmUnackedTick(server: *Server) void {
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
-    var iter = queue.getUnacked();
-    while (iter.next()) |blob| {
-        drainOneUnacked(server, blob.bytes(), recipient, now);
+    var done: u32 = 0;
+    while (done < SM_DRAIN_CHUNK) {
+        const node = server.sm_drain_head orelse break;
+        if (node.pos == node.queue.count) {
+            server.sm_drain_head = node.next;
+            if (server.sm_drain_tail == node) server.sm_drain_tail = null;
+            node.queue.deinit();
+            server.allocator.destroy(node.queue);
+            server.allocator.destroy(node);
+            continue;
+        }
+        const idx = (node.queue.head + node.pos) % sm_state.UNACKED_CAPACITY;
+        node.pos += 1;
+        const blob = node.queue.entries[idx] orelse continue;
+        node.queue.entries[idx] = null;
+        done += 1;
+        if (node.recipient_len == 0) {
+            _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+        } else {
+            drainOneUnacked(server, blob.bytes(), node.recipient[0..node.recipient_len], now);
+        }
+        blob.release();
+    }
+    if (server.sm_drain_head != null) {
+        server.loop.selfWake() catch |err| {
+            log.warn("SM unacked drain self-wake failed: {s}; leftovers wait for the next event", .{@errorName(err)});
+        };
     }
 }
 
-/// Per-stanza section-5 outcome for drainUnackedToOffline. Counters live in
-/// delivery_queue (module globals, cold teardown path).
+/// Synchronous drain used only when the parking node's allocation
+/// failed: every queued stanza still reaches one counted outcome.
+fn drainQueueNow(server: *Server, queue: *sm_state.SmUnackedQueue, recipient: []const u8) void {
+    const now: u64 = @intCast(@max(std.time.timestamp(), 0));
+    var iter = queue.getUnacked();
+    while (iter.next()) |blob| {
+        if (recipient.len == 0) {
+            _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+        } else {
+            drainOneUnacked(server, blob.bytes(), recipient, now);
+        }
+    }
+}
+
+/// Per-stanza section-5 outcome for the parked unacked drain. Counters
+/// live in delivery_queue (module globals, cold teardown path).
 fn drainOneUnacked(server: *Server, stanza: []const u8, recipient: []const u8, now: u64) void {
     const head_end = std.mem.indexOfScalar(u8, stanza, '>') orelse {
         _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
@@ -1759,6 +1860,8 @@ test "S15: an overflowed session drains unacked messages to offline storage" {
 
     session.sm_overflow = true;
     reapOutboundOverflow(&server, &changes);
+    // The drain is parked at teardown and runs chunked at the batch tail.
+    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
 
     // Only the plain <message> reached the offline store; the session
     // was reaped with resource-constraint.
@@ -2999,6 +3102,150 @@ test "T316: a repeated destroySession is a counted no-op" {
 // C11 regression tests: every unacked stanza reaches a counted outcome:
 // stored offline, bounced, or a counted drop. Never a silent loss (T430).
 
+test "C11: detach moves the unacked queue off the producer budget (T-265C5A0E)" {
+    const allocator = std.testing.allocator;
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const session = try makeAuthenticatedSession(&server, 1, "alice");
+    session.stream.state = .active;
+    session.stream.bound_jid = xmpp_lib.Jid.parse("alice@localhost/res") catch null;
+    session.sm_resume_enabled = true;
+    session.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    @memcpy(&session.sm_id, "aaaa1111bbbb2222cccc3333dddd4444");
+    server.free_count -= 1;
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(server.smBlobBudget());
+    _ = queue.push("<message from='bob@localhost/res' to='alice@localhost' id='m1'/>");
+    session.sm_unacked = queue;
+
+    const producer = server.smBlobBudget();
+    const charged = producer.bytes_in_flight.load(.monotonic);
+    try std.testing.expect(charged > 0);
+
+    closeSession(&server, 1, &changes);
+
+    // Detached, still resumable, and the queue's charges moved onto the
+    // worker's retention budget.
+    try std.testing.expect(session.sm_detached);
+    try std.testing.expect(!session.sm_overflow);
+    try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
+    try std.testing.expectEqual(charged, server.smRetentionBudget().bytes_in_flight.load(.monotonic));
+    try std.testing.expect(queue.detached);
+
+    // Teardown returns the retention charges and parks the drain.
+    session.sm_resume_enabled = false;
+    destroySession(&server, 1, session, &changes);
+    try std.testing.expect(server.sm_drain_head != null);
+    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
+    try std.testing.expectEqual(@as(u64, 0), server.smRetentionBudget().bytes_in_flight.load(.monotonic));
+}
+
+test "C11: a full SM retention budget fails the detach into a counted drain (T-265C5A0E)" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, false, 0);
+    defer sm.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.session_map = &sm;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const bob = try makeAuthenticatedSession(&server, 3, "bob");
+    bob.stream.bound_jid = xmpp_lib.Jid.parse("bob@localhost/res") catch null;
+    try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
+    server.free_count -= 1;
+
+    const session = try makeAuthenticatedSession(&server, 1, "alice");
+    session.stream.state = .active;
+    session.stream.bound_jid = xmpp_lib.Jid.parse("alice@localhost/res") catch null;
+    session.sm_resume_enabled = true;
+    session.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    @memcpy(&session.sm_id, "bbbb2222cccc3333dddd4444eeee5555");
+    server.free_count -= 1;
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(server.smBlobBudget());
+    _ = queue.push("<message from='bob@localhost/res' to='alice@localhost' id='m1' type='chat'><body>hi</body></message>");
+    _ = queue.push("<iq from='bob@localhost/res' to='alice@localhost' id='iq1' type='get'><ping/></iq>");
+    session.sm_unacked = queue;
+
+    // A retention budget that cannot take even one blob refuses the move,
+    // so the detach flags the session for the reap instead of pinning the
+    // producer budget for the resume tail.
+    server.sm_retention_budget = .{ .allocator = allocator, .limit = 1 };
+    closeSession(&server, 1, &changes);
+    try std.testing.expect(session.sm_detached);
+    try std.testing.expect(session.sm_overflow);
+
+    const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
+    const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
+    const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
+    const failed0 = delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic);
+    reapOutboundOverflow(&server, &changes);
+    try std.testing.expect(server.sessions[1] == null);
+    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
+
+    // Every queued stanza reached a counted outcome: the message stored,
+    // the IQ bounced to its sender.
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_stored.load(.monotonic) - stored0);
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0);
+    try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+    try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic) - failed0);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("alice@localhost"));
+
+    bob.sm_resume_enabled = false;
+    destroySession(&server, 3, bob, &changes);
+}
+
+test "C11: the unacked drain is chunked per iteration (T-265C5A0E)" {
+    const allocator = std.testing.allocator;
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // A detached queue deeper than one chunk: a mass expiry (or any
+    // teardown burst) must spread the drain across iterations.
+    var stanzas: [SM_DRAIN_CHUNK + 5][]const u8 = undefined;
+    for (&stanzas) |*s| s.* = "<message type='error' from='bob@localhost/res' id='x'/>";
+    const detached = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "cccc3333dddd4444eeee5555ffff6666", &stanzas);
+
+    const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
+    destroySession(&server, 2, detached, &changes);
+    try std.testing.expect(server.sm_drain_head != null);
+
+    // One tick drains at most SM_DRAIN_CHUNK stanzas; the rest wait for
+    // the next iteration.
+    drainSmUnackedTick(&server);
+    try std.testing.expectEqual(@as(u64, SM_DRAIN_CHUNK), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+    try std.testing.expect(server.sm_drain_head != null);
+
+    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
+    try std.testing.expectEqual(@as(u64, stanzas.len), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+}
+
 fn makeDetachedWithStanzas(
     server: *Server,
     id: usize,
@@ -3065,6 +3312,8 @@ test "C11: expiry drain stores messages offline and bounces IQs" {
     const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
     const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
     destroySession(&server, 2, detached, &changes);
+    // The drain is parked at teardown and runs chunked at the batch tail.
+    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
 
     // The message reached the offline store; the IQ bounced to its sender.
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("alice@localhost"));
@@ -3121,6 +3370,7 @@ test "C11: offline-quota refusal bounces the message to its sender" {
     const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
     const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
     destroySession(&server, 2, detached, &changes);
+    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
 
     // Refusal counted, then the bounce reached the sender: nothing lost.
     try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_offline_refused.load(.monotonic) - refused0);
@@ -3173,6 +3423,7 @@ test "C11: error, result and groupchat unacked stanzas drop counted, never bounc
     const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
     const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
     destroySession(&server, 2, detached, &changes);
+    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
 
     try std.testing.expectEqual(@as(u64, 3), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
     try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0);

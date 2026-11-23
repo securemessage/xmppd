@@ -405,6 +405,18 @@ pub const Server = struct {
     /// smBlobBudget(); the field never moves after init.
     sm_blob_budget_fallback: ?delivery_queue_mod.BlobBudget = null,
 
+    /// Dedicated budget carrying blob charges retained by this worker's
+    /// detached SM unacked queues (T-265C5A0E): the resume tail stops
+    /// pinning producing workers' ring budgets. Lazily initialized by
+    /// smRetentionBudget(); the field never moves after init.
+    sm_retention_budget: ?delivery_queue_mod.BlobBudget = null,
+
+    /// FIFO of unacked queues parked for a chunked section-5 drain
+    /// (T-265C5A0E). drainSmUnackedTick empties it at the batch tail,
+    /// SM_DRAIN_CHUNK stanzas per iteration.
+    sm_drain_head: ?*session_lifecycle.SmDrain = null,
+    sm_drain_tail: ?*session_lifecycle.SmDrain = null,
+
     /// Stale per-session events skipped because the session was detached or
     /// closed after kevent returned this batch (S28). Counted and logged at
     /// debug so a regression here is visible instead of silent.
@@ -854,6 +866,15 @@ pub const Server = struct {
         if (self.delivered_targets.len > 0) self.allocator.free(self.delivered_targets);
         if (self.fanout_entries.len > 0) self.allocator.free(self.fanout_entries);
         if (self.byte_scratch.len > 0) self.allocator.free(self.byte_scratch);
+        // Parked section-5 drains own the sessions' old unacked queues;
+        // return their blob charges before the allocator goes away.
+        while (self.sm_drain_head) |node| {
+            self.sm_drain_head = node.next;
+            node.queue.deinit();
+            self.allocator.destroy(node.queue);
+            self.allocator.destroy(node);
+        }
+        self.sm_drain_tail = null;
         self.sm_id_map.deinit(self.allocator);
         self.sm_redirects.deinit(self.allocator);
         self.listener.deinit();
@@ -1062,6 +1083,21 @@ pub const Server = struct {
         return &self.sm_blob_budget_fallback.?;
     }
 
+    /// The budget carrying blob charges retained by this worker's
+    /// detached SM unacked queues (T-265C5A0E): detached queues move
+    /// their charges here at detach so a resume tail never starves the
+    /// producing ring budgets. Hard-bounded at SM_RETENTION_LIMIT; a full
+    /// budget fails the detaching session so its queue drains counted.
+    pub fn smRetentionBudget(self: *Server) *delivery_queue_mod.BlobBudget {
+        if (self.sm_retention_budget == null) {
+            self.sm_retention_budget = .{
+                .allocator = self.allocator,
+                .limit = delivery_queue_mod.BlobBudget.SM_RETENTION_LIMIT,
+            };
+        }
+        return &self.sm_retention_budget.?;
+    }
+
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
     pub fn run(self: *Server) !void {
         var change_buf: [CHANGE_BUF_SIZE]posix.Kevent = undefined;
@@ -1178,6 +1214,11 @@ pub const Server = struct {
 
             // Fail sessions whose outbound delivery overflowed in this batch.
             session_lifecycle.reapOutboundOverflow(self, &changes);
+
+            // C11/T-265C5A0E: chunked section-5 drain. Parked unacked
+            // queues lose at most SM_DRAIN_CHUNK stanzas per iteration;
+            // leftovers re-drive the loop on the self-wake knote.
+            session_lifecycle.drainSmUnackedTick(self);
 
             // C11: settle the expiry wheel's one-shot arm once per batch
             // (detaches, destroys and drains all mark sm_expiry_pending).

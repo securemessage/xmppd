@@ -288,6 +288,13 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     session.sm_id_len = detached.sm_id_len;
     session.sm_unacked = detached.sm_unacked;
     detached.sm_unacked = null; // Ownership transferred
+    // The queue is live again: new entries charge this worker's delivery
+    // budget instead of the SM retention budget. Retained blobs keep the
+    // charges they already carry and return them on ack or teardown.
+    if (session.sm_unacked) |q| {
+        q.detached = false;
+        q.budget = self.smBlobBudget();
+    }
 
     // Transfer XMPP session state — copy JID strings into session-owned buffers
     // because the detached session's buffers will be freed below.
@@ -1003,7 +1010,7 @@ fn failResumedSession(self: *Server, session: *Session, changes: *ChangeList) vo
     sendSmFailed(self, session, "internal-server-error", changes);
     // The failed element must reach the wire before the teardown.
     session.conn.flushSync();
-    session_lifecycle.drainUnackedToOffline(self, session);
+    session_lifecycle.parkUnackedDrain(self, session);
     session_lifecycle.forceCloseSession(self, session.conn.id, changes);
 }
 

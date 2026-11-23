@@ -145,13 +145,21 @@ pub const DeliveryClass = enum(u8) {
 /// replay queues and actor retry lists (ADR-3). One allocation: header
 /// followed by `len` payload bytes. The producing worker's `BlobBudget`
 /// bounds its in-flight bytes; the last release on any thread frees the
-/// allocation and returns the bytes to that budget.
+/// allocation through `alloc` and returns the bytes to whichever budget
+/// carries the charge.
 pub const Blob = struct {
     /// Open references: ring slots, mailbox entries, SM entries, the
     /// producer's own handle.
     refs: std.atomic.Value(u32),
-    /// Owning budget: frees return their byte charge here.
-    budget: *BlobBudget,
+    /// Budget currently carrying this blob's byte charge. Atomic because
+    /// a retainer (a detached SM queue) may move the charge while other
+    /// references are still open (transferChargeTo); the freeing release
+    /// returns it to whatever pointer is current.
+    budget: std.atomic.Value(*BlobBudget),
+    /// Allocator that made this allocation. Recorded on the blob so the
+    /// last release frees correctly no matter which budget the charge
+    /// was moved to.
+    alloc: std.mem.Allocator,
     /// Payload length in bytes.
     len: u32,
 
@@ -167,15 +175,40 @@ pub const Blob = struct {
         _ = self.refs.fetchAdd(1, .monotonic);
     }
 
-    /// Drop a reference. The last one frees the allocation through the
-    /// home budget's allocator and returns the byte charge.
+    /// Drop a reference. The last one frees the allocation through `alloc`
+    /// and returns the byte charge to the current budget.
     pub fn release(self: *Blob) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-        const budget = self.budget;
+        const budget = self.budget.load(.acquire);
         const size = @sizeOf(Blob) + self.len;
         const raw: [*]align(@alignOf(Blob)) u8 = @ptrCast(@alignCast(self));
-        budget.allocator.free(raw[0..size]);
+        self.alloc.free(raw[0..size]);
         _ = budget.bytes_in_flight.fetchSub(size, .acq_rel);
+    }
+
+    /// Move this blob's byte charge from its current budget onto `to`
+    /// (T-265C5A0E): detached SM queues transfer their retention off the
+    /// producing workers' ring budgets so a 300 s resume tail can never
+    /// starve a producer. The caller MUST hold a reference (a queue entry
+    /// counts): while one is held the freeing release cannot run, so the
+    /// charge cannot be returned twice. Returns false, changing nothing,
+    /// when `to` cannot take the charge.
+    pub fn transferChargeTo(self: *Blob, to: *BlobBudget) bool {
+        const size: u64 = @sizeOf(Blob) + self.len;
+        while (true) {
+            const cur = self.budget.load(.acquire);
+            if (cur == to) return true;
+            if (to.bytes_in_flight.fetchAdd(size, .acq_rel) + size > to.limit) {
+                _ = to.bytes_in_flight.fetchSub(size, .acq_rel);
+                return false;
+            }
+            if (self.budget.cmpxchgWeak(cur, to, .acq_rel, .acquire)) |_| {
+                _ = to.bytes_in_flight.fetchSub(size, .acq_rel);
+                continue;
+            }
+            _ = cur.bytes_in_flight.fetchSub(size, .acq_rel);
+            return true;
+        }
     }
 };
 
@@ -191,6 +224,13 @@ pub const BlobBudget = struct {
 
     /// Default per-worker in-flight cap (ADR-3).
     pub const DEFAULT_LIMIT: u64 = 4 * 1024 * 1024;
+
+    /// Per-worker bound on blob charges retained by detached SM unacked
+    /// queues (T-265C5A0E). Detach moves every retained charge off the
+    /// producing ring budgets onto one retention budget, so the resume
+    /// tail is bounded here instead of starving producers. Larger than a
+    /// producer budget because a worker may hold many detached queues.
+    pub const SM_RETENTION_LIMIT: u64 = 16 * 1024 * 1024;
 
     /// Copy `payload` into a new refcounted blob; the caller owns the
     /// initial reference. Fails closed on budget exhaustion, allocation
@@ -212,7 +252,8 @@ pub const BlobBudget = struct {
         const blob: *Blob = @ptrCast(raw.ptr);
         blob.* = .{
             .refs = std.atomic.Value(u32).init(1),
-            .budget = self,
+            .budget = std.atomic.Value(*BlobBudget).init(self),
+            .alloc = self.allocator,
             .len = @intCast(payload.len),
         };
         @memcpy(raw.ptr[@sizeOf(Blob)..size], payload);

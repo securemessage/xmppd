@@ -1509,8 +1509,8 @@ test "Server: a cross-worker delivery to a resumable session shares the ring blo
     // queue holds the only reference.
     try std.testing.expectEqual(@as(u32, 1), queue.count);
     const entry = queue.entries[queue.head].?;
-    try std.testing.expect(entry.budget == &delivery_sys.budgets[0]);
-    try std.testing.expect(entry.budget != &sm_budget);
+    try std.testing.expect(entry.budget.load(.monotonic) == &delivery_sys.budgets[0]);
+    try std.testing.expect(entry.budget.load(.monotonic) != &sm_budget);
     try std.testing.expectEqual(@as(u32, 1), entry.refs.load(.monotonic));
     try std.testing.expectEqualStrings(payload, entry.bytes());
 }
