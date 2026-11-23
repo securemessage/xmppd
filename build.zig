@@ -1550,6 +1550,43 @@ pub fn build(b: *std.Build) void {
 
     const run_config_tests = b.addRunArtifact(config_tests);
 
+    // --- Config schema -> doc/CONFIGURATION.md (R8) ---
+    // The doc renders from the ADR-9 schema (Sections defaults and
+    // file_spec), so the one table feeds the loader, --help and the doc.
+
+    const gen_docs_mod = b.createModule(.{
+        .root_source_file = b.path("src/config/gen_docs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gen_docs_mod.addImport("schema", schema_mod);
+    gen_docs_mod.addImport("conf", conf_mod);
+
+    const gen_docs = b.addExecutable(.{
+        .name = "gen-config-docs",
+        .root_module = gen_docs_mod,
+    });
+
+    const gen_docs_tests = b.addTest(.{
+        .name = "gen-docs-tests",
+        .root_module = gen_docs_mod,
+    });
+
+    const run_gen_docs_tests = b.addRunArtifact(gen_docs_tests);
+
+    const run_docs_config = b.addRunArtifact(gen_docs);
+    run_docs_config.addArg("doc/CONFIGURATION.md");
+    const docs_config_step = b.step("docs-config",
+        "Regenerate doc/CONFIGURATION.md from src/config/schema.zig");
+    docs_config_step.dependOn(&run_docs_config.step);
+
+    const run_docs_config_check = b.addRunArtifact(gen_docs);
+    run_docs_config_check.addArg("--check");
+    run_docs_config_check.addArg("doc/CONFIGURATION.md");
+    const docs_config_check_step = b.step("docs-config-check",
+        "Fail when doc/CONFIGURATION.md is stale vs src/config/schema.zig");
+    docs_config_check_step.dependOn(&run_docs_config_check.step);
+
     // --- HTTP client module (for OIDC backend) ---
 
     const http_mod = b.createModule(.{
@@ -2272,11 +2309,13 @@ pub fn build(b: *std.Build) void {
     const test_auth_step = b.step("test-auth", "Run only the auth daemon startup tests");
     const test_auth_oidc_step = b.step("test-auth-oidc", "Run only the OIDC auth daemon tests");
     const test_schema_step = b.step("test-schema", "Run only the shared configuration schema tests");
+    const test_gen_docs_step = b.step("test-gen-docs", "Run only the config doc-generation tests");
     test_core_step.dependOn(&run_core_tests.step);
     test_s2s_step.dependOn(&run_s2s_main_tests.step);
     test_auth_step.dependOn(&run_auth_main_tests.step);
     test_auth_oidc_step.dependOn(&run_oidc_main_tests.step);
     test_schema_step.dependOn(&run_schema_tests.step);
+    test_gen_docs_step.dependOn(&run_gen_docs_tests.step);
 
     const test_step = b.step("test", "Run all library tests");
     // A green test suite must also prove every install artifact compiles.
@@ -2411,6 +2450,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_message_tests.step);
     test_step.dependOn(&run_room_mailbox_tests.step);
     test_step.dependOn(&run_config_tests.step);
+    test_step.dependOn(&run_gen_docs_tests.step);
     test_step.dependOn(&run_http_tests.step);
     test_step.dependOn(&run_jwt_tests.step);
     test_step.dependOn(&run_oidc_store_tests.step);
