@@ -138,7 +138,7 @@ pub const Wheel = struct {
     /// revolution `(cursor, cursor + SLOT_COUNT]` and one bucket holds one
     /// deadline, so the minimum is the first non-empty bucket scanning
     /// forward from `cursor + 1`: at most SLOT_COUNT head checks and no
-    /// node walk — O(buckets), never O(sessions).
+    /// node walk: O(buckets), never O(sessions).
     fn scanMin(self: *const Wheel) i64 {
         var i: usize = 1;
         while (i <= SLOT_COUNT) : (i += 1) {

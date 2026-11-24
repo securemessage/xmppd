@@ -28,7 +28,7 @@ T-684D1A21; subsumes T317 and V19; with C4 it closes T429/T430).
    recipient. Retention is bounded per session by
    `[core] sm_max_unacked_bytes` (default 4 MiB = 256 x 16 KiB), so a
    worker's worst-case retention is `sessions_per_worker x
-   sm_max_unacked_bytes` — config-derived, no hidden worker ceiling.
+   sm_max_unacked_bytes`, config-derived, no hidden worker ceiling.
    Wheel adds three words per session slot.
 6. **Many requests per connection.** Unchanged (XEP-0198 already streams).
 7. **Beyond one host.** Cross-worker resume already hands off state; with
