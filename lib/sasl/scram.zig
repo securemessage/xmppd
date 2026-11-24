@@ -560,19 +560,32 @@ pub fn mintServerNonce(out_b64: *[server_nonce_b64_len]u8, now: i64) []const u8 
     return std.base64.standard.Encoder.encode(out_b64, &raw);
 }
 
+/// Decode the issue time a timed server nonce carries, or null when the
+/// value is not the timed layout (wrong length or malformed base64).
+pub fn serverNonceIssued(nonce_b64: []const u8) ?i64 {
+    var raw: [server_nonce_raw_len]u8 = undefined;
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(nonce_b64) catch return null;
+    if (n != server_nonce_raw_len) return null;
+    dec.decode(&raw, nonce_b64) catch return null;
+    return @bitCast(std.mem.readInt(u64, raw[0..8], .big));
+}
+
+/// Decode and bound-check a timed server nonce: returns the embedded issue
+/// time when it falls inside [now - window_seconds, now + skew_seconds],
+/// else null. Wrong length or malformed base64 fails closed.
+pub fn serverNonceIssuedInWindow(nonce_b64: []const u8, now: i64, window_seconds: i64, skew_seconds: i64) ?i64 {
+    const issued = serverNonceIssued(nonce_b64) orelse return null;
+    if (issued < now - window_seconds) return null;
+    if (issued > now + skew_seconds) return null;
+    return issued;
+}
+
 /// True when nonce_b64 decodes to a timed nonce whose issue time is inside
 /// [now - window_seconds, now + skew_seconds]. Wrong length or malformed
 /// base64 fails closed.
 pub fn serverNonceFresh(nonce_b64: []const u8, now: i64, window_seconds: i64, skew_seconds: i64) bool {
-    var raw: [server_nonce_raw_len]u8 = undefined;
-    const dec = std.base64.standard.Decoder;
-    const n = dec.calcSizeForSlice(nonce_b64) catch return false;
-    if (n != server_nonce_raw_len) return false;
-    dec.decode(&raw, nonce_b64) catch return false;
-    const issued: i64 = @bitCast(std.mem.readInt(u64, raw[0..8], .big));
-    if (issued < now - window_seconds) return false;
-    if (issued > now + skew_seconds) return false;
-    return true;
+    return serverNonceIssuedInWindow(nonce_b64, now, window_seconds, skew_seconds) != null;
 }
 
 /// PBKDF2 iteration count used when the store derives credentials at

@@ -110,7 +110,7 @@ test "AuthHandler: OAUTHBEARER admits the identity the IdP returns" {
     const allocator = std.testing.allocator;
 
     var store = TestIdpStore{ .token_user = "bob@idp.example" };
-    var handler = TestIdpHandler.init(allocator, &store, .{});
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     const result = handleSync(&handler, .{ .auth_request = .{
@@ -130,7 +130,7 @@ test "AuthHandler: OAUTHBEARER binds the prepared localpart" {
     const allocator = std.testing.allocator;
 
     var store = TestIdpStore{ .token_user = "NaplesTB@idp.example" };
-    var handler = TestIdpHandler.init(allocator, &store, .{});
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     const result = handleSync(&handler, .{ .auth_request = .{
@@ -162,7 +162,7 @@ test "AuthHandler: invalid IdP identities get not-authorized with IP-only charge
         .ip_lockout_threshold = 1,
     });
     defer limiter.deinit();
-    var handler = TestIdpHandler.init(allocator, &store, .{});
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -194,7 +194,7 @@ test "AuthHandler: a lock on the IdP identity rejects OAUTHBEARER" {
     try locks.lock("bob", .permanent);
 
     var store = TestIdpStore{ .token_user = "Bob@idp.example" };
-    var handler = TestIdpHandler.init(allocator, &store, .{});
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     defer handler.deinit();
     var lock_checker: LockStoreChecker(MemoryBackend) = undefined;
     lock_checker.init(&locks, allocator);
@@ -230,7 +230,7 @@ test "AuthHandler: OAUTHBEARER denies a locked IP before validating the token" {
     defer limiter.deinit();
     limiter.recordOutcome("anyone", "10.0.0.7", false);
 
-    var handler = TestIdpHandler.init(allocator, &store, .{});
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 

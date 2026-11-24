@@ -194,6 +194,11 @@ pub fn AuthHandler(comptime Store: type) type {
         /// tolerance (auth.scram_nonce_skew_seconds).
         replay_window_seconds: i64 = scram_mech.DEFAULT_NONCE_WINDOW_SECONDS,
         nonce_skew_seconds: i64 = scram_mech.DEFAULT_NONCE_SKEW_SECONDS,
+        /// Server nonces issued before this wall second are refused: set
+        /// to boot time, so a restarted verifier whose replay table is
+        /// empty cannot let a pre-boot challenge pass when the table
+        /// cannot prove it was never consumed.
+        replay_floor_seconds: i64 = 0,
         /// Admission policy: permanent locks and the rate limiter.
         policy: policy_mod.Policy = .{},
         /// Registration configuration.
@@ -228,21 +233,28 @@ pub fn AuthHandler(comptime Store: type) type {
             replay_capacity: usize = scram_mech.DEFAULT_REPLAY_CAPACITY,
             nonce_window_seconds: i64 = scram_mech.DEFAULT_NONCE_WINDOW_SECONDS,
             nonce_skew_seconds: i64 = scram_mech.DEFAULT_NONCE_SKEW_SECONDS,
+            /// Boot-time floor for timed server nonces; null stamps the
+            /// init timestamp. Tests set it to pin the boundary.
+            nonce_floor_seconds: ?i64 = null,
             /// The persisted {db}/auth fake-derivation key; null mints a
             /// per-boot one (tests, OIDC daemon).
             scram_secret: ?[32]u8 = null,
         };
 
-        pub fn init(allocator: std.mem.Allocator, store: *Store, opts: InitOpts) Self {
+        /// The replay table is required for SCRAM when replay_capacity is
+        /// nonzero: failing its allocation fails init, so the daemon
+        /// cannot start up silently refusing every verify.
+        pub fn init(allocator: std.mem.Allocator, store: *Store, opts: InitOpts) !Self {
             var handler = Self{
                 .store = store,
                 .allocator = allocator,
                 .scram_secret = undefined,
                 .replay_window_seconds = opts.nonce_window_seconds,
                 .nonce_skew_seconds = opts.nonce_skew_seconds,
+                .replay_floor_seconds = opts.nonce_floor_seconds orelse std.time.timestamp(),
             };
             if (opts.replay_capacity > 0) {
-                handler.replay_entries = allocator.alloc(scram_mech.ReplayEntry, opts.replay_capacity) catch &.{};
+                handler.replay_entries = try allocator.alloc(scram_mech.ReplayEntry, opts.replay_capacity);
                 for (handler.replay_entries) |*e| e.* = .{};
             }
             if (opts.scram_secret) |s| {
@@ -438,7 +450,7 @@ test "AuthMetrics: PLAIN moves the started, completed and outcome counters" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "secret123");
-    var handler = TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     const c = &metrics.counters;
@@ -474,7 +486,7 @@ test "AuthMetrics: SCRAM v2 counts one exchange per verify" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "secret123");
-    var handler = TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     const c = &metrics.counters;
@@ -511,7 +523,7 @@ test "AuthMetrics: OAUTHBEARER moves its own mechanism counters" {
     defer metrics.reset();
 
     var store = testkit.TestIdpStore{ .token_user = "bob@idp.example" };
-    var handler = testkit.TestIdpHandler.init(allocator, &store, .{});
+    var handler = try testkit.TestIdpHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     const c = &metrics.counters;
@@ -552,7 +564,7 @@ test "AuthMetrics: limiter admits, refusals and lockouts move under driven excha
         .ip_lockout_threshold = 100,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -606,7 +618,7 @@ test "AuthMetrics: a locked account's verify counts the refusal and lockout" {
         .ip_lockout_threshold = 100,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -644,7 +656,7 @@ test "AuthMetrics: an IP window denial and IP lockout move their counters" {
         .ip_lockout_threshold = 1,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -685,7 +697,7 @@ test "AuthMetrics: crypto-pool completions move jobs, high-water and latency" {
     var pool = crypto_pool_mod.CryptoPool{ .allocator = allocator };
     try pool.start(1);
     defer pool.stop();
-    var handler = TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.enableCryptoPool(&pool);
     defer handler.deinit();
 

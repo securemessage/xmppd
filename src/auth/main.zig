@@ -199,9 +199,12 @@ pub fn main() !void {
         .nonce_window_seconds = v.auth.scram_nonce_window_seconds,
         .nonce_skew_seconds = v.auth.scram_nonce_skew_seconds,
         .scram_secret = scram_secret,
-    });
+    }) catch |err| {
+        log.err("replay cache alloc of {d} entries failed ({s}); refusing to start", .{ replay_capacity, @errorName(err) });
+        return err;
+    };
     if (handler.replay_entries.len == 0) {
-        log.warn("replay cache alloc of {d} entries failed; every SCRAM verify refuses", .{replay_capacity});
+        log.warn("replay cache configured with 0 entries; every SCRAM verify refuses", .{});
     } else {
         log.info("replay cache: {d} entries ({d} logins/s ceiling x {d}s window), nonce skew {d}s", .{
             handler.replay_entries.len, v.auth.login_rate_ceiling, v.auth.scram_nonce_window_seconds, v.auth.scram_nonce_skew_seconds,
