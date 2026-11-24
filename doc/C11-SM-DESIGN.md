@@ -116,16 +116,17 @@ revolution and each bucket's entries are all due at its tick). Intrusive
 - `destroySession` unlinks centrally (flag-guarded, so wheel-free sessions
   are a no-op).
 - `expireDetachedSessions` drains due buckets and destroys those sessions
-  (which already runs `drainUnackedToOffline`), then re-arms.
+  (which already runs the unacked drain), then re-arms.
 - The worker keeps ONE one-shot `EVFILT_TIMER` on `SM_EXPIRY_TIMER_IDENT`,
   re-armed to the wheel's next deadline after every insert/remove/drain
   (`armSmExpiry`); empty wheel disarms. The 30 s periodic registration and
   its whole-session-table scan go away. No per-session timers, no polling:
   the loop sleeps until the next deadline.
-- `scanMin` is O(buckets): linked deadlines all fall within one revolution
-  of the cursor and one bucket holds one deadline (asserted on insert),
-  so the minimum is the first non-empty bucket forward from `cursor + 1`.
-  At most 512 head checks, never a node walk.
+- `scanMin` is O(buckets): the absolute minimum over the 512 bucket
+  heads, independent of the cursor. Bucket lists are sorted by deadline,
+  so entries a full revolution apart (idle wheel, delayed timer turn)
+  share a bucket safely and the head is always the bucket's earliest.
+  Head checks only, never a node walk.
 - `sm_detach_time`, wheel deadlines and `armSmExpiry` run on
   `clock_gettime(CLOCK.MONOTONIC)`: a wall-clock step can neither stall
   expiry nor mass-expire detached sessions. Wall clock remains only for
@@ -137,7 +138,15 @@ revolution and each bucket's entries are all due at its tick). Intrusive
 
 `drainUnackedToOffline` becomes the XEP-0198 §5 policy point, per stanza,
 counted per outcome (nothing lost silently; this is the #81 fix: the 3120
-counted-but-lost offline-quota drops now bounce):
+counted-but-lost offline-quota drops now bounce). Queues park on a bounded
+FIFO (`SM_DRAIN_PARK_MAX_NODES` / `SM_DRAIN_PARK_MAX_BYTES`, retained bytes
+charged while parked) and drain `SM_DRAIN_CHUNK` credits per loop turn,
+with empty-queue retirement costing one credit. Offline stores submit to
+a bounded off-loop executor (`sm_drain_exec`, archive-queue discipline:
+job ring + wake pipe + writer thread, completions settle on the loop);
+nothing commits on the event loop, and a full ring refuses then bounces
+rather than falling back to an inline commit. Park overflow drains
+inline through the same submissions, counted `sm_drain_park_overflow`.
 
 - `<message>` (not `error`/`groupchat`): `storeHeldPointer`. Stored ->
   `sm_unacked_stored`. Refusal or error -> `sm_offline_refused`, then the
@@ -155,8 +164,9 @@ counted-but-lost offline-quota drops now bounce):
   would be a room JID).
 
 New module atomics in ring.zig (`sm_unacked_stored`, `sm_unacked_bounced`,
-`sm_unacked_dropped`, `sm_unacked_bounce_failed`, `sm_offline_refused`),
-exported through `metrics.Externals` and the SIGUSR1 dump.
+`sm_unacked_dropped`, `sm_unacked_bounce_failed`, `sm_offline_refused`,
+`sm_drain_park_overflow`), exported through `metrics.Externals` and the
+SIGUSR1 dump.
 
 ### T317: force-close on resume re-bind failure (item e)
 
