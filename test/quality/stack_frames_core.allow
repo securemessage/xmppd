@@ -33,28 +33,22 @@
 #     xml.Reader, xmpp.Stream) are identical across the window, so no
 #     commit in the range grew the frame. The +16 records the
 #     -Dcpu=baseline measurement pin itself.
-#   A5 (protocol v2 stateless SCRAM, ADR-6):
-#   c2s.lifecycle.acceptConnections +2112: Session gains the parked v2
-#     exchange state (bare/cnonce/server-first/user/cb buffers) inline so
-#     client-final needs no lookup or alloc.
-#   worker.Server.* init fns +112, main.main +112, workerThread +32:
-#     Server gains scram_param_cache as a 16 B slice field; the table
-#     itself is heap-allocated in run() so no init try grows a !Server
-#     slot. Each number is the field's 16 B times the fn's Server slots.
 #   main.main      +192 Q1 203a49b (pre-rebase fc7d7de): Root.init union
 #                  wraps the DebugAllocator in Debug builds (-Dallocator
 #                  default debug)
+#   A5 re-baseline on the respun head (post-C3 out-param init, parked
+#     SCRAM exchanges moved to a heap pool): worker.Server.initFromFdOpts,
+#     initWithMaxSessions, main.configureServer and
+#     registry.RoomRegistry.createRoom all measure under the 16 KiB
+#     threshold so their rows are removed (any return is flagged as new);
+#     every remaining row is re-pinned at the -Dcpu=baseline measurement.
 archive_queue.ArchiveWriteQueue.init	186000
-c2s.lifecycle.acceptConnections	83456
+c2s.lifecycle.acceptConnections	17312
 listener.Listener.accept	25952
-main.configureServer	167696
-main.main	3067624
-main.workerThread	710944
+main.main	1301992
+main.workerThread	355680
 muc.fanout.longestEncodedRealJid	212224
-muc.handler.handleMucDiscoItems	179056
+muc.handler.handleMucDiscoItems	179040
 muc.handler.handleMucGroupchat	17048
-presence.handler.sendPresenceProbes	17040
-registry.RoomRegistry.createRoom	275920
-worker.worker.Server.initFromFdOpts	2132888
-worker.worker.Server.initWithMaxSessions	2488392
-worker.worker.Server.run	67056
+presence.handler.sendPresenceProbes	17008
+worker.worker.Server.run	67040

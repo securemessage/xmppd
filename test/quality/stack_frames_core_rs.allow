@@ -19,15 +19,13 @@
 #                  lands an empty TrivialRoot where the DebugAllocator sat
 #   worker.worker.Server.dispatchEvents -32256 C2 9799e21: dirty-list
 #                  flush at the batch tail shrank the frame (measured)
-#   main.main +15888 A5 (protocol v2 stateless SCRAM, ADR-6): Server's
-#                  scram_param_cache slice field (+16 B) and Session's
-#                  parked-exchange buffers (+2112 B) through main's
-#                  Server/Session materializations; the cache table
-#                  itself is heap-allocated in run().
-main.configureServer	173672
-main.main	2726360
+#   A5 re-baseline on the respun head (post-C3 out-param init, parked
+#     SCRAM exchanges moved to a heap pool): main.configureServer and
+#     registry.RoomRegistry.createRoom measure under the 16 KiB threshold
+#     so their rows are removed (any return is flagged as new); every
+#     remaining row is re-pinned at the -Dcpu=baseline measurement.
+main.main	1296856
 muc.fanout.longestEncodedRealJid	210536
-muc.handler.handleMucDiscoItems	175944
-registry.RoomRegistry.createRoom	214104
-worker.worker.Server.dispatchEvents	45624
+muc.handler.handleMucDiscoItems	175928
+worker.worker.Server.dispatchEvents	34632
 worker.worker.Server.run	70632
