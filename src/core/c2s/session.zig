@@ -717,7 +717,7 @@ pub const Session = struct {
                 .pushed => {},
                 // A stanza the client will count but we cannot replay is the
                 // same silent-gap class as overflow (S15) — fail the session.
-                .alloc_failed, .overflow => {
+                .alloc_failed, .overflow, .bytes_refused => {
                     self.sm_overflow = true;
                     log.warn("connection {d} SM unacked queue failure ({d} stanzas) — failing session", .{ self.conn.id, sm_state.UNACKED_CAPACITY });
                 },
@@ -3945,8 +3945,7 @@ test "S15: queueSendStanza counts the stanza for XEP-0198" {
     session.sm_enabled = true;
     // Owned by session.deinit once assigned.
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    var budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
-    queue.* = sm_state.SmUnackedQueue.init(&budget);
+    queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     session.sm_unacked = queue;
 
     const before = session.sm_out_seq;
@@ -3976,8 +3975,7 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.sm_enabled = true;
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    var budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
-    queue.* = sm_state.SmUnackedQueue.init(&budget);
+    queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     target.sm_unacked = queue;
     server.sessions[5] = target;
 
@@ -4022,8 +4020,7 @@ test "S15: an oversize stanza is refused untracked, a fitting refusal still coun
     session.sm_enabled = true;
     // Owned by session.deinit once assigned.
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    var budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
-    queue.* = sm_state.SmUnackedQueue.init(&budget);
+    queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     session.sm_unacked = queue;
     // Shrink the outbound bound to the ring so the fixtures stay small.
     session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
