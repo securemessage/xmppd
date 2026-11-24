@@ -30,6 +30,7 @@ const routing_deliver = @import("../routing/deliver.zig");
 const stanza_writer = @import("../stanza/writer.zig");
 const connection_mod = @import("../connection.zig");
 const delivery_queue_mod = @import("delivery_queue");
+const sm_drain_exec_mod = @import("sm_drain_exec.zig");
 
 const log = std.log.scoped(.lifecycle);
 
@@ -514,9 +515,9 @@ pub const SmDrain = struct {
 };
 
 /// Per-iteration bound on unacked stanzas drained across all parked
-/// queues (T-265C5A0E). Each drained stanza costs at most one store
-/// attempt plus one bounce; the chunk keeps a mass expiry or a teardown
-/// burst from stalling a whole event batch.
+/// queues (T-265C5A0E). Each drained stanza costs at most one bounded
+/// executor submission plus one bounce, so a mass expiry or a teardown
+/// burst never stalls a whole event batch.
 pub const SM_DRAIN_CHUNK: u32 = 32;
 
 /// XEP-0198 section-5 drain (C11, chunked by T-265C5A0E): on teardown of
@@ -533,9 +534,11 @@ pub const SM_DRAIN_CHUNK: u32 = 32;
 ///
 /// The queue is parked on the worker's drain list and the per-stanza
 /// work runs in drainSmUnackedTick at the batch tail, SM_DRAIN_CHUNK
-/// stanzas per iteration, so the drain never monopolizes one kevent
-/// batch. A drain-node allocation failure falls back to an inline drain
-/// so the OOM path still loses nothing silently.
+/// credits per iteration, so the drain never monopolizes one kevent
+/// batch. Offline stores are submitted to the bounded off-loop executor
+/// and settled on completion; a drain-node allocation failure drains
+/// inline through the same bounded submissions so no stanza escapes a
+/// counted outcome.
 pub fn parkUnackedDrain(server: *Server, session: *Session) void {
     const queue = session.sm_unacked orelse return;
     session.sm_unacked = null; // the drain node owns it from here
@@ -577,11 +580,20 @@ pub fn parkUnackedDrain(server: *Server, session: *Session) void {
 }
 
 /// Batch-tail continuation for parked unacked drains (T-265C5A0E):
-/// SM_DRAIN_CHUNK stanzas at most leave the queues per call and
+/// SM_DRAIN_CHUNK credits at most leave the queues per call and
 /// leftovers re-drive the loop through the self-wake knote, so the work
-/// lands across ordinary iterations instead of one kevent batch. Called
-/// once per event-loop iteration next to reapOutboundOverflow.
+/// lands across ordinary
+/// iterations instead of one kevent batch. Executor completions are
+/// settled first, bounded by MAX_JOBS. Called once per event-loop
+/// iteration next to reapOutboundOverflow.
 pub fn drainSmUnackedTick(server: *Server) void {
+    var completed = server.sm_drain_completed.swap(null, .acq_rel);
+    while (completed) |job| {
+        const next = job.next;
+        settleDrainJob(server, job);
+        completed = next;
+    }
+
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
     var done: u32 = 0;
     while (done < SM_DRAIN_CHUNK) {
@@ -602,7 +614,7 @@ pub fn drainSmUnackedTick(server: *Server) void {
         if (node.recipient_len == 0) {
             _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
         } else {
-            drainOneUnacked(server, blob.bytes(), node.recipient[0..node.recipient_len], now);
+            drainOneUnacked(server, blob, node.recipient[0..node.recipient_len], now);
         }
         node.queue.bytes -= blob.len;
         blob.releaseRetention();
@@ -614,8 +626,10 @@ pub fn drainSmUnackedTick(server: *Server) void {
     }
 }
 
-/// Synchronous drain used only when the parking node's allocation
-/// failed: every queued stanza still reaches one counted outcome.
+/// Synchronous drain used when the queue cannot be parked (node
+/// allocation failure or parked-retention pressure): every queued
+/// stanza still reaches one counted outcome through the same bounded
+/// executor submissions.
 fn drainQueueNow(server: *Server, queue: *sm_state.SmUnackedQueue, recipient: []const u8) void {
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
     var iter = queue.getUnacked();
@@ -623,22 +637,46 @@ fn drainQueueNow(server: *Server, queue: *sm_state.SmUnackedQueue, recipient: []
         if (recipient.len == 0) {
             _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
         } else {
-            drainOneUnacked(server, blob.bytes(), recipient, now);
+            drainOneUnacked(server, blob, recipient, now);
         }
     }
 }
 
-/// Per-stanza section-5 outcome for the parked unacked drain. Counters
-/// live in delivery_queue (module globals, cold teardown path).
-fn drainOneUnacked(server: *Server, stanza: []const u8, recipient: []const u8, now: u64) void {
-    const head_end = std.mem.indexOfScalar(u8, stanza, '>') orelse {
-        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
-        return;
-    };
+/// Header fields the drain's outcome decisions need: the tag name and
+/// the raw attribute text up to the tag's end.
+const UnackedHead = struct {
+    head: []const u8,
+    tag_name: []const u8,
+};
+
+fn parseUnackedHead(stanza: []const u8) ?UnackedHead {
+    const head_end = std.mem.indexOfScalar(u8, stanza, '>') orelse return null;
     const head = stanza[0..head_end];
     var tag_end: usize = 1;
     while (tag_end < head.len and head[tag_end] != ' ' and head[tag_end] != '/') : (tag_end += 1) {}
-    const tag_name = head[1..tag_end];
+    return .{ .head = head, .tag_name = head[1..tag_end] };
+}
+
+/// Executor adapter for the offline store: folds the `!bool` commit
+/// result into the job's `stored` flag. Runs on the executor thread.
+fn offlineStoreHeld(ctx: *anyopaque, recipient: []const u8, from_jid: []const u8, stanza_id: []const u8, timestamp: u64, stanza_xml: []const u8) bool {
+    const store: *offline_store_mod.GenericOfflineStore(server_mod.OpBackendType) = @ptrCast(@alignCast(ctx));
+    return store.storeHeldPointer(recipient, from_jid, stanza_id, timestamp, stanza_xml) catch |err| {
+        log.warn("unacked drain: offline store failed for {s}: {s}", .{ recipient, @errorName(err) });
+        return false;
+    };
+}
+
+/// Per-stanza section-5 outcome for the parked unacked drain. Counters
+/// live in delivery_queue (module globals, cold teardown path).
+fn drainOneUnacked(server: *Server, blob: *delivery_queue_mod.Blob, recipient: []const u8, now: u64) void {
+    const stanza = blob.bytes();
+    const parsed = parseUnackedHead(stanza) orelse {
+        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+        return;
+    };
+    const head = parsed.head;
+    const tag_name = parsed.tag_name;
     const stanza_type = c2s_session.headAttr(head, "type");
 
     // RFC 6120: never send an error for an error or a result.
@@ -657,29 +695,63 @@ fn drainOneUnacked(server: *Server, stanza: []const u8, recipient: []const u8, n
                 return;
             }
         }
-        const stored = if (server.offline) |store|
-            store.storeHeldPointer(
-                recipient,
-                c2s_session.headAttr(head, "from") orelse "",
-                c2s_session.headAttr(head, "id") orelse "offline",
-                now,
-                stanza,
-            ) catch |err| refused: {
-                noteDrop("unacked drain: offline store failed for {s}: {s}", .{ recipient, @errorName(err) });
-                break :refused false;
-            }
-        else
-            false;
-        if (stored) {
-            _ = delivery_queue_mod.sm_unacked_stored.fetchAdd(1, .monotonic);
+        if (server.offline) |store| {
+            // The commit runs on the drain executor thread and the job's
+            // completion settles the outcome; there is no inline commit
+            // fallback - a full ring or a failed job allocation counts as
+            // a store refusal and the stanza bounces like any refusal.
+            server.sm_drain_exec.submit(.{
+                .completed = &server.sm_drain_completed,
+                .wake = &server.loop,
+                .store_ctx = store,
+                .store_fn = offlineStoreHeld,
+                .blob = blob,
+                .recipient = recipient,
+                .from_jid = c2s_session.headAttr(head, "from") orelse "",
+                .stanza_id = c2s_session.headAttr(head, "id") orelse "offline",
+                .timestamp = now,
+            }) catch {
+                _ = delivery_queue_mod.sm_offline_refused.fetchAdd(1, .monotonic);
+                if (bounceUnackedStanza(server, recipient, head, tag_name)) {
+                    _ = delivery_queue_mod.sm_unacked_bounced.fetchAdd(1, .monotonic);
+                } else {
+                    _ = delivery_queue_mod.sm_unacked_bounce_failed.fetchAdd(1, .monotonic);
+                }
+                return;
+            };
             return;
         }
-        // A refusal (quota, missing store, store error) still reaches the
-        // sender as an error instead of vanishing.
+        // No store at all: a refusal still reaches the sender as an
+        // error instead of vanishing.
         _ = delivery_queue_mod.sm_offline_refused.fetchAdd(1, .monotonic);
     }
 
     if (bounceUnackedStanza(server, recipient, head, tag_name)) {
+        _ = delivery_queue_mod.sm_unacked_bounced.fetchAdd(1, .monotonic);
+    } else {
+        _ = delivery_queue_mod.sm_unacked_bounce_failed.fetchAdd(1, .monotonic);
+    }
+}
+
+/// Settle one executor completion on the loop: a stored stanza counts
+/// and frees the job; a refused one bounces like the synchronous
+/// refusal it replaced. The head parse is redone from the job's
+/// retained blob so the executor thread stays store-only.
+fn settleDrainJob(server: *Server, job: *sm_drain_exec_mod.Job) void {
+    defer job.destroy();
+    if (job.stored) {
+        _ = delivery_queue_mod.sm_unacked_stored.fetchAdd(1, .monotonic);
+        return;
+    }
+    // A refusal (quota, store error, executor-side failure) still
+    // reaches the sender as an error instead of vanishing.
+    _ = delivery_queue_mod.sm_offline_refused.fetchAdd(1, .monotonic);
+    const parsed = parseUnackedHead(job.blob.bytes()) orelse {
+        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+        return;
+    };
+    const recipient = job.recipient[0..job.recipient_len];
+    if (bounceUnackedStanza(server, recipient, parsed.head, parsed.tag_name)) {
         _ = delivery_queue_mod.sm_unacked_bounced.fetchAdd(1, .monotonic);
     } else {
         _ = delivery_queue_mod.sm_unacked_bounce_failed.fetchAdd(1, .monotonic);
@@ -1339,6 +1411,19 @@ const archive_backend = @import("archive_backend");
 const offline_store_mod = @import("generic_offline_store");
 const archive_store_mod = @import("archive_store");
 
+/// Drive a parked drain to completion without a live writer thread:
+/// the tick submits store jobs, pumpStore commits them synchronously,
+/// and the next tick settles their completions.
+fn drainParkedFully(server: *Server) void {
+    while (server.sm_drain_head != null or
+        server.sm_drain_exec.pending() > 0 or
+        server.sm_drain_completed.load(.monotonic) != null)
+    {
+        drainSmUnackedTick(server);
+        _ = server.sm_drain_exec.pumpStore(sm_drain_exec_mod.Executor.MAX_JOBS);
+    }
+}
+
 fn testSocketPair() ![2]posix.fd_t {
     var fds: [2]posix.fd_t = undefined;
     const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds);
@@ -1850,7 +1935,7 @@ test "S15: an overflowed session drains unacked messages to offline storage" {
     session.sm_overflow = true;
     reapOutboundOverflow(&server, &changes);
     // The drain is parked at teardown and runs chunked at the batch tail.
-    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
+    drainParkedFully(&server);
 
     // Only the plain <message> reached the offline store; the session
     // was reaped with resource-constraint.
@@ -3135,7 +3220,7 @@ test "C11: SM retention never charges the producer's transport budget" {
     session.sm_resume_enabled = false;
     destroySession(&server, 1, session, &changes);
     try std.testing.expect(server.sm_drain_head != null);
-    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
+    drainParkedFully(&server);
     try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
 }
 
@@ -3204,7 +3289,7 @@ test "C11: the session byte bound fails only the holder into a counted drain" {
     const failed0 = delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic);
     reapOutboundOverflow(&server, &changes);
     try std.testing.expect(server.sessions[1] == null);
-    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
+    drainParkedFully(&server);
 
     // Every queued stanza reached a counted outcome: the message stored,
     // the IQ bounced to its sender.
@@ -3244,7 +3329,7 @@ test "C11: the unacked drain is chunked per iteration (T-265C5A0E)" {
     try std.testing.expectEqual(@as(u64, SM_DRAIN_CHUNK), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
     try std.testing.expect(server.sm_drain_head != null);
 
-    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
+    drainParkedFully(&server);
     try std.testing.expectEqual(@as(u64, stanzas.len), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
 }
 
@@ -3315,7 +3400,7 @@ test "C11: expiry drain stores messages offline and bounces IQs" {
     const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
     destroySession(&server, 2, detached, &changes);
     // The drain is parked at teardown and runs chunked at the batch tail.
-    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
+    drainParkedFully(&server);
 
     // The message reached the offline store; the IQ bounced to its sender.
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("alice@localhost"));
@@ -3372,7 +3457,7 @@ test "C11: offline-quota refusal bounces the message to its sender" {
     const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
     const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
     destroySession(&server, 2, detached, &changes);
-    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
+    drainParkedFully(&server);
 
     // Refusal counted, then the bounce reached the sender: nothing lost.
     try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_offline_refused.load(.monotonic) - refused0);
@@ -3425,7 +3510,7 @@ test "C11: error, result and groupchat unacked stanzas drop counted, never bounc
     const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
     const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
     destroySession(&server, 2, detached, &changes);
-    while (server.sm_drain_head != null) drainSmUnackedTick(&server);
+    drainParkedFully(&server);
 
     try std.testing.expectEqual(@as(u64, 3), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
     try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0);
@@ -3433,6 +3518,112 @@ test "C11: error, result and groupchat unacked stanzas drop counted, never bounc
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
     const pending = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
     try std.testing.expect(std.mem.indexOf(u8, pending, "service-unavailable") == null);
+
+    bob.sm_resume_enabled = false;
+    destroySession(&server, 3, bob, &changes);
+}
+
+test "C11: the drain's offline store commits off the loop via the executor" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const detached = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "3344556677889900aabbccddee112233", &.{
+        "<message from='bob@localhost/res' to='alice@localhost' id='m1' type='chat'><body>hi</body></message>",
+    });
+
+    destroySession(&server, 2, detached, &changes);
+
+    // The tick submits the store job; nothing commits on this thread.
+    drainSmUnackedTick(&server);
+    try std.testing.expectEqual(@as(usize, 1), server.sm_drain_exec.pending());
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
+
+    // The executor-side pump commits; the outcome settles on the next
+    // tick through the completion stack.
+    try std.testing.expectEqual(@as(usize, 1), server.sm_drain_exec.pumpStore(sm_drain_exec_mod.Executor.MAX_JOBS));
+    const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
+    drainSmUnackedTick(&server);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("alice@localhost"));
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_stored.load(.monotonic) - stored0);
+    try std.testing.expect(server.sm_drain_head == null);
+    try std.testing.expect(server.sm_drain_completed.load(.monotonic) == null);
+}
+
+test "C11: a full drain-store ring refuses and bounces, never commits inline" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var sm = SessionMap.init(allocator, false, 0);
+    defer sm.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    server.session_map = &sm;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const bob = try makeAuthenticatedSession(&server, 3, "bob");
+    bob.stream.bound_jid = xmpp_lib.Jid.parse("bob@localhost/res") catch null;
+    try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
+    server.free_count -= 1;
+
+    // Two parked queues fill the executor ring: MAX_JOBS submissions
+    // queue, the rest hit the bounded refusal and bounce.
+    var stanzas: [sm_state.UNACKED_CAPACITY][]const u8 = undefined;
+    for (&stanzas, 0..) |*s, i| {
+        s.* = if (i % 2 == 0)
+            "<message from='bob@localhost/res' to='alice@localhost' id='mx' type='chat'><body>hi</body></message>"
+        else
+            "<presence from='bob@localhost/res' to='alice@localhost'/>";
+    }
+    const d1 = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "44556677889900aabbccddee11223344", &stanzas);
+    const d2 = try makeDetachedWithStanzas(&server, 4, "carol", "carol@localhost/res", "556677889900aabbccddee1122334455", &stanzas);
+
+    destroySession(&server, 2, d1, &changes);
+    destroySession(&server, 4, d2, &changes);
+
+    const refused0 = delivery_queue_mod.sm_offline_refused.load(.monotonic);
+    const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
+    // Ticks keep submitting until the ring is full; nothing commits on
+    // this thread and the count stays zero.
+    while (server.sm_drain_exec.pending() < sm_drain_exec_mod.Executor.MAX_JOBS and server.sm_drain_head != null) {
+        drainSmUnackedTick(&server);
+    }
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
+    try std.testing.expectEqual(@as(usize, sm_drain_exec_mod.Executor.MAX_JOBS), server.sm_drain_exec.pending());
+
+    // The rest of the drain now hits the full ring: refused and bounced.
+    drainParkedFully(&server);
+    try std.testing.expect(delivery_queue_mod.sm_offline_refused.load(.monotonic) - refused0 > 0);
+    try std.testing.expect(delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0 > 0);
+    try std.testing.expectEqual(@as(usize, 0), server.sm_drain_exec.pending());
 
     bob.sm_resume_enabled = false;
     destroySession(&server, 3, bob, &changes);

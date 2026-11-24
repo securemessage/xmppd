@@ -81,6 +81,7 @@ pub const sub_cache_mod = @import("../subscription_cache.zig");
 pub const caps_mod = @import("../caps.zig");
 const router = @import("../routing/router.zig");
 const session_lifecycle = @import("../c2s/lifecycle.zig");
+const sm_drain_exec_mod = @import("../c2s/sm_drain_exec.zig");
 const stanza_writer = @import("../stanza/writer.zig");
 const stanza_facts = @import("../stanza/facts.zig");
 const room_registry_mod = @import("room_registry");
@@ -408,9 +409,20 @@ pub const Server = struct {
 
     /// FIFO of unacked queues parked for a chunked section-5 drain
     /// (T-265C5A0E). drainSmUnackedTick empties it at the batch tail,
-    /// SM_DRAIN_CHUNK stanzas per iteration.
+    /// SM_DRAIN_CHUNK credits per iteration.
     sm_drain_head: ?*session_lifecycle.SmDrain = null,
     sm_drain_tail: ?*session_lifecycle.SmDrain = null,
+
+    /// Off-loop executor for the drain's offline stores: commits run on
+    /// its writer thread and completions land on sm_drain_completed via
+    /// the self-wake knote for drainSmUnackedTick to settle.
+    sm_drain_exec: sm_drain_exec_mod.Executor = .{},
+    /// Drain store jobs finished by the executor, popped by
+    /// drainSmUnackedTick.
+    sm_drain_completed: std.atomic.Value(?*sm_drain_exec_mod.Job) = std.atomic.Value(?*sm_drain_exec_mod.Job).init(null),
+    /// Retention held by parked drains: freed session slots recycle while
+    /// parked queues stay, so the parked list is bounded separately from
+    /// the per-session queue bound.
 
     /// Stale per-session events skipped because the session was detached or
     /// closed after kevent returned this batch (S28). Counted and logged at
@@ -861,6 +873,17 @@ pub const Server = struct {
         if (self.delivered_targets.len > 0) self.allocator.free(self.delivered_targets);
         if (self.fanout_entries.len > 0) self.allocator.free(self.fanout_entries);
         if (self.byte_scratch.len > 0) self.allocator.free(self.byte_scratch);
+        // The drain executor's writer thread must join before its jobs
+        // or the loop go away: completions wake this loop's knote and
+        // jobs release blobs owned by this allocator.
+        self.sm_drain_exec.stop();
+        var drain_completed = self.sm_drain_completed.swap(null, .acq_rel);
+        while (drain_completed) |job| {
+            const next = job.next;
+            job.destroy();
+            drain_completed = next;
+        }
+        self.sm_drain_exec.deinit();
         // Parked section-5 drains own the sessions' old unacked queues;
         // return their blob charges before the allocator goes away.
         while (self.sm_drain_head) |node| {
@@ -1143,6 +1166,14 @@ pub const Server = struct {
         // Start owed reconnect deadlines before the first wait rather than
         // delaying them until after the first unrelated event.
         self.reconcileIpcWriteInterest(&changes);
+
+        // The SM drain's offline commits run on a dedicated writer
+        // thread so LMDB write latency never reaches this loop; the
+        // executor is only submitted to when a store is configured. A
+        // spawn failure fails the worker: submissions that can never be
+        // pumped would strand their stanzas uncounted.
+        if (self.offline != null) try self.sm_drain_exec.start();
+        defer self.sm_drain_exec.stop();
 
         while (self.running) {
             // Mark active before processing events (coalesced signaling)
