@@ -360,7 +360,7 @@ pub fn deliverMulticastToWorkers(self: *Server, room: *const room_registry_mod.R
 test "multicast to N remote workers serializes the payload once" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 4);
     defer delivery_sys.deinit();
@@ -414,7 +414,7 @@ test "cross-thread delivery: enqueue and drain" {
     const allocator = std.testing.allocator;
 
     // Set up shared infrastructure
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -469,7 +469,7 @@ test "cross-thread delivery: enqueue and drain" {
 test "V14: per-session filters apply to a remote target" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -634,7 +634,7 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -680,7 +680,7 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
 test "cross-thread delivery: generation mismatch drops stanza" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -727,7 +727,7 @@ test "Server: S13 message held behind a draining offline tail" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -809,7 +809,7 @@ test "Re-review 6.8: the router holds a bare-JID message once per worker" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -871,7 +871,7 @@ test "Re-review 6.8: the S2S hold asks the store once per worker" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -919,7 +919,7 @@ test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -973,7 +973,7 @@ test "Server: G3 inbound S2S delivery parks behind a draining offline tail" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -1027,7 +1027,7 @@ test "Server: G3 type normal parks behind a draining offline tail" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -1101,7 +1101,7 @@ test "Server: H4 a cross-worker message lands behind an existing offline tail" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -1189,7 +1189,7 @@ test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -1266,7 +1266,7 @@ test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
 test "Server: H2 a cross-worker hold failure bounces to the sender on the same worker" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1330,7 +1330,7 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
 test "Server: H2 a cross-worker hold failure bounces across workers" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1404,7 +1404,7 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -1479,7 +1479,7 @@ test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -1577,7 +1577,7 @@ test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -1652,7 +1652,7 @@ test "Server: E2b an unstorable inbound S2S stanza bounces but an error stanza d
     var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -1749,7 +1749,7 @@ test "Server: G7 an inbound id with an entity is escaped once in the bounce" {
     var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sock_path = try std.fmt.bufPrint(&sock_buf, "{s}/s2s.sock", .{dir});
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -1811,7 +1811,7 @@ test "Server: G7 a storage error on the offline hold still bounces" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -1875,7 +1875,7 @@ test "Server: S13 hold at quota bounces instead of dropping silently" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -1964,7 +1964,7 @@ test "N1: two draining resources hold a bare-JID message once" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -2051,7 +2051,7 @@ test "N1: two identical stanza-less messages to a draining bare JID are two rows
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -2118,7 +2118,7 @@ test "c2s: one routed message to two draining workers holds one row" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -2211,7 +2211,7 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -2282,7 +2282,7 @@ test "N1: two workers draining one bare JID hold a message once" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();

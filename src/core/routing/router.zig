@@ -1300,7 +1300,7 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
 test "Server: an over-long sender bare JID still delivers live" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
@@ -1362,7 +1362,7 @@ test "Server: an over-long sender bare JID still delivers live" {
 test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sender" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -1422,7 +1422,7 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
 test "S14: failed cross-worker resource does not block local delivery" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1482,7 +1482,7 @@ test "S14: failed cross-worker resource does not block local delivery" {
 test "S14: a cross-worker stanza larger than the old slot cap is delivered" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1553,7 +1553,7 @@ test "S14: a refused cross-worker stanza falls back to the offline store" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1605,7 +1605,7 @@ test "S14: a refused cross-worker stanza falls back to the offline store" {
 test "S14: a refused cross-worker stanza with no offline store bounces" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1653,7 +1653,7 @@ test "S14: a refused cross-worker stanza with no offline store bounces" {
 // requesting worker resend a tail the resumed client already has.
 test "Server: G4 a near-limit online stanza is bounced when delivery cannot queue it" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
@@ -1712,7 +1712,7 @@ test "Server: G4 a near-limit online stanza is bounced when delivery cannot queu
 test "Router: the local and cross-worker delivery forms are byte-identical" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();

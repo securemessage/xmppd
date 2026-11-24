@@ -1,23 +1,29 @@
 //! # SessionMap — thread-safe JID-keyed session routing table
 //!
-//! Single source of truth for all session routing, replacing both the per-worker
-//! SessionRegistry and the global SharedSessionRegistry. Keyed on JID strings
-//! (no integer slot mapping, no partitioning, no sync between two registries).
+//! Single source of truth for all session routing. Keys are normalized JID
+//! values (`Key`): the domain is ASCII-folded once and both the full-JID and
+//! bare-JID hashes are computed before any lock is taken, so no map operation
+//! hashes inside a critical section.
 //!
-//! ## Dual Index
+//! ## Indexes
 //!
-//! - `full_map`: full JID ("alice@host/mobile") → SessionEntry — O(1) exact lookup
-//! - `bare_map`: bare JID ("alice@host") → BoundedArray of SessionEntry — O(1) multi-resource lookup
-//!
-//! Both indexes are maintained atomically on bind/unbind.
+//! - `full_map`: normalized full JID ("alice@host/mobile") -> *SessionEntry —
+//!   O(1) exact lookup; this is the one entry store.
+//! - `bare_map`: normalized bare JID ("alice@host") -> list of *SessionEntry —
+//!   O(1) multi-resource index into the same entries. Presence and priority
+//!   updates touch a single object; nothing is kept in sync by hand.
 //!
 //! ## Thread Safety
 //!
-//! All locking is internal. Callers never see the lock. A `multi_worker` flag
-//! gates lock acquisition — in single-thread mode, no lock overhead at all.
+//! All locking is internal. A `multi_worker` flag gates lock acquisition — in
+//! single-worker mode there is no lock overhead.
 //!
-//! - Read (shared) lock: findByFullJid, findByBareJid, findAvailableByBareJid
-//! - Write (exclusive) lock: bind, unbind, setPresenceAvailable
+//! - Read (shared) lock: findByFullJid, findByBareJid, findAvailableByBareJid,
+//!   isAvailable, hasBound
+//! - Write (exclusive) lock: bind, unbind, setPresenceState,
+//!   setPresenceAvailable, setPriority
+//!
+//! No logging happens while a lock is held.
 
 const std = @import("std");
 const token_kinds = @import("token_kinds");
@@ -63,22 +69,104 @@ pub const JidParts = struct {
 /// resource — no inline 16-slot tax on every account.
 pub const DEFAULT_MAX_RESOURCES: usize = 256;
 
-/// Heap-backed list of session entries for a bare JID (multi-resource).
-/// Grows on demand up to the SessionMap's max_resources cap (T198) — the old
-/// inline [16] array capped every account at 16 binds with 1.2KB of inline
-/// storage per account entry regardless of use.
+/// Normalized session-routing key: "local@domain[/resource]" with the domain
+/// part ASCII-lowercased at build time (T305). `bytes[0..bare_len]` is the
+/// bare JID, so one string serves both indexes. `full_hash` and `bare_hash`
+/// are computed in `initBuf`, before any lock is taken; map contexts return
+/// them directly so no lock hold ever pays for hashing.
+///
+/// The localpart is not folded here: its spelling is owned by the RFC 7622
+/// UsernameCaseMapped preparation at ingress. The resource is
+/// case-sensitive.
+pub const Key = struct {
+    bytes: []const u8,
+    bare_len: u16,
+    full_hash: u64,
+    bare_hash: u64,
+
+    pub fn bare(self: Key) []const u8 {
+        return self.bytes[0..self.bare_len];
+    }
+
+    /// Build a normalized key into `buf` without allocating. Returns null
+    /// when the JID does not fit.
+    pub fn initBuf(buf: []u8, local: []const u8, domain: []const u8, resource: []const u8) ?Key {
+        const bare_len = local.len + 1 + domain.len;
+        const len = bare_len + if (resource.len > 0) 1 + resource.len else 0;
+        if (len > buf.len or bare_len > std.math.maxInt(u16)) return null;
+
+        var pos: usize = 0;
+        @memcpy(buf[pos..][0..local.len], local);
+        pos += local.len;
+        buf[pos] = '@';
+        pos += 1;
+        for (domain, 0..) |c, i| {
+            buf[pos + i] = std.ascii.toLower(c);
+        }
+        pos += domain.len;
+        if (resource.len > 0) {
+            buf[pos] = '/';
+            pos += 1;
+            @memcpy(buf[pos..][0..resource.len], resource);
+        }
+
+        const bytes = buf[0..len];
+        return .{
+            .bytes = bytes,
+            .bare_len = @intCast(bare_len),
+            .full_hash = std.hash.Wyhash.hash(0, bytes),
+            .bare_hash = std.hash.Wyhash.hash(0, bytes[0..bare_len]),
+        };
+    }
+
+    /// Heap-copy the key bytes for map storage. Caller frees with
+    /// `allocator.free(key.bytes)`.
+    fn dupeBytes(self: Key, allocator: std.mem.Allocator) !Key {
+        var owned = self;
+        owned.bytes = try allocator.dupe(u8, self.bytes);
+        return owned;
+    }
+};
+
+/// Precomputed-hash context for the full-JID index.
+const FullCtx = struct {
+    pub fn hash(_: FullCtx, key: Key) u64 {
+        return key.full_hash;
+    }
+    pub fn eql(_: FullCtx, a: Key, b: Key) bool {
+        return std.mem.eql(u8, a.bytes, b.bytes);
+    }
+};
+
+/// Precomputed-hash context for the bare-JID index.
+const BareCtx = struct {
+    pub fn hash(_: BareCtx, key: Key) u64 {
+        return key.bare_hash;
+    }
+    pub fn eql(_: BareCtx, a: Key, b: Key) bool {
+        return std.mem.eql(u8, a.bare(), b.bare());
+    }
+};
+
+const FullMap = std.HashMapUnmanaged(Key, *SessionEntry, FullCtx, std.hash_map.default_max_load_percentage);
+const BareMap = std.HashMapUnmanaged(Key, EntryList, BareCtx, std.hash_map.default_max_load_percentage);
+
+/// Heap-backed list of entry ids (*SessionEntry) for one bare JID
+/// (multi-resource). Grows on demand up to the SessionMap's max_resources
+/// cap (T198). Entries are the same objects full_map owns; nothing is
+/// duplicated.
 pub const EntryList = struct {
     /// Backing buffer; slice length is the allocated CAPACITY.
-    buf: []SessionEntry = &.{},
+    buf: []*SessionEntry = &.{},
     /// Number of live entries.
     len: usize = 0,
 
     const GROW_STEP: usize = 16;
 
-    pub fn append(self: *EntryList, allocator: std.mem.Allocator, entry: SessionEntry, max: usize) !void {
+    pub fn append(self: *EntryList, allocator: std.mem.Allocator, entry: *SessionEntry, max: usize) !void {
         if (self.len >= max) return error.TooManyResources;
         if (self.len >= self.buf.len) {
-            const grown = try allocator.alloc(SessionEntry, self.buf.len + GROW_STEP);
+            const grown = try allocator.alloc(*SessionEntry, self.buf.len + GROW_STEP);
             @memcpy(grown[0..self.len], self.buf[0..self.len]);
             if (self.buf.len > 0) allocator.free(self.buf);
             self.buf = grown;
@@ -87,15 +175,15 @@ pub const EntryList = struct {
         self.len += 1;
     }
 
-    pub fn constSlice(self: *const EntryList) []const SessionEntry {
+    pub fn constSlice(self: *const EntryList) []const *SessionEntry {
         return self.buf[0..self.len];
     }
 
-    pub fn slice(self: *EntryList) []SessionEntry {
+    pub fn slice(self: *EntryList) []*SessionEntry {
         return self.buf[0..self.len];
     }
 
-    pub fn orderedRemove(self: *EntryList, index: usize) SessionEntry {
+    pub fn orderedRemove(self: *EntryList, index: usize) *SessionEntry {
         const removed = self.buf[index];
         var i = index;
         while (i + 1 < self.len) : (i += 1) {
@@ -103,6 +191,17 @@ pub const EntryList = struct {
         }
         self.len -= 1;
         return removed;
+    }
+
+    /// Remove one entry by identity. Returns false when absent.
+    pub fn removePtr(self: *EntryList, entry: *SessionEntry) bool {
+        for (self.slice(), 0..) |candidate, i| {
+            if (candidate == entry) {
+                _ = self.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn deinit(self: *EntryList, allocator: std.mem.Allocator) void {
@@ -114,39 +213,40 @@ pub const EntryList = struct {
 
 /// Thread-safe, JID-keyed session routing table.
 pub const SessionMap = struct {
-    full_map: std.StringHashMap(SessionEntry),
-    bare_map: std.StringHashMap(EntryList),
+    full_map: FullMap = .empty,
+    bare_map: BareMap = .empty,
     lock: std.Thread.RwLock = .{},
     multi_worker: bool,
     allocator: std.mem.Allocator,
     /// Per-account (bare JID) resource cap (T198).
     max_resources: usize,
 
-    pub fn init(allocator: std.mem.Allocator, multi_worker: bool, max_resources: usize) SessionMap {
+    /// `workers` is the configured core worker count; locks are only taken
+    /// when more than one worker can reach the map.
+    pub fn init(allocator: std.mem.Allocator, workers: usize, max_resources: usize) SessionMap {
         return .{
-            .full_map = std.StringHashMap(SessionEntry).init(allocator),
-            .bare_map = std.StringHashMap(EntryList).init(allocator),
-            .multi_worker = multi_worker,
+            .multi_worker = workers > 1,
             .allocator = allocator,
             .max_resources = if (max_resources == 0) DEFAULT_MAX_RESOURCES else max_resources,
         };
     }
 
     pub fn deinit(self: *SessionMap) void {
-        // Free all owned key strings in full_map
+        // Free all owned key strings and entry objects in full_map
         var full_iter = self.full_map.iterator();
         while (full_iter.next()) |kv| {
-            self.allocator.free(kv.key_ptr.*);
+            self.allocator.free(kv.key_ptr.bytes);
+            self.allocator.destroy(kv.value_ptr.*);
         }
-        self.full_map.deinit();
+        self.full_map.deinit(self.allocator);
 
         // Free all owned entry lists + key strings in bare_map
         var bare_iter = self.bare_map.iterator();
         while (bare_iter.next()) |kv| {
             kv.value_ptr.deinit(self.allocator);
-            self.allocator.free(kv.key_ptr.*);
+            self.allocator.free(kv.key_ptr.bytes);
         }
-        self.bare_map.deinit();
+        self.bare_map.deinit(self.allocator);
     }
 
     /// Register a session after successful resource binding. `token` names
@@ -160,65 +260,73 @@ pub const SessionMap = struct {
         domain: []const u8,
         resource: []const u8,
     ) !void {
-        if (self.multi_worker) self.lock.lock();
-        defer if (self.multi_worker) self.lock.unlock();
-
         if (resource.len > MAX_RESOURCE_LEN) return error.ResourceTooLong;
 
-        var entry = SessionEntry{
+        // Normalize and hash outside the lock; allocations that only commit
+        // on success happen there too so a rejected bind owns nothing.
+        var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+        const key = Key.initBuf(&key_buf, local, domain, resource) orelse return error.JidTooLong;
+
+        const owned_key = try key.dupeBytes(self.allocator);
+        errdefer self.allocator.free(owned_key.bytes);
+
+        const entry = try self.allocator.create(SessionEntry);
+        errdefer self.allocator.destroy(entry);
+        entry.* = .{
             .worker_id = worker_id,
             .token = token,
             .resource_len = @intCast(resource.len),
         };
         @memcpy(entry.resource_buf[0..resource.len], resource);
 
-        // Check for duplicate using stack buffer (no allocation)
-        var check_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const check_jid = buildJidBuf(&check_buf, local, domain, resource) orelse return error.JidTooLong;
-        if (self.full_map.contains(check_jid)) {
-            return error.AlreadyBound;
+        {
+            if (self.multi_worker) self.lock.lock();
+            defer if (self.multi_worker) self.lock.unlock();
+
+            if (self.full_map.contains(key)) {
+                return error.AlreadyBound;
+            }
+
+            // Bare index first so a TooManyResources cap does not leave the
+            // full_map entry dangling (roll back both on append failure).
+            var fresh_bare_key: ?Key = null;
+            const list = if (self.bare_map.getPtr(key)) |list| list else blk: {
+                const bare_key = Key{
+                    .bytes = undefined,
+                    .bare_len = key.bare_len,
+                    .full_hash = key.bare_hash,
+                    .bare_hash = key.bare_hash,
+                };
+                const bare_bytes = try self.allocator.dupe(u8, key.bare());
+                errdefer self.allocator.free(bare_bytes);
+                var stored_bare = bare_key;
+                stored_bare.bytes = bare_bytes;
+                try self.bare_map.put(self.allocator, stored_bare, .{});
+                fresh_bare_key = stored_bare;
+                break :blk self.bare_map.getPtr(stored_bare).?;
+            };
+
+            // A fresh bare entry that never houses a binding is rolled back
+            // by this flag (T254).
+            var bare_owned = fresh_bare_key != null;
+            defer if (bare_owned) {
+                var kv = self.bare_map.fetchRemove(fresh_bare_key.?).?;
+                kv.value.deinit(self.allocator);
+                self.allocator.free(kv.key.bytes);
+            };
+
+            list.append(self.allocator, entry, self.max_resources) catch |err| {
+                return err;
+            };
+            self.full_map.put(self.allocator, owned_key, entry) catch |err| {
+                _ = list.orderedRemove(list.len - 1);
+                return err;
+            };
+            bare_owned = false; // the fresh bare key now houses a binding
         }
 
-        // Build full JID key: local@domain/resource (heap-allocated, owned by map)
-        const full_key = try self.buildFullJid(local, domain, resource);
-        errdefer self.allocator.free(full_key);
-
-        // Update bare_map first so a TooManyResources cap doesn't leave the
-        // full_map entry dangling (roll back both on append failure).
-        const bare_key = try self.buildBareJid(local, domain);
-        var bare_owned = true;
-        defer if (bare_owned) self.allocator.free(bare_key);
-        const gop = try self.bare_map.getOrPut(bare_key);
-        if (!gop.found_existing) gop.value_ptr.* = EntryList{};
-
-        gop.value_ptr.append(self.allocator, entry, self.max_resources) catch |err| {
-            // Roll back a fresh getOrPut entry so the map never holds a
-            // dangling key or an orphaned empty list (T254).
-            if (!gop.found_existing) {
-                var kv = self.bare_map.fetchRemove(bare_key).?;
-                kv.value.deinit(self.allocator);
-                self.allocator.free(kv.key);
-                bare_owned = false; // key freed above
-            }
-            return err;
-        };
-        bare_owned = gop.found_existing;
-
-        self.full_map.put(full_key, entry) catch |err| {
-            // Roll back the bare append (keep the maps consistent).
-            _ = gop.value_ptr.orderedRemove(gop.value_ptr.len - 1);
-            if (!gop.found_existing) {
-                // fresh getOrPut entry that never housed a binding
-                var kv = self.bare_map.fetchRemove(bare_key).?;
-                kv.value.deinit(self.allocator);
-                self.allocator.free(kv.key);
-                bare_owned = false; // key freed above
-            }
-            return err;
-        };
-
-        log.info("bind {s}@{s}/{s} worker={d} session={d} gen={d}", .{
-            local, domain, resource, worker_id, token.index, token.gen,
+        log.info("bind {s} worker={d} session={d} gen={d}", .{
+            key.bytes, worker_id, token.index, token.gen,
         });
     }
 
@@ -229,48 +337,37 @@ pub const SessionMap = struct {
         domain: []const u8,
         resource: []const u8,
     ) ?SessionEntry {
-        if (self.multi_worker) self.lock.lock();
-        defer if (self.multi_worker) self.lock.unlock();
+        var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+        const key = Key.initBuf(&key_buf, local, domain, resource) orelse return null;
 
-        // Build full JID for lookup
-        var full_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const full_jid = buildJidBuf(&full_buf, local, domain, resource) orelse return null;
+        var removed: SessionEntry = undefined;
+        {
+            if (self.multi_worker) self.lock.lock();
+            defer if (self.multi_worker) self.lock.unlock();
 
-        // Remove from full_map
-        const removed = self.full_map.fetchRemove(full_jid) orelse return null;
-        // Free the owned key
-        self.allocator.free(removed.key);
-        const entry = removed.value;
+            const kv = self.full_map.fetchRemove(key) orelse return null;
+            const entry_ptr = kv.value;
+            removed = entry_ptr.*;
 
-        // Remove from bare_map
-        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return entry;
-
-        if (self.bare_map.getPtr(bare_jid)) |list| {
-            // Find and remove the matching entry from the list
-            var i: usize = 0;
-            while (i < list.len) {
-                if (list.slice()[i].token.eql(entry.token) and
-                    list.slice()[i].worker_id == entry.worker_id)
-                {
-                    _ = list.orderedRemove(i);
-                    break;
+            if (self.bare_map.getPtr(key)) |list| {
+                _ = list.removePtr(entry_ptr);
+                // If bare JID has no more resources, remove the entry entirely
+                if (list.len == 0) {
+                    var bare_kv = self.bare_map.fetchRemove(key).?;
+                    bare_kv.value.deinit(self.allocator);
+                    self.allocator.free(bare_kv.key.bytes);
                 }
-                i += 1;
             }
-            // If bare JID has no more resources, remove the bare_map entry entirely
-            if (list.len == 0) {
-                list.deinit(self.allocator);
-                const bare_removed = self.bare_map.fetchRemove(bare_jid);
-                if (bare_removed) |br| self.allocator.free(br.key);
-            }
+
+            self.allocator.free(kv.key.bytes);
+            self.allocator.destroy(entry_ptr);
         }
 
-        log.info("unbind {s}@{s}/{s} (was worker={d} session={d} gen={d})", .{
-            local, domain, resource, entry.worker_id, entry.token.index, entry.token.gen,
+        log.info("unbind {s} (was worker={d} session={d} gen={d})", .{
+            key.bytes, removed.worker_id, removed.token.index, removed.token.gen,
         });
 
-        return entry;
+        return removed;
     }
 
     /// Find a session by full JID (local@domain/resource). O(1).
@@ -280,12 +377,14 @@ pub const SessionMap = struct {
         domain: []const u8,
         resource: []const u8,
     ) ?SessionEntry {
+        var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+        const key = Key.initBuf(&key_buf, local, domain, resource) orelse return null;
+
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var buf: [MAX_JID_OCTETS]u8 = undefined;
-        const full_jid = buildJidBuf(&buf, local, domain, resource) orelse return null;
-        return self.full_map.get(full_jid);
+        const entry = self.full_map.get(key) orelse return null;
+        return entry.*;
     }
 
     /// Find all sessions for a bare JID (local@domain). O(1) + O(resources).
@@ -296,15 +395,17 @@ pub const SessionMap = struct {
         domain: []const u8,
         buf: []SessionEntry,
     ) usize {
+        var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+        const key = Key.initBuf(&key_buf, local, domain, "") orelse return 0;
+
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return 0;
-
-        const list = self.bare_map.get(bare_jid) orelse return 0;
+        const list = self.bare_map.getPtr(key) orelse return 0;
         const count = @min(list.len, buf.len);
-        @memcpy(buf[0..count], list.constSlice()[0..count]);
+        for (list.constSlice()[0..count], buf[0..count]) |entry_ptr, *out| {
+            out.* = entry_ptr.*;
+        }
         return count;
     }
 
@@ -315,18 +416,18 @@ pub const SessionMap = struct {
         domain: []const u8,
         buf: []SessionEntry,
     ) usize {
+        var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+        const key = Key.initBuf(&key_buf, local, domain, "") orelse return 0;
+
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return 0;
-
-        const list = self.bare_map.get(bare_jid) orelse return 0;
+        const list = self.bare_map.getPtr(key) orelse return 0;
         var count: usize = 0;
-        for (list.constSlice()) |entry| {
-            if (entry.presence_available) {
+        for (list.constSlice()) |entry_ptr| {
+            if (entry_ptr.presence_available) {
                 if (count >= buf.len) break;
-                buf[count] = entry;
+                buf[count] = entry_ptr.*;
                 count += 1;
             }
         }
@@ -350,13 +451,13 @@ pub const SessionMap = struct {
 
         var total: usize = 0;
         for (jids, 0..) |jid, jid_idx| {
-            var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
-            const bare_jid = buildBareBuf(&bare_buf, jid.local, jid.domain) orelse continue;
-            const list = self.bare_map.get(bare_jid) orelse continue;
-            for (list.constSlice()) |entry| {
-                if (!entry.presence_available) continue;
+            var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+            const key = Key.initBuf(&key_buf, jid.local, jid.domain, "") orelse continue;
+            const list = self.bare_map.getPtr(key) orelse continue;
+            for (list.constSlice()) |entry_ptr| {
+                if (!entry_ptr.presence_available) continue;
                 if (total >= out.len) return total;
-                out[total] = entry;
+                out[total] = entry_ptr.*;
                 if (out_jid_idx) |idxs| idxs[total] = @intCast(jid_idx);
                 total += 1;
             }
@@ -364,22 +465,59 @@ pub const SessionMap = struct {
         return total;
     }
 
-    /// Check if any session for a bare JID is presence-available.
-    pub fn isAvailable(self: *SessionMap, local: []const u8, domain: []const u8) bool {
+    /// Check if any session is bound for a bare JID (presence state ignored).
+    pub fn hasBound(self: *SessionMap, local: []const u8, domain: []const u8) bool {
+        var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+        const key = Key.initBuf(&key_buf, local, domain, "") orelse return false;
+
         if (self.multi_worker) self.lock.lockShared();
         defer if (self.multi_worker) self.lock.unlockShared();
 
-        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return false;
+        const list = self.bare_map.getPtr(key) orelse return false;
+        return list.len > 0;
+    }
 
-        const list = self.bare_map.get(bare_jid) orelse return false;
-        for (list.constSlice()) |entry| {
-            if (entry.presence_available) return true;
+    /// Check if any session for a bare JID is presence-available.
+    pub fn isAvailable(self: *SessionMap, local: []const u8, domain: []const u8) bool {
+        var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+        const key = Key.initBuf(&key_buf, local, domain, "") orelse return false;
+
+        if (self.multi_worker) self.lock.lockShared();
+        defer if (self.multi_worker) self.lock.unlockShared();
+
+        const list = self.bare_map.getPtr(key) orelse return false;
+        for (list.constSlice()) |entry_ptr| {
+            if (entry_ptr.presence_available) return true;
         }
         return false;
     }
 
-    /// Mark a session as presence-available or unavailable.
+    /// Update presence availability and priority for a session under one
+    /// exclusive hold (T268). The entry is one object behind both indexes,
+    /// so this is a single lookup and write — no re-lookup and nothing to
+    /// keep in sync.
+    pub fn setPresenceState(
+        self: *SessionMap,
+        local: []const u8,
+        domain: []const u8,
+        resource: []const u8,
+        available: bool,
+        priority: i8,
+    ) void {
+        var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+        const key = Key.initBuf(&key_buf, local, domain, resource) orelse return;
+
+        if (self.multi_worker) self.lock.lock();
+        defer if (self.multi_worker) self.lock.unlock();
+
+        if (self.full_map.getPtr(key)) |entry_ptr| {
+            entry_ptr.*.presence_available = available;
+            entry_ptr.*.priority = priority;
+        }
+    }
+
+    /// Mark a session as presence-available or unavailable, keeping its
+    /// current priority.
     pub fn setPresenceAvailable(
         self: *SessionMap,
         local: []const u8,
@@ -387,34 +525,19 @@ pub const SessionMap = struct {
         resource: []const u8,
         available: bool,
     ) void {
+        var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+        const key = Key.initBuf(&key_buf, local, domain, resource) orelse return;
+
         if (self.multi_worker) self.lock.lock();
         defer if (self.multi_worker) self.lock.unlock();
 
-        // Update full_map entry
-        var full_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const full_jid = buildJidBuf(&full_buf, local, domain, resource) orelse return;
-        if (self.full_map.getPtr(full_jid)) |entry| {
-            entry.presence_available = available;
-        }
-
-        // Update bare_map entry
-        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return;
-        if (self.bare_map.getPtr(bare_jid)) |list| {
-            for (list.slice()) |*entry| {
-                // Match by full JID identity (worker + token)
-                if (self.full_map.get(full_jid)) |full_entry| {
-                    if (entry.worker_id == full_entry.worker_id and
-                        entry.token.eql(full_entry.token))
-                    {
-                        entry.presence_available = available;
-                    }
-                }
-            }
+        if (self.full_map.getPtr(key)) |entry_ptr| {
+            entry_ptr.*.presence_available = available;
         }
     }
 
-    /// Set resource priority for a session (RFC 6121 §4.7.2.3).
+    /// Set resource priority for a session (RFC 6121 §4.7.2.3), keeping its
+    /// current availability.
     pub fn setPriority(
         self: *SessionMap,
         local: []const u8,
@@ -422,92 +545,15 @@ pub const SessionMap = struct {
         resource: []const u8,
         prio: i8,
     ) void {
+        var key_buf: [MAX_JID_OCTETS]u8 = undefined;
+        const key = Key.initBuf(&key_buf, local, domain, resource) orelse return;
+
         if (self.multi_worker) self.lock.lock();
         defer if (self.multi_worker) self.lock.unlock();
 
-        var full_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const full_jid = buildJidBuf(&full_buf, local, domain, resource) orelse return;
-        if (self.full_map.getPtr(full_jid)) |entry| {
-            entry.priority = prio;
+        if (self.full_map.getPtr(key)) |entry_ptr| {
+            entry_ptr.*.priority = prio;
         }
-
-        var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const bare_jid = buildBareBuf(&bare_buf, local, domain) orelse return;
-        if (self.bare_map.getPtr(bare_jid)) |list| {
-            if (self.full_map.get(full_jid)) |full_entry| {
-                for (list.slice()) |*entry| {
-                    if (entry.worker_id == full_entry.worker_id and
-                        entry.token.eql(full_entry.token))
-                    {
-                        entry.priority = prio;
-                    }
-                }
-            }
-        }
-    }
-
-    // ========================================================================
-    // Internal helpers — build JID strings
-    // ========================================================================
-
-    /// Allocate and build "local@domain/resource" key string.
-    fn buildFullJid(self: *SessionMap, local: []const u8, domain: []const u8, resource: []const u8) ![]u8 {
-        const len = local.len + 1 + domain.len + 1 + resource.len;
-        const key = try self.allocator.alloc(u8, len);
-        var pos: usize = 0;
-        @memcpy(key[pos..][0..local.len], local);
-        pos += local.len;
-        key[pos] = '@';
-        pos += 1;
-        @memcpy(key[pos..][0..domain.len], domain);
-        pos += domain.len;
-        key[pos] = '/';
-        pos += 1;
-        @memcpy(key[pos..][0..resource.len], resource);
-        return key;
-    }
-
-    /// Allocate and build "local@domain" key string.
-    fn buildBareJid(self: *SessionMap, local: []const u8, domain: []const u8) ![]u8 {
-        const len = local.len + 1 + domain.len;
-        const key = try self.allocator.alloc(u8, len);
-        var pos: usize = 0;
-        @memcpy(key[pos..][0..local.len], local);
-        pos += local.len;
-        key[pos] = '@';
-        pos += 1;
-        @memcpy(key[pos..][0..domain.len], domain);
-        return key;
-    }
-
-    /// Build "local@domain/resource" into a stack buffer (no allocation).
-    fn buildJidBuf(buf: []u8, local: []const u8, domain: []const u8, resource: []const u8) ?[]const u8 {
-        const len = local.len + 1 + domain.len + 1 + resource.len;
-        if (len > buf.len) return null;
-        var pos: usize = 0;
-        @memcpy(buf[pos..][0..local.len], local);
-        pos += local.len;
-        buf[pos] = '@';
-        pos += 1;
-        @memcpy(buf[pos..][0..domain.len], domain);
-        pos += domain.len;
-        buf[pos] = '/';
-        pos += 1;
-        @memcpy(buf[pos..][0..resource.len], resource);
-        return buf[0..len];
-    }
-
-    /// Build "local@domain" into a stack buffer (no allocation).
-    fn buildBareBuf(buf: []u8, local: []const u8, domain: []const u8) ?[]const u8 {
-        const len = local.len + 1 + domain.len;
-        if (len > buf.len) return null;
-        var pos: usize = 0;
-        @memcpy(buf[pos..][0..local.len], local);
-        pos += local.len;
-        buf[pos] = '@';
-        pos += 1;
-        @memcpy(buf[pos..][0..domain.len], domain);
-        return buf[0..len];
     }
 };
 
@@ -516,7 +562,7 @@ pub const SessionMap = struct {
 // ============================================================================
 
 test "SessionMap: bind and findByFullJid" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     const tok = Token.init(5, 1, token_kinds.session);
@@ -529,7 +575,7 @@ test "SessionMap: bind and findByFullJid" {
 }
 
 test "SessionMap: unbind removes entry" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(1, Token.init(3, 1, token_kinds.session), "bob", "localhost", "desktop");
@@ -542,7 +588,7 @@ test "SessionMap: unbind removes entry" {
 }
 
 test "SessionMap: findByBareJid multi-resource" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
@@ -555,7 +601,7 @@ test "SessionMap: findByBareJid multi-resource" {
 }
 
 test "SessionMap: findAvailableByBareJid" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
@@ -573,7 +619,7 @@ test "SessionMap: findAvailableByBareJid" {
 }
 
 test "SessionMap: findAvailableByBareJidBatch resolves many JIDs in one hold" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
@@ -615,7 +661,7 @@ test "SessionMap: findAvailableByBareJidBatch resolves many JIDs in one hold" {
 }
 
 test "SessionMap: S18 batch over 512 entries does not truncate at the resource cap" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     // 32 JIDs x 20 available resources = 640 entries, over the old
@@ -647,7 +693,7 @@ test "SessionMap: S18 batch over 512 entries does not truncate at the resource c
 }
 
 test "SessionMap: duplicate bind fails" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(5, 1, token_kinds.session), "alice", "localhost", "mobile");
@@ -655,7 +701,7 @@ test "SessionMap: duplicate bind fails" {
 }
 
 test "SessionMap: resource cap is configurable (T198)" {
-    var map = SessionMap.init(std.testing.allocator, false, 3);
+    var map = SessionMap.init(std.testing.allocator, 1, 3);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "u", "localhost", "a");
@@ -675,7 +721,7 @@ test "SessionMap: resource cap is configurable (T198)" {
 }
 
 test "SessionMap: default cap no longer hits the old inline-16 wall (T198)" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     var res_buf: [8]u8 = undefined;
@@ -699,14 +745,14 @@ test "SessionMap: default cap no longer hits the old inline-16 wall (T198)" {
 }
 
 test "SessionMap: unbind nonexistent returns null" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     try std.testing.expect(map.unbind("alice", "localhost", "ghost") == null);
 }
 
 test "SessionMap: a re-bound slot stores the caller's fresh token" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     // Generations are minted by the owning worker, not the map: a slot
@@ -720,7 +766,7 @@ test "SessionMap: a re-bound slot stores the caller's fresh token" {
 }
 
 test "SessionMap: bare_map cleaned on last unbind" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
@@ -737,7 +783,7 @@ test "SessionMap: bare_map cleaned on last unbind" {
 }
 
 test "SessionMap: T254 resource cap rejection keeps maps consistent" {
-    var map = SessionMap.init(std.testing.allocator, false, 2);
+    var map = SessionMap.init(std.testing.allocator, 1, 2);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "a");
@@ -761,7 +807,7 @@ test "SessionMap: T254 OOM rollback at every bind allocation point" {
     var fail_index: usize = 0;
     while (fail_index < 32) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var map = SessionMap.init(failing.allocator(), false, 0);
+        var map = SessionMap.init(failing.allocator(), 1, 0);
         if (map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile")) |_| {
             map.deinit();
             break;
@@ -777,7 +823,7 @@ test "SessionMap: T254 OOM rollback at every bind allocation point" {
 }
 
 test "SessionMap: workers on different threads" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 4, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "host", "mobile");
@@ -795,7 +841,7 @@ test "SessionMap: workers on different threads" {
 }
 
 test "SessionMap: resource stored in entry" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "host", "mobile");
@@ -820,7 +866,7 @@ test "SessionMap: resource stored in entry" {
 }
 
 test "SessionMap: a 320-octet localpart binds and resolves" {
-    var map = SessionMap.init(std.testing.allocator, false, 0);
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     var local: [320]u8 = undefined;
@@ -833,4 +879,63 @@ test "SessionMap: a 320-octet localpart binds and resolves" {
     var buf: [1]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 1), map.findAvailableByBareJid(&local, "localhost", &buf));
     try std.testing.expect(map.unbind(&local, "localhost", "res") != null);
+}
+
+test "SessionMap: setPresenceState updates both fields under one hold (T268)" {
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    defer map.deinit();
+
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "desk");
+    map.setPresenceState("alice", "localhost", "desk", true, 42);
+
+    const entry = map.findByFullJid("alice", "localhost", "desk").?;
+    try std.testing.expect(entry.presence_available);
+    try std.testing.expectEqual(@as(i8, 42), entry.priority);
+
+    // The bare index sees the same object: no second copy to keep in sync.
+    var buf: [4]SessionEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 1), map.findAvailableByBareJid("alice", "localhost", &buf));
+    try std.testing.expectEqual(@as(i8, 42), buf[0].priority);
+}
+
+test "SessionMap: domain is case-folded for keys (T305)" {
+    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    defer map.deinit();
+
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "Alice", "Example.COM", "Mobile");
+
+    // Any case spelling of the domain resolves to the same entry.
+    const folded = map.findByFullJid("Alice", "example.com", "Mobile");
+    try std.testing.expect(folded != null);
+    var buf: [4]SessionEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 1), map.findByBareJid("Alice", "EXAMPLE.com", &buf));
+
+    // Localpart and resource keep their case: different localpart is a
+    // different account, different resource a different binding.
+    try std.testing.expect(map.findByFullJid("alice", "example.com", "Mobile") == null);
+    try std.testing.expect(map.findByFullJid("Alice", "example.com", "mobile") == null);
+
+    // The same full JID under another domain case is a duplicate, not a
+    // second binding.
+    try std.testing.expectError(error.AlreadyBound, map.bind(1, Token.init(2, 1, token_kinds.session), "Alice", "EXAMPLE.com", "Mobile"));
+
+    // Unbind under yet another spelling removes the single entry.
+    try std.testing.expect(map.unbind("Alice", "eXaMpLe.CoM", "Mobile") != null);
+    try std.testing.expect(map.findByFullJid("Alice", "example.com", "Mobile") == null);
+    try std.testing.expectEqual(@as(usize, 0), map.bare_map.count());
+}
+
+test "SessionMap: normalized key computes both hashes once" {
+    var buf: [MAX_JID_OCTETS]u8 = undefined;
+    const key = Key.initBuf(&buf, "Alice", "Example.COM", "Mobile").?;
+
+    try std.testing.expectEqualStrings("Alice@example.com/Mobile", key.bytes);
+    try std.testing.expectEqualStrings("Alice@example.com", key.bare());
+    try std.testing.expectEqual(std.hash.Wyhash.hash(0, "Alice@example.com/Mobile"), key.full_hash);
+    try std.testing.expectEqual(std.hash.Wyhash.hash(0, "Alice@example.com"), key.bare_hash);
+
+    // A bare lookup key (no resource) is the bare string itself.
+    const bare_only = Key.initBuf(&buf, "Alice", "Example.COM", "").?;
+    try std.testing.expectEqualStrings("Alice@example.com", bare_only.bytes);
+    try std.testing.expectEqual(key.bare_hash, bare_only.bare_hash);
 }

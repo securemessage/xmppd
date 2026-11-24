@@ -270,8 +270,7 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
     if (type_str.len == 0) {
         // Available presence
         if (server.session_map) |sm| {
-            sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, true);
-            sm.setPriority(bound.local, bound.domain, bound.resource, prio);
+            sm.setPresenceState(bound.local, bound.domain, bound.resource, true, prio);
         }
         const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
 
@@ -326,8 +325,7 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
         logAvailable(session.conn.id, bound.local, bound.domain, bound.resource, prio);
     } else if (std.mem.eql(u8, type_str, "unavailable")) {
         if (server.session_map) |sm| {
-            sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, false);
-            sm.setPriority(bound.local, bound.domain, bound.resource, -128);
+            sm.setPresenceState(bound.local, bound.domain, bound.resource, false, -128);
         }
         broadcastUnavailable(server, bound.local, bound.domain, bound.resource, changes);
 
@@ -1501,7 +1499,7 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
     var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
     server.roster = &roster;
 
-    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    var sm = session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
     server.session_map = &sm;
 
@@ -1575,7 +1573,7 @@ test "S1: subscription presence escapes the owner bare JID" {
     var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
     server.roster = &roster;
 
-    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    var sm = session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
     server.session_map = &sm;
 
@@ -1716,7 +1714,7 @@ test "A62: block check sees a >256-byte recipient JID in full" {
     var bs = @import("block_store").BlockStore(server_mod.OpBackendType).init(&db);
     server.block_store = &bs;
 
-    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    var sm = session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
     server.session_map = &sm;
 

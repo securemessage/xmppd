@@ -1764,7 +1764,7 @@ test "T152: rebind with same resource evicts stale session" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
-    var sm = SessionMap.init(allocator, false, 0);
+    var sm = SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
     server.session_map = &sm;
 

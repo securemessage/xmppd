@@ -252,7 +252,7 @@ pub fn main() !void {
     };
 
     // Session map — single JID-keyed routing table (multi_worker flag gates lock overhead)
-    var session_map = SessionMap.init(allocator, worker_count > 1, max_resources_per_account);
+    var session_map = SessionMap.init(allocator, worker_count, max_resources_per_account);
     defer session_map.deinit();
     log.info("session map allocated (multi_worker={s})", .{if (worker_count > 1) "true" else "false"});
 
