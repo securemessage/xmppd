@@ -177,8 +177,8 @@ pub noinline fn dump(worker_id: u16, ext: Externals) void {
         worker_id, read(&c.scram_exchange_full), read(&c.scram_stale),
     });
     log.info("worker {d} sm unacked drain: stored={d} bounced={d} dropped={d} bounce_failed={d} offline_refused={d} park_overflow={d}", .{
-        worker_id,              ext.sm_unacked_stored,        ext.sm_unacked_bounced,
-        ext.sm_unacked_dropped, ext.sm_unacked_bounce_failed, ext.sm_offline_refused,
+        worker_id,                  ext.sm_unacked_stored,        ext.sm_unacked_bounced,
+        ext.sm_unacked_dropped,     ext.sm_unacked_bounce_failed, ext.sm_offline_refused,
         ext.sm_drain_park_overflow,
     });
     var buf: [HIST_BUCKETS * 24]u8 = undefined;
