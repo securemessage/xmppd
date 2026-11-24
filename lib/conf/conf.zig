@@ -45,6 +45,18 @@ pub const FieldSpec = struct {
     aliases: []const []const u8 = &.{},
     /// One-line description for generated --help.
     help: []const u8 = "",
+    /// Longer description for generated docs; empty renders `help`.
+    doc: []const u8 = "",
+    /// Doc Default-column override for non-literal defaults such as
+    /// "(follows `[auth] socket`)"; empty renders the field initializer.
+    doc_default: []const u8 = "",
+    /// Daemons that consume the resolved value, for generated docs
+    /// ("master, core"). The loader ignores it.
+    used_by: []const u8 = "",
+    /// The consuming daemon refuses to start without this key; the doc
+    /// renders "(required)" as its default. Doc metadata only: presence
+    /// checks stay with the daemon (see requireOidcConfig).
+    required: bool = false,
 };
 
 /// One CLI spelling bound to a field.

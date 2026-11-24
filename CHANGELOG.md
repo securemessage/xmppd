@@ -21,6 +21,9 @@
   `localpart_claim = email` is gated on `email_verified` and documented
   as the weakest choice. See doc/UPGRADING.md for the required
   `oidc-unclaimed` / `oidc-link` migration steps.
+- Q7 hardening follow-up (PR #27, T-8DE2C892): PBKDF2 outputs and the
+  buffers that carry them are zeroed before release, and the KDF test
+  vectors were made independent of the implementation under test.
 
 ### Upgrade notes
 
@@ -101,17 +104,28 @@
      logging one error that names `xmppctl migrate-precis`. There is no
      raw-name read fallback.
 
-- **Ingress preparation is still a tracked follow-up:** PR #9 has merged,
-  but master still prepares no localpart at stanza or payload ingress. The
-  F6 work is PR #46 (in progress). Until it lands, mail and presence
-  addressed to the old spelling (for example `NaplesTB@domain`) are stored
-  under that old spelling and stay unreachable, including offline delivery.
-  Address accounts by their prepared localpart. Roster items, blocklist
-  items, MUC affiliations and MAM `with` filters can also store the old
-  spelling, and JIDs whose domain differs in case from the configured
-  hosted domain are not treated as local. After PR #46 lands, rerun
-  `migrate-precis` to absorb every row written under an old spelling in the
-  meantime.
+- **Ingress preparation landed with F6 (PR #46).** Stanzas and payload
+  JIDs that name the hosted domain are prepared at ingress: the domain is
+  rewritten to the configured spelling (matched case-insensitively, one
+  trailing dot ignored per RFC 7622 section 3.2) and the localpart gets
+  the same UsernameCaseMapped preparation the account store applies, so
+  `NaplesTB@EXAMPLE.ORG` resolves to `naplestb@example.org` in routing,
+  roster, offline and archive. Remote-domain JIDs pass through unchanged,
+  as does the MUC domain. Rows written under an old spelling before the
+  upgrade still need one `xmppctl migrate-precis` run; nothing written
+  afterwards does.
+
+- **The MAM `by_contact` index gained a v2 key.** The v1 layout
+  `owner\0with\0timestamp_be(8)` put two messages indexed in the same
+  second on one key, so the second store overwrote the first's index row
+  and the message vanished from `with`-filtered queries. The v2 key
+  appends the stanza id. Surviving v1 rows still answer queries, so reads
+  keep working, but the rows the v1 overwrite already destroyed only come
+  back through the offline migration: stop every xmppd daemon, run
+  `xmppctl migrate-archive --hosted-domain example.org` to see the plan,
+  then `--apply`. The plan is journaled before the first commit and every
+  op is idempotent, so an interrupted run resumes with a repeated
+  `--apply` (PR #59).
 
 - **The master validates its configuration file strictly.** An unknown
   section or key, a bad value or a malformed line is a startup error
@@ -148,6 +162,80 @@
   with `file:line` diagnostics instead of silent defaults or clamps. An
   unset `[oidc] socket` inherits `[auth] socket`. See doc/UPGRADING.md.
 
+### Features
+
+- F6 local-domain ingress preparation (PR #46): stanza `to`/`from` and
+  the payload JIDs that name the hosted domain are prepared at ingress on
+  both c2s and s2s (iq_handler, muc_handler, presence, router, session).
+  See the Upgrade notes entry for the migration impact.
+- X3 event-driven master (PR #72, T282): the supervisor loop runs on the
+  lib/net Loop; child startup is gated on readiness pipes instead of
+  sleeps; shutdown and orphan cleanup are deadline-driven with SIGHUP
+  fan-out; the master binds the c2s and s2s listeners itself through the
+  shared bindTcp (honoring `[server] bind_address` and IPv6) and passes
+  them to the children as `--listen-fd`. A gated startup ends cleanly on
+  TERM without spawning.
+- M1 per-worker counters and SIGUSR1 dump (PR #64): xmppd-core keeps
+  per-worker session/stanza/drop counters and writes a dump on SIGUSR1
+  for live diagnosis; unbound conns are only ever read by that dump.
+- S35 XEP-0203 delay stamps on offline delivery (PR #48, forge #25):
+  offline messages delivered at login now carry a `<delay>` stamp so
+  clients can show the real send time.
+- s2s outbound retry (PR #71, T416/T417): a temporary connect or DNS
+  failure retries the domain on a 5 s / 15 s / 45 s backoff and the
+  outbound queue survives across retries; non-fatal dialback error
+  verdicts no longer tear the stream down.
+- ADR-13 shared async DNS resolver and cache v2 with serve-stale
+  (PRs #15, #32, #33, #52): lib/dns resolves SRV chains off the event
+  loop, caches positive and negative answers and serves stale entries
+  (RFC 8767) while a refresh is in flight; s2s resolves through it.
+- xmppc: consumer one-shot timers on the engine loop (PR #5,
+  T-A9AE7D9C) and `SessionConfig.allow_plain` for PLAIN-only auth
+  backends such as OIDC rigs (d3c08d7).
+- Q1 root allocator selection (PR #68): `-Dallocator=debug|c|smp` picks
+  the root allocator for all daemons (debug in Debug builds, c in
+  release builds).
+- kTLS observability (Q11): the c2s handshake logs kTLS TX/RX engagement
+  and the negotiated cipher, so a silent fallback to userland TLS shows
+  up in the log.
+
+### Changed
+
+- F5 typed configuration (PR #17, ADR-9): the INI file is parsed once
+  into typed values through lib/conf, and doc/CONFIGURATION.md is
+  generated from src/config/schema.zig. New keys: `[s2s] bind_address`,
+  `[auth] ip_lockout_threshold`, `[auth] users_scan_limit`,
+  `[server] lmdb_map_size_mb`, and the OIDC `localpart_*`/`idp_*`
+  family (see UPGRADING.md and CONFIGURATION.md).
+- X4 completed the lib/conf migration (PRs #87, #92, #96): one
+  `Sections` struct and `file_spec` table in src/config/schema.zig
+  describe every file key; the master, xmppd-core, xmppd-s2s, both auth
+  daemons and xmppctl all load it through lib/conf, and the master
+  forwards the resolved values once through a sealed `--conf-fd`
+  instead of argv flags. See the strict-loader Upgrade notes above.
+- A3 auth policy module and rate limiter v2 (PR #21, T-0D7A44BE, T281):
+  per-IP failures now lock out the address after
+  `[auth] ip_lockout_threshold` consecutive failures (default 20), on
+  top of the existing per-account lockout.
+- OIDC IdP exchanges moved off the event loop (PR #34, T-8E43C580):
+  token, JWKS and introspection calls run on a worker pool
+  (`[oidc] idp_threads`, `idp_max_outstanding`, `idp_connect_timeout_ms`,
+  `idp_timeout_ms`) instead of stalling the auth daemon.
+- Master hardening: running the supervisor as root without a configured
+  `[server] user` is refused (run-user aliases that resolve to uid/gid 0
+  are refused by id, not by name), and the respawn path does no NSS or
+  pid-file I/O on the supervisor loop (PR #85, T431; PR #8, C5/F3/B8).
+- s2s verification moved to the shared DANE module (S29, PR #56): xmppc
+  and s2s both verify through lib/dane instead of local copies.
+- Message carbons apply the XEP-0280 policy on the cross-worker delivery
+  path (PR #53, T-D689B13D).
+- S34 part 2 (PR #45, forge #23): the non-standard `db:features` stream
+  feature is no longer advertised on dialback streams.
+- A9 crypto pool (PR #39): bounded job rings, zeroed inline credential
+  buffers and coalesced wakes on the PBKDF2 pool.
+- Q2 (PR #68): cross-thread queue wakeups coalesce, so a burst of
+  completions costs one wake instead of one per item.
+
 ### Fixed
 
 - S33 disco/caps: removed the `http://jabber.org/protocol/pubsub#subscribe`
@@ -159,6 +247,134 @@
   roster-derived notify model. A caps.zig consistency test now requires
   every advertised `pubsub#*` feature to name its dispatch branch. The
   XEP-0115 `ver` hash changes as a result of the removed feature.
+- DANE TLSA selector-1 never matched: `extractSpki` did not descend into
+  the certificate's outer SEQUENCE, so SPKI hashes silently fell back to
+  full-cert hashes and externally computed selector-1 records failed
+  verification (c04b243).
+- Storage: account and roster JIDs are no longer clipped at 256 bytes
+  (PR #51, T-A6201BB0); iterators keep full prefixes up to the 511-byte
+  key cap (PR #47, T-5A36FA65) and every backend's prefix-scan edge cases
+  are pinned (PR #50); a failed batch commit now ends the batch on every
+  backend, and a write batch reports a BEGIN that could not start
+  (PR #8, C4/F4); a second SQLite connection provably surfaces a busy
+  BEGIN; a failed LMDB open closes the env it created.
+- MAM archive (PR #59): the `by_contact` v2 index (see Upgrade notes),
+  plus offline-migration coverage for interrupted runs and restarts.
+- MUC nick takeover: a same-nick resource takeover now repairs the
+  jid_map and tells the replaced resource it left, so index updates
+  cannot leave a ghost occupant (T413, S30; e2e-muc-nick-takeover wired
+  into the multiworker CI lane).
+- XEP-0198: every outbound stanza is counted for `h` accounting, an ack
+  with a backwards `h` no longer wipes the replay queue, and the SM-ID
+  map survives more than 64 detached sessions and removals (S15/S24/S17,
+  PR #9).
+- Offline queue (PR #9): delivery works without an archive present (G2);
+  hold dedup keys on a minted dispatch token so one held copy serves
+  every resource of a bare JID; a drain stops when a delivered pointer
+  cannot be deleted, arms a retry when its count fails, and clears the
+  pending flag only after re-counting the tail; a stuck delete is redone
+  without resending the stanza.
+- Cross-worker delivery (PR #9): a failed remote delivery no longer
+  reports success (S14), and room-mailbox overflow bounces to the sender
+  instead of silently dropping (S16).
+- Core loop and routing (PRs #8, #9): a full write buffer flushes before
+  the peer is torn down; a stanza that cannot be accumulated closes the
+  stream (H6); route buffers size to the resource cap instead of 16
+  (S18); a rolled-back `bare_map` append no longer strands registration
+  (T254); STARTTLS upgrades only after `<proceed/>` has fully flushed
+  (T215); `purgeFd` compacts in place so a staged EV_DELETE/EV_ADD pair
+  cannot invert across fds (S20).
+- XML layer (PR #9): element and attribute names validate against the
+  XML Name production (S21), numeric character references parse as u21
+  and UTF-8 encode, a nested `stream:stream` inside an open stream is
+  rejected (S27), a namespace-stack overflow is a hard error sized to
+  max depth (S12), and the per-stanza reader-arena reset is restored
+  with cross-stanza borrowers copied (S11). Stored values that carry
+  markup (MUC room config, PEP payload/item id/avatar) are stored
+  decoded and escaped on output (S1).
+- TLS: a WANT_WRITE write is retried with the identical slice (S23, the
+  kTLS rule), and kTLS engagement is logged after the handshake (Q11).
+- Auth daemon (PR #8): `unlock` removes every fold-equal legacy lock row
+  including duplicates (D3), the OIDC daemon migrates legacy lock keys
+  at start (D4), privilege-drop refusals log at err (D8), a failed SASL
+  exchange leaves no stream state behind and a full pending-verify table
+  answers the submission invalid (C6), out-of-order SASL, STARTTLS and
+  dialback outcomes are rejected (F1), and queued work is answered when
+  an outbound connection cannot be initiated (F2).
+- s2s dialback: `db:verify` never travels before the post-TLS auth
+  phase (C1), an undeliverable `db:verify` is answered and retried (B3),
+  a callback connection teardown answers its exchanges invalid (C2),
+  and the IPC write filter drops once the backlog drains (S10).
+- OIDC (T428, PR #70): a token whose `aud` claim is a JSON array is
+  accepted.
+- xmppctl (PR #83, T438): `oidc-links` reports every row in the
+  namespace, and `oidc-unclaimed` fails when the namespace cannot be
+  scanned instead of reporting zero unclaimed accounts.
+- migrate-precis review follow-ups (PR #57).
+- Store hot paths (PR #65, T-944ED1A2, T-E32A817D): hot info logs moved
+  off the read path, every remaining silent stanza drop is counted and
+  logged, and an oversize write-buffer refusal keeps the session.
+- Archive writer (PR #14, S31/Q8): a rejected store no longer breaks
+  later archive writes, the lost-wakeup window on the writer queue is
+  closed, and drop/failure logging is rate-limited.
+- LMDB operator experience (PRs #36, #37, #40, #43): maps are excluded
+  from core dumps, the vmmap lookup retries on ENOMEM, and map
+  exhaustion is pinned and warned distinctly.
+- lib/http: response-head grammar follow-ups and the LOW/NIT items from
+  the re-review (PRs #42, #55).
+- xmppc: MAM result wrappers unwrap into archived stanzas (PR #6).
+- Crypto-pool failed start, SCRAM documentation and LMDB bounds
+  follow-ups (PR #54, T-13A2BD7A).
+- Supervisor lane (T-62A50554): the drop-probe wait is EINTR-safe and
+  status-checked, the capture drain is proven to reach EOF past cap plus
+  pipe buffer, and the capture read end closes before waitpid.
+
+### Internal
+
+- lib/net (F2/F3, ADR-8; PRs #31, #41): shared connection and frame
+  primitives; the auth IPC, s2s and xmppc now run on FrameReader /
+  FrameWriter with a comptime codec (A2, PR #70).
+- F4 StanzaWriter (PRs #16, #29): serializer with a SIMD escaper in
+  lib/xml/writer.zig.
+- A6 (PRs #86, #89): the auth handler is split into mech, account and
+  policy modules with explicit capabilities, and one runner now drives
+  both xmppd-auth and xmppd-auth-oidc.
+- C2 core Outbox (ADR-2, PR #81): outbound stanzas queue per session and
+  flush at the end of the event-loop iteration.
+- C7 (PR #73): move-only split of server.zig and Session into the
+  ADR-12 layout; no behavior change.
+- X2b (PR #52): s2s DNS moved onto lib/dns async.
+
+### Testing
+
+- Deflake sweeps: lib/net deadline, accept-queue and handshake-driver
+  tests (PRs #58, #60), s2s SO_ERROR last-target tests (PR #76, T432),
+  OIDC reply waits made load-independent (PR #78, T433), unix-socket
+  test paths made independent of checkout depth (PR #82, T436), stale
+  ICMP refusals drained and chain deadlines pinned in lib/dns
+  (PR #66), s2s callback teardown moved to event drive with
+  fabricated-target listener fixtures (PR #67), and the forked
+  event-loop child exits via `_exit`.
+- M2 load-driver scenarios (PR #63), M3 microbenchmark suite (PR #61),
+  and M4 CI quality ratchets (PR #62): counting-allocator check,
+  stack-frame audit and catch ratchet wired into the quality job.
+- CI: the multiworker-e2e and quality jobs are green on master again
+  (PRs #79, #80).
+
+### Documentation
+
+- doc/ARCHITECTURE.md rewritten for the ADR-12 layout (Outbox, envelope
+  ring, shared auth runner, lib/conf, lib/net), doc/STORAGE_DESIGN.md
+  corrected against the code, and doc/CONFIGURATION.md generated from
+  src/config/schema.zig by `zig build docs-config` with a staleness
+  check (R8).
+- DOAP project description (XEP-0453) with a compliance-table sync
+  (PR #18), and the remaining XEP-0440 mentions plus the roadmap
+  phase-history table aligned (PR #28).
+- The primary repo URL moved to github.com/xmppd/xmppd (PR #77) and
+  Codeberg references were dropped (PR #74).
+- The v0.9.1 plan, its findings and the ADR records live in
+  doc/T197_QUALITY_SWEEP.md.
 
 ## v0.9.0 - 2026-10-04
 

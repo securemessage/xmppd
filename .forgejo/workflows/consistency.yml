@@ -21,3 +21,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: XEP feature-matrix consistency
         run: sh test/consistency/check_xep_matrix.sh
+      - name: CONFIGURATION.md matches src/config/schema.zig
+        run: zig build docs-config-check
