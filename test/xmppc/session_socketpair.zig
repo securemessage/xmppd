@@ -912,7 +912,7 @@ test "socketpair: rejected resume surfaces sm_failed and drops the queue (T-9BC4
     ctx.engine.waitLoopExit();
 
     // Leg 2: server answers <failed/>; the resume ran pre-bind so the
-    // stream still has no JID — the client binds, does a fresh SM enable,
+    // stream still has no JID: the client binds, does a fresh SM enable,
     // drops the dead id's queue and surfaces sm_failed(1) (V19).
     var fds: [2]posix.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &fds) != 0)
