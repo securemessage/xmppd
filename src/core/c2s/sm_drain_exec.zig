@@ -14,7 +14,11 @@
 //! owning loop thread; `writerMain` and `pumpStore` run on the executor
 //! thread (tests drive `pumpStore` on the test thread when no thread was
 //! started). Completions are popped and settled back on the loop by the
-//! drain tick, which also releases each job's retained blob.
+//! drain tick, which also releases each job's retained blob. The release
+//! CAS that publishes a completion is the executor's last access to the
+//! job - the loop may destroy it immediately - so the worker wake handle
+//! is captured beforehand; `stop()` joins the writer before the owning
+//! loop's memory can go away.
 
 const std = @import("std");
 const posix = std.posix;
@@ -42,7 +46,9 @@ pub const Job = struct {
     next: ?*Job = null,
     /// Completion stack of the owning worker.
     completed: *std.atomic.Value(?*Job),
-    /// Loop the executor wakes after pushing the completion.
+    /// Loop the executor wakes after pushing the completion. Borrowed:
+    /// the owning worker stops (joins) the executor before its loop is
+    /// deinitialized, so the handle outlives every in-flight completion.
     wake: *EventLoop,
     store_ctx: *anyopaque,
     store_fn: StoreFn,
@@ -108,6 +114,13 @@ pub const Executor = struct {
     queue_full: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     completed_jobs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     wake_failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// Test hook: invoked on the executor thread between the completion
+    /// CAS and the worker self-wake, so a test can settle the job while
+    /// the writer still owes the wake. Set by the owning loop before
+    /// start/submit; never written cross-thread.
+    test_after_publish: ?*const fn (ctx: ?*anyopaque) void = null,
+    test_after_publish_ctx: ?*anyopaque = null,
 
     /// Queue a store job. Non-blocking: fails with error.Full when the
     /// ring is at MAX_JOBS or the job allocation fails, so the caller
@@ -251,8 +264,12 @@ pub const Executor = struct {
 
     /// Push the job onto its worker's completion stack and wake that
     /// loop. Treiber push: release so the stack top the loop pops
-    /// carries the committed `stored` value.
+    /// carries the committed `stored` value. The publishing CAS hands
+    /// the job to the worker, which may settle and destroy it on the
+    /// same tick, so the wake handle is captured first and the CAS is
+    /// the final access to job-owned memory.
     fn pushCompleted(self: *Executor, job: *Job) void {
+        const wake = job.wake;
         var top = job.completed.load(.monotonic);
         while (true) {
             job.next = top;
@@ -263,7 +280,8 @@ pub const Executor = struct {
             break;
         }
         _ = self.completed_jobs.fetchAdd(1, .monotonic);
-        job.wake.selfWake() catch {
+        if (self.test_after_publish) |hook| hook(self.test_after_publish_ctx);
+        wake.selfWake() catch {
             _ = self.wake_failed.fetchAdd(1, .monotonic);
             log.err("SM drain executor: completion self-wake failed", .{});
         };
@@ -487,5 +505,77 @@ test "Executor: the writer thread commits and stop drains the queue" {
     try std.testing.expectEqual(@as(u32, 2), store.calls);
     const job2 = completed.swap(null, .acq_rel).?;
     job2.destroy();
+    std.heap.c_allocator.free(store.last_stanza);
+}
+
+test "Executor: a completion may settle before the writer reaches the wake" {
+    // A worker that pops its completion stack on the same tick can
+    // settle and free the job before the executor thread runs the
+    // self-wake. The wake handle is captured before the publish CAS, so
+    // the stale read the gate makes possible cannot happen: a writer
+    // that still read job.wake would self-wake the dead loop and count
+    // a failure.
+    const allocator = std.testing.allocator;
+    var exec: Executor = .{};
+    defer exec.deinit();
+
+    var loop = try testLoop(allocator);
+    defer loop.deinit();
+    // Stand-in for a post-publish job.wake read: an EventLoop whose
+    // kqueue is invalid, so self-waking it fails deterministically and
+    // increments wake_failed.
+    var dead: EventLoop = undefined;
+    dead.kq = -1;
+
+    var completed: std.atomic.Value(?*Job) = std.atomic.Value(?*Job).init(null);
+    var store: MockStore = .{};
+
+    const Gate = struct {
+        release_writer: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        fn afterPublish(ctx: ?*anyopaque) void {
+            const gate: *@This() = @ptrCast(@alignCast(ctx.?));
+            while (!gate.release_writer.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    var gate: Gate = .{};
+    exec.test_after_publish = Gate.afterPublish;
+    exec.test_after_publish_ctx = &gate;
+
+    try exec.start();
+    const blob = try Blob.createUncharged(allocator, "<message id='uaf'/>");
+    try exec.submit(.{
+        .completed = &completed,
+        .wake = &loop,
+        .store_ctx = &store,
+        .store_fn = MockStore.store,
+        .blob = blob,
+        .recipient = "alice@localhost",
+        .from_jid = "bob@localhost/res",
+        .stanza_id = "uaf",
+        .timestamp = 3,
+    });
+    blob.releaseRetention();
+
+    // Wait for the publish CAS, then settle the way the drain tick
+    // would: consume the outcome and poison the stale wake handle while
+    // the writer still owes the wake.
+    var job: ?*Job = null;
+    var tries: usize = 0;
+    while (job == null and tries < 1_000_000) : (tries += 1) {
+        job = completed.swap(null, .acq_rel);
+        if (job == null) std.atomic.spinLoopHint();
+    }
+    const settled = job.?;
+    try std.testing.expect(settled.stored);
+    settled.wake = &dead;
+    gate.release_writer.store(true, .release);
+
+    // stop() joins the writer after it pushes through the gate; the job
+    // is only freed afterwards so a stale read would observe the dead
+    // loop deterministically.
+    exec.stop();
+    settled.destroy();
+    try std.testing.expectEqual(@as(u32, 1), store.calls);
+    try std.testing.expectEqual(@as(u64, 0), exec.wake_failed.load(.monotonic));
     std.heap.c_allocator.free(store.last_stanza);
 }
