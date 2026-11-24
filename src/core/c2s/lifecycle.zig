@@ -367,22 +367,11 @@ fn detachSession(server: *Server, id: usize, session: *Session, changes: *Change
     session.sm_detached = true;
     server.detached_count += 1;
     c2s_sm.smIdMapInsert(server, session.sm_id[0..session.sm_id_len], id);
-    session.sm_detach_time = std.time.timestamp();
+    session.sm_detach_time = sm_state.monotonicSeconds();
     // C11: the resume deadline joins the worker's expiry wheel; the single
     // one-shot timer is re-armed at the iteration tail (sm_expiry_pending).
     server.sm_expiry.insert(session, session.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
     server.sm_expiry_pending = true;
-
-    // T-265C5A0E: retained unacked blobs stop charging their producers'
-    // ring budgets here; the worker's dedicated SM retention budget
-    // carries the resume tail instead. A full retention budget cannot
-    // hold the queue, so the session is flagged for the batch-end reap:
-    // destruction parks it for the chunked counted drain.
-    if (session.sm_unacked) |queue| {
-        if (!queue.retainOn(server.smRetentionBudget())) {
-            session.sm_overflow = true;
-        }
-    }
 
     // Remove from kqueue and close the fd. Purge instead of staging deletes:
     // close(2) drops the knotes, and a staged delete/add for this number
@@ -615,7 +604,8 @@ pub fn drainSmUnackedTick(server: *Server) void {
         } else {
             drainOneUnacked(server, blob.bytes(), node.recipient[0..node.recipient_len], now);
         }
-        blob.release();
+        node.queue.bytes -= blob.len;
+        blob.releaseRetention();
     }
     if (server.sm_drain_head != null) {
         server.loop.selfWake() catch |err| {
@@ -755,7 +745,7 @@ fn bounceUnackedStanza(server: *Server, recipient: []const u8, head: []const u8,
 pub fn expireDetachedSessions(server: *Server, changes: *ChangeList) void {
     server.sm_expiry_armed = false;
     if (server.sm_expiry.count > 0) {
-        server.sm_expiry.expireDue(std.time.timestamp(), ExpireCtx{
+        server.sm_expiry.expireDue(sm_state.monotonicSeconds(), ExpireCtx{
             .server = server,
             .changes = changes,
         }, expireOneDetached);
@@ -773,7 +763,7 @@ fn expireOneDetached(ctx: ExpireCtx, session: *Session) void {
     log.info("session {d} SM resume expired (id={s}, elapsed={d}s)", .{
         id,
         session.sm_id[0..session.sm_id_len],
-        std.time.timestamp() - session.sm_detach_time,
+        sm_state.monotonicSeconds() - session.sm_detach_time,
     });
     session.sm_resume_enabled = false; // Prevent re-detach
     destroySession(ctx.server, id, session, ctx.changes);
@@ -1410,7 +1400,7 @@ test "T158: detach timer expires sessions at 300s, not before" {
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
-    const now = std.time.timestamp();
+    const now = sm_state.monotonicSeconds();
 
     // Session 1: detached 301 seconds ago — MUST be expired
     const s1 = try makeAuthenticatedSession(&server, 1, "alice");
@@ -1848,8 +1838,7 @@ test "S15: an overflowed session drains unacked messages to offline storage" {
     server.free_count -= 1;
     // Owned by session.deinit once assigned.
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
-    queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
+    queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     session.sm_unacked = queue;
 
     _ = queue.push("<message from='alice@localhost' to='bob@localhost' id='m1'><body>held</body></message>");
@@ -1931,7 +1920,7 @@ test "T158: detach timer does not expire session at exactly 299s" {
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
-    const now = std.time.timestamp();
+    const now = sm_state.monotonicSeconds();
 
     // Session detached 299 seconds ago — must NOT be expired (boundary check)
     const s1 = try makeAuthenticatedSession(&server, 1, "carol");
@@ -1967,7 +1956,7 @@ test "T158: detach timer expires session at exactly 300s" {
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
-    const now = std.time.timestamp();
+    const now = sm_state.monotonicSeconds();
 
     // Session detached exactly 300 seconds ago — MUST be expired (>= comparison)
     const s1 = try makeAuthenticatedSession(&server, 1, "dave");
@@ -2019,7 +2008,7 @@ test "C11: detach links the expiry wheel and the drain fires once" {
     const s2 = try makeAuthenticatedSession(&server, 2, "bob");
     s2.sm_resume_enabled = true;
     s2.sm_detached = true;
-    s2.sm_detach_time = std.time.timestamp();
+    s2.sm_detach_time = sm_state.monotonicSeconds();
     s2.sm_id_len = sm_state.SM_ID_HEX_LEN;
     const id2 = "eeee5555ffff6666aaaa7777bbbb8888";
     @memcpy(&s2.sm_id, id2);
@@ -2030,7 +2019,7 @@ test "C11: detach links the expiry wheel and the drain fires once" {
 
     // Push s1's deadline into the past, then drain.
     _ = server.sm_expiry.unlink(s1);
-    server.sm_expiry.insert(s1, std.time.timestamp() - 1);
+    server.sm_expiry.insert(s1, sm_state.monotonicSeconds() - 1);
     expireDetachedSessions(&server, &changes);
 
     try std.testing.expect(server.sessions[1] == null);
@@ -2734,8 +2723,7 @@ test "S35: SM replay resends the stamped stanza unchanged" {
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
     session.sm_enabled = true;
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
-    queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
+    queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     session.sm_unacked = queue;
     server.sessions[1] = session;
     defer {
@@ -3102,7 +3090,7 @@ test "T316: a repeated destroySession is a counted no-op" {
 // C11 regression tests: every unacked stanza reaches a counted outcome:
 // stored offline, bounced, or a counted drop. Never a silent loss (T430).
 
-test "C11: detach moves the unacked queue off the producer budget (T-265C5A0E)" {
+test "C11: SM retention never charges the producer's transport budget" {
     const allocator = std.testing.allocator;
 
     var server: Server = undefined;
@@ -3119,34 +3107,39 @@ test "C11: detach moves the unacked queue off the producer budget (T-265C5A0E)" 
     session.sm_id_len = sm_state.SM_ID_HEX_LEN;
     @memcpy(&session.sm_id, "aaaa1111bbbb2222cccc3333dddd4444");
     server.free_count -= 1;
-    const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(server.smBlobBudget());
-    _ = queue.push("<message from='bob@localhost/res' to='alice@localhost' id='m1'/>");
-    session.sm_unacked = queue;
 
-    const producer = server.smBlobBudget();
-    const charged = producer.bytes_in_flight.load(.monotonic);
-    try std.testing.expect(charged > 0);
+    // A producer-charged blob (the shape a delivered stanza takes in
+    // transport) lands in the queue as a retention reference; the
+    // producer's charge ends with the producer's own handle.
+    var producer = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    const blob = try producer.produce("<message from='bob@localhost/res' to='alice@localhost' id='m1'/>");
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
+    _ = queue.pushBlob(blob);
+    _ = queue.push("<presence from='bob@localhost/res' to='alice@localhost'/>");
+    session.sm_unacked = queue;
+    blob.release();
+    try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
 
     closeSession(&server, 1, &changes);
 
-    // Detached, still resumable, and the queue's charges moved onto the
-    // worker's retention budget.
+    // Detached, still resumable; the retained bytes are the session's own
+    // account, never the producer's.
     try std.testing.expect(session.sm_detached);
     try std.testing.expect(!session.sm_overflow);
     try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
-    try std.testing.expectEqual(charged, server.smRetentionBudget().bytes_in_flight.load(.monotonic));
-    try std.testing.expect(queue.detached);
+    try std.testing.expect(queue.bytes > 0);
 
-    // Teardown returns the retention charges and parks the drain.
+    // Teardown parks the counted drain; draining refunds the session's
+    // account to zero.
     session.sm_resume_enabled = false;
     destroySession(&server, 1, session, &changes);
     try std.testing.expect(server.sm_drain_head != null);
     while (server.sm_drain_head != null) drainSmUnackedTick(&server);
-    try std.testing.expectEqual(@as(u64, 0), server.smRetentionBudget().bytes_in_flight.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
 }
 
-test "C11: a full SM retention budget fails the detach into a counted drain (T-265C5A0E)" {
+test "C11: the session byte bound fails only the holder into a counted drain" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -3178,20 +3171,29 @@ test "C11: a full SM retention budget fails the detach into a counted drain (T-2
     const session = try makeAuthenticatedSession(&server, 1, "alice");
     session.stream.state = .active;
     session.stream.bound_jid = xmpp_lib.Jid.parse("alice@localhost/res") catch null;
+    session.sm_enabled = true;
     session.sm_resume_enabled = true;
     session.sm_id_len = sm_state.SM_ID_HEX_LEN;
     @memcpy(&session.sm_id, "bbbb2222cccc3333dddd4444eeee5555");
     server.free_count -= 1;
+    const m1 = "<message from='bob@localhost/res' to='alice@localhost' id='m1' type='chat'><body>hi</body></message>";
+    const iq1 = "<iq from='bob@localhost/res' to='alice@localhost' id='iq1' type='get'><ping/></iq>";
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(server.smBlobBudget());
-    _ = queue.push("<message from='bob@localhost/res' to='alice@localhost' id='m1' type='chat'><body>hi</body></message>");
-    _ = queue.push("<iq from='bob@localhost/res' to='alice@localhost' id='iq1' type='get'><ping/></iq>");
+    queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
     session.sm_unacked = queue;
 
-    // A retention budget that cannot take even one blob refuses the move,
-    // so the detach flags the session for the reap instead of pinning the
-    // producer budget for the resume tail.
-    server.sm_retention_budget = .{ .allocator = allocator, .limit = 1 };
+    // The per-session byte bound ([core] sm_max_unacked_bytes) fits both
+    // stanzas exactly; a third push is refused and fails this session
+    // alone into the counted drain.
+    server.sm_max_unacked_bytes = m1.len + iq1.len;
+    queue.byte_limit = server.sm_max_unacked_bytes;
+    session.smTrackOutbound(m1, null);
+    session.smTrackOutbound(iq1, null);
+    try std.testing.expect(!session.sm_overflow);
+    session.smTrackOutbound("<presence from='bob@localhost/res' to='alice@localhost'/>", null);
+    try std.testing.expect(session.sm_overflow);
+    try std.testing.expectEqual(@as(u32, 2), queue.count);
+
     closeSession(&server, 1, &changes);
     try std.testing.expect(session.sm_detached);
     try std.testing.expect(session.sm_overflow);
@@ -3260,14 +3262,14 @@ fn makeDetachedWithStanzas(
     session.stream.bound_jid = xmpp_lib.Jid.parse(bound_full_jid) catch null;
     session.sm_resume_enabled = true;
     session.sm_detached = true;
-    session.sm_detach_time = std.time.timestamp();
+    session.sm_detach_time = sm_state.monotonicSeconds();
     session.sm_id_len = sm_state.SM_ID_HEX_LEN;
     @memcpy(&session.sm_id, sm_id[0..sm_state.SM_ID_HEX_LEN]);
     server.detached_count += 1;
     c2s_sm.smIdMapInsert(server, &session.sm_id, id);
     server.sm_expiry.insert(session, session.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
     const queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(server.smBlobBudget());
+    queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
     for (stanzas) |s| _ = queue.push(s);
     session.sm_unacked = queue;
     server.free_count -= 1;
