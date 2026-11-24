@@ -130,7 +130,7 @@ pub fn handleSmEnable(self: *Server, session: *Session, elem: xml.Element, chang
             if (session.nonza(fbs.getWritten()) == .failed_closed) return;
             return;
         };
-        queue.* = sm_state.SmUnackedQueue.init(self.smBlobBudget());
+        queue.* = sm_state.SmUnackedQueue.init(self.allocator, self.sm_max_unacked_bytes);
         session.sm_unacked = queue;
 
         w.writeAll("<enabled xmlns='urn:xmpp:sm:3' id='") catch return;
@@ -288,13 +288,6 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     session.sm_id_len = detached.sm_id_len;
     session.sm_unacked = detached.sm_unacked;
     detached.sm_unacked = null; // Ownership transferred
-    // The queue is live again: new entries charge this worker's delivery
-    // budget instead of the SM retention budget. Retained blobs keep the
-    // charges they already carry and return them on ack or teardown.
-    if (session.sm_unacked) |q| {
-        q.detached = false;
-        q.budget = self.smBlobBudget();
-    }
 
     // Transfer XMPP session state — copy JID strings into session-owned buffers
     // because the detached session's buffers will be freed below.
@@ -505,7 +498,7 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
 
     if (detached.sm_overflow)
         return fail(self, req, "item-not-found", "unacked queue overflowed");
-    if (std.time.timestamp() - detached.sm_detach_time > sm_state.DEFAULT_RESUME_TIMEOUT)
+    if (sm_state.monotonicSeconds() - detached.sm_detach_time > sm_state.DEFAULT_RESUME_TIMEOUT)
         return fail(self, req, "item-not-found", "resume window expired");
     if (detached.sm_detached == false)
         return fail(self, req, "unexpected-request", "session not detached");
@@ -557,19 +550,19 @@ pub fn handleSmResumeRequest(self: *Server, req: actor_message.SmResumeRequest) 
         .last_h = if (detached.sm_unacked) |q| q.last_h else 0,
         .offline_pending = detached.offline_pending,
         .offline_last_sent_sequence = detached.offline_last_sent_sequence,
-        .created = std.time.timestamp(),
+        .created = sm_state.monotonicSeconds(),
     };
     @memcpy(&bundle.previd, req.previd[0..sm_state.SM_ID_HEX_LEN]);
 
     if (detached.sm_unacked) |q| {
         var iter = q.getUnacked();
         while (iter.next()) |blob| {
-            // The bundle carries a reference, not a copy (C11): the queue's
-            // ref is freed by detached.deinit below, the bundle's keeps the
-            // allocation alive for the resuming worker.
-            blob.addRef();
+            // The bundle carries a retention reference, not a copy (C11):
+            // the queue's ref is freed by detached.deinit below, the
+            // bundle's keeps the allocation alive for the resuming worker.
+            blob.retain();
             bundle.stanzas.append(sm_handoff.allocator, blob) catch {
-                blob.release();
+                blob.releaseRetention();
                 bundle.deinit();
                 sm_handoff.allocator.destroy(bundle);
                 return fail(self, req, "item-not-found", "bundle alloc failed");
@@ -675,7 +668,7 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
         sendSmFailed(self, session, "item-not-found", changes);
         return;
     };
-    queue.* = sm_state.SmUnackedQueue.init(self.smBlobBudget());
+    queue.* = sm_state.SmUnackedQueue.init(self.allocator, self.sm_max_unacked_bytes);
     queue.base_seq = bundle.base_seq;
     queue.last_h = bundle.last_h;
     var replay_count: u32 = 0;
@@ -1048,7 +1041,7 @@ pub fn smRedirectNote(self: *Server, previd: []const u8, worker: u16) void {
     if (previd.len != sm_state.SM_ID_HEX_LEN) return;
     var key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
     @memcpy(&key, previd);
-    const now = std.time.timestamp();
+    const now = sm_state.monotonicSeconds();
     smRedirectsPurgeExpired(self, now);
     if (self.sm_redirects.count() >= MAX_SM_REDIRECTS and !self.sm_redirects.contains(key)) {
         var oldest_key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
@@ -1073,7 +1066,7 @@ pub fn smRedirectLookup(self: *Server, previd: []const u8) ?u16 {
     var key: [sm_state.SM_ID_HEX_LEN]u8 = undefined;
     @memcpy(&key, previd);
     const entry = self.sm_redirects.getPtr(key) orelse return null;
-    if (std.time.timestamp() - entry.moved_at > sm_state.DEFAULT_RESUME_TIMEOUT) {
+    if (sm_state.monotonicSeconds() - entry.moved_at > sm_state.DEFAULT_RESUME_TIMEOUT) {
         _ = self.sm_redirects.remove(key);
         return null;
     }
@@ -1267,8 +1260,7 @@ test "Server: S24 a h above the sent count fails the stream" {
     session.stream.state = .active;
     session.sm_enabled = true;
     const queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
-    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = std.testing.allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
-    queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
+    queue.* = sm_state.SmUnackedQueue.init(std.testing.allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     _ = queue.push("<message/>");
     _ = queue.push("<presence/>");
     session.sm_unacked = queue;
@@ -1430,10 +1422,9 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
     detached.init(det_fds[0], 2, "localhost", false, std.testing.allocator);
     detached.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     detached.sm_detached = true;
-    detached.sm_detach_time = std.time.timestamp();
+    detached.sm_detach_time = sm_state.monotonicSeconds();
     const det_queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
-    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = std.testing.allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
-    det_queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
+    det_queue.* = sm_state.SmUnackedQueue.init(std.testing.allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     det_queue.base_seq = 6;
     det_queue.last_h = 5;
     _ = det_queue.push("<message/>");
@@ -1535,9 +1526,10 @@ test "Server: S24 cross-worker handoff carries last_h" {
         .last_presence = sm_handoff.allocator.dupe(u8, "") catch unreachable,
         .base_seq = 6,
         .last_h = 5,
-        .created = std.time.timestamp(),
+        .created = sm_state.monotonicSeconds(),
     };
-    bundle.stanzas.append(sm_handoff.allocator, testSmBudget().produce("<message/>") catch unreachable) catch unreachable;
+    // Bundle stanza refs are retention refs (see handleSmResumeReply).
+    bundle.stanzas.append(sm_handoff.allocator, delivery_queue_mod.Blob.createUncharged(sm_handoff.allocator, "<message/>") catch unreachable) catch unreachable;
     try sm_handoff.put(&previd, bundle);
 
     handleSmResumeReply(&server, .{
@@ -1589,22 +1581,6 @@ pub fn captureSmResumeStatus(ds: *DeliverySystem, req_worker: u16, out: *Capture
     }.handle);
 }
 
-/// Stable budget for test-built unacked queues: a queue can outlive the
-/// helper that built it (released inside `server.deinit`, which may run
-/// after a test's `delivery_sys.deinit`), so the budget must live for the
-/// whole test process.
-var test_sm_budget: ?delivery_queue_mod.BlobBudget = null;
-
-pub fn testSmBudget() *delivery_queue_mod.BlobBudget {
-    if (test_sm_budget == null) {
-        test_sm_budget = .{
-            .allocator = std.testing.allocator,
-            .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT,
-        };
-    }
-    return &test_sm_budget.?;
-}
-
 /// Build a detached session on `slot` (acked up to `last_h`, `unacked` stanzas
 /// outstanding from `base_seq`) registered under `previd`, ready for a
 /// cross-worker resume request. The caller owns the session; on a rejected
@@ -1622,12 +1598,12 @@ pub fn makeDetachedForResume(
     detached.init(fd, slot, "localhost", false, std.testing.allocator);
     detached.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     detached.sm_detached = true;
-    detached.sm_detach_time = std.time.timestamp();
+    detached.sm_detach_time = sm_state.monotonicSeconds();
     detached.sm_resume_enabled = true;
     @memcpy(&detached.sm_id, previd[0..sm_state.SM_ID_HEX_LEN]);
     detached.sm_id_len = sm_state.SM_ID_HEX_LEN;
     const queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(testSmBudget());
+    queue.* = sm_state.SmUnackedQueue.init(std.testing.allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     queue.base_seq = base_seq;
     queue.last_h = last_h;
     var i: u32 = 0;
@@ -1890,9 +1866,10 @@ test "T317: cross-worker resume re-bind failure fails and closes the session" {
         .last_presence = sm_handoff.allocator.dupe(u8, "") catch unreachable,
         .base_seq = 6,
         .last_h = 5,
-        .created = std.time.timestamp(),
+        .created = sm_state.monotonicSeconds(),
     };
-    bundle.stanzas.append(sm_handoff.allocator, testSmBudget().produce("<message/>") catch unreachable) catch unreachable;
+    // Bundle stanza refs are retention refs (see handleSmResumeReply).
+    bundle.stanzas.append(sm_handoff.allocator, delivery_queue_mod.Blob.createUncharged(sm_handoff.allocator, "<message/>") catch unreachable) catch unreachable;
     try sm_handoff.put(&previd, bundle);
 
     handleSmResumeReply(&server, .{
