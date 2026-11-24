@@ -306,6 +306,12 @@ fn makeKev(ident: usize, filter: i16, flags: u16) posix.Kevent {
 /// or `deadline_ns` passes. The fd filter is staged EV_ADD|EV_ONESHOT in the
 /// same kevent() call that waits; the cancel fd is staged as a persistent
 /// EV_ADD (re-adding an existing knote is an idempotent modify).
+///
+/// A deadline already in the past still harvests once, without blocking:
+/// an event the kernel posted before the wait ran is the truth about the
+/// fd, and reporting Timeout without looking would relabel an outcome that
+/// already happened (T440: a refused connect reported Timeout whenever
+/// scheduling delay ate the budget before the wait was reached).
 fn waitIo(
     kq: posix.fd_t,
     fd: posix.fd_t,
@@ -314,8 +320,7 @@ fn waitIo(
     cancel_fd: posix.fd_t,
 ) WaitError!void {
     const now = monotonicNs();
-    if (now >= deadline_ns) return error.Timeout;
-    const remaining = deadline_ns - now;
+    const remaining: u64 = if (now >= deadline_ns) 0 else deadline_ns - now;
 
     var changes: [2]posix.Kevent = undefined;
     var n_changes: usize = 0;
@@ -1731,10 +1736,97 @@ test "a refused connection is ConnectionFailed" {
 
     var url_buf: [128]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{port});
+    // The refusal is a kernel event, not a duration: the bound is the
+    // write event the kernel posts, and the deadline only insures against
+    // a hang, so it sits far out. A tight budget would let scheduling
+    // delay relabel the refusal as Timeout (T440).
     try std.testing.expectError(
         HttpError.ConnectionFailed,
-        client.get(std.testing.allocator, url, testOptions(2000, 2000)),
+        client.get(std.testing.allocator, url, testOptions(30_000, 30_000)),
     );
+}
+
+test "an event already posted beats a deadline in the past" {
+    // socketpair data is posted synchronously by write(), so the read
+    // event is pending before the wait runs. waitIo with a deadline
+    // already expired must still harvest it; reverting the
+    // expired-deadline harvest returns error.Timeout here instead (T440).
+    const kq = try posix.kqueue();
+    defer posix.close(kq);
+    var sp: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &sp),
+    );
+    defer posix.close(sp[0]);
+    defer posix.close(sp[1]);
+    _ = try posix.write(sp[0], "x");
+    try waitIo(kq, sp[1], std.c.EVFILT.READ, 0, -1);
+}
+
+test "a refusal already posted beats a deadline in the past" {
+    // Drive a real refusal to a latched kernel event, then wait with a
+    // deadline already expired: waitIo must still deliver the event the
+    // kernel posted, not relabel it Timeout. With the expired-deadline
+    // harvest reverted this returns error.Timeout instead (T440).
+    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    var bind_addr: std.c.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    try posix.bind(listen_fd, @ptrCast(&bind_addr), @sizeOf(std.c.sockaddr.in));
+    var alen: posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try posix.getsockname(listen_fd, @ptrCast(&bind_addr), &alen);
+    posix.close(listen_fd);
+
+    const kq = try posix.kqueue();
+    defer posix.close(kq);
+    // Loopback connect() may report the refusal synchronously or leave it
+    // pending depending on when the RST is processed; an errored socket
+    // posts EVFILT_WRITE either way, so both paths reach the harvest.
+    // A synchronous success means the just-closed port was rebound -
+    // retry with a fresh socket.
+    var fd: posix.fd_t = undefined;
+    var pending = false;
+    var tries: usize = 0;
+    while (true) {
+        tries += 1;
+        try std.testing.expect(tries <= 64);
+        fd = try posix.socket(
+            posix.AF.INET,
+            posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
+            0,
+        );
+        if (posix.connect(fd, @ptrCast(&bind_addr), @sizeOf(std.c.sockaddr.in))) |_| {
+            posix.close(fd);
+            continue;
+        } else |err| switch (err) {
+            error.WouldBlock, error.ConnectionPending => {
+                pending = true;
+                break;
+            },
+            error.ConnectionRefused => break,
+            else => {
+                posix.close(fd);
+                return err;
+            },
+        }
+    }
+    defer posix.close(fd);
+
+    // The wait returns the instant the kernel posts the refusal; the
+    // deadline is hang insurance, not a measured window. Only a pending
+    // connect latches SO_ERROR asynchronously - a synchronously refused
+    // socket reports the error via connect() itself but is still posted
+    // writable, so the expired-deadline harvest is exercised either way.
+    if (pending) {
+        try waitIo(kq, fd, std.c.EVFILT.WRITE, monotonicNs() + 30 * std.time.ns_per_s, -1);
+    }
+    try waitIo(kq, fd, std.c.EVFILT.WRITE, 0, -1);
+    if (pending) {
+        try std.testing.expectError(error.ConnectionRefused, posix.getsockoptError(fd));
+    }
 }
 
 fn closeAfter(fds: []const posix.fd_t, delay_ms: u64) void {
