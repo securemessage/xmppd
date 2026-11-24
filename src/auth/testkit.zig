@@ -5,6 +5,7 @@
 //! builders. Imported only by test code; production never reaches it.
 
 const std = @import("std");
+const sasl = @import("sasl");
 const protocol = @import("ipc_protocol");
 const backend_mod = @import("backend");
 const user_store_mod = @import("user_store");
@@ -96,6 +97,14 @@ pub fn plainRequest(conn_id: u32, ip: []const u8, payload: []const u8) protocol.
     } };
 }
 
+/// Buffer length for a minted server nonce (b64).
+pub const SNONCE_B64_LEN = sasl.scram.server_nonce_b64_len;
+
+/// Mint a timed server nonce (v2 freshness layout) issued at `now`.
+pub fn mintSnonce(buf: *[SNONCE_B64_LEN]u8, now: i64) []const u8 {
+    return sasl.scram.mintServerNonce(buf, now);
+}
+
 /// Test helper: build the server-first-message exactly the way core does
 /// under protocol v2 (ADR-6): combined nonce = client nonce + server nonce,
 /// then the cached (salt, iterations).
@@ -127,7 +136,6 @@ pub fn scramV2Exchange(
     server_nonce_b64: []const u8,
     sf_buf: []u8,
 ) !V2Exchange {
-    const sasl = @import("sasl");
     const cf = try client.clientFirst();
     const first = try sasl.scram.parseClientFirst(cf);
 

@@ -174,8 +174,23 @@ pub fn main() !void {
     var rate_limiter = try RateLimiter.init(allocator, rate_policy);
     defer rate_limiter.deinit();
 
-    // Initialize auth handler
-    var handler = AuthHandler.init(allocator, &store);
+    // Initialize auth handler. The replay cache is sized from the
+    // configured login-rate ceiling times the nonce freshness window
+    // (ADR-6): a window sized for the declared ceiling can hold every live
+    // nonce a compliant load produces, so inserts refuse before they evict.
+    const replay_capacity = @as(usize, v.auth.login_rate_ceiling) * @as(usize, v.auth.scram_nonce_window_seconds);
+    var handler = AuthHandler.init(allocator, &store, .{
+        .replay_capacity = replay_capacity,
+        .nonce_window_seconds = v.auth.scram_nonce_window_seconds,
+        .nonce_skew_seconds = v.auth.scram_nonce_skew_seconds,
+    });
+    if (handler.replay_entries.len == 0) {
+        log.warn("replay cache alloc of {d} entries failed; every SCRAM verify refuses", .{replay_capacity});
+    } else {
+        log.info("replay cache: {d} entries ({d} logins/s ceiling x {d}s window), nonce skew {d}s", .{
+            handler.replay_entries.len, v.auth.login_rate_ceiling, v.auth.scram_nonce_window_seconds, v.auth.scram_nonce_skew_seconds,
+        });
+    }
     if (rate_limit_enabled) {
         handler.setRateLimiter(&rate_limiter);
         log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} account / {d} ip failures", .{

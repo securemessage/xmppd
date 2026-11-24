@@ -536,8 +536,50 @@ pub fn parseClientFirstBare(bare: []const u8) error{InvalidMessage}!struct {
 }
 
 /// Upper bound for the server-nonce portion of the combined nonce (base64
-/// text). 24 raw bytes encode to 32 chars; anything past 64 is malformed.
+/// text). The timed nonce below encodes to 36 chars; anything past 64 is
+/// malformed.
 pub const server_nonce_max_len = 64;
+
+/// Server-nonce freshness layout (ADR-6 v2): the core mints the server
+/// nonce as b64(u64 wall-seconds big-endian || 18 random bytes). The auth
+/// daemon decodes it and refuses anything outside
+/// [now - window, now + skew]. The timestamp rides inside
+/// server-first-message, so the client proof covers it and a replayer
+/// cannot refresh it.
+pub const server_nonce_issued_len: usize = 8;
+pub const server_nonce_random_len: usize = 18;
+pub const server_nonce_raw_len: usize = server_nonce_issued_len + server_nonce_random_len;
+pub const server_nonce_b64_len: usize = std.base64.standard.Encoder.calcSize(server_nonce_raw_len);
+
+/// Mint a timestamped server nonce (wall `now` in whole seconds) into
+/// out_b64; returns the b64 slice.
+pub fn mintServerNonce(out_b64: *[server_nonce_b64_len]u8, now: i64) []const u8 {
+    var raw: [server_nonce_raw_len]u8 = undefined;
+    std.mem.writeInt(u64, raw[0..8], @intCast(now), .big);
+    std.crypto.random.bytes(raw[8..]);
+    return std.base64.standard.Encoder.encode(out_b64, &raw);
+}
+
+/// True when nonce_b64 decodes to a timed nonce whose issue time is inside
+/// [now - window_seconds, now + skew_seconds]. Wrong length or malformed
+/// base64 fails closed.
+pub fn serverNonceFresh(nonce_b64: []const u8, now: i64, window_seconds: i64, skew_seconds: i64) bool {
+    var raw: [server_nonce_raw_len]u8 = undefined;
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(nonce_b64) catch return false;
+    if (n != server_nonce_raw_len) return false;
+    dec.decode(&raw, nonce_b64) catch return false;
+    const issued: i64 = @bitCast(std.mem.readInt(u64, raw[0..8], .big));
+    if (issued < now - window_seconds) return false;
+    if (issued > now + skew_seconds) return false;
+    return true;
+}
+
+/// PBKDF2 iteration count used when the store derives credentials at
+/// account creation or password change. The auth daemon's deterministic
+/// fake credentials must serve the same count so an unknown account is
+/// indistinguishable from a real one.
+pub const default_iteration_count: u32 = 4096;
 
 pub const ExchangeError = error{
     InvalidMessage,

@@ -207,8 +207,9 @@ pub fn main() !void {
     var rate_limiter = try RateLimiter.init(allocator, rate_cfg.policy);
     defer rate_limiter.deinit();
 
-    // Initialize auth handler (generic over OidcStore)
-    var handler = AuthHandler.init(allocator, &oidc_store);
+    // Initialize auth handler (generic over OidcStore). No SCRAM here, so
+    // the replay cache stays empty.
+    var handler = AuthHandler.init(allocator, &oidc_store, .{ .replay_capacity = 0 });
     if (rate_cfg.enabled) {
         handler.setRateLimiter(&rate_limiter);
         log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} account / {d} ip failures", .{
@@ -1224,7 +1225,7 @@ const DaemonFixture = struct {
         self.limiter = try RateLimiter.init(allocator, limiter_policy orelse .{});
         errdefer self.limiter.deinit();
 
-        self.handler = AuthHandler.init(allocator, &self.store);
+        self.handler = AuthHandler.init(allocator, &self.store, .{ .replay_capacity = 0 });
         self.handler.setRateLimiter(&self.limiter);
         errdefer self.handler.deinit();
 

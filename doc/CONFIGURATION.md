@@ -55,6 +55,9 @@ listed under the daemon that accepts them.
 | `crypto_threads` | `4` | auth | Password hash threads (`0` disables the pool and derives inline) |
 | `registration` | `false` | auth | In-band registration (XEP-0077) |
 | `require_invite` | `true` | auth | Require invitation code for registration |
+| `login_rate_ceiling` | `512` | auth | Sustained SCRAM login rate the replay cache is sized for (capacity = ceiling x nonce window) |
+| `scram_nonce_window_seconds` | `60` | auth | Seconds a core-minted server nonce stays consumable; also the replay-cache entry TTL |
+| `scram_nonce_skew_seconds` | `15` | auth | Seconds of forward clock skew tolerated on server-nonce timestamps |
 
 ### [s2s]
 
@@ -253,6 +256,9 @@ File keys:
   [auth] crypto_threads               default: 4  password hash threads
   [auth] registration                 default: false  enable registration
   [auth] require_invite               default: true  registration needs invite
+  [auth] login_rate_ceiling           default: 512  sustained logins/s ceiling
+  [auth] scram_nonce_window_seconds   default: 60  server nonce freshness window
+  [auth] scram_nonce_skew_seconds     default: 15  nonce future-dating tolerance
   [s2s] socket                       default: /var/run/xmppd/s2s.sock  s2s IPC socket
   [s2s] port                         default: 5269  s2s listen port
   [s2s] enabled                      default: true  enable s2s

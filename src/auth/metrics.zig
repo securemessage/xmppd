@@ -58,9 +58,12 @@ pub const Counters = struct {
     pool_queue_high_water: Counter = .init(0),
     pool_jobs: Counter = .init(0),
     pool_latency_us: [HIST_BUCKETS]Counter = @splat(.init(0)),
-    /// SCRAM session table occupancy and its high-water mark.
+    /// SCRAM replay-cache occupancy and its high-water mark, plus the
+    /// count of verifies refused because the probe window was all live
+    /// (temporary-auth-failure; a live tag is never evicted).
     replay_occupied: Counter = .init(0),
     replay_high_water: Counter = .init(0),
+    replay_refusals: Counter = .init(0),
     /// Times a lane's intake paused on the outbound backlog watermark.
     ipc_intake_pauses: Counter = .init(0),
 };
@@ -142,6 +145,12 @@ pub inline fn replayInserted() void {
     if (n > hw) counters.replay_high_water.store(n, .monotonic);
 }
 
+/// An insert hit a probe window of all-live tags; the verify is refused
+/// with temporary-auth-failure rather than evicting a live tag.
+pub inline fn replayRefused() void {
+    bump(&counters.replay_refusals, 1);
+}
+
 /// A replay slot went inactive; a remove without a matching insert is a
 /// programmer error.
 pub inline fn replayRemoved() void {
@@ -208,8 +217,8 @@ pub fn dump() void {
         rw.print("{s}:{d}", .{ name, n }) catch break;
     }
     log.info("auth outcomes: {s}", .{rw.buffered()});
-    log.info("auth scram replay: occupied={d} high_water={d}; ipc_intake_pauses={d}", .{
-        read(&c.replay_occupied), read(&c.replay_high_water), read(&c.ipc_intake_pauses),
+    log.info("auth scram replay: occupied={d} high_water={d} refusals={d}; ipc_intake_pauses={d}", .{
+        read(&c.replay_occupied), read(&c.replay_high_water), read(&c.replay_refusals), read(&c.ipc_intake_pauses),
     });
     var hbuf: [HIST_BUCKETS * 24]u8 = undefined;
     var hw: std.Io.Writer = .fixed(&hbuf);

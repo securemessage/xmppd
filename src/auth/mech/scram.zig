@@ -27,13 +27,18 @@ const hashUsername = handler_mod.hashUsername;
 threadlocal var scram_salt_buf: [32]u8 = undefined;
 threadlocal var scram_sfinal_buf: [64]u8 = undefined;
 
-/// Server-nonce replay cache: fixed capacity, expiry checked at insert and
-/// lookup, no timer. 16384 x 32 B covers a 10k-login burst inside one
-/// nonce lifetime.
-pub const REPLAY_CAPACITY = 16384;
+/// Server-nonce replay cache: open-addressed, expiry checked at insert and
+/// lookup, no timer. Capacity comes from config at handler init
+/// (auth.login_rate_ceiling x auth.scram_nonce_window_seconds); this is the
+/// fallback default.
+pub const DEFAULT_REPLAY_CAPACITY = 16384;
 /// A server nonce is consumable for this long after core mints it; matches
-/// the old exchange staleness deadline (SCRAM_SLOT_STALE_SECONDS).
-pub const REPLAY_TTL_SECONDS: i64 = 60;
+/// the old exchange staleness deadline (SCRAM_SLOT_STALE_SECONDS). The
+/// handler's configured window replaces this at runtime.
+pub const DEFAULT_NONCE_WINDOW_SECONDS: i64 = 60;
+/// Forward tolerance for a nonce timestamped a little ahead of the auth
+/// daemon's clock.
+pub const DEFAULT_NONCE_SKEW_SECONDS: i64 = 15;
 /// Bounded probe window for insert and lookup.
 const REPLAY_PROBE = 8;
 /// Iteration count served for unknown users; the same constant the store
@@ -59,8 +64,8 @@ fn nonceTag(secret: *const [32]u8, nonce: []const u8) [16]u8 {
     return tag;
 }
 
-fn replayHome(tag: *const [16]u8) usize {
-    return std.mem.readInt(u64, tag[0..8], .little) % REPLAY_CAPACITY;
+fn replayHome(tag: *const [16]u8, capacity: usize) usize {
+    return std.mem.readInt(u64, tag[0..8], .little) % capacity;
 }
 
 /// Free an entry in place and drop the occupancy gauge.
@@ -73,13 +78,15 @@ fn replayFree(e: *ReplayEntry) void {
 /// True when nonce is already consumed and unexpired; expired hits are
 /// reclaimed in place so lookup also refreshes occupancy.
 fn replaySeen(comptime Store: type, self: *handler_mod.AuthHandler(Store), nonce: []const u8, now: i64) bool {
+    const capacity = self.replay_entries.len;
+    if (capacity == 0) return false;
     const tag = nonceTag(&self.scram_secret, nonce);
-    const home = replayHome(&tag);
+    const home = replayHome(&tag, capacity);
     var i: usize = 0;
     while (i < REPLAY_PROBE) : (i += 1) {
-        const e = &self.replay_entries[(home + i) % REPLAY_CAPACITY];
+        const e = &self.replay_entries[(home + i) % capacity];
         if (!e.occupied) continue;
-        if (now - e.touched_at > REPLAY_TTL_SECONDS) {
+        if (now - e.touched_at > self.replay_window_seconds) {
             replayFree(e);
             continue;
         }
@@ -89,28 +96,26 @@ fn replaySeen(comptime Store: type, self: *handler_mod.AuthHandler(Store), nonce
 }
 
 /// Consume nonce into the replay cache. First free-or-expired slot inside
-/// the probe window wins; if the window is all live, the eldest entry is
-/// evicted so inserts stay O(1) under flood.
-fn replayInsert(comptime Store: type, self: *handler_mod.AuthHandler(Store), nonce: []const u8, now: i64) void {
+/// the probe window wins. A window of all-live entries is error.CacheFull:
+/// evicting a live tag would reopen it to replay, so the verify is refused
+/// with temporary-auth-failure instead and counted (review 770).
+fn replayInsert(comptime Store: type, self: *handler_mod.AuthHandler(Store), nonce: []const u8, now: i64) error{CacheFull}!void {
+    const capacity = self.replay_entries.len;
+    if (capacity == 0) return error.CacheFull;
     const tag = nonceTag(&self.scram_secret, nonce);
-    const home = replayHome(&tag);
-    var eldest: usize = home;
+    const home = replayHome(&tag, capacity);
     var i: usize = 0;
     while (i < REPLAY_PROBE) : (i += 1) {
-        const idx = (home + i) % REPLAY_CAPACITY;
-        const e = &self.replay_entries[idx];
-        if (!e.occupied or now - e.touched_at > REPLAY_TTL_SECONDS) {
+        const e = &self.replay_entries[(home + i) % capacity];
+        if (!e.occupied or now - e.touched_at > self.replay_window_seconds) {
             replayFree(e);
             e.* = .{ .tag = tag, .touched_at = now, .occupied = true };
             metrics.replayInserted();
             return;
         }
-        if (e.touched_at < self.replay_entries[eldest].touched_at) eldest = idx;
     }
-    const e = &self.replay_entries[eldest];
-    replayFree(e);
-    e.* = .{ .tag = tag, .touched_at = now, .occupied = true };
-    metrics.replayInserted();
+    metrics.replayRefused();
+    return error.CacheFull;
 }
 
 /// Credentials for a username that does not exist, derived from the
@@ -241,15 +246,31 @@ pub fn handleScramVerify(comptime Store: type, self: *handler_mod.AuthHandler(St
         return authFailure(req.conn_id, .not_authorized);
     };
 
-    // The exchange is well-formed now: consume the server nonce before the
-    // proof runs, so a retry needs a fresh challenge either way.
+    // Freshness covered by the proof: the core embeds its issue time in the
+    // server nonce, which the client signs inside server-first. A nonce
+    // outside [now - window, now + skew] is refused; so is one that does
+    // not decode to the timed layout at all.
     const now = std.time.timestamp();
+    if (!sasl.scram.serverNonceFresh(parsed.server_nonce, now, self.replay_window_seconds, self.nonce_skew_seconds)) {
+        log.info("SCRAM auth failed: stale or undecodable server nonce conn={d}", .{req.conn_id});
+        self.policy.recordOutcome(account_username, req.client_ip, .failure);
+        return authFailure(req.conn_id, .not_authorized);
+    }
+
+    // The exchange is well-formed and fresh now: consume the server nonce
+    // before the proof runs, so a retry needs a fresh challenge either way.
     if (replaySeen(Store, self, parsed.server_nonce, now)) {
         log.info("SCRAM auth failed: replayed server nonce conn={d}", .{req.conn_id});
         self.policy.recordOutcome(account_username, req.client_ip, .failure);
         return authFailure(req.conn_id, .not_authorized);
     }
-    replayInsert(Store, self, parsed.server_nonce, now);
+    replayInsert(Store, self, parsed.server_nonce, now) catch {
+        // A live-tag eviction would reopen that tag to replay; refuse the
+        // verify instead (counted by authFailure + metrics.replayRefused).
+        log.info("SCRAM auth failed: replay cache probe window full conn={d}", .{req.conn_id});
+        self.policy.recordOutcome(account_username, req.client_ip, .failure);
+        return authFailure(req.conn_id, .temporary_auth_failure);
+    };
 
     const server_sig = sasl.scram.verifyProof(&creds, parsed.auth_message, &parsed.client_proof) catch {
         log.info("SCRAM auth failed: proof verification for conn={d}", .{req.conn_id});
@@ -290,7 +311,12 @@ const RateLimiter = @import("rate_limiter").RateLimiter;
 
 /// The RFC 7677 client nonce, reused so vector-shaped messages stay pinned.
 const RFC_CNONCE = "rOprNGfwEbeRWgbNEkqO";
-const TEST_SNOUNCE_B64 = "srvNoncetESTsrvNoncetEST00==";
+
+/// A fresh timed server nonce for tests; caller keeps the buffer alive for
+/// the exchange.
+fn testSnonce(buf: *[testkit.SNONCE_B64_LEN]u8) []const u8 {
+    return testkit.mintSnonce(buf, std.time.timestamp());
+}
 
 test "SCRAM v2: full login verifies a proof computed independently of the library" {
     const allocator = std.testing.allocator;
@@ -299,7 +325,7 @@ test "SCRAM v2: full login verifies a proof computed independently of the librar
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "user", "pencil");
-    var handler = TestHandler.init(allocator, &store);
+    var handler = TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     const params = handleSync(&handler, .{ .scram_params_request = .{
@@ -315,10 +341,12 @@ test "SCRAM v2: full login verifies a proof computed independently of the librar
     // scram library under test.
     const bare = "n=user,r=" ++ RFC_CNONCE;
     const enc = std.base64.standard.Encoder;
+    var nb: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const snonce = testSnonce(&nb);
     var salt_b64: [64]u8 = undefined;
     const salt_enc = enc.encode(salt_b64[0..enc.calcSize(params.scram_params.salt.len)], params.scram_params.salt);
     const sfirst = try std.fmt.allocPrint(allocator, "r={s}{s},s={s},i={d}", .{
-        RFC_CNONCE, TEST_SNOUNCE_B64, salt_enc, params.scram_params.iteration_count,
+        RFC_CNONCE, snonce, salt_enc, params.scram_params.iteration_count,
     });
     defer allocator.free(sfirst);
 
@@ -333,7 +361,7 @@ test "SCRAM v2: full login verifies a proof computed independently of the librar
     var stored_key: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&ckey, &stored_key, .{});
 
-    const client_final_no_proof = try std.fmt.allocPrint(allocator, "c=biws,r={s}{s}", .{ RFC_CNONCE, TEST_SNOUNCE_B64 });
+    const client_final_no_proof = try std.fmt.allocPrint(allocator, "c=biws,r={s}{s}", .{ RFC_CNONCE, snonce });
     defer allocator.free(client_final_no_proof);
     const auth_message = try std.fmt.allocPrint(allocator, "{s},{s},{s}", .{ bare, sfirst, client_final_no_proof });
     defer allocator.free(auth_message);
@@ -379,7 +407,7 @@ test "SCRAM v2: a replayed client-final is refused by the nonce cache" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = TestHandler.init(allocator, &store);
+    var handler = TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     // Drive one real exchange, capturing the verify message byte for byte.
@@ -393,7 +421,8 @@ test "SCRAM v2: a replayed client-final is refused by the nonce cache" {
         .client_ip = "10.0.0.7",
     } }) orelse return error.NoResponse;
     var sf: [512]u8 = undefined;
-    const sfirst = testkit.serverFirst(&sf, first.client_nonce, TEST_SNOUNCE_B64, params.scram_params.salt, params.scram_params.iteration_count);
+    var nb: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const sfirst = testkit.serverFirst(&sf, first.client_nonce, testSnonce(&nb), params.scram_params.salt, params.scram_params.iteration_count);
     try client.parseServerFirst(sfirst);
     var salted: [32]u8 = undefined;
     sasl.scram.pbkdf2("pw", client.salt_raw[0..client.salt_raw_len], client.iteration_count, &salted);
@@ -425,7 +454,7 @@ test "SCRAM v2: unknown user's params are deterministic and same-shaped" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = TestHandler.init(allocator, &store);
+    var handler = TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     // Reply slices borrow a threadlocal buffer that the next reply reuses:
@@ -471,7 +500,7 @@ test "SCRAM v2: a mismatched channel binding fails the exchange" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = TestHandler.init(allocator, &store);
+    var handler = TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var client = sasl.ScramClient.init(allocator, "alice", "pw");
@@ -486,7 +515,8 @@ test "SCRAM v2: a mismatched channel binding fails the exchange" {
         .username = first.raw_name,
         .client_ip = "10.0.0.5",
     } }) orelse return error.NoResponse;
-    const sfirst = testkit.serverFirst(&sf, first.client_nonce, TEST_SNOUNCE_B64, params.scram_params.salt, params.scram_params.iteration_count);
+    var nb: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const sfirst = testkit.serverFirst(&sf, first.client_nonce, testSnonce(&nb), params.scram_params.salt, params.scram_params.iteration_count);
     try client.parseServerFirst(sfirst);
     var salted: [32]u8 = undefined;
     sasl.scram.pbkdf2("pw", client.salt_raw[0..client.salt_raw_len], client.iteration_count, &salted);
@@ -519,16 +549,17 @@ test "SCRAM v2: the daemon holds no per-exchange state after a reply" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = TestHandler.init(allocator, &store);
+    var handler = TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var client = sasl.ScramClient.init(allocator, "alice", "pw");
     defer client.deinit();
     var sf: [512]u8 = undefined;
-    _ = try testkit.scramV2Exchange(&handler, &client, 1, "10.0.0.1", "pw", "nonceAAA=", &sf);
+    var nb1: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    _ = try testkit.scramV2Exchange(&handler, &client, 1, "10.0.0.1", "pw", testkit.mintSnonce(&nb1, std.time.timestamp()), &sf);
     // Replay consumption is the only footprint left: one occupied entry.
     var occupied: usize = 0;
-    for (&handler.replay_entries) |*e| {
+    for (handler.replay_entries) |*e| {
         if (e.occupied) occupied += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), occupied);
@@ -541,13 +572,14 @@ test "SCRAM v2: prepared account name is returned while the exchange keeps the w
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "testuser", "testpassword");
-    var handler = TestHandler.init(allocator, &store);
+    var handler = TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var client = sasl.ScramClient.init(allocator, "TestUser", "testpassword");
     defer client.deinit();
     var sf: [512]u8 = undefined;
-    const ex = try testkit.scramV2Exchange(&handler, &client, 5, "10.0.0.5", "testpassword", "nonceBBB=", &sf);
+    var nb2: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const ex = try testkit.scramV2Exchange(&handler, &client, 5, "10.0.0.5", "testpassword", testkit.mintSnonce(&nb2, std.time.timestamp()), &sf);
     try std.testing.expect(ex.verify_msg.? == .auth_success);
     try std.testing.expectEqualStrings("testuser", ex.verify_msg.?.auth_success.username);
     try std.testing.expect(ex.verify_msg.?.auth_success.server_final.len > 0);
@@ -559,7 +591,7 @@ test "SCRAM v2: an unformattable account name fails not-authorized" {
     var db = try MemoryBackend.open("", .{});
     defer db.close();
     var store = TestUserStore.init(&db);
-    var handler = TestHandler.init(allocator, &store);
+    var handler = TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     // U+E000 is prohibited by OpaqueString; the verify must refuse
@@ -585,13 +617,14 @@ test "SCRAM v2: unknown user verify fails the same way a wrong password does" {
     var db = try MemoryBackend.open("", .{});
     defer db.close();
     var store = TestUserStore.init(&db);
-    var handler = TestHandler.init(allocator, &store);
+    var handler = TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var client = sasl.ScramClient.init(allocator, "ghost", "pw");
     defer client.deinit();
     var sf: [512]u8 = undefined;
-    const ex = try testkit.scramV2Exchange(&handler, &client, 3, "10.0.0.3", "pw", "nonceCCC=", &sf);
+    var nb3: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const ex = try testkit.scramV2Exchange(&handler, &client, 3, "10.0.0.3", "pw", testkit.mintSnonce(&nb3, std.time.timestamp()), &sf);
     try std.testing.expect(ex.params_msg.? == .scram_params);
     try std.testing.expect(ex.verify_msg.? == .auth_failure);
     try std.testing.expectEqualStrings("not-authorized", ex.verify_msg.?.auth_failure.reason);
@@ -604,13 +637,14 @@ test "SCRAM v2: credential cache is invalidated on password change" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "old-pass");
-    var handler = TestHandler.init(allocator, &store);
+    var handler = TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var c1 = sasl.ScramClient.init(allocator, "alice", "old-pass");
     defer c1.deinit();
     var sf1: [512]u8 = undefined;
-    const ok = try testkit.scramV2Exchange(&handler, &c1, 1, "10.0.0.1", "old-pass", "nonceDDD=", &sf1);
+    var nb4: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const ok = try testkit.scramV2Exchange(&handler, &c1, 1, "10.0.0.1", "old-pass", testkit.mintSnonce(&nb4, std.time.timestamp()), &sf1);
     try std.testing.expect(ok.verify_msg.? == .auth_success);
 
     // Password rotation over the account IPC invalidates the daemon's
@@ -624,47 +658,139 @@ test "SCRAM v2: credential cache is invalidated on password change" {
     var c2 = sasl.ScramClient.init(allocator, "alice", "old-pass");
     defer c2.deinit();
     var sf2: [512]u8 = undefined;
-    const stale = try testkit.scramV2Exchange(&handler, &c2, 2, "10.0.0.2", "old-pass", "nonceEEE=", &sf2);
+    var nb5: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const stale = try testkit.scramV2Exchange(&handler, &c2, 2, "10.0.0.2", "old-pass", testkit.mintSnonce(&nb5, std.time.timestamp()), &sf2);
     try std.testing.expect(stale.verify_msg.? == .auth_failure);
 
     var c3 = sasl.ScramClient.init(allocator, "alice", "new-pass");
     defer c3.deinit();
     var sf3: [512]u8 = undefined;
-    const fresh = try testkit.scramV2Exchange(&handler, &c3, 3, "10.0.0.3", "new-pass", "nonceFFF=", &sf3);
+    var nb6: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const fresh = try testkit.scramV2Exchange(&handler, &c3, 3, "10.0.0.3", "new-pass", testkit.mintSnonce(&nb6, std.time.timestamp()), &sf3);
     try std.testing.expect(fresh.verify_msg.? == .auth_success);
 }
 
-test "SCRAM v2: replay cache expires entries lazily and stays bounded under flood" {
+test "SCRAM v2: replay cache expires entries lazily and stays bounded" {
     const allocator = std.testing.allocator;
     var db = try MemoryBackend.open("", .{});
     defer db.close();
     var store = TestUserStore.init(&db);
-    var handler = TestHandler.init(allocator, &store);
+    var handler = TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     const now = std.time.timestamp();
+    const ttl = handler.replay_window_seconds;
 
-    // Insert then seen: same nonce is a replay within the TTL.
-    replayInsert(TestUserStore, &handler, "nonce-one", now);
+    // Insert then seen: same nonce is a replay within the window.
+    try replayInsert(TestUserStore, &handler, "nonce-one", now);
     try std.testing.expect(replaySeen(TestUserStore, &handler, "nonce-one", now));
     try std.testing.expect(!replaySeen(TestUserStore, &handler, "nonce-two", now));
 
-    // Past the TTL the entry is reclaimed at lookup and can be re-consumed.
-    const later = now + REPLAY_TTL_SECONDS + 1;
+    // Past the window the entry is reclaimed at lookup and can be
+    // re-consumed.
+    const later = now + ttl + 1;
     try std.testing.expect(!replaySeen(TestUserStore, &handler, "nonce-one", later));
-    replayInsert(TestUserStore, &handler, "nonce-one", later);
+    try replayInsert(TestUserStore, &handler, "nonce-one", later);
     try std.testing.expect(replaySeen(TestUserStore, &handler, "nonce-one", later));
 
-    // Flooding nonces never grows the cache past capacity and never blocks.
+    // Flood past capacity: inserts refuse before evicting a live tag, so
+    // the table never grows past its bound and live tags stay consumed.
     var i: usize = 0;
     var buf: [32]u8 = undefined;
-    while (i < REPLAY_CAPACITY * 2) : (i += 1) {
+    var refusals: usize = 0;
+    while (i < handler.replay_entries.len * 2) : (i += 1) {
         const nonce = std.fmt.bufPrint(&buf, "flood-{d}", .{i}) catch unreachable;
-        replayInsert(TestUserStore, &handler, nonce, later);
+        replayInsert(TestUserStore, &handler, nonce, later) catch {
+            refusals += 1;
+            continue;
+        };
     }
     var occupied: usize = 0;
-    for (&handler.replay_entries) |*e| {
+    for (handler.replay_entries) |*e| {
         if (e.occupied) occupied += 1;
     }
-    try std.testing.expect(occupied <= REPLAY_CAPACITY);
+    try std.testing.expect(occupied <= handler.replay_entries.len);
+    try std.testing.expect(refusals > 0);
+    try std.testing.expect(replaySeen(TestUserStore, &handler, "nonce-one", later));
+}
+
+test "SCRAM v2: a server nonce older than the freshness window is refused" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw");
+    var handler = TestHandler.init(allocator, &store, .{});
+    defer handler.deinit();
+
+    // The exchange is otherwise well-formed: proof, params and binding all
+    // check out. Only the embedded issue time sits past the window, so a
+    // replayer cannot replay a week-old capture.
+    var client = sasl.ScramClient.init(allocator, "alice", "pw");
+    defer client.deinit();
+    var sf: [512]u8 = undefined;
+    var nb: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const stale = std.time.timestamp() - handler.replay_window_seconds - 1;
+    const ex = try testkit.scramV2Exchange(&handler, &client, 11, "10.0.0.11", "pw", testkit.mintSnonce(&nb, stale), &sf);
+    try std.testing.expect(ex.verify_msg.? == .auth_failure);
+    try std.testing.expectEqualStrings("not-authorized", ex.verify_msg.?.auth_failure.reason);
+}
+
+test "SCRAM v2: a future-dated server nonce beyond skew is refused" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw");
+    var handler = TestHandler.init(allocator, &store, .{});
+    defer handler.deinit();
+
+    var client = sasl.ScramClient.init(allocator, "alice", "pw");
+    defer client.deinit();
+    var sf: [512]u8 = undefined;
+    var nb: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const future = std.time.timestamp() + handler.nonce_skew_seconds + 60;
+    const ex = try testkit.scramV2Exchange(&handler, &client, 12, "10.0.0.12", "pw", testkit.mintSnonce(&nb, future), &sf);
+    try std.testing.expect(ex.verify_msg.? == .auth_failure);
+    try std.testing.expectEqualStrings("not-authorized", ex.verify_msg.?.auth_failure.reason);
+}
+
+test "SCRAM v2: a full probe window refuses the verify rather than evicting a live tag" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw");
+    // Capacity equal to the probe window: every nonce's window covers the
+    // whole table, so a full table is a full probe window by construction.
+    var handler = TestHandler.init(allocator, &store, .{ .replay_capacity = REPLAY_PROBE });
+    defer handler.deinit();
+
+    const now = std.time.timestamp();
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < REPLAY_PROBE) : (i += 1) {
+        const nonce = std.fmt.bufPrint(&buf, "live-{d}", .{i}) catch unreachable;
+        try replayInsert(TestUserStore, &handler, nonce, now);
+    }
+
+    // The next insert cannot evict a live tag: it refuses, and the tags it
+    // would have displaced still read as consumed.
+    const ninth = std.fmt.bufPrint(&buf, "live-{d}", .{REPLAY_PROBE}) catch unreachable;
+    try std.testing.expectError(error.CacheFull, replayInsert(TestUserStore, &handler, ninth, now));
+    try std.testing.expect(replaySeen(TestUserStore, &handler, "live-0", now));
+
+    // At the verify level the refusal is temporary-auth-failure, counted.
+    metrics.reset();
+    var client = sasl.ScramClient.init(allocator, "alice", "pw");
+    defer client.deinit();
+    var sf: [512]u8 = undefined;
+    var nb: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const ex = try testkit.scramV2Exchange(&handler, &client, 13, "10.0.0.13", "pw", testSnonce(&nb), &sf);
+    try std.testing.expect(ex.verify_msg.? == .auth_failure);
+    try std.testing.expectEqualStrings("temporary-auth-failure", ex.verify_msg.?.auth_failure.reason);
+    try std.testing.expectEqual(@as(u64, 1), metrics.counters.replay_refusals.load(.monotonic));
 }

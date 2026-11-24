@@ -1840,12 +1840,12 @@ fn processScramAuthComplete(self: *Server, session: *Session, client_first: []co
 pub fn sendScramChallenge(self: *Server, session: *Session, salt: []const u8, iterations: u32, changes: *ChangeList) bool {
     const cnonce = session.scram_cnonce_buf[0..session.scram_cnonce_len];
 
-    // 24 raw bytes of server nonce encode to 32 base64 chars.
-    var snonce_raw: [24]u8 = undefined;
-    std.crypto.random.bytes(&snonce_raw);
+    // The server nonce carries this core's issue time (u64 seconds) plus
+    // 18 random bytes; the auth daemon's freshness window bounds how long
+    // it can be replayed, and the client proof covers the timestamp.
+    var snonce_b64: [sasl.scram.server_nonce_b64_len]u8 = undefined;
+    const snonce = sasl.scram.mintServerNonce(&snonce_b64, std.time.timestamp());
     const encoder = std.base64.standard.Encoder;
-    var snonce_b64: [32]u8 = undefined;
-    _ = encoder.encode(&snonce_b64, &snonce_raw);
 
     var salt_b64: [44]u8 = undefined;
     const enc_len = encoder.calcSize(salt.len);
@@ -1857,7 +1857,7 @@ pub fn sendScramChallenge(self: *Server, session: *Session, salt: []const u8, it
     const salt_enc = encoder.encode(salt_b64[0..enc_len], salt);
 
     var fbs = std.io.fixedBufferStream(&session.scram_sfirst_buf);
-    fbs.writer().print("r={s}{s},s={s},i={d}", .{ cnonce, snonce_b64, salt_enc, iterations }) catch {
+    fbs.writer().print("r={s}{s},s={s},i={d}", .{ cnonce, snonce, salt_enc, iterations }) catch {
         const fail_action = session.stream.saslFailure("temporary-auth-failure");
         executeAction(self, session, fail_action, changes);
         return false;
