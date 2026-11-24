@@ -131,6 +131,7 @@ pub fn handleAccountDelete(comptime Store: type, self: *handler_mod.AuthHandler(
     // delete callback for cleanup. For now, locks are cleaned via xmppctl unlock
     // or naturally don't apply once the account is gone.
 
+    self.cacheInvalidate(account_username);
     log.info("account deleted (auth): '{s}'", .{account_username});
     return protocol.Message{ .account_delete_result = .{
         .conn_id = req.conn_id,
@@ -554,6 +555,43 @@ test "AuthHandler: account delete resolves the RFC 7622 account name" {
     try std.testing.expect(!invalid.account_delete_result.success);
     try std.testing.expectEqualStrings("not-acceptable", invalid.account_delete_result.reason);
     try std.testing.expect((try store.lookup(allocator, "bad name")) != null);
+}
+
+test "AuthHandler: account delete drops the daemon credential cache entry" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw");
+    var handler = TestHandler.init(allocator, &store, .{});
+    defer handler.deinit();
+
+    // Populate the daemon cred cache with alice's real params.
+    const real = handleSync(&handler, .{ .scram_params_request = .{
+        .conn_id = 350,
+        .username = "alice",
+        .client_ip = "10.0.0.1",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(real == .scram_params);
+    var real_salt: [32]u8 = undefined;
+    @memcpy(&real_salt, real.scram_params.salt);
+
+    const deleted = handleSync(&handler, .{ .account_delete_request = .{
+        .conn_id = 351,
+        .username = "alice",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(deleted.account_delete_result.success);
+
+    // A params read after the delete must miss the cache: the deterministic
+    // fake salt differs from the real one that was cached.
+    const after = handleSync(&handler, .{ .scram_params_request = .{
+        .conn_id = 352,
+        .username = "alice",
+        .client_ip = "10.0.0.1",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(after == .scram_params);
+    try std.testing.expect(!std.mem.eql(u8, &real_salt, after.scram_params.salt));
 }
 
 test "AuthHandler: registration rejects PRECIS-invalid names with not-acceptable" {
