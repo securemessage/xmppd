@@ -466,19 +466,16 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, changes: *ChangeLi
 
     // For each subscribed contact, check if local or remote. T130: local
     // contacts resolve in chunks, one shared-lock hold per JID's shard.
-    // The chunk only bounds the JidParts stack buffer; the visitor delivers
-    // each entry, so no resource is ever skipped for lack of buffer space.
+    // The collect only copies the account's routing entries; each contact's
+    // presence stanza is built and delivered after the lock is released.
     const SUBS_PER_CHUNK = Server.PRESENCE_CHUNK_JIDS;
 
     const ProbeCtx = struct {
         server: *Server,
         session: *Session,
-        parts: []const session_map_mod.JidParts,
         to_str: []const u8,
 
-        fn visit(ctx: *@This(), jid_idx: usize, entry: *const SessionEntry) void {
-            const contact = ctx.parts[jid_idx];
-
+        fn deliver(ctx: *@This(), contact: session_map_mod.JidParts, entry: *const SessionEntry) void {
             // Retrieve the contact's stored presence inner XML (status/show/priority)
             const contact_inner = if (entry.worker_id == ctx.server.worker_id) blk: {
                 const contact_sess = ctx.server.sessionForEventToken(entry.token) orelse break :blk @as([]const u8, "");
@@ -555,8 +552,11 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, changes: *ChangeLi
             parts_len += 1;
         }
 
-        var ctx = ProbeCtx{ .server = server, .session = session, .parts = parts_buf[0..parts_len], .to_str = to_str };
-        sm.forEachAvailableBatch(parts_buf[0..parts_len], &ctx, ProbeCtx.visit);
+        var ctx = ProbeCtx{ .server = server, .session = session, .to_str = to_str };
+        for (parts_buf[0..parts_len]) |contact| {
+            const n = sm.collectAvailable(contact.local, contact.domain, server.fanoutScratch());
+            for (server.fanout_entries[0..n]) |*entry| ctx.deliver(contact, entry);
+        }
 
         contact_i = end;
     }
@@ -784,7 +784,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             to_jid: xmpp.Jid,
 
             // Deliver to the approver's session
-            fn visit(ctx: *@This(), pentry: *const session_map_mod.SessionEntry) void {
+            fn deliver(ctx: *@This(), pentry: *const session_map_mod.SessionEntry) void {
                 // Look up the contact's session to retrieve their stored presence inner XML.
                 const contact_inner = if (pentry.worker_id == ctx.server.worker_id) blk: {
                     const contact_sess = ctx.server.sessionForEventToken(pentry.token) orelse break :blk @as([]const u8, "");
@@ -818,7 +818,8 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             }
         };
         var ctx: Ctx = .{ .server = server, .session = session, .to_jid = to_jid };
-        sd_sm.forEachAvailable(to_jid.local, to_jid.domain, &ctx, Ctx.visit);
+        const n = sd_sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch());
+        for (server.fanout_entries[0..n]) |*pentry| ctx.deliver(pentry);
     }
 
     log.info("{s} approved subscription from {s}", .{ owner_bare, to_str });
@@ -969,56 +970,37 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
 
         // Each owner resource needs its own stanza ('from' carries the
         // resource), and deliverPresenceToTarget resolves the contact's
-        // resources in the map itself - it must not run inside the visit,
-        // where a nested map hold is a programmer error. Phase 1 builds the
-        // stanzas under the visitor; phase 2 delivers them. The list is
+        // resources with its own collect, which would overwrite the shared
+        // fan-out scratch mid-iteration. The owner list is a private copy,
         // bounded by the configured per-account resource cap.
-        var unavail_stanzas = std.ArrayList([]const u8).empty;
-        defer {
-            for (unavail_stanzas.items) |s| server.allocator.free(s);
-            unavail_stanzas.deinit(server.allocator);
-        }
-
-        const BuildCtx = struct {
-            server: *Server,
-            to_str: []const u8,
-            local: []const u8,
-            domain: []const u8,
-            stanzas: *std.ArrayList([]const u8),
-
-            fn visit(ctx: *@This(), oent: *const SessionEntry) void {
-                var unavail_buf: [router.JID_STANZA_MAX]u8 = undefined;
-                var unavail_fbs = std.io.fixedBufferStream(&unavail_buf);
-                const uw = unavail_fbs.writer();
-                const unavail_xml = stanza: {
-                    uw.writeAll("<presence from='") catch break :stanza null;
-                    xml.escapeWrite(uw, ctx.local) catch break :stanza null;
-                    uw.writeByte('@') catch break :stanza null;
-                    xml.escapeWrite(uw, ctx.domain) catch break :stanza null;
-                    uw.writeByte('/') catch break :stanza null;
-                    xml.escapeWrite(uw, oent.resource()) catch break :stanza null;
-                    uw.writeAll("' to='") catch break :stanza null;
-                    xml.escapeWrite(uw, ctx.to_str) catch break :stanza null;
-                    uw.writeAll("' type='unavailable'/>") catch break :stanza null;
-                    break :stanza unavail_fbs.getWritten();
-                } orelse {
-                    noteJidOverflow("unavailable stanza to '{s}' exceeds {d} bytes; resource skipped", .{ ctx.to_str, router.JID_STANZA_MAX });
-                    return;
-                };
-                const owned = ctx.server.allocator.dupe(u8, unavail_xml) catch {
-                    noteDrop("unavailable stanza for '{s}' not collected: out of memory", .{ctx.to_str});
-                    return;
-                };
-                ctx.stanzas.append(ctx.server.allocator, owned) catch {
-                    ctx.server.allocator.free(owned);
-                    noteDrop("unavailable stanza for '{s}' not collected: out of memory", .{ctx.to_str});
-                };
-            }
+        const owner_entries = blk: {
+            const n = unsub_sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch());
+            break :blk server.allocator.dupe(SessionEntry, server.fanout_entries[0..n]) catch {
+                noteDrop("unavailable stanza fan-out for '{s}' not collected: out of memory", .{to_str});
+                break :blk @as([]SessionEntry, &.{});
+            };
         };
-        var build_ctx = BuildCtx{ .server = server, .to_str = to_str, .local = bound.local, .domain = bound.domain, .stanzas = &unavail_stanzas };
-        unsub_sm.forEachAvailable(bound.local, bound.domain, &build_ctx, BuildCtx.visit);
+        defer if (owner_entries.len > 0) server.allocator.free(owner_entries);
 
-        for (unavail_stanzas.items) |unavail_xml| {
+        for (owner_entries) |*oent| {
+            var unavail_buf: [router.JID_STANZA_MAX]u8 = undefined;
+            var unavail_fbs = std.io.fixedBufferStream(&unavail_buf);
+            const uw = unavail_fbs.writer();
+            const unavail_xml = stanza: {
+                uw.writeAll("<presence from='") catch break :stanza null;
+                xml.escapeWrite(uw, bound.local) catch break :stanza null;
+                uw.writeByte('@') catch break :stanza null;
+                xml.escapeWrite(uw, bound.domain) catch break :stanza null;
+                uw.writeByte('/') catch break :stanza null;
+                xml.escapeWrite(uw, oent.resource()) catch break :stanza null;
+                uw.writeAll("' to='") catch break :stanza null;
+                xml.escapeWrite(uw, to_str) catch break :stanza null;
+                uw.writeAll("' type='unavailable'/>") catch break :stanza null;
+                break :stanza unavail_fbs.getWritten();
+            } orelse {
+                noteJidOverflow("unavailable stanza to '{s}' exceeds {d} bytes; resource skipped", .{ to_str, router.JID_STANZA_MAX });
+                continue;
+            };
             deliverPresenceToTarget(server, to_jid.local, to_jid.domain, unavail_xml, changes);
         }
     }
@@ -1171,7 +1153,7 @@ fn broadcastToOwnResources(
         server: *Server,
         presence_xml: []const u8,
 
-        fn visit(ctx: *@This(), entry: *const SessionEntry) void {
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
             if (entry.worker_id == ctx.server.worker_id) {
                 const target = ctx.server.sessionForEventToken(entry.token) orelse return;
                 // stanza() handles the T153 detached case: it tracks for
@@ -1184,7 +1166,8 @@ fn broadcastToOwnResources(
         }
     };
     var own_ctx = OwnCtx{ .server = server, .presence_xml = presence_xml };
-    sm.forEach(bound.local, bound.domain, &own_ctx, OwnCtx.visit);
+    const n = sm.collectBound(bound.local, bound.domain, server.fanoutScratch());
+    for (server.fanout_entries[0..n]) |*entry| own_ctx.deliver(entry);
 }
 
 /// RFC 6121 §4.4.2 (reverse direction): When a new resource becomes available,
@@ -1204,7 +1187,7 @@ fn sendOtherResourcesPresence(
         bare: []const u8,
         new_resource: []const u8,
 
-        fn visit(ctx: *@This(), entry: *const SessionEntry) void {
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
             const entry_resource = entry.resource();
             // Skip self - the new resource already knows its own presence.
             if (std.mem.eql(u8, entry_resource, ctx.new_resource)) return;
@@ -1236,7 +1219,8 @@ fn sendOtherResourcesPresence(
         }
     };
     var other_ctx = OtherCtx{ .new_session = new_session, .bare = new_session.stream.boundBare(), .new_resource = bound.resource };
-    sm.forEachAvailable(bound.local, bound.domain, &other_ctx, OtherCtx.visit);
+    const n = sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch());
+    for (server.fanout_entries[0..n]) |*entry| other_ctx.deliver(entry);
 }
 
 /// RFC 6121 §8.5.2.1.2: Dispatch directed presence to all available resources
@@ -1294,7 +1278,7 @@ pub fn dispatchDirectedPresenceToBareJid(
         server: *Server,
         presence_xml: []const u8,
 
-        fn visit(ctx: *@This(), entry: *const SessionEntry) void {
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
             if (entry.worker_id == ctx.server.worker_id) {
                 const target = ctx.server.sessionForEventToken(entry.token) orelse return;
                 fanout.deliverToSession(target, ctx.presence_xml, entry.token.index);
@@ -1304,7 +1288,8 @@ pub fn dispatchDirectedPresenceToBareJid(
         }
     };
     var directed_ctx = DirectedCtx{ .server = server, .presence_xml = presence_xml };
-    sm.forEachAvailable(target_local, target_domain, &directed_ctx, DirectedCtx.visit);
+    const n = sm.collectAvailable(target_local, target_domain, server.fanoutScratch());
+    for (server.fanout_entries[0..n]) |*entry| directed_ctx.deliver(entry);
 }
 
 /// Deliver a presence stanza to all available sessions of subscriber JIDs.
@@ -1312,7 +1297,8 @@ pub fn dispatchDirectedPresenceToBareJid(
 ///
 /// T130 batching: subscribers are processed in fixed-size chunks. Per chunk,
 /// each JID resolves under one shared-lock hold on its own shard
-/// (forEachAvailableBatch) and each remote worker's MPSC queue gets a
+/// (collectAvailable copies the routing entries; delivery then runs on the
+/// copies) and each remote worker's MPSC queue gets a
 /// single pipe wake regardless of how many target sessions it has
 /// (enqueue + one wakeWorker), instead of a lock per JID and a pipe write
 /// per session. Chunking caps stack usage at 32 subscriber JIDs.
@@ -1331,8 +1317,7 @@ fn deliverPresenceToSubscribers(
         /// Remote workers that received at least one enqueue this chunk.
         pending_workers: [metrics.MAX_WORKERS]bool = .{false} ** metrics.MAX_WORKERS,
 
-        fn visit(ctx: *@This(), jid_idx: usize, entry: *const SessionEntry) void {
-            _ = jid_idx;
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
             if (entry.worker_id == ctx.server.worker_id) {
                 const target_session = ctx.server.sessionForEventToken(entry.token) orelse return;
                 fanout.deliverToSession(target_session, ctx.presence_xml, entry.token.index);
@@ -1374,7 +1359,10 @@ fn deliverPresenceToSubscribers(
         }
 
         var subs_ctx = SubsCtx{ .server = server, .presence_xml = presence_xml };
-        sm.forEachAvailableBatch(parts_buf[0..parts_len], &subs_ctx, SubsCtx.visit);
+        for (parts_buf[0..parts_len]) |part| {
+            const n = sm.collectAvailable(part.local, part.domain, server.fanoutScratch());
+            for (server.fanout_entries[0..n]) |*entry| subs_ctx.deliver(entry);
+        }
 
         // Remote targets: wake each worker that got an enqueue, once.
         if (server.delivery_system) |ds| {
@@ -1404,7 +1392,7 @@ pub fn deliverPresenceToTarget(
         server: *Server,
         presence_xml: []const u8,
 
-        fn visit(ctx: *@This(), entry: *const SessionEntry) void {
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
             if (entry.worker_id == ctx.server.worker_id) {
                 const target_session = ctx.server.sessionForEventToken(entry.token) orelse return;
                 fanout.deliverToSession(target_session, ctx.presence_xml, entry.token.index);
@@ -1414,7 +1402,8 @@ pub fn deliverPresenceToTarget(
         }
     };
     var target_ctx = TargetCtx{ .server = server, .presence_xml = presence_xml };
-    sm.forEach(target_local, target_domain, &target_ctx, TargetCtx.visit);
+    const n = sm.collectBound(target_local, target_domain, server.fanoutScratch());
+    for (server.fanout_entries[0..n]) |*entry| target_ctx.deliver(entry);
 }
 
 test "S4: subscription presence with an over-long to gets jid-malformed" {

@@ -11,8 +11,8 @@ ADR-4 item 1 (generational tokens) landed as C3; this note covers items 2-5:
    hand).
 2. Lock sharding by bare-JID hash (per-shard `RwLock`); no logging under any
    shard lock.
-3. Visitor API `forEachAvailable(bare, ctx, fn)`; no fixed result buffers
-   (S18).
+3. Copy-out fan-out API `collectAvailable(bare, out)`; no fixed result
+   buffers (S18).
 4. `Session` caches its full and bare JID strings at bind.
 
 ## Scale litmus (skill section 0)
@@ -32,11 +32,11 @@ ADR-4 item 1 (generational tokens) landed as C3; this note covers items 2-5:
    flows through the existing per-worker rings. The allocator stays the
    process `smp_allocator` (sharded, thread-safe); key/entry allocations are
    per-bind (a cold path relative to stanza routing).
-4. Nothing blocks a loop: no new blocking work enters any lock. Visitor
-   callbacks run bounded work only (serialize into scratch, append to a
-   worker ring or a session outbox); a debug assertion forbids re-entering
-   the map from a callback, which is the only way a callback could wait on
-   another map lock. Logging moves outside the lock (Q5).
+4. Nothing blocks a loop: no new blocking work enters any lock. A collect
+   hold does bounded work only (index probe plus a `SessionEntry` memcpy);
+   callers serialize, enqueue, deliver and log on the copies after the
+   lock is released, so no shard hold ever covers delivery or a failure
+   path. Logging moves outside the lock (Q5).
 5. Connection economics: per bound resource the map keeps one heap key
    (~bare+full bytes once) and one `SessionEntry` (~104 B) instead of a key
    plus two duplicated entries and a 16-slot inline array head. A bare JID
@@ -45,14 +45,14 @@ ADR-4 item 1 (generational tokens) landed as C3; this note covers items 2-5:
 6. Many requests per connection: unchanged.
 7. Beyond one host: unchanged (s2s addressing is by JID either way).
 8. Expensive operations priced: JID hashing and case-folding are O(JID
-   bytes), done once per call outside the lock. Visitor fan-out work is
+   bytes), done once per call outside the lock. Collect fan-out work is
    O(resources of one account), bounded by `max_resources_per_account`
    (config, default 256).
 9. Overload behavior: the resource cap is unchanged and fails closed with
    `TooManyResources`; the T254 rollback invariants are kept and tested.
 10. Measured: the existing module tests plus the full Debug and ReleaseSafe
     suites cover correctness; the S18 batch regression test (640 entries
-    across 32 accounts) is kept through the batch visitor.
+    across 32 accounts) is kept through per-JID collects.
 
 ## Layouts
 
@@ -128,29 +128,33 @@ shard_mask: usize, // shard_count - 1, shard_count is a power of two
   released, which also removes the write(2) the sweep flagged under the
   exclusive lock (Q5 piece).
 - Re-entrancy is asserted: a thread-local hold depth checked at lock
-  acquisition panics in safe builds if a visitor callback calls back into
-  the map, since any nested hold can deadlock across shards.
+  acquisition panics in safe builds on any nested hold, since a nested
+  hold can deadlock across shards.
 
-### Visitor API (ADR-4 item 4, S18)
+### Copy-out fan-out API (ADR-4 item 4, S18)
 
 ```zig
-pub fn forEach(self, local, domain, ctx, comptime visit) void
-pub fn forEachAvailable(self, local, domain, ctx, comptime visit) void
-pub fn forEachAvailableBatch(self, jids, ctx, comptime visit) void
+pub fn collectBound(self, local, domain, out: []SessionEntry) usize
+pub fn collectAvailable(self, local, domain, out: []SessionEntry) usize
 ```
 
-- `visit` is `fn (ctx, *const SessionEntry) void`, or
-  `fn (ctx, jid_index, *const SessionEntry) void` for the batch form;
-  `jid_index` replaces the `out_jid_idx` side channel.
-- The callback runs under the shard's shared lock, so the entry list is
-  stable while it runs. Contract: bounded work, leaf locks only, no
-  `SessionMap` calls (asserted). That is what removes every result buffer:
-  fan-out sites serialize and enqueue per entry instead of copying entries
-  out first.
-- `forEachAvailableBatch` takes the shard lock per JID inside the loop
-  (each account can live on a different shard), preserving today's
-  "resolve a chunk, wake each remote worker once" batching without holding
-  a global lock.
+- Under one shared-lock hold the map copies the account's `SessionEntry`
+  values into the caller's buffer and returns the count. The locked
+  section only selects and copies bounded routing state; the caller then
+  iterates the copies to serialize, enqueue, deliver and log, so delivery
+  and its failure paths never extend a shard hold.
+- `out` must have room for the per-account resource cap: the bind path
+  caps each account's entry list there, so a `max_resources` buffer always
+  receives the complete fan-out. Each Server keeps a lazily grown
+  `fanout_entries` scratch at that bound for its fan-out sites, grown on
+  the `delivered_targets` pattern.
+- The token in a copied entry stays authoritative: the owning worker still
+  validates generations at delivery (`sessionForEventToken`, cross-worker
+  slot dispatch), so an unbind between copy and delivery resolves to a
+  counted stale-token skip exactly as a mid-iteration removal did before.
+- T130 presence batching keeps its shape: callers chunk JIDs and collect
+  per JID (one shared-lock hold per JID's shard), then deliver each JID's
+  copies; remote workers still get one pipe wake per chunk.
 - `findByFullJid` keeps its signature (one entry copied out is a point
   lookup, not a result buffer). `hasBound(local, domain)` replaces the
   `[1]SessionEntry` probes; `isAvailable` stays.
@@ -158,7 +162,7 @@ pub fn forEachAvailableBatch(self, jids, ctx, comptime visit) void
   `findAvailableByBareJidBatch` are deleted, and with them the worker
   scratch-entry banks (`scratch_entries_a/b/c`, `scratch_ids_a`,
   `scratch_jid_idxs_a`, `leaseScratch`, `growScratch`). The S18 640-entry
-  batch test moves onto the batch visitor.
+  batch test runs on per-JID collects.
 
 ### Cached bound JID strings (ADR-4 item 5)
 

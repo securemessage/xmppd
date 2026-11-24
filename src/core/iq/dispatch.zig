@@ -2087,7 +2087,7 @@ fn sendPepNotification(
             body_after_to: []const u8,
             msg_buf: []u8,
 
-            fn visit(ctx: *@This(), entry: *const SessionEntry) void {
+            fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
                 // XEP-0163 section 4.3: notify ALL subscribed resources including the publisher
                 var mfbs = std.io.fixedBufferStream(ctx.msg_buf);
                 const mw = mfbs.writer();
@@ -2127,7 +2127,8 @@ fn sendPepNotification(
             .body_after_to = body_after_to,
             .msg_buf = self_msg_lease.buf,
         };
-        sm.forEachAvailable(bound.local, bound.domain, &self_ctx, SelfCtx.visit);
+        const n = sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch());
+        for (server.fanout_entries[0..n]) |*entry| self_ctx.deliver(entry);
     }
 
     // Deliver to presence subscribers (contacts with "from" or "both" subscription) — cached (T129)
@@ -2179,7 +2180,7 @@ fn sendPepNotification(
             body_after_to: []const u8,
             msg_buf: []u8,
 
-            fn visit(ctx: *@This(), entry: *const SessionEntry) void {
+            fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
                 var mfbs = std.io.fixedBufferStream(ctx.msg_buf);
                 const mw = mfbs.writer();
                 const notif_xml = stanza: {
@@ -2217,7 +2218,8 @@ fn sendPepNotification(
             .body_after_to = body_after_to,
             .msg_buf = sub_msg_lease.buf,
         };
-        sm.forEachAvailable(sub_local, sub_domain, &sub_ctx, SubCtx.visit);
+        const n = sm.collectAvailable(sub_local, sub_domain, server.fanoutScratch());
+        for (server.fanout_entries[0..n]) |*entry| sub_ctx.deliver(entry);
     }
 }
 
@@ -2392,7 +2394,7 @@ fn pushBlockPush(
         action: []const u8,
         item_jid: []const u8,
 
-        fn visit(ctx: *@This(), entry: *const SessionEntry) void {
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
             if (entry.worker_id != ctx.server.worker_id) return; // Cross-thread push: deferred to post-V1 (T89 pattern)
             const target = ctx.server.sessionForEventToken(entry.token) orelse return;
             // Skip the originating session (it already got the IQ result)
@@ -2429,7 +2431,8 @@ fn pushBlockPush(
         }
     };
     var push_ctx = PushCtx{ .server = server, .sender_session = sender_session, .user_local = user_local, .user_domain = user_domain, .action = action, .item_jid = item_jid };
-    sm.forEachAvailable(user_local, user_domain, &push_ctx, PushCtx.visit);
+    const n = sm.collectAvailable(user_local, user_domain, server.fanoutScratch());
+    for (server.fanout_entries[0..n]) |*entry| push_ctx.deliver(entry);
 }
 
 pub fn sendIqError(server: *Server, session: *Session, iq_id: []const u8, condition: []const u8) void {
@@ -2589,7 +2592,7 @@ pub fn pushRosterItem(
         user_domain: []const u8,
         item_xml: []const u8,
 
-        fn visit(ctx: *@This(), entry: *const SessionEntry) void {
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
             // Build full push IQ per target (different 'to' and 'id')
             var full_buf: [4096]u8 = undefined;
             var ffbs = std.io.fixedBufferStream(&full_buf);
@@ -2627,7 +2630,8 @@ pub fn pushRosterItem(
         }
     };
     var roster_ctx = RosterPushCtx{ .server = server, .user_local = user_local, .user_domain = user_domain, .item_xml = item_xml };
-    sm.forEach(user_local, user_domain, &roster_ctx, RosterPushCtx.visit);
+    const n = sm.collectBound(user_local, user_domain, server.fanoutScratch());
+    for (server.fanout_entries[0..n]) |*entry| roster_ctx.deliver(entry);
 }
 
 /// Write the MD5 hex hash of a bare JID for Gravatar URL construction.

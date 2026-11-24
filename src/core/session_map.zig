@@ -13,9 +13,12 @@
 //!   O(1) multi-resource index into the same entries. Presence and priority
 //!   updates touch a single object; nothing is kept in sync by hand.
 //!
-//! Fan-out reads go through the visitor API (`forEach`, `forEachAvailable`,
-//! `forEachAvailableBatch`): the callback runs under the shard's shared lock
-//! on a stable entry list, so no call site needs a result buffer.
+//! Fan-out reads go through the copy-out API (`collectBound`,
+//! `collectAvailable`): under one shared-lock hold the map copies the
+//! account's `SessionEntry` values - the bounded routing state - into the
+//! caller's buffer, and the caller serializes, delivers and logs after the
+//! lock is released. A buffer of `max_resources` entries never truncates:
+//! the bind path caps each account's entry list there.
 //!
 //! ## Thread Safety
 //!
@@ -24,8 +27,8 @@
 //! index pair. A `multi_worker` flag gates lock acquisition - in
 //! single-worker mode there is exactly one shard and no lock overhead.
 //!
-//! - Read (shared) lock: findByFullJid, forEach, forEachAvailable,
-//!   forEachAvailableBatch, isAvailable, hasBound
+//! - Read (shared) lock: findByFullJid, collectBound, collectAvailable,
+//!   isAvailable, hasBound
 //! - Write (exclusive) lock: bind, unbind, setPresenceState,
 //!   setPresenceAvailable, setPriority
 //!
@@ -65,7 +68,7 @@ pub const SessionEntry = struct {
     }
 };
 
-/// A pre-split bare JID for batch resolution (T130).
+/// A pre-split bare JID for caller-side fan-out chunking (T130).
 pub const JidParts = struct {
     local: []const u8,
     domain: []const u8,
@@ -235,9 +238,8 @@ const Shard = struct {
 };
 
 /// Number of locks the calling thread holds on this map right now. Checked
-/// at every acquisition: a nested hold is a programmer error (a visitor
-/// callback reaching back into the map is the only way to produce one) and
-/// deadlocks the thread in multi-worker mode or corrupts the iteration in
+/// at every acquisition: a nested hold is a programmer error and deadlocks
+/// the thread in multi-worker mode or corrupts the iteration in
 /// single-worker mode.
 threadlocal var hold_depth: usize = 0;
 
@@ -455,74 +457,57 @@ pub const SessionMap = struct {
         return entry.*;
     }
 
-    /// Visit every bound resource of a bare JID under the shard's shared
-    /// lock (S18, ADR-4 item 4). The entry list is stable for the call, so
-    /// callers serialize and enqueue per entry instead of copying entries
-    /// into a fixed result buffer. `visit(ctx, entry)` runs bounded work
-    /// only - leaf locks, no SessionMap calls (asserted via hold_depth).
-    pub fn forEach(
+    /// Copy the routing entry of every bound resource of a bare JID into
+    /// `out` under one shared-lock hold (S18, ADR-4 item 4). The locked
+    /// section only selects and copies bounded routing state; callers
+    /// serialize, deliver and log on the copies after this returns, so no
+    /// stanza build, enqueue or log line ever extends a shard hold. `out`
+    /// must have room for the per-account resource cap (`max_resources`):
+    /// the bind path caps the entry list there, so a cap-sized buffer
+    /// always receives the complete fan-out. Returns the number copied.
+    pub fn collectBound(
         self: *SessionMap,
         local: []const u8,
         domain: []const u8,
-        ctx: anytype,
-        comptime visit: anytype,
-    ) void {
+        out: []SessionEntry,
+    ) usize {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const key = Key.initBuf(&key_buf, local, domain, "") orelse return;
+        const key = Key.initBuf(&key_buf, local, domain, "") orelse return 0;
 
         const shard = self.shardFor(key);
         self.lockShard(shard, false);
         defer self.unlockShard(shard, false);
 
-        const list = shard.bare_map.getPtr(key) orelse return;
-        for (list.constSlice()) |entry_ptr| visit(ctx, entry_ptr);
+        const list = shard.bare_map.getPtr(key) orelse return 0;
+        const n = @min(list.len, out.len);
+        for (list.constSlice()[0..n], out[0..n]) |entry_ptr, *dst| dst.* = entry_ptr.*;
+        return n;
     }
 
-    /// `forEach` restricted to presence-available resources.
-    pub fn forEachAvailable(
+    /// `collectBound` restricted to presence-available resources.
+    pub fn collectAvailable(
         self: *SessionMap,
         local: []const u8,
         domain: []const u8,
-        ctx: anytype,
-        comptime visit: anytype,
-    ) void {
+        out: []SessionEntry,
+    ) usize {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const key = Key.initBuf(&key_buf, local, domain, "") orelse return;
+        const key = Key.initBuf(&key_buf, local, domain, "") orelse return 0;
 
         const shard = self.shardFor(key);
         self.lockShard(shard, false);
         defer self.unlockShard(shard, false);
 
-        const list = shard.bare_map.getPtr(key) orelse return;
-        for (list.constSlice()) |entry_ptr| {
-            if (entry_ptr.presence_available) visit(ctx, entry_ptr);
-        }
-    }
-
-    /// `forEachAvailable` over many bare JIDs (T130 presence broadcast
-    /// batching): one call per chunk, one shared-lock hold per JID's shard
-    /// since accounts can live on different shards. `visit(ctx, jid_index,
-    /// entry)` receives the index into `jids` the entry resolved from, which
-    /// replaces the old out_jid_idx side channel for per-target payloads.
-    pub fn forEachAvailableBatch(
-        self: *SessionMap,
-        jids: []const JidParts,
-        ctx: anytype,
-        comptime visit: anytype,
-    ) void {
-        for (jids, 0..) |jid, jid_idx| {
-            var key_buf: [MAX_JID_OCTETS]u8 = undefined;
-            const key = Key.initBuf(&key_buf, jid.local, jid.domain, "") orelse continue;
-
-            const shard = self.shardFor(key);
-            self.lockShard(shard, false);
-            defer self.unlockShard(shard, false);
-
-            const list = shard.bare_map.getPtr(key) orelse continue;
-            for (list.constSlice()) |entry_ptr| {
-                if (entry_ptr.presence_available) visit(ctx, jid_idx, entry_ptr);
+        const list = shard.bare_map.getPtr(key) orelse return 0;
+        const n = @min(list.len, out.len);
+        var copied: usize = 0;
+        for (list.constSlice()[0..n]) |entry_ptr| {
+            if (entry_ptr.presence_available) {
+                out[copied] = entry_ptr.*;
+                copied += 1;
             }
         }
+        return copied;
     }
 
     /// Check if any session is bound for a bare JID (presence state ignored).
@@ -626,44 +611,12 @@ pub const SessionMap = struct {
 // Tests
 // ============================================================================
 
-const CollectCtx = struct {
-    out: []SessionEntry,
-    idxs: ?[]usize = null,
-    n: usize = 0,
-
-    fn visit(c: *CollectCtx, e: *const SessionEntry) void {
-        if (c.n < c.out.len) {
-            c.out[c.n] = e.*;
-            if (c.idxs) |ix| ix[c.n] = 0;
-        }
-        c.n += 1;
-    }
-
-    fn visitBatch(c: *CollectCtx, jid_idx: usize, e: *const SessionEntry) void {
-        if (c.n < c.out.len) {
-            c.out[c.n] = e.*;
-            if (c.idxs) |ix| ix[c.n] = jid_idx;
-        }
-        c.n += 1;
-    }
-};
-
 fn collectBound(map: *SessionMap, local: []const u8, domain: []const u8, out: []SessionEntry) usize {
-    var ctx = CollectCtx{ .out = out };
-    map.forEach(local, domain, &ctx, CollectCtx.visit);
-    return ctx.n;
+    return map.collectBound(local, domain, out);
 }
 
 fn collectAvailable(map: *SessionMap, local: []const u8, domain: []const u8, out: []SessionEntry) usize {
-    var ctx = CollectCtx{ .out = out };
-    map.forEachAvailable(local, domain, &ctx, CollectCtx.visit);
-    return ctx.n;
-}
-
-fn collectAvailableBatch(map: *SessionMap, jids: []const JidParts, out: []SessionEntry, idxs: []usize) usize {
-    var ctx = CollectCtx{ .out = out, .idxs = idxs };
-    map.forEachAvailableBatch(jids, &ctx, CollectCtx.visitBatch);
-    return ctx.n;
+    return map.collectAvailable(local, domain, out);
 }
 
 test "SessionMap: bind and findByFullJid" {
@@ -692,7 +645,7 @@ test "SessionMap: unbind removes entry" {
     try std.testing.expect(map.findByFullJid("bob", "localhost", "desktop") == null);
 }
 
-test "SessionMap: forEach visits every bound resource" {
+test "SessionMap: collectBound copies every bound resource" {
     var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
@@ -705,7 +658,7 @@ test "SessionMap: forEach visits every bound resource" {
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
-test "SessionMap: forEachAvailable" {
+test "SessionMap: collectAvailable" {
     var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
@@ -723,7 +676,7 @@ test "SessionMap: forEachAvailable" {
     try std.testing.expectEqual(@as(u32, 1), buf[0].token.index);
 }
 
-test "SessionMap: forEachAvailableBatch resolves many JIDs, grouped per JID" {
+test "SessionMap: per-JID collects resolve many JIDs, grouped per JID" {
     var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
@@ -743,36 +696,33 @@ test "SessionMap: forEachAvailableBatch resolves many JIDs, grouped per JID" {
         .{ .local = "carol", .domain = "localhost" },
         .{ .local = "nobody", .domain = "localhost" },
     };
+    // T130 callers collect per JID; the results stay grouped in request
+    // order when each collect's output is appended to one buffer.
     var buf: [8]SessionEntry = undefined;
     var idxs: [8]usize = undefined;
-    const total = collectAvailableBatch(&map, &jids, &buf, &idxs);
+    var scratch: [8]SessionEntry = undefined;
+    var total: usize = 0;
+    for (&jids, 0..) |jid, jid_idx| {
+        const n = map.collectAvailable(jid.local, jid.domain, &scratch);
+        for (scratch[0..n]) |e| {
+            buf[total] = e;
+            idxs[total] = jid_idx;
+            total += 1;
+        }
+    }
     try std.testing.expectEqual(@as(usize, 3), total);
     // alice (jid 0) x2 available, carol (jid 2) x1, bob/nobody none
     try std.testing.expectEqual(@as(usize, 0), idxs[0]);
     try std.testing.expectEqual(@as(usize, 0), idxs[1]);
     try std.testing.expectEqual(@as(usize, 2), idxs[2]);
-
-    // Batch must match the per-JID call's results, in order
-    var single: [8]SessionEntry = undefined;
-    var want: usize = 0;
-    for (jids) |jid| {
-        want += collectAvailable(&map, jid.local, jid.domain, &single);
-    }
-    try std.testing.expectEqual(want, total);
-
-    // No truncation: the visitor sees every entry even when the caller's
-    // collection slice cannot hold them all (S18).
-    var small: [2]SessionEntry = undefined;
-    var small_idxs: [2]usize = undefined;
-    try std.testing.expectEqual(@as(usize, 3), collectAvailableBatch(&map, &jids, &small, &small_idxs));
 }
 
-test "SessionMap: S18 batch over 512 entries does not truncate at the resource cap" {
+test "SessionMap: S18 fan-out over 32 accounts does not truncate at the old bound" {
     var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     // 32 JIDs x 20 available resources = 640 entries, over the old
-    // 32x16 chunk cap.
+    // 32x16 chunk cap and the old inline-16 per-account bound.
     var local_buf: [32][10]u8 = undefined;
     var jid_storage: [32]JidParts = undefined;
     var sid: u32 = 1;
@@ -788,11 +738,24 @@ test "SessionMap: S18 batch over 512 entries does not truncate at the resource c
         }
     }
 
-    var buf: [32 * 256]SessionEntry = undefined;
-    var idxs: [32 * 256]usize = undefined;
-    const total = collectAvailableBatch(&map, &jid_storage, &buf, &idxs);
+    // Per-JID collect into a cap-sized scratch never truncates; entries
+    // stay grouped by JID in request order.
+    var scratch: [64]SessionEntry = undefined;
+    const buf = try std.testing.allocator.alloc(SessionEntry, 640);
+    defer std.testing.allocator.free(buf);
+    const idxs = try std.testing.allocator.alloc(usize, 640);
+    defer std.testing.allocator.free(idxs);
+    var total: usize = 0;
+    for (&jid_storage, 0..) |jid, jid_idx| {
+        const n = map.collectAvailable(jid.local, jid.domain, &scratch);
+        try std.testing.expectEqual(@as(usize, 20), n);
+        for (scratch[0..n]) |e| {
+            buf[total] = e;
+            idxs[total] = jid_idx;
+            total += 1;
+        }
+    }
     try std.testing.expectEqual(@as(usize, 640), total);
-    // Entries stay grouped by JID in request order.
     try std.testing.expectEqual(@as(usize, 0), idxs[0]);
     try std.testing.expectEqual(@as(usize, 0), idxs[19]);
     try std.testing.expectEqual(@as(usize, 1), idxs[20]);

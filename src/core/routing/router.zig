@@ -176,6 +176,30 @@ fn hasPrivateHint(allocator: std.mem.Allocator, inner_xml: []const u8) bool {
     return false;
 }
 
+/// Selection pass state: the available-resource count and the
+/// highest-priority entry, which is all the single-target picks need.
+const Selection = struct {
+    count: usize = 0,
+    best: ?SessionEntry = null,
+    best_prio: i8 = std.math.minInt(i8),
+};
+
+/// Copy an account's available routing entries into `out` (one shared-lock
+/// hold that only selects and copies) and pick the highest-priority one out
+/// of the copies. Ties resolve to the first entry seen, matching bind order.
+fn selectAvailable(sm: *SessionMap, to_jid: xmpp.Jid, out: []SessionEntry) Selection {
+    var sel: Selection = .{};
+    const n = sm.collectAvailable(to_jid.local, to_jid.domain, out);
+    for (out[0..n]) |*entry| {
+        sel.count += 1;
+        if (entry.priority > sel.best_prio) {
+            sel.best_prio = entry.priority;
+            sel.best = entry.*;
+        }
+    }
+    return sel;
+}
+
 /// Route a fully accumulated stanza to target session(s).
 /// Reconstructs the opening tag with the sender's full JID as 'from',
 /// appends the accumulated child XML, and closes the stanza.
@@ -274,26 +298,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
 
     // Route: resolve the target resource set via the unified session map.
     // A full JID or a best-resource pick yields one copied entry; a bare-JID
-    // fan-out is visited under the shard lock on each pass. There is no
-    // result buffer (S18): selection copies at most one SessionEntry, the
-    // remote-enqueue and local-delivery passes re-visit the shard.
+    // fan-out collects the routing entries under one shard-lock hold per
+    // pass, and selection, remote enqueue and local delivery all iterate
+    // the copies with the lock already released (ADR-4).
     const sm = server.session_map orelse return;
-
-    // Selection pass: counts the available resources and remembers the
-    // highest-priority one, which is all the single-target picks need.
-    const SelectCtx = struct {
-        count: usize = 0,
-        best: ?SessionEntry = null,
-        best_prio: i8 = std.math.minInt(i8),
-
-        fn visit(sel: *@This(), entry: *const SessionEntry) void {
-            sel.count += 1;
-            if (entry.priority > sel.best_prio) {
-                sel.best_prio = entry.priority;
-                sel.best = entry.*;
-            }
-        }
-    };
 
     var single: ?SessionEntry = null;
     var fanout_bare = false;
@@ -306,14 +314,12 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             // Resource not found (§8.5.3.2): type='chat' falls back to the
             // best available resource (§8.5.3.2.1). Other kinds store offline
             // or bounce below.
-            var sel: SelectCtx = .{};
-            sm.forEachAvailable(to_jid.local, to_jid.domain, &sel, SelectCtx.visit);
+            const sel = selectAvailable(sm, to_jid, server.fanoutScratch());
             if (sel.best_prio >= 0) single = sel.best;
         }
     } else {
         // RFC 6121 §8.5.2: Stanza addressed to bare JID - deliver to available resources.
-        var sel: SelectCtx = .{};
-        sm.forEachAvailable(to_jid.local, to_jid.domain, &sel, SelectCtx.visit);
+        const sel = selectAvailable(sm, to_jid, server.fanoutScratch());
         if (sel.count > 0) {
             if (session.stanza_kind == .iq) {
                 // RFC 6121 §8.5.2.1.3: IQ to bare JID - deliver to ONE best resource.
@@ -425,7 +431,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         }
 
         /// Remote enqueue for one routed entry; local entries are counted
-        /// here and delivered in the second pass.
+        /// here and delivered in the second pass. Runs on a copied entry
+        /// after the collect's lock hold has ended.
         fn routeOneRemote(ctx: *@This(), entry: SessionEntry) void {
             if (entry.worker_id == ctx.server.worker_id) {
                 ctx.local_routed += 1;
@@ -450,17 +457,6 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
                 // the sender gets an error if no resource accepts the stanza.
                 ctx.delivery_failed = true;
             }
-        }
-
-        fn visitRemote(ctx: *@This(), entry: *const SessionEntry) void {
-            if (!ctx.routed(entry)) return;
-            ctx.routeOneRemote(entry.*);
-        }
-
-        fn visitLocal(ctx: *@This(), entry: *const SessionEntry) void {
-            if (!ctx.routed(entry)) return;
-            if (entry.worker_id != ctx.server.worker_id) return;
-            ctx.deliverLocal(entry.*);
         }
 
         /// Local delivery to the resolved session: offline-tail hold when the
@@ -552,7 +548,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     if (single) |e| {
         dctx.routeOneRemote(e);
     } else if (fanout_bare) {
-        sm.forEachAvailable(to_jid.local, to_jid.domain, &dctx, RouteCtx.visitRemote);
+        const n = sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch());
+        for (server.fanout_entries[0..n]) |*entry| {
+            if (dctx.routed(entry)) dctx.routeOneRemote(entry.*);
+        }
     }
 
     // Build sender bare JID for archive. A bare JID over the store-key limit
@@ -700,8 +699,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         noteDrop("connection {d} stanza to {s} exceeds the delivery buffer, not routed", .{ session.conn.id, to_str });
     }
 
-    // Forward to each local target session; the visitor re-applies the
-    // routing filter so each resource that accepts the stanza can join the
+    // Forward to each local target session; the loop re-applies the routing
+    // filter so each resource that accepts the stanza can join the
     // delivered set.
     dctx.built = built;
     dctx.is_typing_only = is_typing_only;
@@ -710,7 +709,10 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     if (single) |e| {
         if (e.worker_id == server.worker_id) dctx.deliverLocal(e);
     } else if (fanout_bare) {
-        sm.forEachAvailable(to_jid.local, to_jid.domain, &dctx, RouteCtx.visitLocal);
+        const n = sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch());
+        for (server.fanout_entries[0..n]) |*entry| {
+            if (dctx.routed(entry) and entry.worker_id == server.worker_id) dctx.deliverLocal(entry.*);
+        }
     }
 
     const bounceable = (session.stanza_kind == .message and !std.mem.eql(u8, type_str, "error")) or
@@ -1077,7 +1079,10 @@ fn sendCarbons(
             };
         }
 
-        fn visit(ctx: *@This(), entry: *const SessionEntry) void {
+        /// Serialize and deliver the carbon for one collected entry. Runs
+        /// after the collect's lock hold has ended: the skip checks,
+        /// serialization, enqueue and drop logging all stay off the lock.
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
             // A resource that already received the original gets no <received>
             // copy of it (XEP-0280 section 7).
             for (ctx.delivered) |t| {
@@ -1125,7 +1130,8 @@ fn sendCarbons(
         .delivered = delivered,
         .cbuf = carbon_lease.buf,
     };
-    sm.forEachAvailable(user_local, user_domain, &carbon_ctx, CarbonCtx.visit);
+    const n = sm.collectAvailable(user_local, user_domain, server.fanoutScratch());
+    for (server.fanout_entries[0..n]) |*entry| carbon_ctx.deliver(entry);
 }
 
 /// Send a not-authorized error for a stanza received before resource

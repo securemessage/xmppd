@@ -308,6 +308,17 @@ pub const Server = struct {
     /// bookkeeping, not a session-map result buffer.
     delivered_targets: []session_map_mod.RouteRef = &.{},
 
+    /// S18: per-worker scratch one fan-out's copied routing entries land in.
+    /// SessionMap.collectBound/collectAvailable fill it under a shared-lock
+    /// hold that only selects and copies; delivery iterates the slice after
+    /// the lock is released, so serialization, enqueues and logging never
+    /// extend a shard hold (ADR-4). Grown lazily to the session map's
+    /// resource cap - the same bound the map enforces on each account's
+    /// entry list, so the scratch can never truncate a fan-out. One live
+    /// iteration per call tree: a loop that reaches a nested collect on
+    /// this server must snapshot its entries elsewhere first.
+    fanout_entries: []session_map_mod.SessionEntry = &.{},
+
     /// S18: per-worker heap scratch for stanza serialization, replacing the
     /// 20 KiB stack buffers that held dispatchStanza, sendCarbons and
     /// broadcastToOwnResources above a 16 KiB frame. BYTE_BANK_COUNT banks of
@@ -782,6 +793,7 @@ pub const Server = struct {
         if (self.free_ids.len > 0) self.allocator.free(self.free_ids);
         if (self.slot_gen.len > 0) self.allocator.free(self.slot_gen);
         if (self.delivered_targets.len > 0) self.allocator.free(self.delivered_targets);
+        if (self.fanout_entries.len > 0) self.allocator.free(self.fanout_entries);
         if (self.byte_scratch.len > 0) self.allocator.free(self.byte_scratch);
         self.sm_id_map.deinit(self.allocator);
         self.sm_redirects.deinit(self.allocator);
@@ -868,6 +880,24 @@ pub const Server = struct {
             };
         }
         return self.delivered_targets;
+    }
+
+    /// The fan-out scratch collectBound/collectAvailable copy into, grown
+    /// lazily to the session map's resource cap like delivered_targets.
+    /// On allocation failure the empty slice collects nothing and the
+    /// fan-out degrades to "no bound resources" rather than truncating
+    /// mid-list.
+    pub fn fanoutScratch(self: *Server) []session_map_mod.SessionEntry {
+        const sm = self.session_map orelse return &.{};
+        if (self.fanout_entries.len < sm.max_resources) {
+            if (self.fanout_entries.len > 0) self.allocator.free(self.fanout_entries);
+            self.fanout_entries = self.allocator.alloc(session_map_mod.SessionEntry, sm.max_resources) catch {
+                log.err("fanout scratch alloc of {d} entries failed", .{sm.max_resources});
+                self.fanout_entries = &.{};
+                return self.fanout_entries;
+            };
+        }
+        return self.fanout_entries;
     }
 
     /// An in-use claim on one byte-scratch bank. Release with `release`,
@@ -1890,10 +1920,6 @@ pub const Server = struct {
                     hold_stored: bool = false,
                     delivered: usize = 0,
 
-                    fn visit(ctx: *@This(), entry: *const SessionEntry) void {
-                        ctx.deliver(entry.*);
-                    }
-
                     fn deliver(ctx: *@This(), entry: SessionEntry) void {
                         ctx.delivered += 1;
                         const srv = ctx.server;
@@ -1938,7 +1964,11 @@ pub const Server = struct {
                 if (single_entry) |e| {
                     dctx.deliver(e);
                 } else {
-                    s2s_sm.forEachAvailable(to_jid.local, to_jid.domain, &dctx, DeliverCtx.visit);
+                    // The collect copies bounded routing state under the
+                    // shard lock; delivery and its logging run on the
+                    // copies with the lock released (ADR-4).
+                    const n = s2s_sm.collectAvailable(to_jid.local, to_jid.domain, self.fanoutScratch());
+                    for (self.fanout_entries[0..n]) |*entry| dctx.deliver(entry.*);
                 }
                 log.info("S2S inbound from {s} delivered to {d} session(s)", .{ m.from_jid, dctx.delivered });
             },
@@ -1969,10 +1999,6 @@ pub const Server = struct {
                     server: *Server,
                     err_xml: []const u8,
 
-                    fn visit(ctx: *@This(), entry: *const SessionEntry) void {
-                        ctx.deliver(entry.*);
-                    }
-
                     fn deliver(ctx: *@This(), sentry: SessionEntry) void {
                         const srv = ctx.server;
                         if (sentry.worker_id == srv.worker_id) {
@@ -1987,7 +2013,8 @@ pub const Server = struct {
                 if (single_entry) |e| {
                     bctx.deliver(e);
                 } else {
-                    fail_sm.forEachAvailable(from_jid.local, from_jid.domain, &bctx, BounceCtx.visit);
+                    const n = fail_sm.collectAvailable(from_jid.local, from_jid.domain, self.fanoutScratch());
+                    for (self.fanout_entries[0..n]) |*entry| bctx.deliver(entry.*);
                 }
                 log.info("S2S delivery failed: {s} → {s}: {s}", .{ m.from_jid, m.to_jid, m.error_type });
             },
