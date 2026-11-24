@@ -1038,7 +1038,8 @@ fn drainReader(r: *FrameReader, rfd: posix.fd_t, ctx: anytype, comptime onFrame:
         const res = try r.recv(rfd);
         const before = r.consumed;
         while (true) {
-            const f = (r.next() catch return false) orelse break;
+            const f_opt = if (r.next()) |o| o else |_| return false;
+            const f = f_opt orelse break;
             try onFrame(ctx, f);
             r.consume(f.consumed);
         }
@@ -1082,7 +1083,7 @@ fn feedSegments(
 /// tag plus the canonical encoding; deep equality is unsound where
 /// decode leaves union tails undefined (MechanismList.mechanisms).
 fn oracleFrame(_: void, f: Frame) !void {
-    const msg = decode(f.payload) catch return;
+    const msg = if (decode(f.payload)) |m| m else |_| return;
     var buf1: [MAX_FRAME_SIZE]u8 = undefined;
     const n1 = try encode(msg, &buf1);
     const frame1 = (try parseFrame(buf1[0..n1])) orelse return error.NoFrame;
@@ -1116,9 +1117,9 @@ fn fuzzIpcCodec(_: void, input: []const u8) !void {
 
     // The peer hangs up: recv reports the queued tail as data, then
     // latches .eof; an unconsumed partial frame is a truncation.
-    posix.shutdown(pair[0], .both) catch {};
+    try posix.shutdown(pair[0], .both);
     _ = try drainReader(&r, pair[1], {}, oracleFrame);
-    _ = r.recv(pair[1]) catch {};
+    _ = try r.recv(pair[1]);
     _ = r.truncated();
 }
 
@@ -1182,7 +1183,7 @@ test "codec: a two-part feed split at every byte boundary yields the same frames
 
         const segments = [2][]const u8{ frame_bytes[0..split], frame_bytes[split..] };
         try std.testing.expect(try feedSegments(&r, pair[0], pair[1], &segments, ctx, recordFrame));
-        posix.shutdown(pair[0], .both) catch {};
+        try posix.shutdown(pair[0], .both);
         try std.testing.expect(try drainReader(&r, pair[1], ctx, recordFrame));
         try std.testing.expect(r.eof);
         try std.testing.expect(!r.truncated());
