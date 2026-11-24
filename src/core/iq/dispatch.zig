@@ -3101,7 +3101,7 @@ test "R5: a roster push to a full remote queue is counted" {
     var server: Server = undefined;
     try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
-    var sm = session_map_mod.SessionMap.init(allocator, 2, 0);
+    var sm = try session_map_mod.SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     server.session_map = &sm;
     var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
@@ -3142,7 +3142,7 @@ test "R5: an unbuildable PEP self-notification is counted, never silent" {
     defer server.deinit();
     server.roster = &roster;
     server.worker_id = 0;
-    var sm = session_map_mod.SessionMap.init(allocator, 2, 0);
+    var sm = try session_map_mod.SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     server.session_map = &sm;
     var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);

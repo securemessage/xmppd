@@ -3601,7 +3601,7 @@ test "S16: mailbox-full bounce targets the sender and fails closed on overflow" 
     var server: Server = undefined;
     try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
-    var sm = sm_mod.SessionMap.init(allocator, 2, 0);
+    var sm = try sm_mod.SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     server.session_map = &sm;
     server.worker_id = 0;
@@ -3668,7 +3668,7 @@ test "S16: a full room mailbox follows the policy: sender error and counter" {
     var server: Server = undefined;
     try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
-    var sm = sm_mod.SessionMap.init(allocator, 2, 0);
+    var sm = try sm_mod.SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     server.session_map = &sm;
     // Registry tears down first: its mailbox items release blobs into the
@@ -4041,7 +4041,7 @@ test "S16: local delivery refuses a stale session generation" {
     var server: Server = undefined;
     try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
-    var sm = sm_mod.SessionMap.init(allocator, 2, 0);
+    var sm = try sm_mod.SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     server.session_map = &sm;
     server.worker_id = 0;

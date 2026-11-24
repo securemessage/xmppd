@@ -15,15 +15,19 @@
 //!
 //! ## Thread Safety
 //!
-//! All locking is internal. A `multi_worker` flag gates lock acquisition — in
-//! single-worker mode there is no lock overhead.
+//! All locking is internal. The map is sharded by bare-JID hash: every JID of
+//! one account resolves to one shard, each shard holds its own `RwLock` and
+//! index pair. A `multi_worker` flag gates lock acquisition — in
+//! single-worker mode there is exactly one shard and no lock overhead.
 //!
 //! - Read (shared) lock: findByFullJid, findByBareJid, findAvailableByBareJid,
 //!   isAvailable, hasBound
 //! - Write (exclusive) lock: bind, unbind, setPresenceState,
 //!   setPresenceAvailable, setPriority
 //!
-//! No logging happens while a lock is held.
+//! No logging happens while a lock is held. A thread-local hold counter
+//! asserts in safe builds that no map entry point is re-entered while a lock
+//! is held, which is the only way a nested hold could deadlock a thread.
 
 const std = @import("std");
 const token_kinds = @import("token_kinds");
@@ -211,20 +215,45 @@ pub const EntryList = struct {
     }
 };
 
-/// Thread-safe, JID-keyed session routing table.
-pub const SessionMap = struct {
+/// One shard: a bare-JID hash bucket with its own lock and index pair.
+const Shard = struct {
     full_map: FullMap = .empty,
     bare_map: BareMap = .empty,
     lock: std.Thread.RwLock = .{},
+};
+
+/// Number of locks the calling thread holds on this map right now. Checked
+/// at every acquisition: a nested hold is a programmer error (a visitor
+/// callback reaching back into the map is the only way to produce one) and
+/// deadlocks the thread in multi-worker mode or corrupts the iteration in
+/// single-worker mode.
+threadlocal var hold_depth: usize = 0;
+
+/// Thread-safe, JID-keyed session routing table.
+pub const SessionMap = struct {
+    shards: []Shard,
+    /// shard_count - 1; shard_count is always a power of two.
+    shard_mask: usize,
     multi_worker: bool,
     allocator: std.mem.Allocator,
     /// Per-account (bare JID) resource cap (T198).
     max_resources: usize,
 
-    /// `workers` is the configured core worker count; locks are only taken
-    /// when more than one worker can reach the map.
-    pub fn init(allocator: std.mem.Allocator, workers: usize, max_resources: usize) SessionMap {
+    /// `workers` is the configured core worker count. One shard when there is
+    /// a single worker (locks then never taken); otherwise
+    /// pow2ceil(8 * workers) clamped to [8, 256] — 8 shards per worker keeps
+    /// a fan-out's lock hold from colliding with a same-shard writer except
+    /// on ~1/shard_count of accounts, and the clamp bounds the table cost.
+    pub fn init(allocator: std.mem.Allocator, workers: usize, max_resources: usize) !SessionMap {
+        const shard_count: usize = if (workers <= 1) 1 else blk: {
+            const scaled = 8 *| workers;
+            break :blk std.math.ceilPowerOfTwo(usize, @min(scaled, 256)) catch unreachable;
+        };
+        const shards = try allocator.alloc(Shard, shard_count);
+        for (shards) |*shard| shard.* = .{};
         return .{
+            .shards = shards,
+            .shard_mask = shard_count - 1,
             .multi_worker = workers > 1,
             .allocator = allocator,
             .max_resources = if (max_resources == 0) DEFAULT_MAX_RESOURCES else max_resources,
@@ -232,21 +261,45 @@ pub const SessionMap = struct {
     }
 
     pub fn deinit(self: *SessionMap) void {
-        // Free all owned key strings and entry objects in full_map
-        var full_iter = self.full_map.iterator();
-        while (full_iter.next()) |kv| {
-            self.allocator.free(kv.key_ptr.bytes);
-            self.allocator.destroy(kv.value_ptr.*);
-        }
-        self.full_map.deinit(self.allocator);
+        for (self.shards) |*shard| {
+            // Free all owned key strings and entry objects in full_map
+            var full_iter = shard.full_map.iterator();
+            while (full_iter.next()) |kv| {
+                self.allocator.free(kv.key_ptr.bytes);
+                self.allocator.destroy(kv.value_ptr.*);
+            }
+            shard.full_map.deinit(self.allocator);
 
-        // Free all owned entry lists + key strings in bare_map
-        var bare_iter = self.bare_map.iterator();
-        while (bare_iter.next()) |kv| {
-            kv.value_ptr.deinit(self.allocator);
-            self.allocator.free(kv.key_ptr.bytes);
+            // Free all owned entry lists + key strings in bare_map
+            var bare_iter = shard.bare_map.iterator();
+            while (bare_iter.next()) |kv| {
+                kv.value_ptr.deinit(self.allocator);
+                self.allocator.free(kv.key_ptr.bytes);
+            }
+            shard.bare_map.deinit(self.allocator);
         }
-        self.bare_map.deinit(self.allocator);
+        self.allocator.free(self.shards);
+    }
+
+    /// Every JID of one account resolves to one shard: full-JID operations
+    /// shard on the same bare hash, so a bind and a later unbind always meet.
+    fn shardFor(self: *SessionMap, key: Key) *Shard {
+        return &self.shards[key.bare_hash & self.shard_mask];
+    }
+
+    fn lockShard(self: *SessionMap, shard: *Shard, comptime exclusive: bool) void {
+        std.debug.assert(hold_depth == 0);
+        hold_depth = 1;
+        if (self.multi_worker) {
+            if (exclusive) shard.lock.lock() else shard.lock.lockShared();
+        }
+    }
+
+    fn unlockShard(self: *SessionMap, shard: *Shard, comptime exclusive: bool) void {
+        hold_depth = 0;
+        if (self.multi_worker) {
+            if (exclusive) shard.lock.unlock() else shard.lock.unlockShared();
+        }
     }
 
     /// Register a session after successful resource binding. `token` names
@@ -280,17 +333,18 @@ pub const SessionMap = struct {
         @memcpy(entry.resource_buf[0..resource.len], resource);
 
         {
-            if (self.multi_worker) self.lock.lock();
-            defer if (self.multi_worker) self.lock.unlock();
+            const shard = self.shardFor(key);
+            self.lockShard(shard, true);
+            defer self.unlockShard(shard, true);
 
-            if (self.full_map.contains(key)) {
+            if (shard.full_map.contains(key)) {
                 return error.AlreadyBound;
             }
 
             // Bare index first so a TooManyResources cap does not leave the
             // full_map entry dangling (roll back both on append failure).
             var fresh_bare_key: ?Key = null;
-            const list = if (self.bare_map.getPtr(key)) |list| list else blk: {
+            const list = if (shard.bare_map.getPtr(key)) |list| list else blk: {
                 const bare_key = Key{
                     .bytes = undefined,
                     .bare_len = key.bare_len,
@@ -301,16 +355,16 @@ pub const SessionMap = struct {
                 errdefer self.allocator.free(bare_bytes);
                 var stored_bare = bare_key;
                 stored_bare.bytes = bare_bytes;
-                try self.bare_map.put(self.allocator, stored_bare, .{});
+                try shard.bare_map.put(self.allocator, stored_bare, .{});
                 fresh_bare_key = stored_bare;
-                break :blk self.bare_map.getPtr(stored_bare).?;
+                break :blk shard.bare_map.getPtr(stored_bare).?;
             };
 
             // A fresh bare entry that never houses a binding is rolled back
             // by this flag (T254).
             var bare_owned = fresh_bare_key != null;
             defer if (bare_owned) {
-                var kv = self.bare_map.fetchRemove(fresh_bare_key.?).?;
+                var kv = shard.bare_map.fetchRemove(fresh_bare_key.?).?;
                 kv.value.deinit(self.allocator);
                 self.allocator.free(kv.key.bytes);
             };
@@ -318,7 +372,7 @@ pub const SessionMap = struct {
             list.append(self.allocator, entry, self.max_resources) catch |err| {
                 return err;
             };
-            self.full_map.put(self.allocator, owned_key, entry) catch |err| {
+            shard.full_map.put(self.allocator, owned_key, entry) catch |err| {
                 _ = list.orderedRemove(list.len - 1);
                 return err;
             };
@@ -342,18 +396,19 @@ pub const SessionMap = struct {
 
         var removed: SessionEntry = undefined;
         {
-            if (self.multi_worker) self.lock.lock();
-            defer if (self.multi_worker) self.lock.unlock();
+            const shard = self.shardFor(key);
+            self.lockShard(shard, true);
+            defer self.unlockShard(shard, true);
 
-            const kv = self.full_map.fetchRemove(key) orelse return null;
+            const kv = shard.full_map.fetchRemove(key) orelse return null;
             const entry_ptr = kv.value;
             removed = entry_ptr.*;
 
-            if (self.bare_map.getPtr(key)) |list| {
+            if (shard.bare_map.getPtr(key)) |list| {
                 _ = list.removePtr(entry_ptr);
                 // If bare JID has no more resources, remove the entry entirely
                 if (list.len == 0) {
-                    var bare_kv = self.bare_map.fetchRemove(key).?;
+                    var bare_kv = shard.bare_map.fetchRemove(key).?;
                     bare_kv.value.deinit(self.allocator);
                     self.allocator.free(bare_kv.key.bytes);
                 }
@@ -380,10 +435,11 @@ pub const SessionMap = struct {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
         const key = Key.initBuf(&key_buf, local, domain, resource) orelse return null;
 
-        if (self.multi_worker) self.lock.lockShared();
-        defer if (self.multi_worker) self.lock.unlockShared();
+        const shard = self.shardFor(key);
+        self.lockShard(shard, false);
+        defer self.unlockShard(shard, false);
 
-        const entry = self.full_map.get(key) orelse return null;
+        const entry = shard.full_map.get(key) orelse return null;
         return entry.*;
     }
 
@@ -398,10 +454,11 @@ pub const SessionMap = struct {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
         const key = Key.initBuf(&key_buf, local, domain, "") orelse return 0;
 
-        if (self.multi_worker) self.lock.lockShared();
-        defer if (self.multi_worker) self.lock.unlockShared();
+        const shard = self.shardFor(key);
+        self.lockShard(shard, false);
+        defer self.unlockShard(shard, false);
 
-        const list = self.bare_map.getPtr(key) orelse return 0;
+        const list = shard.bare_map.getPtr(key) orelse return 0;
         const count = @min(list.len, buf.len);
         for (list.constSlice()[0..count], buf[0..count]) |entry_ptr, *out| {
             out.* = entry_ptr.*;
@@ -419,10 +476,11 @@ pub const SessionMap = struct {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
         const key = Key.initBuf(&key_buf, local, domain, "") orelse return 0;
 
-        if (self.multi_worker) self.lock.lockShared();
-        defer if (self.multi_worker) self.lock.unlockShared();
+        const shard = self.shardFor(key);
+        self.lockShard(shard, false);
+        defer self.unlockShard(shard, false);
 
-        const list = self.bare_map.getPtr(key) orelse return 0;
+        const list = shard.bare_map.getPtr(key) orelse return 0;
         var count: usize = 0;
         for (list.constSlice()) |entry_ptr| {
             if (entry_ptr.presence_available) {
@@ -434,26 +492,29 @@ pub const SessionMap = struct {
         return count;
     }
 
-    /// Resolve many bare JIDs to their presence-available entries in ONE
-    /// shared-lock hold (T130 presence broadcast batching). If out_jidIdx is
-    /// provided, each appended entry is paired with the index (into jids) of
-    /// the bare JID it came from — needed when per-target payloads differ
-    /// (presence probes address the contact's own JID). Returns entries
-    /// appended (truncated at out.len — callers chunk).
+    /// Resolve many bare JIDs to their presence-available entries (T130
+    /// presence broadcast batching): one call per chunk, one shared-lock hold
+    /// per JID's shard. If out_jidIdx is provided, each appended entry is
+    /// paired with the index (into jids) of the bare JID it came from —
+    /// needed when per-target payloads differ (presence probes address the
+    /// contact's own JID). Returns entries appended (truncated at out.len —
+    /// callers chunk).
     pub fn findAvailableByBareJidBatch(
         self: *SessionMap,
         jids: []const JidParts,
         out: []SessionEntry,
         out_jid_idx: ?[]u16,
     ) usize {
-        if (self.multi_worker) self.lock.lockShared();
-        defer if (self.multi_worker) self.lock.unlockShared();
-
         var total: usize = 0;
         for (jids, 0..) |jid, jid_idx| {
             var key_buf: [MAX_JID_OCTETS]u8 = undefined;
             const key = Key.initBuf(&key_buf, jid.local, jid.domain, "") orelse continue;
-            const list = self.bare_map.getPtr(key) orelse continue;
+
+            const shard = self.shardFor(key);
+            self.lockShard(shard, false);
+            defer self.unlockShard(shard, false);
+
+            const list = shard.bare_map.getPtr(key) orelse continue;
             for (list.constSlice()) |entry_ptr| {
                 if (!entry_ptr.presence_available) continue;
                 if (total >= out.len) return total;
@@ -470,10 +531,11 @@ pub const SessionMap = struct {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
         const key = Key.initBuf(&key_buf, local, domain, "") orelse return false;
 
-        if (self.multi_worker) self.lock.lockShared();
-        defer if (self.multi_worker) self.lock.unlockShared();
+        const shard = self.shardFor(key);
+        self.lockShard(shard, false);
+        defer self.unlockShard(shard, false);
 
-        const list = self.bare_map.getPtr(key) orelse return false;
+        const list = shard.bare_map.getPtr(key) orelse return false;
         return list.len > 0;
     }
 
@@ -482,10 +544,11 @@ pub const SessionMap = struct {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
         const key = Key.initBuf(&key_buf, local, domain, "") orelse return false;
 
-        if (self.multi_worker) self.lock.lockShared();
-        defer if (self.multi_worker) self.lock.unlockShared();
+        const shard = self.shardFor(key);
+        self.lockShard(shard, false);
+        defer self.unlockShard(shard, false);
 
-        const list = self.bare_map.getPtr(key) orelse return false;
+        const list = shard.bare_map.getPtr(key) orelse return false;
         for (list.constSlice()) |entry_ptr| {
             if (entry_ptr.presence_available) return true;
         }
@@ -507,10 +570,11 @@ pub const SessionMap = struct {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
         const key = Key.initBuf(&key_buf, local, domain, resource) orelse return;
 
-        if (self.multi_worker) self.lock.lock();
-        defer if (self.multi_worker) self.lock.unlock();
+        const shard = self.shardFor(key);
+        self.lockShard(shard, true);
+        defer self.unlockShard(shard, true);
 
-        if (self.full_map.getPtr(key)) |entry_ptr| {
+        if (shard.full_map.getPtr(key)) |entry_ptr| {
             entry_ptr.*.presence_available = available;
             entry_ptr.*.priority = priority;
         }
@@ -528,10 +592,11 @@ pub const SessionMap = struct {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
         const key = Key.initBuf(&key_buf, local, domain, resource) orelse return;
 
-        if (self.multi_worker) self.lock.lock();
-        defer if (self.multi_worker) self.lock.unlock();
+        const shard = self.shardFor(key);
+        self.lockShard(shard, true);
+        defer self.unlockShard(shard, true);
 
-        if (self.full_map.getPtr(key)) |entry_ptr| {
+        if (shard.full_map.getPtr(key)) |entry_ptr| {
             entry_ptr.*.presence_available = available;
         }
     }
@@ -548,10 +613,11 @@ pub const SessionMap = struct {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
         const key = Key.initBuf(&key_buf, local, domain, resource) orelse return;
 
-        if (self.multi_worker) self.lock.lock();
-        defer if (self.multi_worker) self.lock.unlock();
+        const shard = self.shardFor(key);
+        self.lockShard(shard, true);
+        defer self.unlockShard(shard, true);
 
-        if (self.full_map.getPtr(key)) |entry_ptr| {
+        if (shard.full_map.getPtr(key)) |entry_ptr| {
             entry_ptr.*.priority = prio;
         }
     }
@@ -562,7 +628,7 @@ pub const SessionMap = struct {
 // ============================================================================
 
 test "SessionMap: bind and findByFullJid" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     const tok = Token.init(5, 1, token_kinds.session);
@@ -575,7 +641,7 @@ test "SessionMap: bind and findByFullJid" {
 }
 
 test "SessionMap: unbind removes entry" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(1, Token.init(3, 1, token_kinds.session), "bob", "localhost", "desktop");
@@ -588,7 +654,7 @@ test "SessionMap: unbind removes entry" {
 }
 
 test "SessionMap: findByBareJid multi-resource" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
@@ -601,7 +667,7 @@ test "SessionMap: findByBareJid multi-resource" {
 }
 
 test "SessionMap: findAvailableByBareJid" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
@@ -619,7 +685,7 @@ test "SessionMap: findAvailableByBareJid" {
 }
 
 test "SessionMap: findAvailableByBareJidBatch resolves many JIDs in one hold" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
@@ -661,7 +727,7 @@ test "SessionMap: findAvailableByBareJidBatch resolves many JIDs in one hold" {
 }
 
 test "SessionMap: S18 batch over 512 entries does not truncate at the resource cap" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     // 32 JIDs x 20 available resources = 640 entries, over the old
@@ -693,7 +759,7 @@ test "SessionMap: S18 batch over 512 entries does not truncate at the resource c
 }
 
 test "SessionMap: duplicate bind fails" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(5, 1, token_kinds.session), "alice", "localhost", "mobile");
@@ -701,7 +767,7 @@ test "SessionMap: duplicate bind fails" {
 }
 
 test "SessionMap: resource cap is configurable (T198)" {
-    var map = SessionMap.init(std.testing.allocator, 1, 3);
+    var map = try SessionMap.init(std.testing.allocator, 1, 3);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "u", "localhost", "a");
@@ -721,7 +787,7 @@ test "SessionMap: resource cap is configurable (T198)" {
 }
 
 test "SessionMap: default cap no longer hits the old inline-16 wall (T198)" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     var res_buf: [8]u8 = undefined;
@@ -741,18 +807,18 @@ test "SessionMap: default cap no longer hits the old inline-16 wall (T198)" {
     }
     var probe: [4]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 0), map.findByBareJid("many", "localhost", &probe));
-    try std.testing.expectEqual(@as(usize, 0), map.bare_map.count());
+    try std.testing.expectEqual(@as(usize, 0), map.shards[0].bare_map.count());
 }
 
 test "SessionMap: unbind nonexistent returns null" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     try std.testing.expect(map.unbind("alice", "localhost", "ghost") == null);
 }
 
 test "SessionMap: a re-bound slot stores the caller's fresh token" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     // Generations are minted by the owning worker, not the map: a slot
@@ -766,7 +832,7 @@ test "SessionMap: a re-bound slot stores the caller's fresh token" {
 }
 
 test "SessionMap: bare_map cleaned on last unbind" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
@@ -783,7 +849,7 @@ test "SessionMap: bare_map cleaned on last unbind" {
 }
 
 test "SessionMap: T254 resource cap rejection keeps maps consistent" {
-    var map = SessionMap.init(std.testing.allocator, 1, 2);
+    var map = try SessionMap.init(std.testing.allocator, 1, 2);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "a");
@@ -807,7 +873,9 @@ test "SessionMap: T254 OOM rollback at every bind allocation point" {
     var fail_index: usize = 0;
     while (fail_index < 32) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var map = SessionMap.init(failing.allocator(), 1, 0);
+        // init itself allocates (the shard slice); an init failure consumed
+        // this index without reaching bind.
+        var map = SessionMap.init(failing.allocator(), 1, 0) catch continue;
         if (map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile")) |_| {
             map.deinit();
             break;
@@ -823,7 +891,7 @@ test "SessionMap: T254 OOM rollback at every bind allocation point" {
 }
 
 test "SessionMap: workers on different threads" {
-    var map = SessionMap.init(std.testing.allocator, 4, 0);
+    var map = try SessionMap.init(std.testing.allocator, 4, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "host", "mobile");
@@ -841,7 +909,7 @@ test "SessionMap: workers on different threads" {
 }
 
 test "SessionMap: resource stored in entry" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "host", "mobile");
@@ -866,7 +934,7 @@ test "SessionMap: resource stored in entry" {
 }
 
 test "SessionMap: a 320-octet localpart binds and resolves" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     var local: [320]u8 = undefined;
@@ -882,7 +950,7 @@ test "SessionMap: a 320-octet localpart binds and resolves" {
 }
 
 test "SessionMap: setPresenceState updates both fields under one hold (T268)" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "desk");
@@ -899,7 +967,7 @@ test "SessionMap: setPresenceState updates both fields under one hold (T268)" {
 }
 
 test "SessionMap: domain is case-folded for keys (T305)" {
-    var map = SessionMap.init(std.testing.allocator, 1, 0);
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "Alice", "Example.COM", "Mobile");
@@ -922,7 +990,51 @@ test "SessionMap: domain is case-folded for keys (T305)" {
     // Unbind under yet another spelling removes the single entry.
     try std.testing.expect(map.unbind("Alice", "eXaMpLe.CoM", "Mobile") != null);
     try std.testing.expect(map.findByFullJid("Alice", "example.com", "Mobile") == null);
-    try std.testing.expectEqual(@as(usize, 0), map.bare_map.count());
+    try std.testing.expectEqual(@as(usize, 0), map.shards[0].bare_map.count());
+}
+
+test "SessionMap: shard count derives from the worker count" {
+    var one = try SessionMap.init(std.testing.allocator, 1, 0);
+    defer one.deinit();
+    try std.testing.expectEqual(@as(usize, 1), one.shards.len);
+
+    // pow2ceil(8 * 4) = 32; the lock is taken in multi-worker mode.
+    var four = try SessionMap.init(std.testing.allocator, 4, 0);
+    defer four.deinit();
+    try std.testing.expectEqual(@as(usize, 32), four.shards.len);
+    try std.testing.expect(four.multi_worker);
+
+    // pow2ceil(8 * workers) clamps at 256 from 32 workers up.
+    var sixty_four = try SessionMap.init(std.testing.allocator, 64, 0);
+    defer sixty_four.deinit();
+    try std.testing.expectEqual(@as(usize, 256), sixty_four.shards.len);
+}
+
+test "SessionMap: every JID of one account lands on one shard" {
+    var map = try SessionMap.init(std.testing.allocator, 4, 0);
+    defer map.deinit();
+
+    var full_buf: [MAX_JID_OCTETS]u8 = undefined;
+    const full = Key.initBuf(&full_buf, "alice", "example.com", "mobile").?;
+    var bare_buf: [MAX_JID_OCTETS]u8 = undefined;
+    const bare = Key.initBuf(&bare_buf, "alice", "example.com", "").?;
+    var other_buf: [MAX_JID_OCTETS]u8 = undefined;
+    const other_res = Key.initBuf(&other_buf, "alice", "example.com", "desk").?;
+
+    // A bind, an unbind and a bare-JID lookup all address the same shard, so
+    // account state is never split across locks.
+    try std.testing.expect(map.shardFor(full) == map.shardFor(bare));
+    try std.testing.expect(map.shardFor(full) == map.shardFor(other_res));
+
+    // Cross-account keys may spread, but each lands deterministically.
+    var bob_buf: [MAX_JID_OCTETS]u8 = undefined;
+    const bob = Key.initBuf(&bob_buf, "bob", "example.com", "mobile").?;
+    _ = map.shardFor(bob);
+
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "example.com", "mobile");
+    _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "example.com", "desk");
+    var found: [4]SessionEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "example.com", &found));
 }
 
 test "SessionMap: normalized key computes both hashes once" {

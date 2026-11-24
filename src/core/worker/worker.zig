@@ -2166,7 +2166,7 @@ test "Server: S18 scratch banks size to the session map resource cap" {
     try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
     defer server.deinit();
 
-    var sm = SessionMap.init(std.testing.allocator, 1, 0);
+    var sm = try SessionMap.init(std.testing.allocator, 1, 0);
     defer sm.deinit();
     server.session_map = &sm;
 
@@ -2930,7 +2930,7 @@ test "S15: raw conn queue ratchet, stanzas go through queueSendStanza" {
 test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
@@ -2996,7 +2996,7 @@ test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down
 test "Server: a full recipient buffer is marked for teardown like the MUC path" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
@@ -3073,7 +3073,7 @@ test "Server: a non-archivable message stores offline with no archive" {
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
@@ -3130,7 +3130,7 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
@@ -3290,7 +3290,7 @@ test "Re-review 6.8: a successful retry delete clears the recorded sequence" {
 test "Re-review 7.6: a form over the write buffer but inside the bank does not mark overflow" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3477,7 +3477,7 @@ test "Server: H4 an inbound S2S message lands behind an existing offline tail" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3553,7 +3553,7 @@ test "Server: H4 a type normal message lands behind an existing offline tail" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3642,7 +3642,7 @@ test "Server: S13 offline store delivers without a committed archive row" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -3730,7 +3730,7 @@ test "Server: E2d an oversized archive form is not stored offline" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -4516,7 +4516,7 @@ test "Server: S13 writable handler resumes the stalled offline drain" {
 test "Server: R5 S2S cross-worker delivery drops are counted" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -5346,7 +5346,7 @@ test "Server: H8 an inline offline archive failure on the c2s path is counted" {
     var fba = std.heap.FixedBufferAllocator.init(&empty_buf);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, fba.allocator());
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -5408,7 +5408,7 @@ test "Server: H8 an inline offline archive failure on the S2S path is counted" {
     var fba = std.heap.FixedBufferAllocator.init(&empty_buf);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, fba.allocator());
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);

@@ -2556,7 +2556,7 @@ test "Server: pre-bind stanza to the domain in another case is server-addressed"
 test "F6: ingress preparation folds the local 'to' before routing" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
@@ -2859,7 +2859,7 @@ pub fn f6Read(fd: posix.fd_t, buf: []u8) []const u8 {
 
 test "F6: self-closing top-level message with malformed 'to' gets jid-malformed" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -2879,7 +2879,7 @@ test "F6: self-closing top-level message with malformed 'to' gets jid-malformed"
 
 test "F6: self-closing top-level message to a mixed-case local JID is routed folded" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -2900,7 +2900,7 @@ test "F6: self-closing top-level message to a mixed-case local JID is routed fol
 
 test "F6: a non-ASCII localpart reaches the account under its prepared spelling" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -2925,7 +2925,7 @@ test "F6: a non-ASCII localpart reaches the account under its prepared spelling"
 
 test "F6: a migrated account receives mail addressed to its legacy spelling" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -2949,7 +2949,7 @@ test "F6: a migrated account receives mail addressed to its legacy spelling" {
 
 test "F6: self-closing presence subscribe to a mixed-case local JID is routed folded" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -2980,7 +2980,7 @@ test "F6: self-closing presence subscribe to a mixed-case local JID is routed fo
 
 test "F6: a self-closing stanza-named child inside an IQ is not prepared" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3002,7 +3002,7 @@ test "F6: a self-closing stanza-named child inside an IQ is not prepared" {
 
 test "F6: type=error stanza with malformed 'to' is dropped without a reply" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3023,7 +3023,7 @@ test "F6: type=error stanza with malformed 'to' is dropped without a reply" {
 
 test "F6: presence with malformed 'to' gets a jid-malformed reply to the full JID" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3046,7 +3046,7 @@ test "F6: presence with malformed 'to' gets a jid-malformed reply to the full JI
 
 test "F6: a malformed 'from' gets jid-malformed" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3066,7 +3066,7 @@ test "F6: a malformed 'from' gets jid-malformed" {
 
 test "F6: jid-malformed reply echoes the offending 'to' in its 'from'" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3116,7 +3116,7 @@ test "F6: pre-auth stanza with a malformed 'to' closes the stream not-authorized
 
 test "F6: groupchat message to the MUC host in another case stays local" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -3142,7 +3142,7 @@ test "F6: groupchat message to the MUC host in another case stays local" {
 
 test "F6: directed presence to the MUC host in another case joins the room" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -3168,7 +3168,7 @@ test "F6: directed presence to the MUC host in another case joins the room" {
 
 test "F6: disco info to the MUC host in another case is the conference service" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3786,7 +3786,7 @@ test "S15: queueSendStanza counts the stanza for XEP-0198" {
 test "S15: live router delivery tracks the stanza for XEP-0198" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
@@ -4072,7 +4072,7 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();

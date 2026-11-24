@@ -1499,7 +1499,7 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
     var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
     server.roster = &roster;
 
-    var sm = session_map_mod.SessionMap.init(allocator, 1, 0);
+    var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
     server.session_map = &sm;
 
@@ -1573,7 +1573,7 @@ test "S1: subscription presence escapes the owner bare JID" {
     var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
     server.roster = &roster;
 
-    var sm = session_map_mod.SessionMap.init(allocator, 1, 0);
+    var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
     server.session_map = &sm;
 
@@ -1714,7 +1714,7 @@ test "A62: block check sees a >256-byte recipient JID in full" {
     var bs = @import("block_store").BlockStore(server_mod.OpBackendType).init(&db);
     server.block_store = &bs;
 
-    var sm = session_map_mod.SessionMap.init(allocator, 1, 0);
+    var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
     server.session_map = &sm;
 

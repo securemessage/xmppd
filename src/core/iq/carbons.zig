@@ -33,7 +33,7 @@ const routing_deliver = @import("../routing/deliver.zig");
 test "carbons: a phone with carbons off on another worker gets only the routed message" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -101,7 +101,7 @@ test "carbons: a phone with carbons off on another worker gets only the routed m
 test "carbons: a Carbons-enabled resource on another worker gets exactly one carbon" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -180,7 +180,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
 test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -266,7 +266,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -358,7 +358,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
 test "carbons: a delivered resource gets no received copy on the same dispatch" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -424,7 +424,7 @@ test "carbons: a delivered resource gets no received copy on the same dispatch" 
 test "carbons: the local received-carbon path skips a resource that got the original" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -482,7 +482,7 @@ test "carbons: the local received-carbon path skips a resource that got the orig
 test "carbons: a resource the delivery loop skipped still gets the received carbon" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var w0: Server = undefined;
@@ -572,7 +572,7 @@ test "carbons: a resource the delivery loop skipped still gets the received carb
 test "carbons: a nested private-looking payload does not suppress the carbon" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var w0: Server = undefined;
@@ -638,7 +638,7 @@ test "carbons: a nested private-looking payload does not suppress the carbon" {
 test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, 2, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
