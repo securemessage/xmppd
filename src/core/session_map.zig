@@ -13,6 +13,10 @@
 //!   O(1) multi-resource index into the same entries. Presence and priority
 //!   updates touch a single object; nothing is kept in sync by hand.
 //!
+//! Fan-out reads go through the visitor API (`forEach`, `forEachAvailable`,
+//! `forEachAvailableBatch`): the callback runs under the shard's shared lock
+//! on a stable entry list, so no call site needs a result buffer.
+//!
 //! ## Thread Safety
 //!
 //! All locking is internal. The map is sharded by bare-JID hash: every JID of
@@ -20,8 +24,8 @@
 //! index pair. A `multi_worker` flag gates lock acquisition — in
 //! single-worker mode there is exactly one shard and no lock overhead.
 //!
-//! - Read (shared) lock: findByFullJid, findByBareJid, findAvailableByBareJid,
-//!   isAvailable, hasBound
+//! - Read (shared) lock: findByFullJid, forEach, forEachAvailable,
+//!   forEachAvailableBatch, isAvailable, hasBound
 //! - Write (exclusive) lock: bind, unbind, setPresenceState,
 //!   setPresenceAvailable, setPriority
 //!
@@ -65,6 +69,14 @@ pub const SessionEntry = struct {
 pub const JidParts = struct {
     local: []const u8,
     domain: []const u8,
+};
+
+/// A routing address: the owning worker plus the slot token that names the
+/// session there. Per-dispatch bookkeeping (the carbons delivered set)
+/// carries RouteRefs where a whole SessionEntry copy is not needed.
+pub const RouteRef = struct {
+    worker_id: u16,
+    token: Token,
 };
 
 /// Default per-account (bare JID) resource cap (T198). Operator-tunable via
@@ -443,69 +455,61 @@ pub const SessionMap = struct {
         return entry.*;
     }
 
-    /// Find all sessions for a bare JID (local@domain). O(1) + O(resources).
-    /// Writes results into the provided buffer. Returns count.
-    pub fn findByBareJid(
+    /// Visit every bound resource of a bare JID under the shard's shared
+    /// lock (S18, ADR-4 item 4). The entry list is stable for the call, so
+    /// callers serialize and enqueue per entry instead of copying entries
+    /// into a fixed result buffer. `visit(ctx, entry)` runs bounded work
+    /// only — leaf locks, no SessionMap calls (asserted via hold_depth).
+    pub fn forEach(
         self: *SessionMap,
         local: []const u8,
         domain: []const u8,
-        buf: []SessionEntry,
-    ) usize {
+        ctx: anytype,
+        comptime visit: anytype,
+    ) void {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const key = Key.initBuf(&key_buf, local, domain, "") orelse return 0;
+        const key = Key.initBuf(&key_buf, local, domain, "") orelse return;
 
         const shard = self.shardFor(key);
         self.lockShard(shard, false);
         defer self.unlockShard(shard, false);
 
-        const list = shard.bare_map.getPtr(key) orelse return 0;
-        const count = @min(list.len, buf.len);
-        for (list.constSlice()[0..count], buf[0..count]) |entry_ptr, *out| {
-            out.* = entry_ptr.*;
-        }
-        return count;
+        const list = shard.bare_map.getPtr(key) orelse return;
+        for (list.constSlice()) |entry_ptr| visit(ctx, entry_ptr);
     }
 
-    /// Find all presence-available sessions for a bare JID. O(1) + O(resources).
-    pub fn findAvailableByBareJid(
+    /// `forEach` restricted to presence-available resources.
+    pub fn forEachAvailable(
         self: *SessionMap,
         local: []const u8,
         domain: []const u8,
-        buf: []SessionEntry,
-    ) usize {
+        ctx: anytype,
+        comptime visit: anytype,
+    ) void {
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
-        const key = Key.initBuf(&key_buf, local, domain, "") orelse return 0;
+        const key = Key.initBuf(&key_buf, local, domain, "") orelse return;
 
         const shard = self.shardFor(key);
         self.lockShard(shard, false);
         defer self.unlockShard(shard, false);
 
-        const list = shard.bare_map.getPtr(key) orelse return 0;
-        var count: usize = 0;
+        const list = shard.bare_map.getPtr(key) orelse return;
         for (list.constSlice()) |entry_ptr| {
-            if (entry_ptr.presence_available) {
-                if (count >= buf.len) break;
-                buf[count] = entry_ptr.*;
-                count += 1;
-            }
+            if (entry_ptr.presence_available) visit(ctx, entry_ptr);
         }
-        return count;
     }
 
-    /// Resolve many bare JIDs to their presence-available entries (T130
-    /// presence broadcast batching): one call per chunk, one shared-lock hold
-    /// per JID's shard. If out_jidIdx is provided, each appended entry is
-    /// paired with the index (into jids) of the bare JID it came from —
-    /// needed when per-target payloads differ (presence probes address the
-    /// contact's own JID). Returns entries appended (truncated at out.len —
-    /// callers chunk).
-    pub fn findAvailableByBareJidBatch(
+    /// `forEachAvailable` over many bare JIDs (T130 presence broadcast
+    /// batching): one call per chunk, one shared-lock hold per JID's shard
+    /// since accounts can live on different shards. `visit(ctx, jid_index,
+    /// entry)` receives the index into `jids` the entry resolved from, which
+    /// replaces the old out_jid_idx side channel for per-target payloads.
+    pub fn forEachAvailableBatch(
         self: *SessionMap,
         jids: []const JidParts,
-        out: []SessionEntry,
-        out_jid_idx: ?[]u16,
-    ) usize {
-        var total: usize = 0;
+        ctx: anytype,
+        comptime visit: anytype,
+    ) void {
         for (jids, 0..) |jid, jid_idx| {
             var key_buf: [MAX_JID_OCTETS]u8 = undefined;
             const key = Key.initBuf(&key_buf, jid.local, jid.domain, "") orelse continue;
@@ -516,14 +520,9 @@ pub const SessionMap = struct {
 
             const list = shard.bare_map.getPtr(key) orelse continue;
             for (list.constSlice()) |entry_ptr| {
-                if (!entry_ptr.presence_available) continue;
-                if (total >= out.len) return total;
-                out[total] = entry_ptr.*;
-                if (out_jid_idx) |idxs| idxs[total] = @intCast(jid_idx);
-                total += 1;
+                if (entry_ptr.presence_available) visit(ctx, jid_idx, entry_ptr);
             }
         }
-        return total;
     }
 
     /// Check if any session is bound for a bare JID (presence state ignored).
@@ -627,6 +626,46 @@ pub const SessionMap = struct {
 // Tests
 // ============================================================================
 
+const CollectCtx = struct {
+    out: []SessionEntry,
+    idxs: ?[]usize = null,
+    n: usize = 0,
+
+    fn visit(c: *CollectCtx, e: *const SessionEntry) void {
+        if (c.n < c.out.len) {
+            c.out[c.n] = e.*;
+            if (c.idxs) |ix| ix[c.n] = 0;
+        }
+        c.n += 1;
+    }
+
+    fn visitBatch(c: *CollectCtx, jid_idx: usize, e: *const SessionEntry) void {
+        if (c.n < c.out.len) {
+            c.out[c.n] = e.*;
+            if (c.idxs) |ix| ix[c.n] = jid_idx;
+        }
+        c.n += 1;
+    }
+};
+
+fn collectBound(map: *SessionMap, local: []const u8, domain: []const u8, out: []SessionEntry) usize {
+    var ctx = CollectCtx{ .out = out };
+    map.forEach(local, domain, &ctx, CollectCtx.visit);
+    return ctx.n;
+}
+
+fn collectAvailable(map: *SessionMap, local: []const u8, domain: []const u8, out: []SessionEntry) usize {
+    var ctx = CollectCtx{ .out = out };
+    map.forEachAvailable(local, domain, &ctx, CollectCtx.visit);
+    return ctx.n;
+}
+
+fn collectAvailableBatch(map: *SessionMap, jids: []const JidParts, out: []SessionEntry, idxs: []usize) usize {
+    var ctx = CollectCtx{ .out = out, .idxs = idxs };
+    map.forEachAvailableBatch(jids, &ctx, CollectCtx.visitBatch);
+    return ctx.n;
+}
+
 test "SessionMap: bind and findByFullJid" {
     var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
@@ -653,7 +692,7 @@ test "SessionMap: unbind removes entry" {
     try std.testing.expect(map.findByFullJid("bob", "localhost", "desktop") == null);
 }
 
-test "SessionMap: findByBareJid multi-resource" {
+test "SessionMap: forEach visits every bound resource" {
     var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
@@ -662,11 +701,11 @@ test "SessionMap: findByBareJid multi-resource" {
     _ = try map.bind(0, Token.init(3, 1, token_kinds.session), "bob", "localhost", "laptop");
 
     var buf: [8]SessionEntry = undefined;
-    const count = map.findByBareJid("alice", "localhost", &buf);
+    const count = collectBound(&map, "alice", "localhost", &buf);
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
-test "SessionMap: findAvailableByBareJid" {
+test "SessionMap: forEachAvailable" {
     var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
@@ -679,12 +718,12 @@ test "SessionMap: findAvailableByBareJid" {
     try std.testing.expect(map.isAvailable("alice", "localhost"));
 
     var buf: [8]SessionEntry = undefined;
-    const count = map.findAvailableByBareJid("alice", "localhost", &buf);
+    const count = collectAvailable(&map, "alice", "localhost", &buf);
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(u32, 1), buf[0].token.index);
 }
 
-test "SessionMap: findAvailableByBareJidBatch resolves many JIDs in one hold" {
+test "SessionMap: forEachAvailableBatch resolves many JIDs, grouped per JID" {
     var map = try SessionMap.init(std.testing.allocator, 1, 0);
     defer map.deinit();
 
@@ -705,25 +744,27 @@ test "SessionMap: findAvailableByBareJidBatch resolves many JIDs in one hold" {
         .{ .local = "nobody", .domain = "localhost" },
     };
     var buf: [8]SessionEntry = undefined;
-    var idxs: [8]u16 = undefined;
-    const total = map.findAvailableByBareJidBatch(&jids, &buf, &idxs);
+    var idxs: [8]usize = undefined;
+    const total = collectAvailableBatch(&map, &jids, &buf, &idxs);
     try std.testing.expectEqual(@as(usize, 3), total);
     // alice (jid 0) x2 available, carol (jid 2) x1, bob/nobody none
-    try std.testing.expectEqual(@as(u16, 0), idxs[0]);
-    try std.testing.expectEqual(@as(u16, 0), idxs[1]);
-    try std.testing.expectEqual(@as(u16, 2), idxs[2]);
+    try std.testing.expectEqual(@as(usize, 0), idxs[0]);
+    try std.testing.expectEqual(@as(usize, 0), idxs[1]);
+    try std.testing.expectEqual(@as(usize, 2), idxs[2]);
 
     // Batch must match the per-JID call's results, in order
     var single: [8]SessionEntry = undefined;
     var want: usize = 0;
     for (jids) |jid| {
-        want += map.findAvailableByBareJid(jid.local, jid.domain, &single);
+        want += collectAvailable(&map, jid.local, jid.domain, &single);
     }
     try std.testing.expectEqual(want, total);
 
-    // Truncation: capacity 2 stops early
+    // No truncation: the visitor sees every entry even when the caller's
+    // collection slice cannot hold them all (S18).
     var small: [2]SessionEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 2), map.findAvailableByBareJidBatch(&jids, &small, null));
+    var small_idxs: [2]usize = undefined;
+    try std.testing.expectEqual(@as(usize, 3), collectAvailableBatch(&map, &jids, &small, &small_idxs));
 }
 
 test "SessionMap: S18 batch over 512 entries does not truncate at the resource cap" {
@@ -748,14 +789,14 @@ test "SessionMap: S18 batch over 512 entries does not truncate at the resource c
     }
 
     var buf: [32 * 256]SessionEntry = undefined;
-    var idxs: [32 * 256]u16 = undefined;
-    const total = map.findAvailableByBareJidBatch(&jid_storage, &buf, &idxs);
+    var idxs: [32 * 256]usize = undefined;
+    const total = collectAvailableBatch(&map, &jid_storage, &buf, &idxs);
     try std.testing.expectEqual(@as(usize, 640), total);
     // Entries stay grouped by JID in request order.
-    try std.testing.expectEqual(@as(u16, 0), idxs[0]);
-    try std.testing.expectEqual(@as(u16, 0), idxs[19]);
-    try std.testing.expectEqual(@as(u16, 1), idxs[20]);
-    try std.testing.expectEqual(@as(u16, 31), idxs[639]);
+    try std.testing.expectEqual(@as(usize, 0), idxs[0]);
+    try std.testing.expectEqual(@as(usize, 0), idxs[19]);
+    try std.testing.expectEqual(@as(usize, 1), idxs[20]);
+    try std.testing.expectEqual(@as(usize, 31), idxs[639]);
 }
 
 test "SessionMap: duplicate bind fails" {
@@ -778,12 +819,12 @@ test "SessionMap: resource cap is configurable (T198)" {
     try std.testing.expect(map.findByFullJid("u", "localhost", "d") == null);
     // Cap messages come from the bare list staying consistent
     var buf: [8]SessionEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 3), map.findByBareJid("u", "localhost", &buf));
+    try std.testing.expectEqual(@as(usize, 3), collectBound(&map, "u", "localhost", &buf));
 
     // After eviction a new bind lands
     _ = map.unbind("u", "localhost", "a");
     _ = try map.bind(0, Token.init(4, 1, token_kinds.session), "u", "localhost", "d");
-    try std.testing.expectEqual(@as(usize, 3), map.findByBareJid("u", "localhost", &buf));
+    try std.testing.expectEqual(@as(usize, 3), collectBound(&map, "u", "localhost", &buf));
 }
 
 test "SessionMap: default cap no longer hits the old inline-16 wall (T198)" {
@@ -797,7 +838,7 @@ test "SessionMap: default cap no longer hits the old inline-16 wall (T198)" {
         _ = try map.bind(0, Token.init(100 + i, 1, token_kinds.session), "many", "localhost", res);
     }
     var buf: [64]SessionEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 40), map.findByBareJid("many", "localhost", &buf));
+    try std.testing.expectEqual(@as(usize, 40), collectBound(&map, "many", "localhost", &buf));
 
     // and leaves cleanly
     i = 0;
@@ -806,7 +847,7 @@ test "SessionMap: default cap no longer hits the old inline-16 wall (T198)" {
         _ = map.unbind("many", "localhost", res);
     }
     var probe: [4]SessionEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 0), map.findByBareJid("many", "localhost", &probe));
+    try std.testing.expectEqual(@as(usize, 0), collectBound(&map, "many", "localhost", &probe));
     try std.testing.expectEqual(@as(usize, 0), map.shards[0].bare_map.count());
 }
 
@@ -839,13 +880,13 @@ test "SessionMap: bare_map cleaned on last unbind" {
     _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "localhost", "desktop");
 
     var buf: [8]SessionEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "localhost", &buf));
+    try std.testing.expectEqual(@as(usize, 2), collectBound(&map, "alice", "localhost", &buf));
 
     _ = map.unbind("alice", "localhost", "mobile");
-    try std.testing.expectEqual(@as(usize, 1), map.findByBareJid("alice", "localhost", &buf));
+    try std.testing.expectEqual(@as(usize, 1), collectBound(&map, "alice", "localhost", &buf));
 
     _ = map.unbind("alice", "localhost", "desktop");
-    try std.testing.expectEqual(@as(usize, 0), map.findByBareJid("alice", "localhost", &buf));
+    try std.testing.expectEqual(@as(usize, 0), collectBound(&map, "alice", "localhost", &buf));
 }
 
 test "SessionMap: T254 resource cap rejection keeps maps consistent" {
@@ -857,13 +898,13 @@ test "SessionMap: T254 resource cap rejection keeps maps consistent" {
     try std.testing.expectError(error.TooManyResources, map.bind(0, Token.init(3, 1, token_kinds.session), "alice", "localhost", "c"));
 
     var buf: [4]SessionEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "localhost", &buf));
+    try std.testing.expectEqual(@as(usize, 2), collectBound(&map, "alice", "localhost", &buf));
     try std.testing.expect(map.findByFullJid("alice", "localhost", "c") == null);
 
     // The rejected bind consumed nothing: a freed slot is reusable.
     _ = map.unbind("alice", "localhost", "a");
     _ = try map.bind(0, Token.init(4, 1, token_kinds.session), "alice", "localhost", "c");
-    try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "localhost", &buf));
+    try std.testing.expectEqual(@as(usize, 2), collectBound(&map, "alice", "localhost", &buf));
 }
 
 test "SessionMap: T254 OOM rollback at every bind allocation point" {
@@ -881,7 +922,7 @@ test "SessionMap: T254 OOM rollback at every bind allocation point" {
             break;
         } else |_| {
             var buf: [4]SessionEntry = undefined;
-            try std.testing.expectEqual(@as(usize, 0), map.findByBareJid("alice", "localhost", &buf));
+            try std.testing.expectEqual(@as(usize, 0), collectBound(&map, "alice", "localhost", &buf));
             try std.testing.expect(map.findByFullJid("alice", "localhost", "mobile") == null);
             map.deinit();
         }
@@ -918,7 +959,7 @@ test "SessionMap: resource stored in entry" {
     map.setPresenceAvailable("alice", "host", "desktop", true);
 
     var buf: [8]SessionEntry = undefined;
-    const count = map.findAvailableByBareJid("alice", "host", &buf);
+    const count = collectAvailable(&map, "alice", "host", &buf);
     try std.testing.expectEqual(@as(usize, 2), count);
 
     // Verify resources are stored and accessible
@@ -945,7 +986,7 @@ test "SessionMap: a 320-octet localpart binds and resolves" {
     try std.testing.expect(entry != null);
 
     var buf: [1]SessionEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 1), map.findAvailableByBareJid(&local, "localhost", &buf));
+    try std.testing.expectEqual(@as(usize, 1), collectAvailable(&map, &local, "localhost", &buf));
     try std.testing.expect(map.unbind(&local, "localhost", "res") != null);
 }
 
@@ -962,7 +1003,7 @@ test "SessionMap: setPresenceState updates both fields under one hold (T268)" {
 
     // The bare index sees the same object: no second copy to keep in sync.
     var buf: [4]SessionEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 1), map.findAvailableByBareJid("alice", "localhost", &buf));
+    try std.testing.expectEqual(@as(usize, 1), collectAvailable(&map, "alice", "localhost", &buf));
     try std.testing.expectEqual(@as(i8, 42), buf[0].priority);
 }
 
@@ -976,7 +1017,7 @@ test "SessionMap: domain is case-folded for keys (T305)" {
     const folded = map.findByFullJid("Alice", "example.com", "Mobile");
     try std.testing.expect(folded != null);
     var buf: [4]SessionEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 1), map.findByBareJid("Alice", "EXAMPLE.com", &buf));
+    try std.testing.expectEqual(@as(usize, 1), collectBound(&map, "Alice", "EXAMPLE.com", &buf));
 
     // Localpart and resource keep their case: different localpart is a
     // different account, different resource a different binding.
@@ -1034,7 +1075,7 @@ test "SessionMap: every JID of one account lands on one shard" {
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "example.com", "mobile");
     _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "example.com", "desk");
     var found: [4]SessionEntry = undefined;
-    try std.testing.expectEqual(@as(usize, 2), map.findByBareJid("alice", "example.com", &found));
+    try std.testing.expectEqual(@as(usize, 2), collectBound(&map, "alice", "example.com", &found));
 }
 
 test "SessionMap: normalized key computes both hashes once" {

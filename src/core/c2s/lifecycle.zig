@@ -423,8 +423,7 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
             // T164: when the account's last resource tears down, record when it
             // went offline (XEP-0012). Written to the shared op DB so any
             // worker answers last-activity without cross-worker routing.
-            var probe_buf: [1]@import("session_map").SessionEntry = undefined;
-            if (sm.findByBareJid(bound.local, bound.domain, &probe_buf) == 0) {
+            if (!sm.hasBound(bound.local, bound.domain)) {
                 if (server.roster) |roster| {
                     recordLastOffline(roster, bound);
                 }
