@@ -102,6 +102,7 @@ pub const Wheel = struct {
                 const b = bucketIndex(self.cursor + i + 1);
                 var node = self.buckets[b];
                 while (node) |session| {
+                    scan_node_visits += 1;
                     const next = session.sm_expiry_next;
                     if (session.sm_expiry_deadline <= now) {
                         self.unlinkImpl(session);
@@ -149,8 +150,10 @@ pub const Wheel = struct {
     }
 };
 
-/// Test instrumentation: bucket heads probed and list nodes visited by
-/// scanMin recomputations. The node counter must stay at zero.
+/// Test instrumentation: bucket heads probed by scanMin, and list nodes
+/// visited by any wheel scan (expireDue's drain is the only legitimate
+/// node walk). A scanMin recompute is head checks only, so a test that
+/// snapshots the node counter around one must see no increase.
 pub var scan_bucket_probes: usize = 0;
 pub var scan_node_visits: usize = 0;
 
@@ -311,5 +314,7 @@ test "wheel: scanMin finds the earliest bucket without visiting nodes" {
     scan_node_visits = 0;
     wheel.expireDue(510, &ctx, cb);
     try std.testing.expectEqual(@as(?i64, 511), wheel.nextDeadline());
-    try std.testing.expectEqual(@as(usize, 0), scan_node_visits);
+    // The drain itself walked exactly the nine due nodes (502..510); the
+    // scanMin recompute it triggers added no node visits on top.
+    try std.testing.expectEqual(@as(usize, 9), scan_node_visits);
 }
