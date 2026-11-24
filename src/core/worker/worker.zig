@@ -98,6 +98,7 @@ const c2s_sm = @import("../c2s/sm.zig");
 const routing_deliver = @import("../routing/deliver.zig");
 const block_store_mod = @import("block_store");
 const metrics = @import("metrics.zig");
+const scram_exchange = @import("scram_exchange.zig");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const pep_store_mod = @import("pep_store");
 const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
@@ -211,6 +212,11 @@ const DIRTY_FLUSH_POPS_MAX: u32 = 256;
 pub const SCRAM_PARAM_CACHE_SIZE = 1024;
 pub const SCRAM_PARAM_TTL_SECONDS: i64 = 300;
 pub const SCRAM_PARAM_USER_MAX = 256;
+/// Default parked-SCRAM-exchange capacity per worker (ADR-6): sized for
+/// far more concurrent in-flight exchanges than the measured auth loop
+/// rate (~700 verifies/s at ~ms each) could ever occupy; config can pull
+/// it down. Each slot costs ~2.1 KiB.
+pub const DEFAULT_SCRAM_EXCHANGE_SLOTS: usize = 256;
 
 pub const ScramParamEntry = struct {
     user_hash: u64 = 0,
@@ -438,6 +444,17 @@ pub const Server = struct {
     /// Heap-allocated with the other large tables so Server stays off the
     /// stack; an empty slice means "no cache" (tests) and always misses.
     scram_param_cache: []ScramParamEntry = &.{},
+    /// Bounded pool of parked SCRAM exchanges (ADR-6); sessions carry a
+    /// token into it instead of ~2 KiB of inline buffers. Empty pool means
+    /// "not provisioned" (tests without ensureScramPool) and refuses every
+    /// acquire.
+    scram_pool: scram_exchange.ScramExchangePool = .{},
+    /// Pool capacity from core.scram_exchange_slots; applied at the next
+    /// ensureScramPool (run() start or first acquire).
+    scram_exchange_slots: usize = DEFAULT_SCRAM_EXCHANGE_SLOTS,
+    /// ensureScramPool runs once: an alloc failure must not retry per
+    /// login attempt.
+    scram_pool_ready: bool = false,
 
     /// Wire the backlog allocators once the Server exists (allocator field
     /// is set during init{,FromFd}).
@@ -816,6 +833,7 @@ pub const Server = struct {
         if (self.free_ids.len > 0) self.allocator.free(self.free_ids);
         if (self.slot_gen.len > 0) self.allocator.free(self.slot_gen);
         if (self.scram_param_cache.len > 0) self.allocator.free(self.scram_param_cache);
+        self.scram_pool.deinit(self.allocator);
         if (self.scratch_entries_a.len > 0) self.allocator.free(self.scratch_entries_a);
         if (self.scratch_entries_b.len > 0) self.allocator.free(self.scratch_entries_b);
         if (self.scratch_entries_c.len > 0) self.allocator.free(self.scratch_entries_c);
@@ -1065,7 +1083,7 @@ pub const Server = struct {
     /// init{,WithMaxSessions,FromFdOpts}: a `try` there reserves a full
     /// !Server slot in the Debug frame (stack_frames caps), and an alloc
     /// failure degrades to every-miss lookups instead of failing startup.
-    fn growScramParamCache(self: *Server) void {
+    pub fn growScramParamCache(self: *Server) void {
         if (self.scram_param_cache.len > 0) return;
         self.scram_param_cache = self.allocator.alloc(ScramParamEntry, SCRAM_PARAM_CACHE_SIZE) catch {
             log.err("scram params cache alloc of {d} entries failed; every lookup misses", .{SCRAM_PARAM_CACHE_SIZE});
@@ -1083,6 +1101,7 @@ pub const Server = struct {
         // M1: per-worker counters live on this thread; SIGUSR1 dumps them.
         metrics.bind(self.worker_id);
         self.growScramParamCache();
+        self.ensureScramPool();
         try self.loop.addSignal(posix.SIG.USR1);
 
         // Initial registration: listener for read
@@ -1607,9 +1626,49 @@ pub const Server = struct {
         return entry;
     }
 
+    /// One-time exchange-pool allocation, sized by scram_exchange_slots.
+    /// Lazy like growScramParamCache: run() warms it, tests and the first
+    /// acquire can trigger it; an alloc failure degrades to a pool that
+    /// refuses every acquire (temporary-auth-failure per login attempt).
+    pub fn ensureScramPool(self: *Server) void {
+        if (self.scram_pool_ready) return;
+        self.scram_pool_ready = true;
+        self.scram_pool.init(self.allocator, self.scram_exchange_slots) catch {
+            log.err("scram exchange pool alloc of {d} slots failed; every acquire refuses", .{self.scram_exchange_slots});
+            return;
+        };
+    }
+
+    /// Lease the exchange slot for a session: an already-held token is
+    /// reused (a retry overwrites the parked pieces), a missing one comes
+    /// out of the pool. Null when the pool is exhausted, counted.
+    pub fn scramExchangeAcquire(self: *Server, session: *Session) ?*scram_exchange.ScramExchange {
+        if (self.scram_pool.get(session.scram_ex)) |ex| return ex;
+        std.debug.assert(session.scram_ex == scram_exchange.TOKEN_NONE);
+        self.ensureScramPool();
+        const token = self.scram_pool.acquire() orelse {
+            if (metrics.get()) |c| metrics.bump(&c.scram_exchange_full, 1);
+            return null;
+        };
+        session.scram_ex = token;
+        return self.scram_pool.get(token);
+    }
+
+    /// The session's parked exchange, or null when it holds no live slot.
+    pub fn scramExchangeOf(self: *Server, session: *Session) ?*scram_exchange.ScramExchange {
+        return self.scram_pool.get(session.scram_ex);
+    }
+
+    /// Return the session's exchange slot to the pool (idempotent).
+    pub fn scramExchangeRelease(self: *Server, session: *Session) void {
+        if (session.scram_ex == scram_exchange.TOKEN_NONE) return;
+        self.scram_pool.release(session.scram_ex);
+        session.scram_ex = scram_exchange.TOKEN_NONE;
+    }
+
     /// Cache insert keyed by the same raw n= username the request carried.
     /// Direct-mapped overwrite: a collision only costs a re-fetch.
-    fn scramParamsStore(self: *Server, username: []const u8, salt: []const u8, iterations: u32) void {
+    pub fn scramParamsStore(self: *Server, username: []const u8, salt: []const u8, iterations: u32) void {
         if (username.len == 0 or username.len > SCRAM_PARAM_USER_MAX) return;
         if (self.scram_param_cache.len == 0) return;
         if (salt.len == 0 or salt.len > 32 or iterations == 0) return;
@@ -1678,8 +1737,13 @@ pub const Server = struct {
                     log.warn("scram_params for connection {d} in unexpected auth state", .{conn_id});
                     return;
                 }
+                const ex = self.scramExchangeOf(session) orelse {
+                    // awaiting_params without a parked exchange is a bug.
+                    std.debug.assert(false);
+                    return;
+                };
                 self.scramParamsStore(
-                    session.scram_user_buf[0..session.scram_user_len],
+                    ex.user_buf[0..ex.user_len],
                     m.salt,
                     m.iteration_count,
                 );

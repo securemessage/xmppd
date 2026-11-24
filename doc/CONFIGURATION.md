@@ -83,6 +83,7 @@ listed under the daemon that accepts them.
 | `max_sessions` | `4096` | core | Maximum concurrent C2S sessions, divided evenly across workers |
 | `fan_out_batch_size` | `32` | core | MUC occupants delivered per loop tick before yielding |
 | `max_resources_per_account` | `256` | core | Maximum resources per account |
+| `scram_exchange_slots` | `256` | core | Concurrent in-flight SCRAM logins per worker; a full pool answers temporary-auth-failure |
 | `workers` | `auto` | master | C2S listener count; `auto` detects CPUs |
 | `log_level` | `info` | (none yet) | Log verbosity (`debug`, `info`, `warn`, `err`); no daemon reads it yet (`std_options` pins `info`) |
 
@@ -267,6 +268,7 @@ File keys:
   [core] max_sessions                 default: 4096  session cap
   [core] fan_out_batch_size           default: 32  fan-out batch
   [core] max_resources_per_account    default: 256  resource cap
+  [core] scram_exchange_slots         default: 256  parked SCRAM exchanges
   [core] workers                      default: auto  worker count
   [core] log_level                    default: info  log verbosity
   [oidc] issuer                       default: 

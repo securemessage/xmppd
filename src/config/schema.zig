@@ -93,6 +93,9 @@ pub const Sections = struct {
         max_sessions: usize = 4096,
         fan_out_batch_size: u8 = 32,
         max_resources_per_account: usize = 256,
+        /// Parked SCRAM exchanges per worker: bounds concurrent in-flight
+        /// logins; a full pool answers temporary-auth-failure.
+        scram_exchange_slots: usize = 256,
         workers: conf.IntOr(enum { auto }, u16) = .{ .kw = .auto },
         listen_fd: [][]const u8 = &.{},
         log_level: enum { debug, info, warn, err } = .info,
@@ -220,6 +223,8 @@ pub const file_spec = [_]conf.FieldSpec{
         .doc = "MUC occupants delivered per loop tick before yielding" },
     .{ .section = "core", .field = "max_resources_per_account", .help = "resource cap", .used_by = "core",
         .doc = "Maximum resources per account" },
+    .{ .section = "core", .field = "scram_exchange_slots", .help = "parked SCRAM exchanges", .used_by = "core",
+        .doc = "Concurrent in-flight SCRAM logins per worker; a full pool answers temporary-auth-failure" },
     .{ .section = "core", .field = "workers", .help = "worker count", .used_by = "master",
         .doc = "C2S listener count; `auto` detects CPUs" },
     .{ .section = "core", .field = "listen_fd", .in_file = false, .help = "inherited listen fd" },

@@ -65,6 +65,7 @@ pub const sm_state = @import("sm_state.zig");
 const sm_handoff = @import("sm_handoff.zig");
 const block_store_mod = @import("block_store");
 const metrics = @import("../worker/metrics.zig");
+const scram_exchange_mod = @import("../worker/scram_exchange.zig");
 const GenericBlockStore = block_store_mod.BlockStore(OpBackendType);
 const pep_store_mod = @import("pep_store");
 const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
@@ -299,27 +300,10 @@ pub const Session = struct {
     /// Stable copy of authenticated username (IPC message data is transient).
     auth_username_buf: [precis.max_username_octets]u8 = undefined,
     auth_username_len: usize = 0,
-    /// Protocol v2 SCRAM (ADR-6): the exchange pieces parked between
-    /// client-first and client-final so the core can build server-first and
-    /// then verify in one round trip.
-    scram_gs2_flag: u8 = 0,
-    /// The escaped n= name: params-request username and params-cache key.
-    scram_user_buf: [256]u8 = undefined,
-    scram_user_len: usize = 0,
-    /// client-first-message-bare verbatim.
-    scram_bare_buf: [1024]u8 = undefined,
-    scram_bare_len: usize = 0,
-    /// The r= client nonce, prefix of the combined nonce in server-first.
-    scram_cnonce_buf: [256]u8 = undefined,
-    scram_cnonce_len: usize = 0,
-    /// The server-first-message this core issued (sent to the daemon for
-    /// verification verbatim; it is part of the AuthMessage).
-    scram_sfirst_buf: [512]u8 = undefined,
-    scram_sfirst_len: usize = 0,
-    /// Channel binding captured at exchange start.
-    scram_cb_type: u8 = 0,
-    scram_cb_buf: [32]u8 = undefined,
-    scram_cb_len: usize = 0,
+    /// Protocol v2 SCRAM (ADR-6): token into the worker's exchange pool for
+    /// the pieces parked between client-first and client-final. TOKEN_NONE
+    /// when this session holds no slot; the pool owns release.
+    scram_ex: u32 = scram_exchange_mod.TOKEN_NONE,
     /// Which SASL element we're collecting text content for.
     sasl_collecting: SaslCollecting = .none,
     /// Buffer for accumulating SASL text content (base64 from XML).
@@ -583,18 +567,14 @@ pub const Session = struct {
         self.conn.deinit();
     }
 
+    /// Reset SASL negotiation state. A held scram_ex slot is not touched
+    /// here: its release needs the Server's pool, so it happens where the
+    /// exchange is consumed or where the session is destroyed.
     pub fn resetSasl(self: *Session) void {
         self.sasl_collecting = .none;
         self.sasl_buf_len = 0;
         self.sasl_mechanism = "";
         self.auth_state = .none;
-        self.scram_gs2_flag = 0;
-        self.scram_user_len = 0;
-        self.scram_bare_len = 0;
-        self.scram_cnonce_len = 0;
-        self.scram_sfirst_len = 0;
-        self.scram_cb_type = 0;
-        self.scram_cb_len = 0;
     }
 
     /// Encode session slot + auth generation into IPC conn_id.
@@ -1793,27 +1773,33 @@ fn processScramAuthComplete(self: *Server, session: *Session, client_first: []co
         return;
     };
 
-    if (parsed.bare.len > session.scram_bare_buf.len or
-        parsed.raw_name.len > session.scram_user_buf.len or
-        parsed.client_nonce.len > session.scram_cnonce_buf.len or
-        cb.data.len > session.scram_cb_buf.len)
+    const ex = self.scramExchangeAcquire(session) orelse {
+        const fail_action = session.stream.saslFailure("temporary-auth-failure");
+        executeAction(self, session, fail_action, changes);
+        return;
+    };
+
+    if (parsed.bare.len > ex.bare_buf.len or
+        parsed.raw_name.len > ex.user_buf.len or
+        parsed.client_nonce.len > ex.cnonce_buf.len or
+        cb.data.len > ex.cb_buf.len)
     {
         const fail_action = session.stream.saslFailure("not-authorized");
         executeAction(self, session, fail_action, changes);
         return;
     }
-    session.scram_gs2_flag = parsed.gs2_flag;
-    @memcpy(session.scram_bare_buf[0..parsed.bare.len], parsed.bare);
-    session.scram_bare_len = parsed.bare.len;
-    @memcpy(session.scram_user_buf[0..parsed.raw_name.len], parsed.raw_name);
-    session.scram_user_len = parsed.raw_name.len;
-    @memcpy(session.scram_cnonce_buf[0..parsed.client_nonce.len], parsed.client_nonce);
-    session.scram_cnonce_len = parsed.client_nonce.len;
-    session.scram_cb_type = cb.cb_type;
-    @memcpy(session.scram_cb_buf[0..cb.data.len], cb.data);
-    session.scram_cb_len = cb.data.len;
+    ex.gs2_flag = parsed.gs2_flag;
+    @memcpy(ex.bare_buf[0..parsed.bare.len], parsed.bare);
+    ex.bare_len = parsed.bare.len;
+    @memcpy(ex.user_buf[0..parsed.raw_name.len], parsed.raw_name);
+    ex.user_len = parsed.raw_name.len;
+    @memcpy(ex.cnonce_buf[0..parsed.client_nonce.len], parsed.client_nonce);
+    ex.cnonce_len = parsed.client_nonce.len;
+    ex.cb_type = cb.cb_type;
+    @memcpy(ex.cb_buf[0..cb.data.len], cb.data);
+    ex.cb_len = cb.data.len;
 
-    if (self.scramParamsLookup(session.scram_user_buf[0..session.scram_user_len])) |params| {
+    if (self.scramParamsLookup(ex.user_buf[0..ex.user_len])) |params| {
         if (!sendScramChallenge(self, session, params.salt[0..], params.iterations, changes)) return;
         session.auth_state = .awaiting_client_final;
         return;
@@ -1823,7 +1809,7 @@ fn processScramAuthComplete(self: *Server, session: *Session, client_first: []co
     // daemon to prepare it and answer a deterministic fake for unknown users.
     self.ipc.send(.{ .scram_params_request = .{
         .conn_id = session.ipcConnId(),
-        .username = session.scram_user_buf[0..session.scram_user_len],
+        .username = ex.user_buf[0..ex.user_len],
         .client_ip = session.conn.peerAddr(),
     } }) catch {
         log.err("connection {d} failed to send scram params request via IPC", .{session.conn.id});
@@ -1838,7 +1824,12 @@ fn processScramAuthComplete(self: *Server, session: *Session, client_first: []co
 /// parked client nonce plus (cached or replied) params, and send it as the
 /// SASL <challenge>. False when the send could not be staged.
 pub fn sendScramChallenge(self: *Server, session: *Session, salt: []const u8, iterations: u32, changes: *ChangeList) bool {
-    const cnonce = session.scram_cnonce_buf[0..session.scram_cnonce_len];
+    const ex = self.scramExchangeOf(session) orelse {
+        // A challenge without a parked exchange is a caller bug.
+        std.debug.assert(false);
+        return false;
+    };
+    const cnonce = ex.cnonce_buf[0..ex.cnonce_len];
 
     // The server nonce carries this core's issue time (u64 seconds) plus
     // 18 random bytes; the auth daemon's freshness window bounds how long
@@ -1856,13 +1847,13 @@ pub fn sendScramChallenge(self: *Server, session: *Session, salt: []const u8, it
     }
     const salt_enc = encoder.encode(salt_b64[0..enc_len], salt);
 
-    var fbs = std.io.fixedBufferStream(&session.scram_sfirst_buf);
+    var fbs = std.io.fixedBufferStream(&ex.sfirst_buf);
     fbs.writer().print("r={s}{s},s={s},i={d}", .{ cnonce, snonce, salt_enc, iterations }) catch {
         const fail_action = session.stream.saslFailure("temporary-auth-failure");
         executeAction(self, session, fail_action, changes);
         return false;
     };
-    session.scram_sfirst_len = fbs.pos;
+    ex.sfirst_len = fbs.pos;
 
     // <challenge> carries the server-first base64'd, matching the old
     // daemon-built path byte for byte.
@@ -1870,7 +1861,7 @@ pub fn sendScramChallenge(self: *Server, session: *Session, salt: []const u8, it
     const w = xml_fbs.writer();
     const challenge_xml = stanza: {
         w.writeAll("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>") catch break :stanza null;
-        stanza_writer.b64EncodeWrite(w, session.scram_sfirst_buf[0..session.scram_sfirst_len]) catch break :stanza null;
+        stanza_writer.b64EncodeWrite(w, ex.sfirst_buf[0..ex.sfirst_len]) catch break :stanza null;
         w.writeAll("</challenge>") catch break :stanza null;
         break :stanza xml_fbs.getWritten();
     } orelse {
@@ -1914,22 +1905,35 @@ pub fn processSaslResponseComplete(self: *Server, session: *Session, changes: *C
         return;
     };
 
-    self.ipc.send(.{ .scram_verify = .{
-        .conn_id = session.ipcConnId(),
-        .client_ip = session.conn.peerAddr(),
-        .cb_type = session.scram_cb_type,
-        .cb_data = session.scram_cb_buf[0..session.scram_cb_len],
-        .gs2_flag = session.scram_gs2_flag,
-        .client_first_bare = session.scram_bare_buf[0..session.scram_bare_len],
-        .server_first = session.scram_sfirst_buf[0..session.scram_sfirst_len],
-        .client_final = decoded,
-    } }) catch {
-        log.err("connection {d} failed to send SCRAM verify via IPC", .{session.conn.id});
+    const ex = self.scramExchangeOf(session) orelse {
+        // awaiting_client_final without a parked exchange is a caller bug.
+        std.debug.assert(false);
         const fail_action = session.stream.saslFailure("temporary-auth-failure");
         executeAction(self, session, fail_action, changes);
         return;
     };
 
+    self.ipc.send(.{ .scram_verify = .{
+        .conn_id = session.ipcConnId(),
+        .client_ip = session.conn.peerAddr(),
+        .cb_type = ex.cb_type,
+        .cb_data = ex.cb_buf[0..ex.cb_len],
+        .gs2_flag = ex.gs2_flag,
+        .client_first_bare = ex.bare_buf[0..ex.bare_len],
+        .server_first = ex.sfirst_buf[0..ex.sfirst_len],
+        .client_final = decoded,
+    } }) catch {
+        log.err("connection {d} failed to send SCRAM verify via IPC", .{session.conn.id});
+        const fail_action = session.stream.saslFailure("temporary-auth-failure");
+        executeAction(self, session, fail_action, changes);
+        self.scramExchangeRelease(session);
+        return;
+    };
+
+    // The parked pieces were consumed into the wire message; the slot goes
+    // back now rather than with the reply. A scram_stale answer carries the
+    // username itself so eviction does not need this state.
+    self.scramExchangeRelease(session);
     session.auth_state = .awaiting_result;
 
     // Write interest: reconcileIpcWriteInterest (S10).
@@ -4461,4 +4465,115 @@ test "Server: S4 jid-malformed subscription escapes the stanza id" {
     try std.testing.expect(std.mem.indexOf(u8, reply, "jid-malformed") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "id='sess-&apos;&amp;&lt;'") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "id='sess-'&<'") == null);
+}
+
+test "Server: a full SCRAM exchange pool answers temporary-auth-failure, counted" {
+    const allocator = std.testing.allocator;
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.scram_exchange_slots = 1;
+    server.ensureScramPool();
+
+    metrics.bind(11);
+    defer metrics.current = null;
+    const c = metrics.get().?;
+    const full_before = c.scram_exchange_full.load(.monotonic);
+
+    const fds1 = try makeSocketPair();
+    defer posix.close(fds1[1]);
+    const s1 = try allocator.create(Session);
+    s1.init(fds1[0], 1, "localhost", false, allocator);
+    server.sessions[1] = s1;
+
+    const fds2 = try makeSocketPair();
+    defer posix.close(fds2[1]);
+    const s2 = try allocator.create(Session);
+    s2.init(fds2[0], 2, "localhost", false, allocator);
+    server.sessions[2] = s2;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    const client_first = "n,,n=user,r=abcdef";
+    const cb = .{ .cb_type = @as(u8, 0), .data = @as([]const u8, "") };
+
+    // The first exchange parks the only slot; the params-cache hit issues
+    // the challenge inline so no IPC round trip is involved.
+    var salt: [32]u8 = undefined;
+    @memset(&salt, 0x5A);
+    server.growScramParamCache();
+    server.scramParamsStore("user", &salt, 4096);
+    processScramAuthComplete(&server, s1, client_first, cb, &changes);
+    try std.testing.expect(s1.scram_ex != scram_exchange_mod.TOKEN_NONE);
+
+    processScramAuthComplete(&server, s2, client_first, cb, &changes);
+    try std.testing.expectEqual(@as(u64, 1), c.scram_exchange_full.load(.monotonic) - full_before);
+    try std.testing.expectEqual(scram_exchange_mod.TOKEN_NONE, s2.scram_ex);
+
+    // The refused attempt fails soft on the wire: the client retries.
+    _ = try s2.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds2[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "temporary-auth-failure") != null);
+}
+
+test "Server: the exchange slot returns to the pool once the verify is sent" {
+    const allocator = std.testing.allocator;
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+    server.scram_exchange_slots = 2;
+    server.ensureScramPool();
+
+    // A real IPC socketpair: the verify lands on the wire for the check.
+    const ipc_fds = try makeSocketPair();
+    defer posix.close(ipc_fds[1]);
+    server.ipc.fd = ipc_fds[0];
+    server.ipc.connected = true;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+
+    // Cache hit: the challenge is issued inline, exchange still parked.
+    var salt: [32]u8 = undefined;
+    @memset(&salt, 0x5A);
+    server.growScramParamCache();
+    server.scramParamsStore("user", &salt, 4096);
+
+    const cb = .{ .cb_type = @as(u8, 0), .data = @as([]const u8, "") };
+    processScramAuthComplete(&server, session, "n,,n=user,r=abcdef", cb, &changes);
+    try std.testing.expect(session.auth_state == .awaiting_client_final);
+    const ex = server.scramExchangeOf(session).?;
+    var issued: [512]u8 = undefined;
+    @memcpy(issued[0..ex.sfirst_len], ex.sfirst_buf[0..ex.sfirst_len]);
+    const issued_sfirst = issued[0..ex.sfirst_len];
+
+    // A client-final arrives; the verify carries every parked piece to the
+    // daemon and the slot goes back to the pool.
+    const enc = std.base64.standard.Encoder;
+    const cf_str = "c=biws,r=xyz,p=qq";
+    var cf_b64: [64]u8 = undefined;
+    const cf = enc.encode(cf_b64[0..enc.calcSize(cf_str.len)], cf_str);
+    @memcpy(session.sasl_buf[0..cf.len], cf);
+    session.sasl_buf_len = cf.len;
+    processSaslResponseComplete(&server, session, &changes);
+
+    try std.testing.expectEqual(scram_exchange_mod.TOKEN_NONE, session.scram_ex);
+    try std.testing.expectEqual(@as(usize, 2), server.scram_pool.free_count);
+    try std.testing.expect(session.auth_state == .awaiting_result);
+
+    var frame_buf: [4096]u8 = undefined;
+    const n = posix.read(ipc_fds[1], &frame_buf) catch 0;
+    try std.testing.expect(n > ipc_protocol.HEADER_SIZE);
+    const decoded = try ipc_protocol.decode(frame_buf[ipc_protocol.HEADER_SIZE..n]);
+    try std.testing.expect(decoded == .scram_verify);
+    const v = decoded.scram_verify;
+    try std.testing.expectEqualStrings(issued_sfirst, v.server_first);
+    try std.testing.expectEqualStrings("n=user,r=abcdef", v.client_first_bare);
 }
