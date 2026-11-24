@@ -1,5 +1,5 @@
-//! A1 (doc T197 §5.7, T405): per-daemon instrumentation for the auth event
-//! loop, in the M1 style (src/core/worker/metrics.zig).
+//! Per-daemon instrumentation for the auth event loop, in the style of
+//! src/core/worker/metrics.zig.
 //!
 //! One global Counters block per process. The auth daemon's event loop is
 //! the only writer and, because SIGUSR1 arrives as EVFILT_SIGNAL on that
@@ -76,21 +76,21 @@ inline fn bump(c: *Counter, n: u64) void {
 
 /// One auth_request arrived; mech is @intFromEnum(MechanismId).
 pub inline fn exchangeStarted(mech: u8) void {
-    if (mech == 0 or mech > MECH_COUNT) return;
+    std.debug.assert(mech >= 1 and mech <= MECH_COUNT);
     bump(&counters.exchanges_started[mech - 1], 1);
 }
 
 /// The exchange produced a terminal reply (not a challenge); mech is
 /// @intFromEnum(MechanismId).
 pub inline fn exchangeCompleted(mech: u8, success: bool) void {
-    if (mech == 0 or mech > MECH_COUNT) return;
+    std.debug.assert(mech >= 1 and mech <= MECH_COUNT);
     bump(&counters.exchanges_completed[mech - 1], 1);
     if (success) bump(&counters.auth_success, 1);
 }
 
 /// One terminal failure reply; reason_idx is @intFromEnum(FailureReason).
 pub inline fn failure(reason_idx: u8) void {
-    if (reason_idx >= REASON_COUNT) return;
+    std.debug.assert(reason_idx < REASON_COUNT);
     bump(&counters.outcomes[reason_idx], 1);
 }
 
@@ -142,11 +142,12 @@ pub inline fn scramActivated() void {
     if (n > hw) counters.scram_high_water.store(n, .monotonic);
 }
 
-/// A SCRAM session slot went inactive; saturating so a stray release can
-/// never wrap the gauge.
+/// A SCRAM session slot went inactive; a release without a matching
+/// activation is a programmer error.
 pub inline fn scramReleased() void {
     const n = counters.scram_active.load(.monotonic);
-    if (n > 0) counters.scram_active.store(n - 1, .monotonic);
+    std.debug.assert(n > 0);
+    counters.scram_active.store(n - 1, .monotonic);
 }
 
 /// A lane's intake paused on the outbound backlog watermark.
@@ -232,7 +233,7 @@ pub fn dump() void {
 // Tests
 // ============================================================================
 
-test "exchange counters move per mechanism and ignore out-of-range ids" {
+test "exchange counters move per mechanism" {
     reset();
     defer reset();
 
@@ -241,10 +242,6 @@ test "exchange counters move per mechanism and ignore out-of-range ids" {
     exchangeStarted(2); // SCRAM-SHA-256
     exchangeCompleted(1, true);
     exchangeCompleted(2, false);
-    exchangeStarted(0); // invalid: enum starts at 1
-    exchangeStarted(4); // invalid: past the last mechanism
-    exchangeCompleted(0, true);
-    exchangeCompleted(9, false);
 
     const c = &counters;
     try std.testing.expectEqual(@as(u64, 2), read(&c.exchanges_started[0]));
@@ -255,14 +252,13 @@ test "exchange counters move per mechanism and ignore out-of-range ids" {
     try std.testing.expectEqual(@as(u64, 1), read(&c.auth_success));
 }
 
-test "failure outcomes move per reason and ignore out-of-range ids" {
+test "failure outcomes move per reason" {
     reset();
     defer reset();
 
     failure(0); // invalid-encoding
     failure(3); // temporary-auth-failure
     failure(3);
-    failure(REASON_COUNT); // ignored
 
     const c = &counters;
     try std.testing.expectEqual(@as(u64, 1), read(&c.outcomes[0]));
@@ -317,7 +313,7 @@ test "poolQueued keeps the high-water mark and poolJobDone assigns log2 buckets"
     try std.testing.expectEqual(@as(u64, 1), read(&c.pool_latency_us[HIST_BUCKETS - 1]));
 }
 
-test "scram occupancy tracks a high-water mark and never wraps" {
+test "scram occupancy tracks a high-water mark" {
     reset();
     defer reset();
 
@@ -328,7 +324,6 @@ test "scram occupancy tracks a high-water mark and never wraps" {
     try std.testing.expectEqual(@as(u64, 2), read(&counters.scram_high_water));
 
     scramReleased();
-    scramReleased(); // below zero: saturates
     try std.testing.expectEqual(@as(u64, 0), read(&counters.scram_active));
     try std.testing.expectEqual(@as(u64, 2), read(&counters.scram_high_water));
 }
