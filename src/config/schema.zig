@@ -96,6 +96,9 @@ pub const Sections = struct {
         /// Parked SCRAM exchanges per worker: bounds concurrent in-flight
         /// logins; a full pool answers temporary-auth-failure.
         scram_exchange_slots: usize = 256,
+        /// Per-session bound on retained XEP-0198 unacked stanza bytes;
+        /// mirrored from sm_state.DEFAULT_MAX_UNACKED_BYTES.
+        sm_max_unacked_bytes: u64 = 4 * 1024 * 1024,
         workers: conf.IntOr(enum { auto }, u16) = .{ .kw = .auto },
         listen_fd: [][]const u8 = &.{},
         log_level: enum { debug, info, warn, err } = .info,
@@ -225,6 +228,8 @@ pub const file_spec = [_]conf.FieldSpec{
         .doc = "Maximum resources per account" },
     .{ .section = "core", .field = "scram_exchange_slots", .help = "parked SCRAM exchanges", .used_by = "core",
         .doc = "Concurrent in-flight SCRAM logins per worker; a full pool answers temporary-auth-failure" },
+    .{ .section = "core", .field = "sm_max_unacked_bytes", .help = "SM unacked byte bound", .used_by = "core",
+        .doc = "Per-session bound on retained stream-management unacked stanza bytes; a session that would exceed it is failed alone, alongside the 256-stanza count bound" },
     .{ .section = "core", .field = "workers", .help = "worker count", .used_by = "master",
         .doc = "C2S listener count; `auto` detects CPUs" },
     .{ .section = "core", .field = "listen_fd", .in_file = false, .help = "inherited listen fd" },

@@ -400,16 +400,11 @@ pub const Server = struct {
     /// Number of currently detached SM sessions (T124 — avoids full sweep when 0).
     detached_count: u16 = 0,
 
-    /// Fallback blob budget for SM unacked queues when no delivery system
-    /// is wired (tests, single-process rigs). Lazily initialized by
-    /// smBlobBudget(); the field never moves after init.
-    sm_blob_budget_fallback: ?delivery_queue_mod.BlobBudget = null,
-
-    /// Dedicated budget carrying blob charges retained by this worker's
-    /// detached SM unacked queues (T-265C5A0E): the resume tail stops
-    /// pinning producing workers' ring budgets. Lazily initialized by
-    /// smRetentionBudget(); the field never moves after init.
-    sm_retention_budget: ?delivery_queue_mod.BlobBudget = null,
+    /// Per-session bound on retained unacked stanza bytes ([core]
+    /// sm_max_unacked_bytes). Every SM unacked queue charges its entries
+    /// to its own account against this bound; a refusal fails that
+    /// session only.
+    sm_max_unacked_bytes: u64 = sm_state.DEFAULT_MAX_UNACKED_BYTES,
 
     /// FIFO of unacked queues parked for a chunked section-5 drain
     /// (T-265C5A0E). drainSmUnackedTick empties it at the batch tail,
@@ -1427,7 +1422,7 @@ pub const Server = struct {
                 self.sm_expiry_pending = false;
                 return;
             }
-            const now = std.time.timestamp();
+            const now = sm_state.monotonicSeconds();
             const delay_ms: u32 = if (deadline <= now)
                 1
             else
@@ -2614,7 +2609,7 @@ test "Server: S28 stale writable event does not destroy a detached session" {
     // Detach for SM resume: purge the fd, close it, keep the session.
     session.sm_resume_enabled = true;
     session.sm_detached = true;
-    session.sm_detach_time = std.time.timestamp();
+    session.sm_detach_time = sm_state.monotonicSeconds();
     session.sm_id_len = sm_state.SM_ID_HEX_LEN;
     const sm_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
     @memcpy(&session.sm_id, sm_id);
@@ -2688,7 +2683,7 @@ test "Server: S28 a same-batch kqueue race keeps a detached session resumable" {
     // The race window: detach after kevent returned, before dispatch.
     session.sm_resume_enabled = true;
     session.sm_detached = true;
-    session.sm_detach_time = std.time.timestamp();
+    session.sm_detach_time = sm_state.monotonicSeconds();
     session.sm_id_len = sm_state.SM_ID_HEX_LEN;
     const sm_id = "b2c3d4e5f60718293a4b5c6d7e8f9001";
     @memcpy(&session.sm_id, sm_id);
@@ -4111,7 +4106,7 @@ test "Server: H3 a resume carries the stalled offline tail" {
         .base_seq = 1,
         .last_h = 0,
         .offline_pending = true,
-        .created = std.time.timestamp(),
+        .created = sm_state.monotonicSeconds(),
     };
     @memcpy(&bundle.previd, previd);
     try sm_handoff.put(previd, bundle);
@@ -4261,7 +4256,7 @@ test "Re-review 6.3: a cross-worker resume carries the recorded sequence" {
         .last_h = 0,
         .offline_pending = true,
         .offline_last_sent_sequence = sent_sequence,
-        .created = std.time.timestamp(),
+        .created = sm_state.monotonicSeconds(),
     };
     @memcpy(&bundle.previd, previd);
     try sm_handoff.put(previd, bundle);
@@ -4325,13 +4320,12 @@ test "Re-review 6.3: a local resume carries the recorded sequence" {
     detached.auth_username_len = 5;
     detached.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     detached.sm_detached = true;
-    detached.sm_detach_time = std.time.timestamp();
+    detached.sm_detach_time = sm_state.monotonicSeconds();
     detached.sm_resume_enabled = true;
     detached.offline_pending = true;
     detached.offline_last_sent_sequence = sent_sequence;
     const det_queue = try allocator.create(sm_state.SmUnackedQueue);
-    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
-    det_queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
+    det_queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     det_queue.base_seq = 1;
     detached.sm_unacked = det_queue;
     server.sessions[2] = detached;
@@ -4414,12 +4408,11 @@ test "Server: H3 a local resume carries the stalled offline tail" {
     detached.auth_username_len = 5;
     detached.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     detached.sm_detached = true;
-    detached.sm_detach_time = std.time.timestamp();
+    detached.sm_detach_time = sm_state.monotonicSeconds();
     detached.sm_resume_enabled = true;
     detached.offline_pending = true;
     const det_queue = try allocator.create(sm_state.SmUnackedQueue);
-    var sm_budget = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
-    det_queue.* = sm_state.SmUnackedQueue.init(&sm_budget);
+    det_queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     det_queue.base_seq = 1;
     detached.sm_unacked = det_queue;
     server.sessions[2] = detached;
@@ -5912,7 +5905,7 @@ test "Server: C11 SM expiry stages exactly one one-shot timer at the wheel deadl
         std.testing.allocator.destroy(session);
     }
 
-    const now = std.time.timestamp();
+    const now = sm_state.monotonicSeconds();
     server.sm_expiry.insert(session, now + sm_state.DEFAULT_RESUME_TIMEOUT);
     server.sm_expiry_pending = true;
 
