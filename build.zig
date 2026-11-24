@@ -2358,6 +2358,10 @@ pub fn build(b: *std.Build) void {
     // --- Test step ---
 
     // Targeted steps for single-artifact runs (revert checks, debugging).
+    const test_xml_step = b.step("test-xml", "Run only the XML module tests");
+    test_xml_step.dependOn(&run_xml_tests.step);
+    const test_ipc_protocol_step = b.step("test-ipc-protocol", "Run only the IPC protocol module tests");
+    test_ipc_protocol_step.dependOn(&run_ipc_protocol_tests.step);
     const test_server_step = b.step("test-server", "Run only the server module tests");
     test_server_step.dependOn(&run_server_tests.step);
     const test_fanout_step = b.step("test-fanout", "Run only the fanout tests");

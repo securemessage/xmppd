@@ -1004,3 +1004,190 @@ test "lib/net FrameWriter hosts encode() in place" {
     const decoded = try decode(frame.payload);
     try std.testing.expectEqual(@as(u32, 7), decoded.auth_failure.conn_id);
 }
+
+// ---------------------------------------------------------------------------
+// R7: fuzz target and split-feed coverage
+// ---------------------------------------------------------------------------
+
+const o_nonblock: c_int = 0x4; // O_NONBLOCK
+
+fn setNonBlocking(fd: posix.fd_t) !void {
+    const fl = std.c.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+    if (fl < 0) return error.Unexpected;
+    if (fl & o_nonblock == 0) {
+        if (std.c.fcntl(fd, posix.F.SETFL, fl | o_nonblock) != 0) return error.Unexpected;
+    }
+}
+
+fn socketpair() ![2]posix.fd_t {
+    var pair: [2]std.c.fd_t = undefined;
+    const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    if (std.c.socketpair(posix.AF.UNIX, flags, 0, &pair) != 0) return error.Unexpected;
+    try setNonBlocking(pair[0]);
+    try setNonBlocking(pair[1]);
+    return pair;
+}
+
+/// Drain `rfd` through `r.recv` until EAGAIN or EOF, handing each
+/// complete frame to `onFrame`. Compaction runs inside `recv` once per
+/// call, so a consumed prefix plus a partial frame rides the real read
+/// path. Returns false when parsing stalls: an oversize header, or a
+/// full buffer with nothing consumable.
+fn drainReader(r: *FrameReader, rfd: posix.fd_t, ctx: anytype, comptime onFrame: anytype) !bool {
+    while (true) {
+        const res = try r.recv(rfd);
+        const before = r.consumed;
+        while (true) {
+            const f_opt = if (r.next()) |o| o else |_| return false;
+            const f = f_opt orelse break;
+            try onFrame(ctx, f);
+            r.consume(f.consumed);
+        }
+        switch (res) {
+            .would_block, .eof => return true,
+            .full => if (r.consumed == before) return false,
+            .data => {},
+        }
+    }
+}
+
+/// Write each segment to `wfd`, interleaving reads so a segment bigger
+/// than the socket buffer still flows, and drain after every write
+/// burst. Returns false on a parse stall (see drainReader).
+fn feedSegments(
+    r: *FrameReader,
+    wfd: posix.fd_t,
+    rfd: posix.fd_t,
+    segments: []const []const u8,
+    ctx: anytype,
+    comptime onFrame: anytype,
+) !bool {
+    for (segments) |seg| {
+        var off: usize = 0;
+        while (true) {
+            if (off < seg.len) {
+                off += posix.write(wfd, seg[off..]) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+            }
+            if (!try drainReader(r, rfd, ctx, onFrame)) return false;
+            if (off >= seg.len) break;
+        }
+    }
+    return true;
+}
+
+/// Round-trip oracle: a message decode accepted must re-encode, and the
+/// re-encoded frame must decode to an equal message. Equality is the
+/// tag plus the canonical encoding; deep equality is unsound where
+/// decode leaves union tails undefined (MechanismList.mechanisms).
+fn oracleFrame(_: void, f: Frame) !void {
+    const msg = if (decode(f.payload)) |m| m else |_| return;
+    var buf1: [MAX_FRAME_SIZE]u8 = undefined;
+    const n1 = try encode(msg, &buf1);
+    const frame1 = (try parseFrame(buf1[0..n1])) orelse return error.NoFrame;
+    const msg2 = try decode(frame1.payload);
+    try std.testing.expectEqual(std.meta.activeTag(msg), std.meta.activeTag(msg2));
+    var buf2: [MAX_FRAME_SIZE]u8 = undefined;
+    const n2 = try encode(msg2, &buf2);
+    try std.testing.expectEqualSlices(u8, buf1[0..n1], buf2[0..n2]);
+}
+
+fn fuzzIpcCodec(_: void, input: []const u8) !void {
+    const pair = try socketpair();
+    defer posix.close(pair[0]);
+    defer posix.close(pair[1]);
+
+    var buf: [MAX_FRAME_SIZE]u8 = undefined;
+    var r = FrameReader.init(&buf);
+
+    // Three segments cut at bytes the input supplies, so a partial frame
+    // outlives a consume and is compacted by recv before it completes.
+    const n = input.len;
+    var c0: usize = 0;
+    var c1: usize = 0;
+    if (n > 0) {
+        c0 = input[0] % (n + 1);
+        c1 = input[n - 1] % (n + 1);
+        if (c0 > c1) std.mem.swap(usize, &c0, &c1);
+    }
+    const segments = [3][]const u8{ input[0..c0], input[c0..c1], input[c1..] };
+    if (!try feedSegments(&r, pair[0], pair[1], &segments, {}, oracleFrame)) return;
+
+    // The peer hangs up: recv reports the queued tail as data, then
+    // latches .eof; an unconsumed partial frame is a truncation.
+    try posix.shutdown(pair[0], .both);
+    _ = try drainReader(&r, pair[1], {}, oracleFrame);
+    _ = try r.recv(pair[1]);
+    _ = r.truncated();
+}
+
+test "fuzz: IPC codec parses arbitrary bytes without crashing" {
+    try std.testing.fuzz({}, fuzzIpcCodec, .{ .corpus = &.{
+        "\x0A\x00\x00\x00\x04\x2A\x00\x00\x00\x06denied",
+        "\x05\x00\x00\x00\x01",
+        "\xFF\xFF\xFF\xFF",
+        "\x01\x00\x00\x00",
+    } });
+}
+
+const SplitCtx = struct {
+    got: *std.ArrayList(u8),
+    alloc: std.mem.Allocator,
+};
+
+fn recordFrame(ctx: SplitCtx, f: Frame) !void {
+    const msg = try decode(f.payload);
+    var tmp: [MAX_FRAME_SIZE]u8 = undefined;
+    const n = try encode(msg, &tmp);
+    try ctx.got.appendSlice(ctx.alloc, tmp[0..n]);
+}
+
+test "codec: a two-part feed split at every byte boundary yields the same frames" {
+    const alloc = std.testing.allocator;
+    var wire: [1024]u8 = undefined;
+    // Two frames: the buffer can then fill with a consumed frame's tail
+    // plus a partial second frame, which is exactly the deferred
+    // compaction recv() documents.
+    const m1 = Message{ .auth_abort = .{ .conn_id = 9 } };
+    const m2 = Message{ .auth_request = .{
+        .conn_id = 42,
+        .mechanism = .scram_sha_256,
+        .client_ip = "192.168.1.100",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "alice",
+        .payload = "n,,n=alice,r=rOprNGfwEbeRWgbNEkqO",
+    } };
+    const n1 = try encode(m1, &wire);
+    const n2 = n1 + try encode(m2, wire[n1..]);
+    const frame_bytes = wire[0..n2];
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(alloc);
+    const ctx = SplitCtx{ .got = &got, .alloc = alloc };
+
+    for (0..frame_bytes.len + 1) |split| {
+        const pair = try socketpair();
+        defer posix.close(pair[0]);
+        defer posix.close(pair[1]);
+        got.clearRetainingCapacity();
+
+        // Sized so the larger frame alone just fits: once split passes
+        // buf.len the first feed fills the buffer with m1 plus most of
+        // m2, and m2 completes only after recv folds m1's consumed
+        // bytes away on the next call.
+        var buf: [encodedLen(m2)]u8 = undefined;
+        var r = FrameReader.init(&buf);
+
+        const segments = [2][]const u8{ frame_bytes[0..split], frame_bytes[split..] };
+        try std.testing.expect(try feedSegments(&r, pair[0], pair[1], &segments, ctx, recordFrame));
+        try posix.shutdown(pair[0], .both);
+        try std.testing.expect(try drainReader(&r, pair[1], ctx, recordFrame));
+        try std.testing.expect(r.eof);
+        try std.testing.expect(!r.truncated());
+        try std.testing.expectEqual(r.len, r.consumed);
+        try std.testing.expectEqualSlices(u8, frame_bytes, got.items);
+    }
+}
