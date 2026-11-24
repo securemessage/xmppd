@@ -462,11 +462,12 @@ test "Executor: the writer thread commits and stop drains the queue" {
     while (completed.load(.acquire) == null and tries < 1_000_000) : (tries += 1) {
         std.atomic.spinLoopHint();
     }
-    const job = completed.load(.acquire).?;
+    const job = completed.swap(null, .acq_rel).?;
     try std.testing.expect(job.stored);
     try std.testing.expectEqual(@as(u32, 1), store.calls);
     job.destroy();
-    std.heap.c_allocator.free(store.last_stanza);
+    // The mock frees the previous capture on its next call; freeing it
+    // here would leave a stale slice for that free to hit a second time.
 
     // stop() joins the writer after it drains whatever is queued.
     const blob2 = try Blob.createUncharged(allocator, "<message id='m10'/>");
@@ -484,7 +485,7 @@ test "Executor: the writer thread commits and stop drains the queue" {
     blob2.releaseRetention();
     exec.stop();
     try std.testing.expectEqual(@as(u32, 2), store.calls);
-    const job2 = completed.load(.acquire).?;
+    const job2 = completed.swap(null, .acq_rel).?;
     job2.destroy();
     std.heap.c_allocator.free(store.last_stanza);
 }

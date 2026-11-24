@@ -3675,7 +3675,7 @@ test "C11: parked drains bound nodes and bytes; overflow drains inline counted" 
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
     var server: Server = undefined;
-    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 6 + SM_DRAIN_PARK_MAX_NODES + SM_DRAIN_CHUNK);
     defer server.deinit();
     server.offline = &offline_store;
 
@@ -3689,7 +3689,7 @@ test "C11: parked drains bound nodes and bytes; overflow drains inline counted" 
     const big_queue = try allocator.create(sm_state.SmUnackedQueue);
     big_queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
     _ = big_queue.push("<presence from='dave@localhost/res'/>");
-    big_queue.bytes = SM_DRAIN_PARK_MAX_BYTES;
+    big_queue.bytes = SM_DRAIN_PARK_MAX_BYTES + 1;
     session.sm_unacked = big_queue;
     parkUnackedDrain(&server, session);
     try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_drain_park_overflow.load(.monotonic) - overflow0);
@@ -3699,8 +3699,6 @@ test "C11: parked drains bound nodes and bytes; overflow drains inline counted" 
     // A sustained park burst: nodes past the cap drain inline too, and
     // retirement costs chunk credit so one tick retires at most
     // SM_DRAIN_CHUNK nodes.
-    var sessions: [SM_DRAIN_PARK_MAX_NODES + SM_DRAIN_CHUNK][]const u8 = undefined;
-    _ = &sessions;
     var i: usize = 0;
     while (i < SM_DRAIN_PARK_MAX_NODES + SM_DRAIN_CHUNK) : (i += 1) {
         const s = try makeAuthenticatedSession(&server, 6 + i, "eve");
@@ -3714,7 +3712,7 @@ test "C11: parked drains bound nodes and bytes; overflow drains inline counted" 
     try std.testing.expectEqual(@as(u64, 1 + SM_DRAIN_CHUNK), delivery_queue_mod.sm_drain_park_overflow.load(.monotonic) - overflow0);
 
     drainSmUnackedTick(&server);
-    try std.testing.expectEqual(@as(u32, SM_DRAIN_CHUNK), server.sm_drain_parked_nodes - (SM_DRAIN_PARK_MAX_NODES - SM_DRAIN_CHUNK));
+    try std.testing.expectEqual(@as(u32, SM_DRAIN_CHUNK), SM_DRAIN_PARK_MAX_NODES - server.sm_drain_parked_nodes);
 
     drainParkedFully(&server);
     try std.testing.expectEqual(@as(u32, 0), server.sm_drain_parked_nodes);
