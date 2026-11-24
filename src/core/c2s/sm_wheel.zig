@@ -11,8 +11,13 @@
 //! Invariants:
 //! - Only detached sessions are linked, each at most once
 //!   (`Session.sm_expiry_linked` guards insert and unlink).
-//! - Deadlines live within one revolution of `now` (resume timeout fits in
-//!   SLOT_COUNT), so entries in one bucket all share its tick's deadline.
+//! - Every linked deadline is strictly newer than `cursor`: deadlines are
+//!   stamped at insert time and `cursor` only advances to past `now`
+//!   values, so `expireDue` covering `(cursor, now]` always reaches a
+//!   due entry's bucket even after a delayed timer turn.
+//! - Bucket lists are sorted by deadline, so a bucket may hold deadlines
+//!   a full revolution apart (idle wheel, stalled loop); the head is the
+//!   bucket's earliest and `scanMin` is exact regardless of `cursor`.
 //! - `expireDue` still checks each entry's real deadline: a session linked
 //!   while a drain was running can sit ahead of its tick's due entries and
 //!   must not be destroyed early.
@@ -31,7 +36,10 @@ comptime {
 }
 
 pub const Wheel = struct {
-    /// Bucket heads, indexed by `deadline mod SLOT_COUNT`.
+    /// Bucket heads, indexed by `deadline mod SLOT_COUNT`. Each bucket's
+    /// list is sorted by deadline, so the head is always the bucket's
+    /// earliest live deadline even when entries a full revolution apart
+    /// share a slot after a delayed timer turn.
     buckets: [SLOT_COUNT]?*Session = .{null} ** SLOT_COUNT,
     /// Newest second already drained. Scans cover `(cursor, now]`.
     cursor: i64 = 0,
@@ -59,21 +67,28 @@ pub const Wheel = struct {
     }
 
     /// Link a session at `deadline` (detach time + resume timeout).
+    /// Entries a multiple of SLOT_COUNT apart share a bucket, which a
+    /// stalled or just-idle wheel can legitimately produce; the sorted
+    /// insert keeps the head at the bucket's earliest deadline.
     pub fn insert(self: *Wheel, session: *Session, deadline: i64) void {
         std.debug.assert(!session.sm_expiry_linked);
         const b = bucketIndex(deadline);
-        // One bucket holds one deadline: linked deadlines all fall within
-        // one revolution of the cursor, so a bucket head stamped with a
-        // different deadline would mean the wheel fell behind by more
-        // than SLOT_COUNT seconds.
-        if (self.buckets[b]) |head| {
-            std.debug.assert(head.sm_expiry_deadline == deadline);
+        var prev: ?*Session = null;
+        var node = self.buckets[b];
+        while (node) |entry| {
+            if (entry.sm_expiry_deadline > deadline) break;
+            prev = entry;
+            node = entry.sm_expiry_next;
         }
         session.sm_expiry_deadline = deadline;
-        session.sm_expiry_prev = null;
-        session.sm_expiry_next = self.buckets[b];
-        if (self.buckets[b]) |head| head.sm_expiry_prev = session;
-        self.buckets[b] = session;
+        session.sm_expiry_prev = prev;
+        session.sm_expiry_next = node;
+        if (node) |entry| entry.sm_expiry_prev = session;
+        if (prev) |entry| {
+            entry.sm_expiry_next = session;
+        } else {
+            self.buckets[b] = session;
+        }
         session.sm_expiry_linked = true;
         self.count += 1;
         if (self.count == 1 or deadline < self.min_deadline) {
@@ -141,22 +156,25 @@ pub const Wheel = struct {
         self.count -= 1;
     }
 
-    /// Earliest linked deadline. Linked deadlines all fall inside the open
-    /// revolution `(cursor, cursor + SLOT_COUNT]` and one bucket holds one
-    /// deadline, so the minimum is the first non-empty bucket scanning
-    /// forward from `cursor + 1`: at most SLOT_COUNT head checks and no
+    /// Earliest linked deadline: the absolute minimum over the SLOT_COUNT
+    /// bucket heads. Heads carry each bucket's earliest deadline, and the
+    /// global minimum does not depend on where the cursor sits, so a min
+    /// recompute is exact after an idle wheel or a delayed timer turn
+    /// whose live deadlines straddle a bucket wrap. Head checks only, no
     /// node walk: O(buckets), never O(sessions).
     fn scanMin(self: *Wheel) i64 {
-        var i: usize = 1;
-        while (i <= SLOT_COUNT) : (i += 1) {
+        std.debug.assert(self.count > 0);
+        var min: i64 = std.math.maxInt(i64);
+        for (self.buckets) |head| {
             self.scan_bucket_probes += 1;
-            const b = bucketIndex(self.cursor + @as(i64, @intCast(i)));
-            if (self.buckets[b]) |head| return head.sm_expiry_deadline;
+            if (head) |entry| {
+                if (entry.sm_expiry_deadline < min) min = entry.sm_expiry_deadline;
+            }
         }
-        unreachable; // count > 0 guarantees a linked entry within the revolution
+        std.debug.assert(min != std.math.maxInt(i64));
+        return min;
     }
 };
-
 
 fn testSession(allocator: std.mem.Allocator, id: usize) !*Session {
     const session = try allocator.create(Session);
@@ -318,4 +336,152 @@ test "wheel: scanMin finds the earliest bucket without visiting nodes" {
     // The drain itself walked exactly the nine due nodes (502..510); the
     // scanMin recompute it triggers added no node visits on top.
     try std.testing.expectEqual(@as(usize, 9), wheel.scan_node_visits);
+}
+
+test "wheel: scan counters live on the wheel instance, not shared" {
+    // Each worker owns its wheel on its loop thread; module-global
+    // counters would be a cross-worker data race. The decl-level check
+    // fails if the counters ever move back to file scope.
+    const wheel_mod = @import("sm_wheel.zig");
+    try std.testing.expect(!@hasDecl(wheel_mod, "scan_bucket_probes"));
+    try std.testing.expect(!@hasDecl(wheel_mod, "scan_node_visits"));
+
+    const allocator = std.testing.allocator;
+    var wheel_a: Wheel = .{};
+    var wheel_b: Wheel = .{};
+    var sessions_a: [3]*Session = undefined;
+    var sessions_b: [2]*Session = undefined;
+    for (&sessions_a, 0..) |*s, i| s.* = try testSession(allocator, i + 1);
+    defer for (sessions_a) |s| freeSession(allocator, s);
+    for (&sessions_b, 0..) |*s, i| s.* = try testSession(allocator, i + 10);
+    defer for (sessions_b) |s| freeSession(allocator, s);
+
+    for (sessions_a, 0..) |s, i| wheel_a.insert(s, 100 + @as(i64, @intCast(i)));
+    for (sessions_b, 0..) |s, i| wheel_b.insert(s, 100 + @as(i64, @intCast(i)));
+
+    // A min-unlink rescan accounts to the scanning wheel only.
+    try std.testing.expect(wheel_a.unlink(sessions_a[0]));
+    try std.testing.expect(wheel_a.scan_bucket_probes > 0);
+    try std.testing.expectEqual(@as(usize, 0), wheel_b.scan_bucket_probes);
+    try std.testing.expect(wheel_b.unlink(sessions_b[0]));
+    try std.testing.expect(wheel_b.scan_bucket_probes > 0);
+}
+
+test "wheel: min removal before the first expiry is exact across a wrap" {
+    const allocator = std.testing.allocator;
+    var wheel: Wheel = .{};
+
+    // Cursor has never advanced (startup or a long idle): live deadlines
+    // sit far ahead of it and straddle the bucket wrap. A cyclic scan
+    // from cursor + 1 would meet the wrapped buckets first and arm the
+    // wrong expiry; the absolute minimum is exact.
+    const s1 = try testSession(allocator, 1);
+    defer freeSession(allocator, s1);
+    const s2 = try testSession(allocator, 2);
+    defer freeSession(allocator, s2);
+    const s3 = try testSession(allocator, 3);
+    defer freeSession(allocator, s3);
+
+    wheel.insert(s1, 5100); // bucket 492
+    wheel.insert(s2, 5110); // bucket 502
+    wheel.insert(s3, 5200); // bucket 80
+    try std.testing.expectEqual(@as(?i64, 5100), wheel.nextDeadline());
+
+    try std.testing.expect(wheel.unlink(s1));
+    try std.testing.expectEqual(@as(?i64, 5110), wheel.nextDeadline());
+
+    try std.testing.expect(wheel.unlink(s2));
+    try std.testing.expectEqual(@as(?i64, 5200), wheel.nextDeadline());
+}
+
+test "wheel: min removal after an idle period stays exact" {
+    const allocator = std.testing.allocator;
+    var wheel: Wheel = .{};
+
+    const Ctx = struct {};
+    const cb = struct {
+        fn run(_: *Ctx, _: *Session) void {}
+    }.run;
+    var ctx: Ctx = .{};
+
+    // An idle wheel still turns its timer on unrelated work and leaves
+    // the cursor far in the past of the next detach burst.
+    wheel.expireDue(5000, &ctx, cb);
+    try std.testing.expectEqual(@as(i64, 5000), wheel.cursor);
+    try std.testing.expectEqual(@as(?i64, null), wheel.nextDeadline());
+
+    const s1 = try testSession(allocator, 1);
+    defer freeSession(allocator, s1);
+    const s2 = try testSession(allocator, 2);
+    defer freeSession(allocator, s2);
+    const s3 = try testSession(allocator, 3);
+    defer freeSession(allocator, s3);
+
+    wheel.insert(s1, 5100); // bucket 492
+    wheel.insert(s2, 5200); // bucket 80
+    wheel.insert(s3, 5220); // bucket 100
+    try std.testing.expectEqual(@as(?i64, 5100), wheel.nextDeadline());
+
+    try std.testing.expect(wheel.unlink(s1));
+    try std.testing.expectEqual(@as(?i64, 5200), wheel.nextDeadline());
+
+    // All three are due by 6000; the clamped revolution still reaches
+    // every bucket and drains them.
+    var fired: usize = 0;
+    const Ctx2 = struct {
+        fired: *usize,
+    };
+    const cb2 = struct {
+        fn run(c: *Ctx2, _: *Session) void {
+            c.fired.* += 1;
+        }
+    }.run;
+    var ctx2: Ctx2 = .{ .fired = &fired };
+    wheel.expireDue(6000, &ctx2, cb2);
+    try std.testing.expectEqual(@as(usize, 2), fired);
+    try std.testing.expectEqual(@as(?i64, null), wheel.nextDeadline());
+}
+
+test "wheel: deadlines a revolution apart share a bucket and stay ordered" {
+    const allocator = std.testing.allocator;
+    var wheel: Wheel = .{};
+
+    // A delayed timer turn can legitimately hold deadlines SLOT_COUNT
+    // apart: the earlier one goes overdue before the later inserts. Same
+    // bucket, sorted list, earliest at the head.
+    const s1 = try testSession(allocator, 1);
+    defer freeSession(allocator, s1);
+    const s2 = try testSession(allocator, 2);
+    defer freeSession(allocator, s2);
+
+    wheel.cursor = 5000;
+    wheel.insert(s1, 5100); // bucket 492
+    wheel.insert(s2, 5100 + SLOT_COUNT); // same bucket, a revolution later
+    try std.testing.expectEqual(@as(usize, 2), wheel.count);
+    try std.testing.expectEqual(@as(?i64, 5100), wheel.nextDeadline());
+
+    const Ctx = struct {
+        fired: usize = 0,
+        last: ?*Session = null,
+    };
+    const cb = struct {
+        fn run(c: *Ctx, session: *Session) void {
+            c.fired += 1;
+            c.last = session;
+        }
+    }.run;
+    var ctx: Ctx = .{};
+
+    // Only the earlier deadline drains at its tick; the revolution-later
+    // entry in the same bucket stays linked.
+    wheel.expireDue(5100, &ctx, cb);
+    try std.testing.expectEqual(@as(usize, 1), ctx.fired);
+    try std.testing.expect(ctx.last == s1);
+    try std.testing.expect(!s1.sm_expiry_linked);
+    try std.testing.expect(s2.sm_expiry_linked);
+    try std.testing.expectEqual(@as(?i64, 5100 + SLOT_COUNT), wheel.nextDeadline());
+
+    wheel.expireDue(5100 + SLOT_COUNT, &ctx, cb);
+    try std.testing.expectEqual(@as(usize, 2), ctx.fired);
+    try std.testing.expectEqual(@as(?i64, null), wheel.nextDeadline());
 }
