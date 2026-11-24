@@ -296,16 +296,17 @@ pub fn handleSmResume(self: *Server, session: *Session, elem: xml.Element, chang
     session.auth_username_len = d_username_len;
     // Resource from the detached bound JID, not the bind accumulator:
     // bind_resource_len is reset to 0 after a successful bind dispatch
-    // (parser accumulator reuse), but bound_jid.resource keeps pointing at
-    // the buffer's still-intact contents.
+    // (parser accumulator reuse). setBoundJid copies the parts into the
+    // stream's own bound_jid_buf, so the detached session's buffers may die
+    // right after this.
     const d_resource_len = detached_jid.resource.len;
     @memcpy(session.bind_resource_buf[0..d_resource_len], detached_jid.resource);
     session.bind_resource_len = d_resource_len;
-    session.stream.bound_jid = .{
+    session.stream.setBoundJid(.{
         .local = session.auth_username_buf[0..d_username_len],
         .domain = self.server_host,
         .resource = session.bind_resource_buf[0..d_resource_len],
-    };
+    });
     session.stream.authenticated_jid = .{
         .local = session.auth_username_buf[0..d_username_len],
         .domain = self.server_host,
@@ -687,11 +688,11 @@ pub fn handleSmResumeReply(self: *Server, rep: actor_message.SmResumeReply, chan
     session.auth_username_len = bundle.username.len;
     @memcpy(session.bind_resource_buf[0..bundle.resource.len], bundle.resource);
     session.bind_resource_len = bundle.resource.len;
-    session.stream.bound_jid = .{
+    session.stream.setBoundJid(.{
         .local = session.auth_username_buf[0..session.auth_username_len],
         .domain = self.server_host,
         .resource = session.bind_resource_buf[0..session.bind_resource_len],
-    };
+    });
     session.stream.authenticated_jid = .{
         .local = session.auth_username_buf[0..session.auth_username_len],
         .domain = self.server_host,
@@ -916,12 +917,7 @@ pub fn gatherSessionRooms(self: *Server, worker_id: u16, session_id: usize, bund
 /// destroySession's session_closed broadcast removes the occupant by
 /// full JID everywhere — no ghost occupancy.
 pub fn replayOccupantMoves(self: *Server, session: *Session, room_jids: []const []const u8, token: Token, old_worker: u16) void {
-    const bound = session.stream.bound_jid orelse return;
-    var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const real_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
-        noteDrop("occupant moves for {s}@{s} not replayed: full JID exceeds {d} bytes", .{ bound.local, bound.domain, router.FULL_JID_MAX });
-        return;
-    };
+    const real_jid = session.stream.boundFull();
 
     for (room_jids) |room_jid| {
         const move = actor_message.RoomOccupantMove{
@@ -1394,7 +1390,7 @@ test "Server: S24 backwards and too-high resume h fail without replay" {
     defer posix.close(det_fds[1]);
     const detached = try std.testing.allocator.create(Session);
     detached.init(det_fds[0], 2, "localhost", false, std.testing.allocator);
-    detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    detached.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     detached.sm_detached = true;
     detached.sm_detach_time = std.time.timestamp();
     const det_queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
@@ -1569,7 +1565,7 @@ pub fn makeDetachedForResume(
 ) !*Session {
     const detached = try std.testing.allocator.create(Session);
     detached.init(fd, slot, "localhost", false, std.testing.allocator);
-    detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    detached.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     detached.sm_detached = true;
     detached.sm_detach_time = std.time.timestamp();
     detached.sm_resume_enabled = true;

@@ -1241,7 +1241,7 @@ test "dispatchStanza: domain-only mixed-case 'to' stays local" {
     session.stanza_to = "LOCALHOST";
     session.stanza_type = "chat";
     session.stanza_id = "m1";
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -1264,7 +1264,7 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     var session: Session = undefined;
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     session.iq_to = "localhost";
     // A reply longer than the outbound bound: the append refuses it even
     // with the outbox empty, so this is oversize, not a slow reader.
@@ -1347,7 +1347,7 @@ test "Server: an over-long sender bare JID still delivers live" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = .{ .local = &long_local, .domain = "localhost", .resource = "mobile" };
+    alice.stream.setBoundJid(.{ .local = &long_local, .domain = "localhost", .resource = "mobile" });
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1395,7 +1395,7 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
     bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.stream.state = .active;
     bob.stream.authenticated = true;
-    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    bob.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desk" });
     server.sessions[5] = bob;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desk");
     sm.setPresenceAvailable("bob", "localhost", "desk", true);
@@ -1413,7 +1413,7 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
     @memset(&local_buf, '&');
     var res_buf: [400]u8 = undefined;
     @memset(&res_buf, '&');
-    alice.stream.bound_jid = .{ .local = &local_buf, .domain = "localhost", .resource = &res_buf };
+    alice.stream.setBoundJid(.{ .local = &local_buf, .domain = "localhost", .resource = &res_buf });
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1472,7 +1472,7 @@ test "S14: failed cross-worker resource does not block local delivery" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1521,7 +1521,7 @@ test "S14: a cross-worker stanza larger than the old slot cap is delivered" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1598,7 +1598,7 @@ test "S14: a refused cross-worker stanza falls back to the offline store" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1647,7 +1647,7 @@ test "S14: a refused cross-worker stanza with no offline store bounces" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1696,7 +1696,7 @@ test "Server: G4 a near-limit online stanza is bounced when delivery cannot queu
     const alice = try allocator.create(Session);
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     server.sessions[9] = alice;
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+    alice.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "mobile" });
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1751,7 +1751,7 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     local.init(local_fds[0], 5, "localhost", false, allocator);
     local.stream.state = .active;
     local.stream.authenticated = true;
-    local.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desk") catch null;
+    local.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desk") catch null);
     server.sessions[5] = local;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desk");
     sm.setPresenceAvailable("bob", "localhost", "desk", true);
@@ -1762,7 +1762,7 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     remote.init(remote_fds[0], 6, "localhost", false, allocator);
     remote.stream.state = .active;
     remote.stream.authenticated = true;
-    remote.stream.bound_jid = xmpp.Jid.parse("bob@localhost/phone") catch null;
+    remote.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/phone") catch null);
     server.sessions[6] = remote;
     _ = try sm.bind(1, Token.init(6, 1, token_kinds.session), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
@@ -1772,7 +1772,7 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     // A JID that needs escaping, so the two forms would differ if either
     // serializer handled it differently.

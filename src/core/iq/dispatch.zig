@@ -893,15 +893,10 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
         return;
     };
 
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     // Build bare JID for roster lookup
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     // Get all roster items via the store's domain API
     const items = roster.getAllItems(server.allocator, bare_jid) catch {
@@ -1010,12 +1005,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     };
 
     // Build bare JID for roster lookup
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     // S4: the store key joins owner + contact into a bounded buffer; a
     // contact JID that cannot fit must be rejected at ingress instead of
@@ -1347,15 +1337,10 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
         return;
     };
 
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     // Build bare JID for archive lookup
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     // Parse max from text (default 50)
     const max: u32 = if (session.mam_max.len > 0)
@@ -1440,12 +1425,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
     if (owner != server.worker_id) {
         // Route to owning worker — they have the archive data
         log.info("routing MAM query for room {s} to owning worker {d} (from {d})", .{ room_jid, owner, server.worker_id });
-        const bound = session.stream.bound_jid orelse return;
-        var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-        const requester_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
-            noteJidOverflow("connection {d} bound full JID exceeds {d} bytes; MAM forward skipped", .{ session.conn.id, router.FULL_JID_MAX });
-            return;
-        };
+        const requester_jid = session.stream.boundFull();
 
         // T173: capture the requester's ABA generation here, where its session
         // is live — the reply's ds.deliver() validates it.
@@ -1598,7 +1578,7 @@ fn handleLastActivitySelfOrServer(server: *Server, session: *Session, iq_id: []c
 /// resource teardown; no record (or no store) is indistinguishable from a
 /// nonexistent account per the vCard anti-harvesting precedent.
 fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, to_jid: @import("xmpp").Jid) void {
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     if (!std.ascii.eqlIgnoreCase(to_jid.domain, server.server_host)) {
         sendIqError(server, session, iq_id, "service-unavailable");
@@ -1612,12 +1592,7 @@ fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, 
         return;
     };
 
-    var requester_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const requester_bare = router.buildBareJid(bound.local, bound.domain, &requester_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const requester_bare = session.stream.boundBare();
 
     const roster = server.roster orelse {
         sendIqError(server, session, iq_id, "item-not-found");
@@ -1660,15 +1635,9 @@ pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []
     try xml.escapeWrite(w, from);
     try w.writeByte('\'');
     // to = client's full JID
-    if (session.stream.bound_jid) |bound| {
+    if (session.stream.bound_jid != null) {
         try w.writeAll(" to='");
-        try xml.escapeWrite(w, bound.local);
-        try w.writeByte('@');
-        try xml.escapeWrite(w, bound.domain);
-        if (bound.resource.len > 0) {
-            try w.writeByte('/');
-            try xml.escapeWrite(w, bound.resource);
-        }
+        try xml.escapeWrite(w, session.stream.boundFull());
         try w.writeByte('\'');
     }
     if (iq_id.len > 0) {
@@ -1682,15 +1651,10 @@ pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []
 /// Uses multiple queueSend calls to avoid write_scratch overflow when
 /// the stored vCard XML is large (vcard_buf and write_scratch are both 4KB).
 fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     // Build bare JID
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
@@ -1798,7 +1762,7 @@ fn handleVcardGetFor(server: *Server, session: *Session, iq_id: []const u8, targ
 
 /// Handle vCard-temp SET — persist accumulated vCard XML from session.vcard_buf.
 fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
     if (session.vcard_overflow) {
         noteDrop("connection {d} vCard exceeds {d} bytes: not-acceptable", .{ session.conn.id, session.vcard_buf.len });
         sendIqErrorWithType(server, session, iq_id, "modify", "not-acceptable");
@@ -1806,12 +1770,7 @@ fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
     }
 
     // Build bare JID
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     const vcard_xml = session.vcard_buf[0..session.vcard_buf_len];
 
@@ -1846,15 +1805,10 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
         sendIqError(server, session, iq_id, "item-not-found");
         return;
     };
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     // Build bare JID
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     const node = session.iq_pep_node;
     if (node.len == 0) {
@@ -1948,7 +1902,7 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
     }
 
     // The target user is the IQ 'to' attribute, or self if not specified
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const iq_to = session.iq_to;
     const bare_jid = jid: {
@@ -1972,11 +1926,7 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
             };
         }
         // Query own PEP node
-        break :jid router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-            noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-            sendIqError(server, session, iq_id, "internal-server-error");
-            return;
-        };
+        break :jid session.stream.boundBare();
     };
 
     // Check if a specific item ID was requested
@@ -2061,15 +2011,9 @@ fn writePepIqHeader(w: anytype, from_bare: []const u8, session: *Session, iq_typ
     try w.writeAll(" from='");
     try xml.escapeWrite(w, from_bare);
     try w.writeByte('\'');
-    if (session.stream.bound_jid) |bound_val| {
+    if (session.stream.bound_jid != null) {
         try w.writeAll(" to='");
-        try xml.escapeWrite(w, bound_val.local);
-        try w.writeByte('@');
-        try xml.escapeWrite(w, bound_val.domain);
-        if (bound_val.resource.len > 0) {
-            try w.writeByte('/');
-            try xml.escapeWrite(w, bound_val.resource);
-        }
+        try xml.escapeWrite(w, session.stream.boundFull());
         try w.writeByte('\'');
     }
     if (iq_id.len > 0) {
@@ -2284,14 +2228,9 @@ fn handleBlocklistGet(server: *Server, session: *Session, iq_id: []const u8, cha
         sendIqError(server, session, iq_id, "item-not-found");
         return;
     };
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     const items = bs.getBlockList(server.allocator, bare_jid) catch {
         sendIqError(server, session, iq_id, "internal-server-error");
@@ -2332,12 +2271,7 @@ fn handleBlock(server: *Server, session: *Session, iq_id: []const u8, changes: *
     };
     const bound = session.stream.bound_jid orelse return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     const item_jid_raw = session.iq_roster_item_jid;
     if (item_jid_raw.len == 0) {
@@ -2390,12 +2324,7 @@ fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes:
     };
     const bound = session.stream.bound_jid orelse return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     var item_jid = session.iq_roster_item_jid;
     if (item_jid.len == 0) {
@@ -2784,7 +2713,7 @@ test "A62: roster get for a >256-byte owner bare JID" {
     const session = try allocator.create(Session);
     session.init(fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = session;
-    session.stream.bound_jid = .{ .local = owner_local, .domain = "localhost", .resource = "res" };
+    session.stream.setBoundJid(.{ .local = owner_local, .domain = "localhost", .resource = "res" });
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -2837,7 +2766,7 @@ test "F6: last-activity query for a mixed-case local domain is not remote" {
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     handleLastActivityFor(&server, session, "la2", .{ .local = "bob", .domain = "LOCALHOST" });
     _ = try session.conn.flushSend();
     var buf: [2048]u8 = undefined;
@@ -2873,7 +2802,7 @@ test "F6: roster set stores the contact under the configured local spelling" {
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     session.iq_roster_item_jid = "NaplesTB@LOCALHOST";
     session.iq_roster_item_count = 1;
 
@@ -2916,7 +2845,7 @@ test "F6: block and unblock use the configured local spelling for the store key"
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
 
     var scratch: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&scratch);
@@ -2960,7 +2889,7 @@ test "F6: MAM 'with' matches the folded archive contact key" {
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     session.mam_with = "NaplesTB@LOCALHOST";
 
     var scratch: [16]posix.Kevent = undefined;
@@ -3008,7 +2937,7 @@ test "F6: MUC MAM 'with' matches the folded archive contact key" {
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     session.mam_with = "NaplesTB@LOCALHOST";
 
     var scratch: [16]posix.Kevent = undefined;
@@ -3062,7 +2991,7 @@ test "F6: cross-worker MUC MAM forwards the prepared 'with'" {
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     session.mam_with = "NaplesTB@LOCALHOST";
     var scratch: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&scratch);
@@ -3085,12 +3014,13 @@ test "R5: an unaddressable IQ error reply is counted, never a truncated stanza" 
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
-    // A bound localpart wider than the 4 KiB scratch: the header cannot be
-    // written, so no reply can even be addressed. The drop must be counted
-    // (R5); a silently truncated stanza would leave bytes pending.
+    // A 'to' wider than the 4 KiB scratch: the header cannot be written,
+    // so no reply can even be addressed. The drop must be counted (R5); a
+    // silently truncated stanza would leave bytes pending.
     var big: [4096]u8 = undefined;
     @memset(&big, 'b');
-    session.stream.bound_jid = .{ .local = &big, .domain = "localhost", .resource = "res" };
+    session.iq_to = &big;
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "res" });
 
     const drops_before = router.jid_overflow_drops.load(.monotonic);
     sendIqErrorWithType(&server, session, "e1", "cancel", "internal-server-error");
@@ -3163,7 +3093,7 @@ test "R5: an unbuildable PEP self-notification is counted, never silent" {
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
 
     // A publisher JID wider than the 20 KiB bank: every per-resource
     // notification is unbuildable and the skip must be counted (R5).
@@ -3189,7 +3119,7 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     var session: Session = undefined;
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     session.iq_to = "localhost";
     // A reply longer than the outbound bound: the append refuses it even
     // with the outbox empty, so this is oversize, not a slow reader.
@@ -3345,7 +3275,7 @@ test "Server: every advertised pubsub feature is dispatched" {
     var session: Session = undefined;
     session.init(fds[0], 1, "localhost", false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
 
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -3443,7 +3373,7 @@ test "Server: pubsub set routes on the verb, not blindly to publish" {
     var session: Session = undefined;
     session.init(fds[0], 1, "localhost", false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
 
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);

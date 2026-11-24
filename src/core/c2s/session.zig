@@ -166,15 +166,9 @@ pub noinline fn answerOversizeIq(session: *Session, stanza: []const u8) void {
         w.writeAll("<iq type='error' from='") catch break :out null;
         xml.escapeWrite(w, if (session.iq_to.len > 0) session.iq_to else session.stream.server_host) catch break :out null;
         w.writeByte('\'') catch break :out null;
-        if (session.stream.bound_jid) |bound| {
+        if (session.stream.bound_jid != null) {
             w.writeAll(" to='") catch break :out null;
-            xml.escapeWrite(w, bound.local) catch break :out null;
-            w.writeByte('@') catch break :out null;
-            xml.escapeWrite(w, bound.domain) catch break :out null;
-            if (bound.resource.len > 0) {
-                w.writeByte('/') catch break :out null;
-                xml.escapeWrite(w, bound.resource) catch break :out null;
-            }
+            xml.escapeWrite(w, session.stream.boundFull()) catch break :out null;
             w.writeByte('\'') catch break :out null;
         }
         w.writeAll(" id='") catch break :out null;
@@ -2040,7 +2034,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
             writer.writeAll("/></failure>") catch return;
             if (session.nonza(fbs.getWritten()) == .failed_closed) return;
         },
-        .send_bind_result => |bound_jid| {
+        .send_bind_result => {
             writer.writeAll("<iq type='result'") catch return;
             if (session.bind_iq_id.len > 0) {
                 writer.writeAll(" id='") catch return;
@@ -2048,15 +2042,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
                 writer.writeByte('\'') catch return;
             }
             writer.writeAll("><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>") catch return;
-            if (bound_jid.local.len > 0) {
-                xml.escapeWrite(writer, bound_jid.local) catch return;
-                writer.writeByte('@') catch return;
-            }
-            xml.escapeWrite(writer, bound_jid.domain) catch return;
-            if (bound_jid.resource.len > 0) {
-                writer.writeByte('/') catch return;
-                xml.escapeWrite(writer, bound_jid.resource) catch return;
-            }
+            xml.escapeWrite(writer, session.stream.boundFull()) catch return;
             writer.writeAll("</jid></bind></iq>") catch return;
             if (session.stanza(fbs.getWritten()) == .failed_closed) return;
         },
@@ -2418,7 +2404,7 @@ test "H6: a broken stanza closes the stream before its close tag arrives" {
     session.stream.authenticated = true;
     session.stream.state = .active;
     session.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "mobile" });
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -2571,7 +2557,7 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
-    target.stream.bound_jid = xmpp.Jid.parse("naplestb@localhost/desk") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("naplestb@localhost/desk") catch null);
     // A bodiless message is typing-only under XEP-0352 and is skipped for
     // CSI-inactive sessions.
     target.csi_active = true;
@@ -2585,7 +2571,7 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     alice.stream.state = .active;
     alice.stream.authenticated = true;
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mob") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mob") catch null);
     server.sessions[9] = alice;
     // Stand in for the reader state at a self-closing top-level stanza's
     // element_start: depth was incremented and restored before the event.
@@ -2755,7 +2741,7 @@ test "F6: malformed local 'to' gets jid-malformed for message and iq" {
     server.sessions[1] = session;
     session.stream.state = .active;
     session.stream.authenticated = true;
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mob") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mob") catch null);
     session.reader.depth = 1;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -2821,7 +2807,7 @@ pub fn f6WireSetupBound(allocator: std.mem.Allocator, server: *Server, sm: *Sess
     target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
-    target.stream.bound_jid = .{ .local = bound_local, .domain = "localhost", .resource = "desk" };
+    target.stream.setBoundJid(.{ .local = bound_local, .domain = "localhost", .resource = "desk" });
     target.csi_active = true;
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), bound_local, "localhost", "desk");
@@ -2840,7 +2826,7 @@ pub fn f6WireSetupBound(allocator: std.mem.Allocator, server: *Server, sm: *Sess
     alice.stream.state = .active;
     alice.stream.authenticated = true;
     alice.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mob" };
+    alice.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "mob" });
     return .{ .target = target, .alice = alice };
 }
 
@@ -3801,7 +3787,7 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.sm_enabled = true;
     const queue = try allocator.create(sm_state.SmUnackedQueue);
     queue.* = sm_state.SmUnackedQueue.init(allocator);
@@ -3816,7 +3802,7 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -3887,7 +3873,7 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     var session: Session = undefined;
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     session.iq_to = "localhost";
     // A reply longer than the outbound bound: the append refuses it even
     // with the outbox empty, so this is oversize, not a slow reader.
@@ -4104,7 +4090,7 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     alice.stream.state = .active;
     alice.stream.authenticated = true;
     alice.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+    alice.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "mobile" });
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -4180,7 +4166,7 @@ test "Server: G4 an oversized vCard is rejected without replacing the stored val
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "mobile" });
 
     const prefix = "<iq type='set' id='v1'><vCard xmlns='vcard-temp'><FN>";
     const suffix = "</FN></vCard></iq>";
@@ -4285,7 +4271,7 @@ test "Server: S4 jid-malformed subscription escapes the stanza id" {
     const session = try allocator.create(Session);
     session.init(fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = session;
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     session.stream.authenticated_jid = session.stream.bound_jid;
 
     var to_buf: [600]u8 = undefined;

@@ -153,8 +153,17 @@ pub const Stream = struct {
     authenticated: bool = false,
     /// The authenticated user's JID (set after SASL)
     authenticated_jid: ?Jid = null,
-    /// The bound full JID (after resource binding)
+    /// The bound full JID (after resource binding). Write through
+    /// setBoundJid only: the cached strings below must stay in sync, and the
+    /// Jid's slices are repointed into bound_jid_buf there.
     bound_jid: ?Jid = null,
+    /// "local@domain/resource" formatted once at bind or SM resume; the bare
+    /// JID is the bound_bare_len prefix. RFC 7622 bounds the whole string.
+    bound_jid_buf: [jid_mod.max_jid_octets]u8 = undefined,
+    /// Length of the formatted full JID inside bound_jid_buf.
+    bound_full_len: u16 = 0,
+    /// Length of the bare "local@domain" prefix inside the full JID.
+    bound_bare_len: u16 = 0,
     /// Stream ID (generated per stream)
     stream_id: [16]u8 = undefined,
     /// Hex-encoded stream ID (persisted for pointer stability)
@@ -339,14 +348,62 @@ pub const Stream = struct {
         // Use requested resource or generate one
         const resource = if (requested_resource.len > 0) requested_resource else "default";
 
-        self.bound_jid = Jid{
+        self.setBoundJid(.{
             .local = auth_jid.local,
             .domain = auth_jid.domain,
             .resource = resource,
-        };
+        });
 
         self.state = .active;
         return .{ .send_bind_result = self.bound_jid.? };
+    }
+
+    /// Record the bound JID and format its string views once. The Jid's
+    /// part slices are repointed into bound_jid_buf, so slices borrowed
+    /// from a caller's parse or bind buffers stay valid here. Pass null to
+    /// unbind. Parts too large for the RFC 7622 limit are a caller bug:
+    /// bind and parse reject them before this point.
+    pub fn setBoundJid(self: *Stream, new_jid: ?Jid) void {
+        const bound = new_jid orelse {
+            self.bound_jid = null;
+            self.bound_full_len = 0;
+            self.bound_bare_len = 0;
+            return;
+        };
+        const needed = bound.local.len + bound.domain.len + bound.resource.len +
+            @intFromBool(bound.local.len > 0) + @intFromBool(bound.resource.len > 0);
+        std.debug.assert(needed <= self.bound_jid_buf.len);
+
+        var w: std.Io.Writer = .fixed(&self.bound_jid_buf);
+        w.writeAll(bound.local) catch unreachable;
+        const domain_off = w.buffered().len + @intFromBool(bound.local.len > 0);
+        if (bound.local.len > 0) w.writeByte('@') catch unreachable;
+        w.writeAll(bound.domain) catch unreachable;
+        const bare_len: u16 = @intCast(w.buffered().len);
+        if (bound.resource.len > 0) {
+            w.writeByte('/') catch unreachable;
+            w.writeAll(bound.resource) catch unreachable;
+        }
+        const s = w.buffered();
+        self.bound_bare_len = bare_len;
+        self.bound_full_len = @intCast(s.len);
+        self.bound_jid = .{
+            .local = s[0..bound.local.len],
+            .domain = s[domain_off..bare_len],
+            .resource = if (bound.resource.len > 0) s[bare_len + 1 ..] else "",
+        };
+    }
+
+    /// The bound "local@domain/resource" string. Asserts the stream is bound.
+    pub fn boundFull(self: *const Stream) []const u8 {
+        std.debug.assert(self.bound_jid != null);
+        return self.bound_jid_buf[0..self.bound_full_len];
+    }
+
+    /// The bound "local@domain" string: a prefix of boundFull. Asserts bound.
+    pub fn boundBare(self: *const Stream) []const u8 {
+        std.debug.assert(self.bound_jid != null);
+        return self.bound_jid_buf[0..self.bound_bare_len];
     }
 
     /// Check if the stream is fully established and can route stanzas.
@@ -444,6 +501,37 @@ pub fn writeStreamError(writer: anytype, err: StreamError, open_params: ?StreamO
 }
 
 // --- Tests ---
+
+test "Stream: setBoundJid caches the JID strings and owns their bytes" {
+    var stream = Stream.init("example.com", false);
+
+    var local: [5]u8 = "alice".*;
+    var domain: [9]u8 = "localhost".*;
+    var resource: [6]u8 = "mobile".*;
+    stream.setBoundJid(.{ .local = &local, .domain = &domain, .resource = &resource });
+
+    try std.testing.expectEqualStrings("alice@localhost", stream.boundBare());
+    try std.testing.expectEqualStrings("alice@localhost/mobile", stream.boundFull());
+    try std.testing.expectEqualStrings("alice", stream.bound_jid.?.local);
+    try std.testing.expectEqualStrings("localhost", stream.bound_jid.?.domain);
+    try std.testing.expectEqualStrings("mobile", stream.bound_jid.?.resource);
+
+    // The cached strings live in bound_jid_buf: scribbling the caller's
+    // source buffers must not change them.
+    @memset(&local, 'x');
+    @memset(&domain, 'x');
+    @memset(&resource, 'x');
+    try std.testing.expectEqualStrings("alice@localhost", stream.boundBare());
+    try std.testing.expectEqualStrings("alice@localhost/mobile", stream.boundFull());
+    try std.testing.expectEqualStrings("alice", stream.bound_jid.?.local);
+    try std.testing.expectEqualStrings("localhost", stream.bound_jid.?.domain);
+    try std.testing.expectEqualStrings("mobile", stream.bound_jid.?.resource);
+
+    stream.setBoundJid(null);
+    try std.testing.expect(stream.bound_jid == null);
+    try std.testing.expectEqual(@as(u16, 0), stream.bound_full_len);
+    try std.testing.expectEqual(@as(u16, 0), stream.bound_bare_len);
+}
 
 test "Stream: full lifecycle (STARTTLS path)" {
     var stream = Stream.init("example.com", false);

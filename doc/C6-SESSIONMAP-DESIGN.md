@@ -95,11 +95,11 @@ bare_map: std.HashMapUnmanaged(Key, EntryList, BareCtx, 80),
   the exact-JID index and the ownership index; `bare_map`'s `EntryList`
   holds `*SessionEntry` (entry ids), so the same account's resources are
   found from one bare key.
-- `setPresenceState(local, domain, resource, available, prio)` replaces
-  `setPresenceAvailable` + `setPriority`: one exclusive hold, one lookup,
-  one object mutated (T268's two locks and inner re-lookup are gone by
-  construction; presence stanzas update availability and priority in one
-  call).
+- `setPresenceState(local, domain, resource, available, prio)` covers the
+  common "set both" case in one exclusive hold, one lookup, one object
+  mutated (T268's two locks and inner re-lookup are gone by construction).
+  The granular `setPresenceAvailable` and `setPriority` setters are kept
+  for the call sites that change only one field.
 - T254 rollback is preserved: a `TooManyResources` append failure on a
   fresh bare entry removes the entry and frees its key; a `full_map.put`
   failure backs out the bare append. The OOM-path test still walks every
@@ -163,11 +163,30 @@ pub fn forEachAvailableBatch(self, jids, ctx, comptime visit) void
 ### Cached bound JID strings (ADR-4 item 5)
 
 - `Stream` gains `bound_jid_buf: [jid.max_jid_octets]u8` plus
-  `boundFull()`/`boundBare()` views; `handleBind` formats
-  "local@domain/resource" once, the bare JID being the prefix slice. Sites
-  that hand-build `local@domain`/`local@domain/resource` from
-  `stream.bound_jid` switch to the cached strings (~70 sites). Escaping at
-  the XML writer is unchanged.
+  `bound_full_len`/`bound_bare_len` and the `boundFull()`/`boundBare()`
+  views; `boundFull` is "local@domain/resource" and `boundBare` its bare
+  prefix. Both assert the stream is bound.
+- `setBoundJid(?Jid)` is the only writer of `bound_jid`. It formats the
+  strings into `bound_jid_buf` once and repoints the stored `Jid`'s part
+  slices into that buffer, so callers can pass JIDs borrowed from parse or
+  bind scratch that dies before the session does. `null` unbinds and clears
+  the cached lengths. A JID too large for the buffer is a caller bug:
+  `handleBind` and parse reject oversized parts before this point, so the
+  setter asserts rather than absorbing it.
+- Sites that hand-built `local@domain`/`local@domain/resource` from
+  `stream.bound_jid` switch to the cached strings: the IQ header writers
+  (`writeIqHeader`, `writePepIqHeader`, `writeSessionJid`, the bind result
+  and IQ error `to=`), the roster/vCard/PEP/blocklist/last-activity store
+  keys, the MUC owner/moderator/participant JIDs, the SM-replay occupant
+  moves, the cross-worker bounce, offline delivery and the presence
+  fan-outs. `bound_jid` stays pub-readable for part-wise access
+  (SM lookups, comparisons); only the setter writes it.
+- Behavior change worth noting: the deleted scratch buffers capped the
+  formatted bare JID at 512 bytes and the full JID at 1024; the bound cache
+  holds the RFC 7622 limits (bare 2047, full 3071), so over-512-byte bound
+  bares now flow where they used to be skipped. Downstream bounded buffers
+  still guard: store keys reject over 511 bytes, stanza and scratch buffers
+  fail the build and count the drop the same as before.
 
 ## Commit order
 

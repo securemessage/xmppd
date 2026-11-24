@@ -2832,7 +2832,7 @@ test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
     target.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
@@ -2846,7 +2846,7 @@ test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -2902,7 +2902,7 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
     _ = std.c.setsockopt(target_fds[1], std.c.SOL.SOCKET, std.c.SO.RCVBUF, &tiny, @sizeOf(c_int));
     const target = try allocator.create(Session);
     target.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
@@ -2927,7 +2927,7 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -2977,7 +2977,7 @@ test "Server: a non-archivable message stores offline with no archive" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     // type='normal' is not archivable, so the held copy is the only copy. It
@@ -3035,7 +3035,7 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
     target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
-    target.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    target.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desktop" });
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
@@ -3048,7 +3048,8 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
 
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    session_lifecycle.deliverOfflineMessages(&server, target, "bob", "localhost", &changes);
+    target.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, target, &changes);
 
     // The flag is gone, so a later live message is delivered, not parked.
     try std.testing.expect(!target.offline_pending);
@@ -3059,7 +3060,7 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -3104,7 +3105,7 @@ test "Re-review 6.8: an empty tail cancels the retry timer" {
     session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
-    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desk" });
     server.sessions[1] = session;
 
     // A stalled drain with its retry timer armed, and a tail that is now empty
@@ -3115,7 +3116,8 @@ test "Re-review 6.8: an empty tail cancels the retry timer" {
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, session, &changes);
 
     try std.testing.expect(!session.offline_pending);
     try std.testing.expect(!session.offline_retry_timer_armed);
@@ -3166,7 +3168,8 @@ test "Re-review 6.8: a successful retry delete clears the recorded sequence" {
 
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, session, &changes);
 
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
     try std.testing.expectEqual(@as(u64, 0), session.offline_last_sent_sequence);
@@ -3193,7 +3196,7 @@ test "Re-review 7.6: a form over the write buffer but inside the bank does not m
     bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.stream.state = .active;
     bob.stream.authenticated = true;
-    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    bob.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desk" });
     server.sessions[5] = bob;
     // Bound bob's outbox at the ring so the form below cannot queue.
     bob.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
@@ -3206,7 +3209,7 @@ test "Re-review 7.6: a form over the write buffer but inside the bank does not m
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
     alice.stream.state = .active;
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -3255,7 +3258,7 @@ test "Re-review 5.4: a stuck delete retry deletes without resending" {
     session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
-    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desk" });
     server.sessions[1] = session;
     server.free_count -= 1;
 
@@ -3271,7 +3274,8 @@ test "Re-review 5.4: a stuck delete retry deletes without resending" {
 
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, session, &changes);
 
     _ = session.conn.flushSend() catch {};
     var buf: [4096]u8 = undefined;
@@ -3311,7 +3315,7 @@ test "Re-review 6.2: a real delete failure records the sequence, the retry does 
     session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
-    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desk" });
     server.sessions[1] = session;
     server.free_count -= 1;
 
@@ -3327,7 +3331,8 @@ test "Re-review 6.2: a real delete failure records the sequence, the retry does 
 
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, session, &changes);
 
     _ = session.conn.flushSend() catch {};
     var buf: [4096]u8 = undefined;
@@ -3337,7 +3342,8 @@ test "Re-review 6.2: a real delete failure records the sequence, the retry does 
     try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("bob@localhost"));
 
     // The retry redoes the delete and must not put a second copy on the wire.
-    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, session, &changes);
 
     _ = session.conn.flushSend() catch {};
     const second = posix.read(fds[1], &buf) catch 0;
@@ -3383,7 +3389,7 @@ test "Server: H4 an inbound S2S message lands behind an existing offline tail" {
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
     target.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.offline_pending = true;
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -3405,7 +3411,8 @@ test "Server: H4 an inbound S2S message lands behind an existing offline tail" {
     try std.testing.expectEqualStrings("tail-0", ptrs[0].stanza_id);
     try std.testing.expectEqualStrings("live-1", ptrs[1].stanza_id);
 
-    session_lifecycle.deliverOfflineMessages(&server, target, "bob", "localhost", &changes);
+    target.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, target, &changes);
     _ = target.conn.flushSend() catch {};
     var wire = std.ArrayList(u8){};
     defer wire.deinit(allocator);
@@ -3459,7 +3466,7 @@ test "Server: H4 a type normal message lands behind an existing offline tail" {
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
     target.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.offline_pending = true;
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -3470,7 +3477,7 @@ test "Server: H4 a type normal message lands behind an existing offline tail" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "normal";
@@ -3490,7 +3497,8 @@ test "Server: H4 a type normal message lands behind an existing offline tail" {
     try std.testing.expectEqualStrings("tail-0", ptrs[0].stanza_id);
     try std.testing.expectEqualStrings("live-1", ptrs[1].stanza_id);
 
-    session_lifecycle.deliverOfflineMessages(&server, target, "bob", "localhost", &changes);
+    target.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, target, &changes);
     _ = target.conn.flushSend() catch {};
     var wire = std.ArrayList(u8){};
     defer wire.deinit(allocator);
@@ -3551,7 +3559,7 @@ test "Server: S13 offline store delivers without a committed archive row" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -3584,11 +3592,12 @@ test "Server: S13 offline store delivers without a committed archive row" {
     bob.stream.state = .active;
     bob.stream.authenticated = true;
     bob.stream.authenticated_jid = .{ .local = "bob", .domain = "localhost" };
-    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    bob.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desk" });
     server.sessions[7] = bob;
     server.free_count -= 1;
 
-    session_lifecycle.deliverOfflineMessages(&server, bob, "bob", "localhost", &changes);
+    bob.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, bob, &changes);
 
     _ = bob.conn.flushSend() catch {};
     var buf: [4096]u8 = undefined;
@@ -3639,7 +3648,7 @@ test "Server: E2d an oversized archive form is not stored offline" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -3796,7 +3805,7 @@ test "Re-review 6.4: a failed count arms a retry instead of parking the session"
     session.init(fds[0], 1, "localhost", false, allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
-    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desk" });
     server.sessions[1] = session;
     server.free_count -= 1;
 
@@ -3809,7 +3818,8 @@ test "Re-review 6.4: a failed count arms a retry instead of parking the session"
     session.offline_pending = true;
     session.offline_store_stalls = 0;
 
-    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, session, &changes);
 
     // The stall is recorded and a prompt retry is staged on the connection:
     // a bare EV_ENABLE re-arms the accept-time DISPATCH write knote.
@@ -3822,7 +3832,8 @@ test "Re-review 6.4: a failed count arms a retry instead of parking the session"
     try std.testing.expect(staged_write);
 
     // With the store recovered the next drain sends the row.
-    session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, session, &changes);
     _ = session.conn.flushSend() catch {};
     var buf: [4096]u8 = undefined;
     const n = posix.read(fds[1], &buf) catch 0;
@@ -3957,7 +3968,7 @@ test "Re-review 6.3: a local resume carries the recorded sequence" {
     detached.init(det_fds[0], 2, "localhost", false, allocator);
     @memcpy(detached.auth_username_buf[0..5], "alice");
     detached.auth_username_len = 5;
-    detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    detached.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     detached.sm_detached = true;
     detached.sm_detach_time = std.time.timestamp();
     detached.sm_resume_enabled = true;
@@ -4045,7 +4056,7 @@ test "Server: H3 a local resume carries the stalled offline tail" {
     detached.init(det_fds[0], 2, "localhost", false, allocator);
     @memcpy(detached.auth_username_buf[0..5], "alice");
     detached.auth_username_len = 5;
-    detached.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    detached.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     detached.sm_detached = true;
     detached.sm_detach_time = std.time.timestamp();
     detached.sm_resume_enabled = true;
@@ -4354,7 +4365,7 @@ test "Server: S13 writable handler resumes the stalled offline drain" {
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = "localhost" };
-    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "res" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "res" });
     server.sessions[1] = session;
     server.free_count -= 1;
     // server.deinit() tears down every live session slot.
@@ -5250,7 +5261,7 @@ test "Server: H8 an inline offline archive failure on the c2s path is counted" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "normal";

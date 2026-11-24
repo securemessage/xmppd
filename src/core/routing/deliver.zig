@@ -280,12 +280,8 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
                 // The stanza can neither be held nor sent without
                 // overtaking the draining tail. Tell the sender rather
                 // than dropping it (H2), as the c2s router does.
-                var recip_buf: [router.BARE_JID_MAX]u8 = undefined;
-                const recipient_bare = router.buildBareJid(bound.local, bound.domain, &recip_buf) catch "";
                 log.warn("cross-worker message to session {d} not held, bouncing to the sender", .{local_session_id});
-                if (recipient_bare.len > 0) {
-                    bounceCrossWorkerUnavailable(c.server, from_jid, recipient_bare, parts.msg_id, "message", c.changes);
-                }
+                bounceCrossWorkerUnavailable(c.server, from_jid, target_session.stream.boundBare(), parts.msg_id, "message", c.changes);
                 return;
             }
             // stanza() covers the T153 detached case itself: it tracks
@@ -657,7 +653,7 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
     session.stream.state = .features_bind;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = xmpp.Jid{ .local = "bob", .domain = "localhost" };
-    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desktop" });
     session.offline_pending = true;
     server.sessions[5] = session;
     try sm.bind(1, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -757,7 +753,7 @@ test "Server: S13 message held behind a draining offline tail" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -838,7 +834,7 @@ test "Re-review 6.8: the router holds a bare-JID message once per worker" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -935,7 +931,7 @@ test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
     target.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.offline_pending = true;
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -986,7 +982,7 @@ test "Server: G3 inbound S2S delivery parks behind a draining offline tail" {
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
     target.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.offline_pending = true;
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -1040,7 +1036,7 @@ test "Server: G3 type normal parks behind a draining offline tail" {
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
     target.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.offline_pending = true;
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -1051,7 +1047,7 @@ test "Server: G3 type normal parks behind a draining offline tail" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "normal";
@@ -1122,7 +1118,7 @@ test "Server: H4 a cross-worker message lands behind an existing offline tail" {
     defer posix.close(target_fds[1]);
     const target = try allocator.create(Session);
     target.init(target_fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.offline_pending = true;
     server.sessions[5] = target;
     try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -1143,7 +1139,8 @@ test "Server: H4 a cross-worker message lands behind an existing offline tail" {
     try std.testing.expectEqualStrings("live-1", ptrs[1].stanza_id);
 
     // The drain puts the tail on the wire first.
-    session_lifecycle.deliverOfflineMessages(&server, target, "bob", "localhost", &changes);
+    target.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    session_lifecycle.deliverOfflineMessages(&server, target, &changes);
     _ = target.conn.flushSend() catch {};
     var wire = std.ArrayList(u8){};
     defer wire.deinit(allocator);
@@ -1287,7 +1284,7 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
     server.sessions[9] = alice;
     _ = try sm.bind(0, server.sessionToken(9), "alice", "localhost", "mobile");
     const alice_bound = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
-    alice.stream.bound_jid = alice_bound;
+    alice.stream.setBoundJid(alice_bound);
 
     // bob (the recipient) lives here too, with a draining offline tail.
     const bob_fds = try makeSocketPair();
@@ -1295,7 +1292,7 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
     const bob = try allocator.create(Session);
     bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.offline_pending = true;
-    bob.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
+    bob.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch unreachable);
     server.sessions[5] = bob;
     try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
 
@@ -1348,7 +1345,7 @@ test "Server: H2 a cross-worker hold failure bounces across workers" {
     const bob = try allocator.create(Session);
     bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.offline_pending = true;
-    bob.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
+    bob.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch unreachable);
     server.sessions[5] = bob;
     try sm.bind(1, server.sessionToken(5), "bob", "localhost", "desktop");
 
@@ -1420,7 +1417,7 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     defer posix.close(fds[1]);
     const target = try allocator.create(Session);
     target.init(fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.sm_detached = true;
     target.sm_resume_enabled = true;
     target.sm_detach_time = std.time.timestamp();
@@ -1914,7 +1911,7 @@ test "Server: S13 hold at quota bounces instead of dropping silently" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1981,7 +1978,7 @@ test "N1: two draining resources hold a bare-JID message once" {
     defer posix.close(desktop_fds[1]);
     const desktop = try allocator.create(Session);
     desktop.init(desktop_fds[0], 5, "localhost", false, allocator);
-    desktop.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch unreachable;
+    desktop.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch unreachable);
     desktop.offline_pending = true;
     server.sessions[5] = desktop;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -1991,7 +1988,7 @@ test "N1: two draining resources hold a bare-JID message once" {
     defer posix.close(phone_fds[1]);
     const phone = try allocator.create(Session);
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
-    phone.stream.bound_jid = xmpp.Jid.parse("bob@localhost/phone") catch unreachable;
+    phone.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/phone") catch unreachable);
     phone.offline_pending = true;
     server.sessions[6] = phone;
     _ = try sm.bind(0, server.sessionToken(6), "bob", "localhost", "phone");
@@ -2002,7 +1999,7 @@ test "N1: two draining resources hold a bare-JID message once" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch unreachable);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -2022,7 +2019,8 @@ test "N1: two draining resources hold a bare-JID message once" {
     // the first to drain. The second finds the tail empty and sends nothing.
     var delivered_copies: usize = 0;
     for ([_]*Session{ desktop, phone }) |session| {
-        session_lifecycle.deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+        session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+        session_lifecycle.deliverOfflineMessages(&server, session, &changes);
         _ = session.conn.flushSend() catch {};
         var wire: [8192]u8 = undefined;
         const fd = if (session == desktop) desktop_fds[1] else phone_fds[1];
@@ -2064,7 +2062,7 @@ test "N1: two identical stanza-less messages to a draining bare JID are two rows
     defer posix.close(desktop_fds[1]);
     const desktop = try allocator.create(Session);
     desktop.init(desktop_fds[0], 5, "localhost", false, allocator);
-    desktop.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    desktop.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     desktop.offline_pending = true;
     server.sessions[5] = desktop;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
@@ -2075,7 +2073,7 @@ test "N1: two identical stanza-less messages to a draining bare JID are two rows
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch unreachable;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch unreachable);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "normal";
@@ -2136,7 +2134,7 @@ test "c2s: one routed message to two draining workers holds one row" {
     const desk = try allocator.create(Session);
     desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.offline_pending = true;
-    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    desk.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desktop" });
     w1.sessions[5] = desk;
     _ = try sm.bind(1, w1.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
@@ -2154,7 +2152,7 @@ test "c2s: one routed message to two draining workers holds one row" {
     const phone = try allocator.create(Session);
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.offline_pending = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     w0.sessions[6] = phone;
     _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
@@ -2164,7 +2162,7 @@ test "c2s: one routed message to two draining workers holds one row" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -2230,7 +2228,7 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     const desk = try allocator.create(Session);
     desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.offline_pending = true;
-    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    desk.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desktop" });
     w1.sessions[5] = desk;
     _ = try sm.bind(1, w1.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
@@ -2249,7 +2247,7 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     const phone = try allocator.create(Session);
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.offline_pending = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     w0.sessions[6] = phone;
     _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);

@@ -121,9 +121,7 @@ pub fn handleMucPresence(
 
     if (owner != server.worker_id and server.delivery_system != null) {
         // Route to owning worker via MPSC
-        const bound = session.stream.bound_jid orelse return;
-        var real_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-        const real_jid = buildFullJid(&real_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+        const real_jid = session.stream.boundFull();
         const join_token = server.sessionToken(session.conn.id);
 
         if (std.mem.eql(u8, type_str, "unavailable")) {
@@ -176,9 +174,7 @@ pub fn handleMucGroupchat(
 
     // One sender JID serves both the remote-owner route and the local
     // lookup; building it twice also doubled the stack buffer.
-    const bound = session.stream.bound_jid orelse return;
-    var sender_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const sender_jid = buildFullJid(&sender_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+    const sender_jid = session.stream.boundFull();
 
     if (owner != server.worker_id and server.delivery_system != null) {
         // Route to owning worker via MPSC
@@ -614,9 +610,7 @@ pub fn handleRoomDiscoInfo(
     const owner = room_registry.roomOwner(room_jid, muc_actor.getWorkerCount(server));
 
     if (owner != server.worker_id and server.delivery_system != null) {
-        var reply_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-        const bound = session.stream.bound_jid orelse return;
-        const reply_jid = buildFullJid(&reply_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+        const reply_jid = session.stream.boundFull();
         // T173: capture the requester's ABA generation here, where its session
         // is live — the reply's ds.deliver() validates it.
         const reply_token = server.sessionToken(session.conn.id);
@@ -717,9 +711,7 @@ pub fn handleMucAdminIq(
     const owner = room_registry.roomOwner(room_jid, muc_actor.getWorkerCount(server));
     if (owner != server.worker_id) {
         // Route to owning worker
-        const req_bound = session.stream.bound_jid orelse return;
-        var req_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-        const req_jid = buildFullJid(&req_jid_buf, req_bound.local, req_bound.domain, req_bound.resource) orelse return;
+        const req_jid = session.stream.boundFull();
 
         const target_nick = session.iq_roster_item_jid;
         const new_role_str = session.iq_roster_item_sub;
@@ -747,9 +739,7 @@ pub fn handleMucAdminIq(
     };
 
     // Verify requester is moderator+ (for kick) or admin+ (for ban)
-    const req_bound = session.stream.bound_jid orelse return;
-    var req_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const req_jid = buildFullJid(&req_jid_buf, req_bound.local, req_bound.domain, req_bound.resource) orelse return;
+    const req_jid = session.stream.boundFull();
     const requester_idx = room.findByRealJid(req_jid) orelse {
         sendIqErrorFromRoom(server, session, room_jid, iq_id, "not-allowed", changes);
         return;
@@ -904,9 +894,8 @@ pub fn handleMucOwnerGet(
     };
 
     // Verify requester is owner
-    const bound = session.stream.bound_jid orelse return;
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = buildBareJid(&bare_buf, bound.local, bound.domain) orelse return;
+    if (session.stream.bound_jid == null) return;
+    const bare_jid = session.stream.boundBare();
     // F6: the affiliation store key uses the configured spelling; the bound
     // JID itself stays as-typed.
     var member_key_buf: [256]u8 = undefined;
@@ -988,9 +977,8 @@ pub fn handleMucOwnerSet(
     };
 
     // Verify requester is owner
-    const bound = session.stream.bound_jid orelse return;
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = buildBareJid(&bare_buf, bound.local, bound.domain) orelse return;
+    if (session.stream.bound_jid == null) return;
+    const bare_jid = session.stream.boundBare();
     // F6: the affiliation store key uses the configured spelling; the bound
     // JID itself stays as-typed.
     var member_key_buf: [256]u8 = undefined;
@@ -1167,11 +1155,8 @@ fn handleJoin(
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     // Get sender's full and bare JID
-    const bound = session.stream.bound_jid orelse return;
-    var real_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-    var bare_jid_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const real_jid = buildFullJid(&real_jid_buf, bound.local, bound.domain, bound.resource) orelse return;
-    const bare_jid = buildBareJid(&bare_jid_buf, bound.local, bound.domain) orelse return;
+    const real_jid = session.stream.boundFull();
+    const bare_jid = session.stream.boundBare();
 
     // Find or create room
     var room = reg.findByJid(room_jid);
@@ -1332,9 +1317,7 @@ fn handlePart(
     const room_jid = buildRoomJid(&room_jid_buf, room_local, muc_host) orelse return;
 
     const room = reg.findByJid(room_jid) orelse return;
-    const part_bound = session.stream.bound_jid orelse return;
-    var part_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const part_jid = buildFullJid(&part_jid_buf, part_bound.local, part_bound.domain, part_bound.resource) orelse return;
+    const part_jid = session.stream.boundFull();
     const removed = room.removeByRealJid(part_jid) orelse return;
 
     log.info("{s} left {s}", .{ removed.getRealJid(), room_jid });
@@ -1793,9 +1776,8 @@ fn notifyReplacedResource(server: *Server, r: *const Room, before: *const Occupa
         return;
     }
     const target = server.sessionForEventToken(before.token) orelse return;
-    const bound = target.stream.bound_jid orelse return;
-    var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const target_jid = buildFullJid(&jid_buf, bound.local, bound.domain, bound.resource) orelse return;
+    if (target.stream.bound_jid == null) return;
+    const target_jid = target.stream.boundFull();
     if (!std.mem.eql(u8, target_jid, before.getRealJid())) return;
     fanout.deliverToSession(target, stanza, before.token.index);
 }
@@ -2831,63 +2813,21 @@ fn buildRoomJid(buf: []u8, local: []const u8, host: []const u8) ?[]const u8 {
     return fbs.getWritten();
 }
 
-fn buildFullJid(buf: []u8, local: []const u8, domain: []const u8, resource: []const u8) ?[]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
-    const ok = built: {
-        w.writeAll(local) catch break :built false;
-        w.writeByte('@') catch break :built false;
-        w.writeAll(domain) catch break :built false;
-        if (resource.len > 0) {
-            w.writeByte('/') catch break :built false;
-            w.writeAll(resource) catch break :built false;
-        }
-        break :built true;
-    };
-    if (!ok) {
-        noteJidOverflow("full JID '{s}@{s}/{s}' exceeds {d} bytes; dropped", .{ local, domain, resource, buf.len });
-        return null;
-    }
-    return fbs.getWritten();
-}
-
-fn buildBareJid(buf: []u8, local: []const u8, domain: []const u8) ?[]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
-    const ok = built: {
-        w.writeAll(local) catch break :built false;
-        w.writeByte('@') catch break :built false;
-        w.writeAll(domain) catch break :built false;
-        break :built true;
-    };
-    if (!ok) {
-        noteJidOverflow("bare JID '{s}@{s}' exceeds {d} bytes; dropped", .{ local, domain, buf.len });
-        return null;
-    }
-    return fbs.getWritten();
-}
-
 /// F6: the affiliation store key must use the configured spelling while the
 /// bound/occupant identity stays as-typed. Prepare the member bare JID for
 /// the store lookup only; remote-domain members pass through unchanged.
 /// A member JID this late cannot practically fail preparation; on error the
 /// raw form is used so the lookup degenerates to a miss, not a wrong key.
-/// The input comes from buildBareJid's 256 B buffer and is already the
-/// prepared bound identity, so re-preparing is idempotent and cannot grow;
-/// 256 B is enough.
+/// The input is the bound bare string, already the prepared bound identity,
+/// so re-preparing is idempotent and cannot grow; 256 B is enough for any
+/// JID that fit the bound buffer.
 fn preparedMemberBare(server: *Server, bare_jid: []const u8, buf: *[256]u8) []const u8 {
     return xmpp.prepareLocalDomainJid(bare_jid, server.server_host, buf) catch bare_jid;
 }
 
 fn writeSessionJid(w: anytype, session: *const Session) !void {
-    const bound = session.stream.bound_jid orelse return;
-    try xml.escapeWrite(w, bound.local);
-    try w.writeByte('@');
-    try xml.escapeWrite(w, bound.domain);
-    if (bound.resource.len > 0) {
-        try w.writeByte('/');
-        try xml.escapeWrite(w, bound.resource);
-    }
+    if (session.stream.bound_jid == null) return;
+    try xml.escapeWrite(w, session.stream.boundFull());
 }
 
 fn writeOccupantRealJid(w: anytype, occ: *const Occupant) !void {
@@ -3361,7 +3301,7 @@ test "S1: room secret with XML specials is accepted on join" {
     defer posix.close(fds[1]);
     const alice = try allocator.create(Session);
     alice.init(fds[0], 0, server.server_host, false, allocator);
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    alice.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "desk" });
     server.sessions[0] = alice; // owned by server.deinit from here on
 
     var scratch: [16]posix.Kevent = undefined;
@@ -3399,7 +3339,7 @@ test "S1: a wrong room secret of the same decoded length is still refused" {
     defer posix.close(fds[1]);
     const bob = try allocator.create(Session);
     bob.init(fds[0], 1, server.server_host, false, allocator);
-    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    bob.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desk" });
     server.sessions[1] = bob;
 
     var scratch: [16]posix.Kevent = undefined;
@@ -3457,7 +3397,7 @@ test "S1: room config form values are stored decoded, escaped once on output" {
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
     session.init(fds[0], 0, server.server_host, false, allocator);
-    session.stream.bound_jid = .{ .local = "owner", .domain = "localhost", .resource = "desk" };
+    session.stream.setBoundJid(.{ .local = "owner", .domain = "localhost", .resource = "desk" });
     server.sessions[0] = session; // owned by server.deinit from here on
     _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", st(0, 1), 0, .moderator, .owner);
 
@@ -3531,7 +3471,7 @@ test "G1: an overflowing room secret rejects the whole config form" {
     defer posix.close(fds[1]);
     const session = try allocator.create(Session);
     session.init(fds[0], 0, server.server_host, false, allocator);
-    session.stream.bound_jid = .{ .local = "owner", .domain = "localhost", .resource = "desk" };
+    session.stream.setBoundJid(.{ .local = "owner", .domain = "localhost", .resource = "desk" });
     server.sessions[0] = session;
     _ = try room.addOccupant("owner", "owner@localhost/desk", "owner@localhost", st(0, 1), 0, .moderator, .owner);
 
@@ -3576,7 +3516,7 @@ test "G1: a protected room with no stored secret refuses the join" {
     defer posix.close(fds[1]);
     const bob = try allocator.create(Session);
     bob.init(fds[0], 0, server.server_host, false, allocator);
-    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    bob.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desk" });
     server.sessions[0] = bob;
 
     // A MUC join with no password element.
@@ -3974,7 +3914,7 @@ test "S16: local replaced-resource notice overflow fails the session" {
     defer posix.close(fds[1]);
     const target = try allocator.create(Session);
     target.init(fds[0], 0, server.server_host, false, allocator);
-    target.stream.bound_jid = .{ .local = "eve", .domain = "localhost", .resource = "phone" };
+    target.stream.setBoundJid(.{ .local = "eve", .domain = "localhost", .resource = "phone" });
     server.sessions[0] = target;
 
     try std.testing.expect(target.conn.ensureWriteBuf());
@@ -4014,7 +3954,7 @@ test "S16: a maximum-length escape-heavy replaced-resource notice is built in a 
     target.init(fds[0], 0, server.server_host, false, allocator);
     // The local check compares raw (unescaped) bytes, so the bound parts
     // must concatenate to the same 1024-byte real JID: 511+1+500+1+11.
-    target.stream.bound_jid = .{ .local = "'" ** 511, .domain = "'" ** 500, .resource = "'" ** 11 };
+    target.stream.setBoundJid(.{ .local = "'" ** 511, .domain = "'" ** 500, .resource = "'" ** 11 });
     server.sessions[0] = target;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -4102,7 +4042,7 @@ test "H5: the first fan-out after a genuine buffer-full loss still reaches the r
         session.init(pair[0], idx, server.server_host, false, allocator);
         session.stream.state = .active;
         session.stream.authenticated = true;
-        session.stream.bound_jid = .{ .local = name, .domain = "localhost", .resource = "desk" };
+        session.stream.setBoundJid(.{ .local = name, .domain = "localhost", .resource = "desk" });
         server.sessions[idx] = session;
         var jid_buf: [128]u8 = undefined;
         const real_jid = try std.fmt.bufPrint(&jid_buf, "{s}@localhost/desk", .{name});
@@ -4177,7 +4117,7 @@ test "H5: the first fan-out after a rejected oversized groupchat reaches every o
         session.init(pair[0], idx, server.server_host, false, allocator);
         session.stream.state = .active;
         session.stream.authenticated = true;
-        session.stream.bound_jid = .{ .local = name, .domain = "localhost", .resource = res };
+        session.stream.setBoundJid(.{ .local = name, .domain = "localhost", .resource = res });
         server.sessions[idx] = session;
         var jid_buf: [256]u8 = undefined;
         const real_jid = try std.fmt.bufPrint(&jid_buf, "{s}@localhost/{s}", .{ name, res });
@@ -4233,7 +4173,7 @@ test "H5: an oversized groupchat body is rejected with a bounce, not a room tear
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
     alice.init(alice_fds[0], 0, server.server_host, false, allocator);
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    alice.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "desk" });
     alice.stream.state = .active;
     alice.stream.authenticated = true;
     server.sessions[0] = alice;
@@ -4243,7 +4183,7 @@ test "H5: an oversized groupchat body is rejected with a bounce, not a room tear
     defer posix.close(bob_fds[1]);
     const bob = try allocator.create(Session);
     bob.init(bob_fds[0], 1, server.server_host, false, allocator);
-    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    bob.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     bob.stream.state = .active;
     bob.stream.authenticated = true;
     server.sessions[1] = bob;
@@ -4314,7 +4254,7 @@ test "S32: id-less groupchat messages archive under minted stanza ids" {
     defer posix.close(fds[1]);
     const alice = try allocator.create(Session);
     alice.init(fds[0], 0, server.server_host, false, allocator);
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    alice.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "desk" });
     alice.stream.state = .active;
     alice.stream.authenticated = true;
     server.sessions[0] = alice;
@@ -4367,7 +4307,7 @@ test "H5: ingress sizing accounts for an occupant JID that escapes wider" {
     defer posix.close(alice_fds[1]);
     const alice = try allocator.create(Session);
     alice.init(alice_fds[0], 0, server.server_host, false, allocator);
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "desk" };
+    alice.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "desk" });
     alice.stream.state = .active;
     alice.stream.authenticated = true;
     server.sessions[0] = alice;
@@ -4591,7 +4531,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     defer posix.close(fds[1]);
     const owner = try allocator.create(Session);
     owner.init(fds[0], 0, server.server_host, false, allocator);
-    owner.stream.bound_jid = .{ .local = "NaplesTB", .domain = "localhost", .resource = "desk" };
+    owner.stream.setBoundJid(.{ .local = "NaplesTB", .domain = "localhost", .resource = "desk" });
     server.sessions[0] = owner;
 
     const form = "<query xmlns='http://jabber.org/protocol/muc#owner'>" ++
@@ -4622,7 +4562,7 @@ test "F6: MUC affiliation store keys use the folded local spelling" {
     defer posix.close(cfds[1]);
     const carol = try allocator.create(Session);
     carol.init(cfds[0], 1, server.server_host, false, allocator);
-    carol.stream.bound_jid = .{ .local = "CarolX", .domain = "localhost", .resource = "wind" };
+    carol.stream.setBoundJid(.{ .local = "CarolX", .domain = "localhost", .resource = "wind" });
     server.sessions[1] = carol;
     const join = "<x xmlns='http://jabber.org/protocol/muc'/>";
     @memcpy(carol.stanza_buf[0..join.len], join);
@@ -4659,7 +4599,7 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     var session: Session = undefined;
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     session.iq_to = "conference.localhost";
     // A reply longer than the outbound bound: the append refuses it even
     // with the outbox empty, so this is oversize, not a slow reader.

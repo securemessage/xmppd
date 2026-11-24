@@ -230,12 +230,8 @@ pub fn dispatchSubscription(server: *Server, session: *Session, ptype: xmpp.Pres
     // An over-long target would overflow the bounded roster key and fail
     // silently downstream (S4): reject it at ingress.
     if (to_str.len > 0) {
-        const bound = session.stream.bound_jid orelse return;
-        var ob_buf: [router.BARE_JID_MAX]u8 = undefined;
-        const owner_jid = router.buildBareJid(bound.local, bound.domain, &ob_buf) catch {
-            noteJidOverflow("subscription owner JID '{s}@{s}' exceeds {d} bytes; stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-            return;
-        };
+        if (session.stream.bound_jid == null) return;
+        const owner_jid = session.stream.boundBare();
         if (!store_keys.fits2(owner_jid, session.stanza_to)) {
             rejectOversizeSubscriptionTo(session, session.stanza_to, changes);
             return;
@@ -290,13 +286,8 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
             // If this ver hash is not in the cache, send a disco#info query
             // to the client to discover its features (XEP-0115 §5.3).
             if (server.caps_cache.lookup(ver) == null) {
-                if (caps_mod.extractNodeFromPresence(inner_xml)) |node| caps_query: {
-                    // Build the full JID for the query target
-                    var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-                    const full_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
-                        noteJidOverflow("connection {d} bound full JID exceeds {d} bytes; caps query skipped", .{ session.conn.id, router.FULL_JID_MAX });
-                        break :caps_query;
-                    };
+                if (caps_mod.extractNodeFromPresence(inner_xml)) |node| {
+                    const full_jid = session.stream.boundFull();
 
                     var query_buf: [1024]u8 = undefined;
                     if (caps_mod.buildCapsQuery(&query_buf, server.server_host, full_jid, node, ver, @intCast(session.conn.id))) |query_xml| {
@@ -306,53 +297,44 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
             }
         }
 
-        broadcastPresence(server, bound.local, bound.domain, bound.resource, inner_xml, changes);
+        broadcastPresence(server, session, inner_xml, changes);
 
         // RFC 6121 §4.4.2: Send presence to all of the user's own available resources.
-        broadcastToOwnResources(server, session, bound.local, bound.domain, bound.resource, changes);
+        broadcastToOwnResources(server, session, changes);
 
         // RFC 6121 §4.4.2: Send the user's other available resources' presence to this new resource.
-        sendOtherResourcesPresence(server, session, bound.local, bound.domain, bound.resource, changes);
+        sendOtherResourcesPresence(server, session, changes);
 
         // Send presence probes to contacts we're subscribed to
-        sendPresenceProbes(server, session, bound.local, bound.domain, changes);
+        sendPresenceProbes(server, session, changes);
 
         // Deliver any offline messages queued for this user
-        session_lifecycle.deliverOfflineMessages(server, session, bound.local, bound.domain, changes);
+        session_lifecycle.deliverOfflineMessages(server, session, changes);
 
         // RFC 6121 §3.1.3 rule 4: Deliver pending subscription requests
-        deliverPendingSubscriptions(server, session, bound.local, bound.domain, changes);
+        deliverPendingSubscriptions(server, session, changes);
 
         logAvailable(session.conn.id, bound.local, bound.domain, bound.resource, prio);
     } else if (std.mem.eql(u8, type_str, "unavailable")) {
         if (server.session_map) |sm| {
             sm.setPresenceState(bound.local, bound.domain, bound.resource, false, -128);
         }
-        broadcastUnavailable(server, bound.local, bound.domain, bound.resource, changes);
+        broadcastUnavailable(server, session, changes);
 
         // RFC 6121 §4.4.2: Send unavailable presence to user's own remaining resources.
-        broadcastToOwnResources(server, session, bound.local, bound.domain, bound.resource, changes);
+        broadcastToOwnResources(server, session, changes);
     }
 }
 
 /// Broadcast available presence to all roster subscribers.
 /// inner_xml contains child elements (priority, show, status) serialized from the client stanza.
-pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8, resource: []const u8, inner_xml: []const u8, changes: *ChangeList) void {
+pub fn broadcastPresence(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
     const roster = server.roster orelse return;
+    _ = session.stream.bound_jid orelse return;
 
-    // Build the from JID string
-    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const from_str = router.buildFullJid(local, domain, resource, &from_buf) catch {
-        noteJidOverflow("presence from '{s}@{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, resource, router.FULL_JID_MAX });
-        return;
-    };
-
-    // Build bare JID for roster lookup
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        noteJidOverflow("presence bare JID '{s}@{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, router.BARE_JID_MAX });
-        return;
-    };
+    // The bound strings were formatted once at bind; no per-call build.
+    const from_str = session.stream.boundFull();
+    const bare_jid = session.stream.boundBare();
 
     // Find subscribers (contacts with "from" or "both" in our roster) — cached (T129)
     //
@@ -406,20 +388,12 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
 }
 
 /// Broadcast unavailable presence to roster subscribers.
-pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const u8, resource: []const u8, changes: *ChangeList) void {
+pub fn broadcastUnavailable(server: *Server, session: *Session, changes: *ChangeList) void {
     const roster = server.roster orelse return;
+    const bound = session.stream.bound_jid orelse return;
 
-    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const from_str = router.buildFullJid(local, domain, resource, &from_buf) catch {
-        noteJidOverflow("unavailable from '{s}@{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, resource, router.FULL_JID_MAX });
-        return;
-    };
-
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        noteJidOverflow("unavailable bare JID '{s}@{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, router.BARE_JID_MAX });
-        return;
-    };
+    const from_str = session.stream.boundFull();
+    const bare_jid = session.stream.boundBare();
 
     // Subscriber JID pointers index into this buffer and stay live through
     // delivery, so it is leased rather than taken on the stack (S18). The
@@ -455,21 +429,18 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
 
     deliverPresenceToSubscribers(server, subscriber_jids, bare_jid, presence_xml, changes);
 
-    logUnavailable(local, domain, resource);
+    logUnavailable(bound.local, bound.domain, bound.resource);
 }
 
 /// Send presence probes to contacts we're subscribed to (to get their current status).
 /// For each available contact resource, sends a per-resource full-JID presence.
 /// Cross-thread contacts receive delivery via MPSC queue.
-pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
+pub fn sendPresenceProbes(server: *Server, session: *Session, changes: *ChangeList) void {
     const roster = server.roster orelse return;
     const sm = server.session_map orelse return;
+    if (session.stream.bound_jid == null) return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        noteJidOverflow("probe source '{s}@{s}' exceeds {d} bytes; probes skipped", .{ local, domain, router.BARE_JID_MAX });
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     // Get contacts whose presence we should receive (to/both) — cached (T129)
     // Contact JID pointers index into this buffer and stay live across the
@@ -490,13 +461,8 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
     };
     const contact_jids = probe_jid_ptrs[0..probe_count];
 
-    // Build our full JID as the 'to' attribute for cross-thread deliveries
-    const bound = session.stream.bound_jid orelse return;
-    var to_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const to_str = router.buildFullJid(bound.local, bound.domain, bound.resource, &to_buf) catch {
-        noteJidOverflow("bound full JID '{s}@{s}/{s}' exceeds {d} bytes; probes skipped", .{ bound.local, bound.domain, bound.resource, router.FULL_JID_MAX });
-        return;
-    };
+    // Our full JID is the 'to' attribute for cross-thread deliveries.
+    const to_str = session.stream.boundFull();
 
     // For each subscribed contact, check if local or remote. T130: local
     // contacts resolve in chunks, one shared-lock hold per JID's shard.
@@ -640,12 +606,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
-    // Build owner bare JID
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-        return;
-    };
+    const owner_bare = session.stream.boundBare();
 
     // Update owner's roster: set ask='subscribe' (preserve existing name/subscription)
     var result_sub: Subscription = .none;
@@ -724,12 +685,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
-    // Build owner bare JID
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-        return;
-    };
+    const owner_bare = session.stream.boundBare();
 
     // Update our roster: contact's subscription gains "from" direction
     var owner_new_sub: Subscription = .from;
@@ -815,7 +771,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     if (sd_sm.findByFullJid(bound.local, bound.domain, bound.resource)) |ent| {
         if (ent.presence_available) {
             const own_inner = session.last_presence_inner[0..session.last_presence_inner_len];
-            broadcastPresence(server, bound.local, bound.domain, bound.resource, own_inner, changes);
+            broadcastPresence(server, session, own_inner, changes);
         }
     }
 
@@ -877,11 +833,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
     const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-        return;
-    };
+    const owner_bare = session.stream.boundBare();
 
     // Update our roster: remove "to" direction
     var owner_new_sub: Subscription = .none;
@@ -963,11 +915,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-        return;
-    };
+    const owner_bare = session.stream.boundBare();
 
     // Update our roster: remove "from" direction
     var owner_new_sub: Subscription = .none;
@@ -1137,15 +1085,12 @@ fn storePendingSubscription(server: *Server, contact_bare: []const u8, sub_pres_
 
 /// Deliver any pending subscription requests to a user who just became available.
 /// Called from dispatchPresence on initial available presence.
-pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
+pub fn deliverPendingSubscriptions(server: *Server, session: *Session, changes: *ChangeList) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const roster = server.roster orelse return;
+    if (session.stream.bound_jid == null) return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        noteDrop("deliverPendingSubscriptions: bare JID too long for {s}@{s}", .{ local, domain });
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     // Prefix scan: all keys starting with "contact_bare\x00"
     var prefix_buf: [store_keys.MAX_KEY_LEN]u8 = undefined;
@@ -1182,20 +1127,13 @@ pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []
 fn broadcastToOwnResources(
     server: *Server,
     sender_session: *Session,
-    local: []const u8,
-    domain: []const u8,
-    resource: []const u8,
     changes: *ChangeList,
 ) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
+    const bound = sender_session.stream.bound_jid orelse return;
 
-    // Build the from full JID
-    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const from_str = router.buildFullJid(local, domain, resource, &from_buf) catch {
-        noteJidOverflow("own-resources presence from '{s}@{s}/{s}' exceeds {d} bytes; skipped", .{ local, domain, resource, router.FULL_JID_MAX });
-        return;
-    };
+    const from_str = sender_session.stream.boundFull();
 
     // Build presence stanza including inner XML (priority, show, status, etc.)
     // Stays live across the delivery loop below, so it is leased (S18).
@@ -1246,7 +1184,7 @@ fn broadcastToOwnResources(
         }
     };
     var own_ctx = OwnCtx{ .server = server, .presence_xml = presence_xml };
-    sm.forEach(local, domain, &own_ctx, OwnCtx.visit);
+    sm.forEach(bound.local, bound.domain, &own_ctx, OwnCtx.visit);
 }
 
 /// RFC 6121 §4.4.2 (reverse direction): When a new resource becomes available,
@@ -1255,18 +1193,15 @@ fn broadcastToOwnResources(
 fn sendOtherResourcesPresence(
     server: *Server,
     new_session: *Session,
-    local: []const u8,
-    domain: []const u8,
-    new_resource: []const u8,
     changes: *ChangeList,
 ) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
+    const bound = new_session.stream.bound_jid orelse return;
 
     const OtherCtx = struct {
         new_session: *Session,
-        local: []const u8,
-        domain: []const u8,
+        bare: []const u8,
         new_resource: []const u8,
 
         fn visit(ctx: *@This(), entry: *const SessionEntry) void {
@@ -1280,9 +1215,7 @@ fn sendOtherResourcesPresence(
             const pw = pres_fbs.writer();
             const presence_xml = stanza: {
                 pw.writeAll("<presence from='") catch break :stanza null;
-                xml.escapeWrite(pw, ctx.local) catch break :stanza null;
-                pw.writeByte('@') catch break :stanza null;
-                xml.escapeWrite(pw, ctx.domain) catch break :stanza null;
+                xml.escapeWrite(pw, ctx.bare) catch break :stanza null;
                 pw.writeByte('/') catch break :stanza null;
                 xml.escapeWrite(pw, entry_resource) catch break :stanza null;
                 pw.writeByte('\'') catch break :stanza null;
@@ -1295,15 +1228,15 @@ fn sendOtherResourcesPresence(
                 }
                 break :stanza pres_fbs.getWritten();
             } orelse {
-                noteJidOverflow("other-resource presence '{s}@{s}/{s}' exceeds {d} bytes; skipped", .{ ctx.local, ctx.domain, entry_resource, router.JID_STANZA_MAX });
+                noteJidOverflow("other-resource presence '{s}/{s}' exceeds {d} bytes; skipped", .{ ctx.bare, entry_resource, router.JID_STANZA_MAX });
                 return;
             };
 
             _ = ctx.new_session.stanza(presence_xml);
         }
     };
-    var other_ctx = OtherCtx{ .new_session = new_session, .local = local, .domain = domain, .new_resource = new_resource };
-    sm.forEachAvailable(local, domain, &other_ctx, OtherCtx.visit);
+    var other_ctx = OtherCtx{ .new_session = new_session, .bare = new_session.stream.boundBare(), .new_resource = bound.resource };
+    sm.forEachAvailable(bound.local, bound.domain, &other_ctx, OtherCtx.visit);
 }
 
 /// RFC 6121 §8.5.2.1.2: Dispatch directed presence to all available resources
@@ -1320,14 +1253,9 @@ pub fn dispatchDirectedPresenceToBareJid(
     defer sender_session.resetStanza();
 
     const sm = server.session_map orelse return;
-    const bound = sender_session.stream.bound_jid orelse return;
+    if (sender_session.stream.bound_jid == null) return;
 
-    // Build the from full JID
-    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const from_str = router.buildFullJid(bound.local, bound.domain, bound.resource, &from_buf) catch {
-        noteJidOverflow("directed presence from '{s}@{s}/{s}' exceeds {d} bytes; dropped", .{ bound.local, bound.domain, bound.resource, router.FULL_JID_MAX });
-        return;
-    };
+    const from_str = sender_session.stream.boundFull();
 
     // Build presence stanza with inner XML. Stays live across the delivery
     // loop below, so it is leased (S18).
@@ -1499,7 +1427,7 @@ test "S4: subscription presence with an over-long to gets jid-malformed" {
     const session = try allocator.create(Session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     server.sessions[0] = session;
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     session.stream.authenticated_jid = session.stream.bound_jid;
 
     // 600-byte target: inside the stanza budget but over a 511-byte store key.
@@ -1552,7 +1480,7 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
     const alice = try allocator.create(Session);
     alice.init(alice_fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = alice;
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/desk") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/desk") catch null);
     alice.stream.authenticated_jid = alice.stream.bound_jid;
 
     // Contact bob has two available resources. The second one is what an
@@ -1624,7 +1552,7 @@ test "S1: subscription presence escapes the owner bare JID" {
     const owner = try allocator.create(Session);
     owner.init(owner_fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = owner;
-    owner.stream.bound_jid = .{ .local = "o'wner", .domain = "localhost", .resource = "desk" };
+    owner.stream.setBoundJid(.{ .local = "o'wner", .domain = "localhost", .resource = "desk" });
     owner.stanza_to = "bob@localhost";
 
     var bob_fds: [2]posix.fd_t = undefined;
@@ -1683,11 +1611,11 @@ test "A62: pending-subscription delivery for a 256-byte bare JID" {
     const session = try allocator.create(Session);
     session.init(fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = session;
-    session.stream.bound_jid = .{ .local = local, .domain = "localhost", .resource = "res" };
+    session.stream.setBoundJid(.{ .local = local, .domain = "localhost", .resource = "res" });
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    deliverPendingSubscriptions(&server, session, local, "localhost", &changes);
+    deliverPendingSubscriptions(&server, session, &changes);
 
     _ = try session.conn.flushSend();
     var rbuf: [2048]u8 = undefined;
@@ -1724,17 +1652,19 @@ test "A62: oversized bare JIDs skip pending-subscription delivery" {
     var changes = ChangeList.init(&change_buf);
     var rbuf: [64]u8 = undefined;
 
-    // 511-byte bare JID: builds, but the bare\x00 prefix exceeds MAX_KEY_LEN.
+    // 511-byte bare JID: binds, but the bare\x00 prefix exceeds MAX_KEY_LEN.
     var big_local: [1023]u8 = undefined;
     @memset(&big_local, 'l');
-    deliverPendingSubscriptions(&server, session, big_local[0..501], "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = big_local[0..501], .domain = "localhost" });
+    deliverPendingSubscriptions(&server, session, &changes);
     const n1 = posix.read(fds[1], &rbuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n1);
 
-    // RFC 7622 maximum bare JID (2047 bytes) exceeds BARE_JID_MAX entirely.
+    // RFC 7622 maximum bare JID (2047 bytes) is far over the key bound too.
     var big_domain: [1023]u8 = undefined;
     @memset(&big_domain, 'd');
-    deliverPendingSubscriptions(&server, session, &big_local, &big_domain, &changes);
+    session.stream.setBoundJid(.{ .local = &big_local, .domain = &big_domain });
+    deliverPendingSubscriptions(&server, session, &changes);
     const n2 = posix.read(fds[1], &rbuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n2);
 }
@@ -1766,7 +1696,7 @@ test "A62: block check sees a >256-byte recipient JID in full" {
     const alice = try allocator.create(Session);
     alice.init(alice_fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = alice;
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
 
     // Two recipients with 300-byte bare JIDs (290-byte localpart).
     var rbuf: [290]u8 = undefined;
@@ -1827,4 +1757,45 @@ test "A62: block check sees a >256-byte recipient JID in full" {
     const n_open = posix.read(o_fds[1], &drain) catch 0;
     try std.testing.expect(n_open > 0);
     try std.testing.expect(std.mem.indexOf(u8, drain[0..n_open], "from='alice@localhost/res'") != null);
+}
+
+test "C6: an over-512-byte bound bare still sees its other resources' presence" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
+    defer sm.deinit();
+    server.session_map = &sm;
+
+    // 612-byte bare JID: legal under RFC 7622 but wider than the stack
+    // scratch this fan-out used to build the bare into, which skipped it.
+    var big_local: [600]u8 = undefined;
+    @memset(&big_local, 'l');
+    const local = big_local[0..];
+
+    // The already-present resource the new resource must be told about.
+    _ = try sm.bind(0, server.sessionToken(4), local, "localhost", "desk");
+    sm.setPresenceAvailable(local, "localhost", "desk", true);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.init(fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = session;
+    session.stream.setBoundJid(.{ .local = local, .domain = "localhost", .resource = "phone" });
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    sendOtherResourcesPresence(&server, session, &changes);
+
+    _ = try session.conn.flushSend();
+    var rbuf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &rbuf) catch 0;
+    const got = rbuf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, got, "<presence from='") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "/desk'") != null);
 }
