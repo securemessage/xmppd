@@ -947,19 +947,29 @@ test "SCRAM: persisted fake secret is created once and stable across loads" {
 test "SCRAM: concurrent starters publish one secret and all agree on it" {
     // Eight starters race on an empty dir. The link(2) publish admits
     // exactly one writer, so every caller returns the same bytes and the
-    // persisted file is complete and 0600.
+    // persisted file is complete and 0600. The release gate is a spin
+    // flag: every worker leaves within nanoseconds, and no sleeper can
+    // be missed by a wake.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const N = 8;
-    var gate: std.Thread.ResetEvent = .{};
+    var go: std.atomic.Value(u32) = .init(0);
     var secrets: [N][32]u8 = undefined;
     var failures: [N]?anyerror = [_]?anyerror{null} ** N;
     var threads: [N]std.Thread = undefined;
 
     const Worker = struct {
-        fn run(dir: std.fs.Dir, start: *std.Thread.ResetEvent, out: *[32]u8, failure: *?anyerror) void {
-            start.wait();
+        fn run(dir: std.fs.Dir, flag: *std.atomic.Value(u32), out: *[32]u8, failure: *?anyerror) void {
+            var spins: u64 = 0;
+            while (flag.load(.acquire) == 0) {
+                spins += 1;
+                if (spins > 1_000_000_000) {
+                    failure.* = error.GateTimeout;
+                    return;
+                }
+                std.atomic.spinLoopHint();
+            }
             out.* = loadOrCreateSecret(dir) catch |err| {
                 failure.* = err;
                 return;
@@ -967,9 +977,9 @@ test "SCRAM: concurrent starters publish one secret and all agree on it" {
         }
     };
     for (0..N) |i| {
-        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{ tmp.dir, &gate, &secrets[i], &failures[i] });
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{ tmp.dir, &go, &secrets[i], &failures[i] });
     }
-    gate.set();
+    go.store(1, .release);
     for (&threads) |t| t.join();
 
     for (failures) |f| try std.testing.expect(f == null);
