@@ -79,10 +79,11 @@ pub const Tag = enum(u8) {
     /// Core→Auth: the connection died mid-exchange; drop any state.
     auth_abort = 0x0D,
 
-    // Auth protocol v2 stateless SCRAM (0x0E-0x0F, 0x13)
+    // Auth protocol v2 stateless SCRAM (0x0E-0x0F, 0x13-0x14)
     scram_params_request = 0x0E,
     scram_params = 0x0F,
     scram_verify = 0x13,
+    scram_stale = 0x14,
 
     // S2S IPC (0x10–0x12)
     s2s_deliver = 0x10,
@@ -146,6 +147,11 @@ pub const Message = union(enum) {
     scram_params: ScramParams,
     /// Core→Auth: one-round-trip stateless SCRAM verify (ADR-6).
     scram_verify: ScramVerify,
+    /// Auth→Core: the verify's server-first carried (salt, iterations) that
+    /// no longer match the stored credentials (password changed after the
+    /// core cached its params). Core evicts its params-cache entry and the
+    /// client retries with fresh parameters.
+    scram_stale: ScramStale,
 
     /// Core→S2S: deliver a stanza to a remote domain.
     s2s_deliver: S2sDeliver,
@@ -233,6 +239,14 @@ pub const ScramVerify = struct {
     server_first: []const u8,
     /// The full client-final-message: "c=<b64>,r=<combined>,p=<b64>"
     client_final: []const u8,
+};
+
+pub const ScramStale = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// The raw n= name from client-first-message-bare: the core's
+    /// params-cache key for the entry to evict.
+    username: []const u8,
 };
 
 // ============================================================================
@@ -734,6 +748,20 @@ test "ScramParams exchange encode/decode roundtrip" {
     try std.testing.expectEqual(@as(u32, 42), rp.conn_id);
     try std.testing.expectEqualSlices(u8, &salt, rp.salt);
     try std.testing.expectEqual(@as(u32, 4096), rp.iteration_count);
+}
+
+test "ScramStale encode/decode roundtrip" {
+    var buf: [512]u8 = undefined;
+    const msg = Message{ .scram_stale = .{ .conn_id = 0x11223344, .username = "n=alice" } };
+    const written = try encode(msg, &buf);
+    const frame = buf[0..written];
+    const payload_len = std.mem.readInt(u32, frame[0..HEADER_SIZE], .little);
+    try std.testing.expectEqual(written - HEADER_SIZE, payload_len);
+    const decoded = try decode(frame[HEADER_SIZE..]);
+    try std.testing.expect(decoded == .scram_stale);
+    const s = decoded.scram_stale;
+    try std.testing.expectEqual(@as(u32, 0x11223344), s.conn_id);
+    try std.testing.expectEqualStrings("n=alice", s.username);
 }
 
 test "AuthAbort encode/decode roundtrip" {

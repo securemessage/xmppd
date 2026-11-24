@@ -71,6 +71,9 @@ pub const Counters = struct {
     /// SCRAM exchange-pool acquires refused because every slot was live;
     /// the attempt answers temporary-auth-failure (ADR-6).
     scram_exchange_full: Counter = .init(0),
+    /// scram_stale answers: the daemon's stored params moved past our
+    /// cache entry (password change); counted per eviction.
+    scram_stale: Counter = .init(0),
     loop_hist_us: [HIST_BUCKETS]Counter = @splat(.init(0)),
 };
 
@@ -161,8 +164,8 @@ pub noinline fn dump(worker_id: u16, ext: Externals) void {
         worker_id,              ext.jid_overflow_drops,   ext.cross_worker_drops,  ext.s2s_bounces,
         ext.offline_not_stored, ext.offline_hold_bounces, ext.offline_drain_drops,
     });
-    log.info("worker {d} scram: exchange_pool_full={d}", .{
-        worker_id, read(&c.scram_exchange_full),
+    log.info("worker {d} scram: exchange_pool_full={d} stale_evictions={d}", .{
+        worker_id, read(&c.scram_exchange_full), read(&c.scram_stale),
     });
     var buf: [HIST_BUCKETS * 24]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);

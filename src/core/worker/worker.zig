@@ -1626,6 +1626,19 @@ pub const Server = struct {
         return entry;
     }
 
+    /// Drop the cached params for one raw n= username: the auth daemon
+    /// answered scram_stale, meaning the entry's (salt, iterations) no
+    /// longer match the stored credentials after a password change.
+    pub fn scramParamsEvict(self: *Server, username: []const u8) void {
+        if (username.len == 0 or username.len > SCRAM_PARAM_USER_MAX) return;
+        if (self.scram_param_cache.len == 0) return;
+        const hash = std.hash.Wyhash.hash(0, username);
+        const entry = &self.scram_param_cache[hash % SCRAM_PARAM_CACHE_SIZE];
+        if (!entry.occupied or entry.user_hash != hash) return;
+        if (!std.mem.eql(u8, entry.user[0..entry.user_len], username)) return;
+        entry.occupied = false;
+    }
+
     /// One-time exchange-pool allocation, sized by scram_exchange_slots.
     /// Lazy like growScramParamCache: run() warms it, tests and the first
     /// acquire can trigger it; an alloc failure degrades to a pool that
@@ -1706,6 +1719,7 @@ pub const Server = struct {
 
         const raw_id: u32 = switch (msg) {
             .scram_params => |m| m.conn_id,
+            .scram_stale => |m| m.conn_id,
             .auth_success => |m| m.conn_id,
             .auth_failure => |m| m.conn_id,
             .register_result => |m| m.conn_id,
@@ -1823,6 +1837,17 @@ pub const Server = struct {
                         c2s_session.handleReadable(self, conn_id, changes);
                     }
                 }
+            },
+            .scram_stale => |m| {
+                // The password changed after we cached (salt, iterations):
+                // evict so the next attempt re-fetches, and fail this one
+                // soft so the client retries rather than locking out.
+                self.scramParamsEvict(m.username);
+                if (metrics.get()) |c| metrics.bump(&c.scram_stale, 1);
+                log.info("connection {d} SCRAM params stale; cache entry evicted", .{conn_id});
+                const fail_action = session.stream.saslFailure("temporary-auth-failure");
+                c2s_session.executeAction(self, session, fail_action, changes);
+                session.resetSasl();
             },
             .auth_failure => |m| {
                 log.info("connection {d} auth failed: {s}", .{ conn_id, m.reason });
@@ -5731,4 +5756,47 @@ test "ADR-4: a slot at the u24 generation ceiling retires and is counted" {
     try std.testing.expectEqual(std.math.maxInt(u24), server.slot_gen[1]);
     try std.testing.expectEqual(free_at_claim, server.free_count);
     try std.testing.expectEqual(base + 1, c.slots_retired.load(.monotonic));
+}
+
+test "Server: scram_stale evicts the cached params and fails soft" {
+    const allocator = std.testing.allocator;
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    metrics.bind(12);
+    defer metrics.current = null;
+    const c = metrics.get().?;
+    const stale_before = c.scram_stale.load(.monotonic);
+
+    server.growScramParamCache();
+    var salt: [32]u8 = undefined;
+    @memset(&salt, 0xAB);
+    server.scramParamsStore("user", &salt, 4096);
+    try std.testing.expect(server.scramParamsLookup("user") != null);
+
+    const fds = try c2s_session.makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+    session.auth_state = .awaiting_result;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    server.dispatchAuthResponse(.{ .scram_stale = .{
+        .conn_id = session.ipcConnId(),
+        .username = "user",
+    } }, &changes);
+
+    // The cache entry is gone so the next attempt re-fetches; this attempt
+    // fails soft so the client retries instead of locking out.
+    try std.testing.expect(server.scramParamsLookup("user") == null);
+    try std.testing.expect(session.auth_state == .none);
+    try std.testing.expectEqual(@as(u64, 1), c.scram_stale.load(.monotonic) - stale_before);
+
+    _ = try session.conn.flushSend();
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &buf) catch 0;
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "temporary-auth-failure") != null);
 }

@@ -64,6 +64,9 @@ pub const Counters = struct {
     replay_occupied: Counter = .init(0),
     replay_high_water: Counter = .init(0),
     replay_refusals: Counter = .init(0),
+    /// Verifies whose server-first params no longer matched the stored
+    /// credentials (password changed mid-cache); answered as scram_stale.
+    scram_stale: Counter = .init(0),
     /// Times a lane's intake paused on the outbound backlog watermark.
     ipc_intake_pauses: Counter = .init(0),
 };
@@ -151,6 +154,12 @@ pub inline fn replayRefused() void {
     bump(&counters.replay_refusals, 1);
 }
 
+/// A verify's (salt, iterations) no longer matched the stored credentials;
+/// answered scram_stale so the core evicts its params-cache entry.
+pub inline fn scramStale() void {
+    bump(&counters.scram_stale, 1);
+}
+
 /// A replay slot went inactive; a remove without a matching insert is a
 /// programmer error.
 pub inline fn replayRemoved() void {
@@ -217,8 +226,8 @@ pub fn dump() void {
         rw.print("{s}:{d}", .{ name, n }) catch break;
     }
     log.info("auth outcomes: {s}", .{rw.buffered()});
-    log.info("auth scram replay: occupied={d} high_water={d} refusals={d}; ipc_intake_pauses={d}", .{
-        read(&c.replay_occupied), read(&c.replay_high_water), read(&c.replay_refusals), read(&c.ipc_intake_pauses),
+    log.info("auth scram replay: occupied={d} high_water={d} refusals={d} stale={d}; ipc_intake_pauses={d}", .{
+        read(&c.replay_occupied), read(&c.replay_high_water), read(&c.replay_refusals), read(&c.scram_stale), read(&c.ipc_intake_pauses),
     });
     var hbuf: [HIST_BUCKETS * 24]u8 = undefined;
     var hw: std.Io.Writer = .fixed(&hbuf);

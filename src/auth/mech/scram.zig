@@ -272,9 +272,24 @@ pub fn handleScramVerify(comptime Store: type, self: *handler_mod.AuthHandler(St
         req.client_final,
         &creds,
         &am_buf,
-    ) catch {
-        self.policy.recordOutcome(account_username, req.client_ip, .failure);
-        return authFailure(req.conn_id, .not_authorized);
+    ) catch |err| switch (err) {
+        // The server-first (salt, iterations) the core issued no longer
+        // matches the stored credentials: the password changed after the
+        // core cached its params. Distinct result so the core evicts the
+        // entry and the next attempt re-fetches instead of failing until
+        // the cache TTL expires.
+        error.ParameterMismatch => {
+            self.policy.recordOutcome(account_username, req.client_ip, .failure);
+            metrics.scramStale();
+            return protocol.Message{ .scram_stale = .{
+                .conn_id = req.conn_id,
+                .username = first.raw_name,
+            } };
+        },
+        else => {
+            self.policy.recordOutcome(account_username, req.client_ip, .failure);
+            return authFailure(req.conn_id, .not_authorized);
+        },
     };
 
     // Freshness covered by the proof: the core embeds its issue time in the
@@ -871,4 +886,72 @@ test "SCRAM: advertised iteration count is identical for real and fake accounts"
     try std.testing.expect(fake == .scram_params);
     try std.testing.expectEqual(real.scram_params.iteration_count, fake.scram_params.iteration_count);
     try std.testing.expectEqual(sasl.scram.default_iteration_count, fake.scram_params.iteration_count);
+}
+
+test "SCRAM v2: params stale after a password change answer scram_stale; next attempt succeeds" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw1");
+    var handler = TestHandler.init(allocator, &store, .{});
+    defer handler.deinit();
+
+    // The pair the core cached before the password change.
+    const params = handleSync(&handler, .{ .scram_params_request = .{
+        .conn_id = 1,
+        .username = "alice",
+        .client_ip = "10.0.0.1",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(params == .scram_params);
+    var stale_salt: [64]u8 = undefined;
+    @memcpy(stale_salt[0..params.scram_params.salt.len], params.scram_params.salt);
+    const stale_iters = params.scram_params.iteration_count;
+
+    // Through the message path so the daemon's credential cache is
+    // invalidated exactly as a core-issued password change does it.
+    const changed = handleSync(&handler, .{ .password_change_request = .{
+        .conn_id = 9,
+        .username = "alice",
+        .new_password = "pw2",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(changed.password_change_result.success);
+
+    // A verify still carrying the cached (salt, iterations): the stored
+    // credentials moved past them, so the answer is the eviction signal,
+    // not a password failure.
+    var client = sasl.ScramClient.init(allocator, "alice", "pw2");
+    defer client.deinit();
+    const cf = try client.clientFirst();
+    const first = try sasl.scram.parseClientFirst(cf);
+    var nb: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    var sf: [512]u8 = undefined;
+    const sfirst = testkit.serverFirst(&sf, first.client_nonce, testSnonce(&nb), stale_salt[0..params.scram_params.salt.len], stale_iters);
+    try client.parseServerFirst(sfirst);
+    var salted: [32]u8 = undefined;
+    sasl.scram.pbkdf2("pw2", client.salt_raw[0..client.salt_raw_len], client.iteration_count, &salted);
+    const final = try client.clientFinal(salted);
+
+    const stale = handleSync(&handler, .{ .scram_verify = .{
+        .conn_id = 1,
+        .client_ip = "10.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .gs2_flag = first.gs2_flag,
+        .client_first_bare = first.bare,
+        .server_first = sfirst,
+        .client_final = final,
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(stale == .scram_stale);
+    try std.testing.expectEqualStrings("alice", stale.scram_stale.username);
+
+    // Next attempt, params re-fetched after the eviction: the new password
+    // verifies in one round trip.
+    var nb2: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    var sf2: [512]u8 = undefined;
+    var client2 = sasl.ScramClient.init(allocator, "alice", "pw2");
+    defer client2.deinit();
+    const ex = try testkit.scramV2Exchange(&handler, &client2, 2, "10.0.0.1", "pw2", testSnonce(&nb2), &sf2);
+    try std.testing.expect(ex.verify_msg.? == .auth_success);
 }
