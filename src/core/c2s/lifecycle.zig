@@ -516,9 +516,19 @@ pub const SmDrain = struct {
 
 /// Per-iteration bound on unacked stanzas drained across all parked
 /// queues (T-265C5A0E). Each drained stanza costs at most one bounded
-/// executor submission plus one bounce, so a mass expiry or a teardown
-/// burst never stalls a whole event batch.
+/// executor submission plus one bounce, and each retired drain node
+/// costs one credit too, so a mass expiry or a teardown burst never
+/// stalls a whole event batch.
 pub const SM_DRAIN_CHUNK: u32 = 32;
+
+/// Parked-drain retention bound: freed session slots recycle while
+/// parked queues still hold blobs, so sessions-per-worker times the
+/// per-session queue bound does not cover them. Two full default queues
+/// park before the byte bound trips; the node bound caps tiny-queue
+/// churn. A park that would overflow instead drains inline through the
+/// same bounded executor path (counted via sm_drain_park_overflow).
+pub const SM_DRAIN_PARK_MAX_NODES: u32 = 64;
+pub const SM_DRAIN_PARK_MAX_BYTES: u64 = 2 * sm_state.DEFAULT_MAX_UNACKED_BYTES;
 
 /// XEP-0198 section-5 drain (C11, chunked by T-265C5A0E): on teardown of
 /// a session with an SM unacked queue, every stanza reaches exactly one
@@ -536,9 +546,9 @@ pub const SM_DRAIN_CHUNK: u32 = 32;
 /// work runs in drainSmUnackedTick at the batch tail, SM_DRAIN_CHUNK
 /// credits per iteration, so the drain never monopolizes one kevent
 /// batch. Offline stores are submitted to the bounded off-loop executor
-/// and settled on completion; a drain-node allocation failure drains
-/// inline through the same bounded submissions so no stanza escapes a
-/// counted outcome.
+/// and settled on completion; a park that would exceed the retention
+/// bound, or a drain-node allocation failure, drains inline through the
+/// same bounded submissions so no stanza escapes a counted outcome.
 pub fn parkUnackedDrain(server: *Server, session: *Session) void {
     const queue = session.sm_unacked orelse return;
     session.sm_unacked = null; // the drain node owns it from here
@@ -555,6 +565,21 @@ pub fn parkUnackedDrain(server: *Server, session: *Session) void {
         }
     } else if (queue.count > 0) {
         noteDrop("session {d} unacked drain: {d} stanzas count as drops (no bound JID)", .{ session.conn.id, queue.count });
+    }
+
+    // Bounded parked retention: a session slot freed at teardown can be
+    // reused while its parked queue still holds blobs. On pressure the
+    // queue drains inline instead of parking; every stanza still flows
+    // through the bounded executor submissions below, and the detour is
+    // counted.
+    if (server.sm_drain_parked_nodes >= SM_DRAIN_PARK_MAX_NODES or
+        server.sm_drain_parked_bytes + queue.bytes > SM_DRAIN_PARK_MAX_BYTES)
+    {
+        _ = delivery_queue_mod.sm_drain_park_overflow.fetchAdd(1, .monotonic);
+        drainQueueNow(server, queue, recipient_buf[0..recipient_len]);
+        queue.deinit();
+        server.allocator.destroy(queue);
+        return;
     }
 
     const node = server.allocator.create(SmDrain) catch {
@@ -577,12 +602,14 @@ pub fn parkUnackedDrain(server: *Server, session: *Session) void {
         server.sm_drain_head = node;
     }
     server.sm_drain_tail = node;
+    server.sm_drain_parked_nodes += 1;
+    server.sm_drain_parked_bytes += queue.bytes;
 }
 
 /// Batch-tail continuation for parked unacked drains (T-265C5A0E):
-/// SM_DRAIN_CHUNK credits at most leave the queues per call and
-/// leftovers re-drive the loop through the self-wake knote, so the work
-/// lands across ordinary
+/// SM_DRAIN_CHUNK credits at most leave the queues per call (one credit
+/// per drained stanza and per retired node) and leftovers re-drive the
+/// loop through the self-wake knote, so the work lands across ordinary
 /// iterations instead of one kevent batch. Executor completions are
 /// settled first, bounded by MAX_JOBS. Called once per event-loop
 /// iteration next to reapOutboundOverflow.
@@ -601,9 +628,14 @@ pub fn drainSmUnackedTick(server: *Server) void {
         if (node.pos == node.queue.count) {
             server.sm_drain_head = node.next;
             if (server.sm_drain_tail == node) server.sm_drain_tail = null;
+            server.sm_drain_parked_bytes -= node.queue.bytes;
+            server.sm_drain_parked_nodes -= 1;
             node.queue.deinit();
             server.allocator.destroy(node.queue);
             server.allocator.destroy(node);
+            // Node cleanup is real work: charge it to the turn's credit
+            // so a flood of empty queues still bounds each iteration.
+            done += 1;
             continue;
         }
         const idx = (node.queue.head + node.pos) % sm_state.UNACKED_CAPACITY;
@@ -617,6 +649,7 @@ pub fn drainSmUnackedTick(server: *Server) void {
             drainOneUnacked(server, blob, node.recipient[0..node.recipient_len], now);
         }
         node.queue.bytes -= blob.len;
+        server.sm_drain_parked_bytes -= blob.len;
         blob.releaseRetention();
     }
     if (server.sm_drain_head != null) {
@@ -3627,4 +3660,64 @@ test "C11: a full drain-store ring refuses and bounces, never commits inline" {
 
     bob.sm_resume_enabled = false;
     destroySession(&server, 3, bob, &changes);
+}
+
+test "C11: parked drains bound nodes and bytes; overflow drains inline counted" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    // A byte-bound overflow: a queue whose retained bytes would pass the
+    // parked cap drains inline through the same submissions, and the
+    // detour is counted once per queue.
+    const overflow0 = delivery_queue_mod.sm_drain_park_overflow.load(.monotonic);
+    const session = try makeAuthenticatedSession(&server, 5, "dave");
+    session.stream.bound_jid = xmpp_lib.Jid.parse("dave@localhost/res") catch null;
+    server.free_count -= 1;
+    const big_queue = try allocator.create(sm_state.SmUnackedQueue);
+    big_queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
+    _ = big_queue.push("<presence from='dave@localhost/res'/>");
+    big_queue.bytes = SM_DRAIN_PARK_MAX_BYTES;
+    session.sm_unacked = big_queue;
+    parkUnackedDrain(&server, session);
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_drain_park_overflow.load(.monotonic) - overflow0);
+    try std.testing.expectEqual(@as(u32, 0), server.sm_drain_parked_nodes);
+    try std.testing.expect(server.sm_drain_head == null);
+
+    // A sustained park burst: nodes past the cap drain inline too, and
+    // retirement costs chunk credit so one tick retires at most
+    // SM_DRAIN_CHUNK nodes.
+    var sessions: [SM_DRAIN_PARK_MAX_NODES + SM_DRAIN_CHUNK][]const u8 = undefined;
+    _ = &sessions;
+    var i: usize = 0;
+    while (i < SM_DRAIN_PARK_MAX_NODES + SM_DRAIN_CHUNK) : (i += 1) {
+        const s = try makeAuthenticatedSession(&server, 6 + i, "eve");
+        server.free_count -= 1;
+        const queue = try allocator.create(sm_state.SmUnackedQueue);
+        queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
+        s.sm_unacked = queue;
+        parkUnackedDrain(&server, s);
+    }
+    try std.testing.expectEqual(@as(u32, SM_DRAIN_PARK_MAX_NODES), server.sm_drain_parked_nodes);
+    try std.testing.expectEqual(@as(u64, 1 + SM_DRAIN_CHUNK), delivery_queue_mod.sm_drain_park_overflow.load(.monotonic) - overflow0);
+
+    drainSmUnackedTick(&server);
+    try std.testing.expectEqual(@as(u32, SM_DRAIN_CHUNK), server.sm_drain_parked_nodes - (SM_DRAIN_PARK_MAX_NODES - SM_DRAIN_CHUNK));
+
+    drainParkedFully(&server);
+    try std.testing.expectEqual(@as(u32, 0), server.sm_drain_parked_nodes);
+    try std.testing.expectEqual(@as(u64, 0), server.sm_drain_parked_bytes);
+    try std.testing.expect(server.sm_drain_head == null);
 }

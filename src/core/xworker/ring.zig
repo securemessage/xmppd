@@ -65,6 +65,9 @@ pub var sm_unacked_bounced = std.atomic.Value(u64).init(0);
 pub var sm_unacked_dropped = std.atomic.Value(u64).init(0);
 pub var sm_unacked_bounce_failed = std.atomic.Value(u64).init(0);
 pub var sm_offline_refused = std.atomic.Value(u64).init(0);
+/// Queues that hit the parked-drain retention bound and drained inline
+/// instead of parking (counted per queue, not per stanza).
+pub var sm_drain_park_overflow = std.atomic.Value(u64).init(0);
 /// Stanzas queueSend refused because they can never fit the write buffer,
 /// counted apart from the slow-reader overflow teardown. The session stays
 /// up; iq results are answered with resource-constraint instead.

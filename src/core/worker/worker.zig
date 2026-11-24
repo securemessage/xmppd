@@ -423,6 +423,8 @@ pub const Server = struct {
     /// Retention held by parked drains: freed session slots recycle while
     /// parked queues stay, so the parked list is bounded separately from
     /// the per-session queue bound.
+    sm_drain_parked_nodes: u32 = 0,
+    sm_drain_parked_bytes: u64 = 0,
 
     /// Stale per-session events skipped because the session was detached or
     /// closed after kevent returned this batch (S28). Counted and logged at
@@ -1284,6 +1286,7 @@ pub const Server = struct {
             .sm_unacked_dropped = delivery_queue_mod.sm_unacked_dropped.load(.monotonic),
             .sm_unacked_bounce_failed = delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic),
             .sm_offline_refused = delivery_queue_mod.sm_offline_refused.load(.monotonic),
+            .sm_drain_park_overflow = delivery_queue_mod.sm_drain_park_overflow.load(.monotonic),
         });
     }
 
