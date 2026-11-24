@@ -145,8 +145,13 @@ with empty-queue retirement costing one credit. Offline stores submit to
 a bounded off-loop executor (`sm_drain_exec`, archive-queue discipline:
 job ring + wake pipe + writer thread, completions settle on the loop);
 nothing commits on the event loop, and a full ring refuses then bounces
-rather than falling back to an inline commit. Park overflow drains
-inline through the same submissions, counted `sm_drain_park_overflow`.
+rather than falling back to an inline commit. Park overflow and
+allocation-failure queues drain through the same submissions but share
+the turn's credit (`sm_drain_turn_credit`, reset per loop iteration);
+stanzas the credit cannot reach take a counted bulk drop
+(`sm_unacked_dropped`, marked `sm_drain_overload_drops`) and the queue
+detour counts `sm_drain_park_overflow`, so a teardown batch's inline
+work is bounded the same way the parked tick is.
 
 - `<message>` (not `error`/`groupchat`): `storeHeldPointer`. Stored ->
   `sm_unacked_stored`. Refusal or error -> `sm_offline_refused`, then the
@@ -165,8 +170,8 @@ inline through the same submissions, counted `sm_drain_park_overflow`.
 
 New module atomics in ring.zig (`sm_unacked_stored`, `sm_unacked_bounced`,
 `sm_unacked_dropped`, `sm_unacked_bounce_failed`, `sm_offline_refused`,
-`sm_drain_park_overflow`), exported through `metrics.Externals` and the
-SIGUSR1 dump.
+`sm_drain_park_overflow`, `sm_drain_overload_drops`), exported through
+`metrics.Externals` and the SIGUSR1 dump.
 
 ### T317: force-close on resume re-bind failure (item e)
 

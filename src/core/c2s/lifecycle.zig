@@ -514,11 +514,13 @@ pub const SmDrain = struct {
     recipient: [router.BARE_JID_MAX]u8 = undefined,
 };
 
-/// Per-iteration bound on unacked stanzas drained across all parked
-/// queues (T-265C5A0E). Each drained stanza costs at most one bounded
-/// executor submission plus one bounce, and each retired drain node
-/// costs one credit too, so a mass expiry or a teardown burst never
-/// stalls a whole event batch.
+/// Per-iteration bound on unacked stanzas drained across all paths
+/// (T-265C5A0E): parked-tick chunks and inline overload drains draw
+/// from the same per-turn credit, reset at the top of each event-loop
+/// iteration. Each drained stanza costs at most one bounded executor
+/// submission plus one bounce, and each retired drain node costs one
+/// credit too, so a mass expiry or a teardown burst never stalls a
+/// whole event batch.
 pub const SM_DRAIN_CHUNK: u32 = 32;
 
 /// Parked-drain retention bound: freed session slots recycle while
@@ -547,8 +549,9 @@ pub const SM_DRAIN_PARK_MAX_BYTES: u64 = 2 * sm_state.DEFAULT_MAX_UNACKED_BYTES;
 /// credits per iteration, so the drain never monopolizes one kevent
 /// batch. Offline stores are submitted to the bounded off-loop executor
 /// and settled on completion; a park that would exceed the retention
-/// bound, or a drain-node allocation failure, drains inline through the
-/// same bounded submissions so no stanza escapes a counted outcome.
+/// bound, or a drain-node allocation failure, drains through the same
+/// bounded submissions under the shared turn credit, with the
+/// remainder bulk-counted so no stanza escapes a counted outcome.
 pub fn parkUnackedDrain(server: *Server, session: *Session) void {
     const queue = session.sm_unacked orelse return;
     session.sm_unacked = null; // the drain node owns it from here
@@ -569,24 +572,25 @@ pub fn parkUnackedDrain(server: *Server, session: *Session) void {
 
     // Bounded parked retention: a session slot freed at teardown can be
     // reused while its parked queue still holds blobs. On pressure the
-    // queue drains inline instead of parking; every stanza still flows
-    // through the bounded executor submissions below, and the detour is
-    // counted.
+    // queue drains through the bounded overload path instead of
+    // parking: what the turn's remaining credit can reach gets a real
+    // outcome, the rest takes a counted bulk drop, and the detour is
+    // counted per queue.
     if (server.sm_drain_parked_nodes >= SM_DRAIN_PARK_MAX_NODES or
         server.sm_drain_parked_bytes + queue.bytes > SM_DRAIN_PARK_MAX_BYTES)
     {
         _ = delivery_queue_mod.sm_drain_park_overflow.fetchAdd(1, .monotonic);
-        drainQueueNow(server, queue, recipient_buf[0..recipient_len]);
+        drainQueueOverload(server, queue, recipient_buf[0..recipient_len]);
         queue.deinit();
         server.allocator.destroy(queue);
         return;
     }
 
     const node = server.allocator.create(SmDrain) catch {
-        // No memory for the parking node: drain inline so no stanza
-        // escapes a counted outcome. Bounded by UNACKED_CAPACITY; the
-        // OOM cold path may stall once.
-        drainQueueNow(server, queue, recipient_buf[0..recipient_len]);
+        // No memory for the parking node: the overload path bounds the
+        // inline work to the turn's remaining credit and bulk-counts
+        // the rest, so no stanza escapes a counted outcome.
+        drainQueueOverload(server, queue, recipient_buf[0..recipient_len]);
         queue.deinit();
         server.allocator.destroy(queue);
         return;
@@ -606,13 +610,13 @@ pub fn parkUnackedDrain(server: *Server, session: *Session) void {
     server.sm_drain_parked_bytes += queue.bytes;
 }
 
-/// Batch-tail continuation for parked unacked drains (T-265C5A0E):
-/// SM_DRAIN_CHUNK credits at most leave the queues per call (one credit
-/// per drained stanza and per retired node) and leftovers re-drive the
-/// loop through the self-wake knote, so the work lands across ordinary
-/// iterations instead of one kevent batch. Executor completions are
-/// settled first, bounded by MAX_JOBS. Called once per event-loop
-/// iteration next to reapOutboundOverflow.
+/// Batch-tail continuation for parked unacked drains (T-265C5A0E): at
+/// most the turn's remaining SM_DRAIN_CHUNK credit leaves the queues
+/// per call (one credit per drained stanza and per retired node) and
+/// leftovers re-drive the loop through the self-wake knote, so the
+/// work lands across ordinary iterations instead of one kevent batch.
+/// Executor completions are settled first, bounded by MAX_JOBS. Called
+/// once per event-loop iteration next to reapOutboundOverflow.
 pub fn drainSmUnackedTick(server: *Server) void {
     var completed = server.sm_drain_completed.swap(null, .acq_rel);
     while (completed) |job| {
@@ -622,8 +626,7 @@ pub fn drainSmUnackedTick(server: *Server) void {
     }
 
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
-    var done: u32 = 0;
-    while (done < SM_DRAIN_CHUNK) {
+    while (server.sm_drain_turn_credit > 0) {
         const node = server.sm_drain_head orelse break;
         if (node.pos == node.queue.count) {
             server.sm_drain_head = node.next;
@@ -635,14 +638,14 @@ pub fn drainSmUnackedTick(server: *Server) void {
             server.allocator.destroy(node);
             // Node cleanup is real work: charge it to the turn's credit
             // so a flood of empty queues still bounds each iteration.
-            done += 1;
+            server.sm_drain_turn_credit -= 1;
             continue;
         }
         const idx = (node.queue.head + node.pos) % sm_state.UNACKED_CAPACITY;
         node.pos += 1;
         const blob = node.queue.entries[idx] orelse continue;
         node.queue.entries[idx] = null;
-        done += 1;
+        server.sm_drain_turn_credit -= 1;
         if (node.recipient_len == 0) {
             _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
         } else {
@@ -659,19 +662,33 @@ pub fn drainSmUnackedTick(server: *Server) void {
     }
 }
 
-/// Synchronous drain used when the queue cannot be parked (node
-/// allocation failure or parked-retention pressure): every queued
-/// stanza still reaches one counted outcome through the same bounded
-/// executor submissions.
-fn drainQueueNow(server: *Server, queue: *sm_state.SmUnackedQueue, recipient: []const u8) void {
+/// Bounded inline drain used when the queue cannot be parked (node
+/// allocation failure or parked-retention pressure): the stanzas the
+/// turn's remaining credit can reach still get a real outcome through
+/// the same bounded executor submissions, and the rest take a counted
+/// bulk drop. There is no deferred capacity left for these entries -
+/// parking is what failed - so deferring the remainder is not an
+/// option and the whole queue must settle this turn.
+fn drainQueueOverload(server: *Server, queue: *sm_state.SmUnackedQueue, recipient: []const u8) void {
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
     var iter = queue.getUnacked();
-    while (iter.next()) |blob| {
+    while (server.sm_drain_turn_credit > 0) {
+        const blob = iter.next() orelse break;
+        server.sm_drain_turn_credit -= 1;
         if (recipient.len == 0) {
             _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
         } else {
             drainOneUnacked(server, blob, recipient, now);
         }
+    }
+    const remaining = queue.count - iter.pos;
+    if (remaining > 0) {
+        // Explicit counted outcome for every stanza the budget did not
+        // reach: sm_unacked_dropped keeps the outcome partition and
+        // sm_drain_overload_drops marks the cause.
+        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(remaining, .monotonic);
+        _ = delivery_queue_mod.sm_drain_overload_drops.fetchAdd(remaining, .monotonic);
+        noteDrop("unacked drain: {d} stanzas dropped, overload budget exhausted", .{remaining});
     }
 }
 
@@ -1452,6 +1469,7 @@ fn drainParkedFully(server: *Server) void {
         server.sm_drain_exec.pending() > 0 or
         server.sm_drain_completed.load(.monotonic) != null)
     {
+        server.sm_drain_turn_credit = SM_DRAIN_CHUNK; // each call stands in for a loop iteration
         drainSmUnackedTick(server);
         _ = server.sm_drain_exec.pumpStore(sm_drain_exec_mod.Executor.MAX_JOBS);
     }
@@ -3647,6 +3665,7 @@ test "C11: a full drain-store ring refuses and bounces, never commits inline" {
     // Ticks keep submitting until the ring is full; nothing commits on
     // this thread and the count stays zero.
     while (server.sm_drain_exec.pending() < sm_drain_exec_mod.Executor.MAX_JOBS and server.sm_drain_head != null) {
+        server.sm_drain_turn_credit = SM_DRAIN_CHUNK; // each tick stands in for a loop iteration
         drainSmUnackedTick(&server);
     }
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
@@ -3711,11 +3730,61 @@ test "C11: parked drains bound nodes and bytes; overflow drains inline counted" 
     try std.testing.expectEqual(@as(u32, SM_DRAIN_PARK_MAX_NODES), server.sm_drain_parked_nodes);
     try std.testing.expectEqual(@as(u64, 1 + SM_DRAIN_CHUNK), delivery_queue_mod.sm_drain_park_overflow.load(.monotonic) - overflow0);
 
+    server.sm_drain_turn_credit = SM_DRAIN_CHUNK; // stands in for a fresh loop iteration
     drainSmUnackedTick(&server);
     try std.testing.expectEqual(@as(u32, SM_DRAIN_CHUNK), SM_DRAIN_PARK_MAX_NODES - server.sm_drain_parked_nodes);
 
     drainParkedFully(&server);
     try std.testing.expectEqual(@as(u32, 0), server.sm_drain_parked_nodes);
     try std.testing.expectEqual(@as(u64, 0), server.sm_drain_parked_bytes);
+    try std.testing.expect(server.sm_drain_head == null);
+}
+
+test "C11: the overload drain shares the per-turn credit and bulk-counts the rest" {
+    // A queue that cannot park drains inline only while turn credit
+    // lasts; the rest of the queue takes the counted overload drop so
+    // repeated overload parks in one batch cannot walk whole queues.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    // No parked capacity at all: every park overflows into the inline
+    // path. Three credits buy three real outcomes; the unroutable
+    // presence makes each one a bounce failure, distinct from a drop.
+    server.sm_drain_parked_nodes = SM_DRAIN_PARK_MAX_NODES;
+    server.sm_drain_turn_credit = 3;
+
+    var stanzas: [6][]const u8 = undefined;
+    for (&stanzas) |*s| s.* = "<presence from='dave@localhost/res'/>";
+    const first = try makeDetachedWithStanzas(&server, 2, "dave", "dave@localhost/res", "6677889900aabbccddee1122334455ff", &stanzas);
+    const second = try makeDetachedWithStanzas(&server, 4, "dave", "dave@localhost/res", "77889900aabbccddee1122334455ff00", &stanzas);
+
+    const bounce_failed0 = delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic);
+    const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
+    const overload0 = delivery_queue_mod.sm_drain_overload_drops.load(.monotonic);
+    const overflow0 = delivery_queue_mod.sm_drain_park_overflow.load(.monotonic);
+
+    parkUnackedDrain(&server, first);
+    parkUnackedDrain(&server, second);
+
+    // The shared credit covers three stanzas across BOTH queues; the
+    // other nine drop counted. Every stanza still has one outcome.
+    try std.testing.expectEqual(@as(u32, 0), server.sm_drain_turn_credit);
+    try std.testing.expectEqual(@as(u64, 3), delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic) - bounce_failed0);
+    try std.testing.expectEqual(@as(u64, 9), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+    try std.testing.expectEqual(@as(u64, 9), delivery_queue_mod.sm_drain_overload_drops.load(.monotonic) - overload0);
+    try std.testing.expectEqual(@as(u64, 2), delivery_queue_mod.sm_drain_park_overflow.load(.monotonic) - overflow0);
     try std.testing.expect(server.sm_drain_head == null);
 }

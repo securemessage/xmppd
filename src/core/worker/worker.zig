@@ -425,6 +425,11 @@ pub const Server = struct {
     /// the per-session queue bound.
     sm_drain_parked_nodes: u32 = 0,
     sm_drain_parked_bytes: u64 = 0,
+    /// Per-iteration credit for section-5 drain work, shared by the
+    /// parked tick and the inline overload drains; reset at the top of
+    /// each loop iteration. Exhausted credit switches the overload path
+    /// to bulk counted drops.
+    sm_drain_turn_credit: u32 = session_lifecycle.SM_DRAIN_CHUNK,
 
     /// Stale per-session events skipped because the session was detached or
     /// closed after kevent returned this batch (S28). Counted and logged at
@@ -1206,6 +1211,11 @@ pub const Server = struct {
                 }
             }
 
+            // C11/T-265C5A0E: one credit bounds all section-5 drain work
+            // per iteration - parked tick chunks and inline overload
+            // drains share it; exhausted credit bulk-counts drops.
+            self.sm_drain_turn_credit = session_lifecycle.SM_DRAIN_CHUNK;
+
             self.dispatchEvents(events, &changes);
 
             // Drain pending fan-outs (bounded continuation — one batch per slot per tick)
@@ -1287,6 +1297,7 @@ pub const Server = struct {
             .sm_unacked_bounce_failed = delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic),
             .sm_offline_refused = delivery_queue_mod.sm_offline_refused.load(.monotonic),
             .sm_drain_park_overflow = delivery_queue_mod.sm_drain_park_overflow.load(.monotonic),
+            .sm_drain_overload_drops = delivery_queue_mod.sm_drain_overload_drops.load(.monotonic),
         });
     }
 

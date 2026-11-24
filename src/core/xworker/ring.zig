@@ -68,6 +68,10 @@ pub var sm_offline_refused = std.atomic.Value(u64).init(0);
 /// Queues that hit the parked-drain retention bound and drained inline
 /// instead of parking (counted per queue, not per stanza).
 pub var sm_drain_park_overflow = std.atomic.Value(u64).init(0);
+/// Stanzas bulk-dropped when the overload drain's per-turn credit ran
+/// out before the queue settled (a subset marker like sm_offline_refused,
+/// not a fifth outcome).
+pub var sm_drain_overload_drops = std.atomic.Value(u64).init(0);
 /// Stanzas queueSend refused because they can never fit the write buffer,
 /// counted apart from the slow-reader overflow teardown. The session stays
 /// up; iq results are answered with resource-constraint instead.
