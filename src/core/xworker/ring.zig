@@ -143,22 +143,29 @@ pub const DeliveryClass = enum(u8) {
 
 /// A refcounted payload shared between ring slots, room mailboxes, SM
 /// replay queues and actor retry lists (ADR-3). One allocation: header
-/// followed by `len` payload bytes. The producing worker's `BlobBudget`
-/// bounds its in-flight bytes; the last release on any thread frees the
-/// allocation through `alloc` and returns the bytes to whichever budget
-/// carries the charge.
+/// followed by `len` payload bytes.
+///
+/// References come in two kinds. Transport references (ring slots, room
+/// mailbox entries, actor retries and the producer's own handle) carry
+/// the producing worker's `BlobBudget` charge: the producer pays for
+/// bytes in transport only, so the charge ends when the last transport
+/// reference ends, whoever still holds the bytes. Retention references
+/// (SM unacked entries, resume handoff bundles) keep the allocation
+/// alive with no copy and no producer charge; the holding session pays
+/// for them on its own bound. The last release of either kind frees the
+/// allocation through `alloc`.
 pub const Blob = struct {
-    /// Open references: ring slots, mailbox entries, SM entries, the
-    /// producer's own handle.
+    /// Open references of both kinds.
     refs: std.atomic.Value(u32),
-    /// Budget currently carrying this blob's byte charge. Atomic because
-    /// a retainer (a detached SM queue) may move the charge while other
-    /// references are still open (transferChargeTo); the freeing release
-    /// returns it to whatever pointer is current.
-    budget: std.atomic.Value(*BlobBudget),
+    /// Open transport references; a subset of `refs`. The producer's byte
+    /// charge is refunded when this count reaches zero.
+    charge_refs: std.atomic.Value(u32),
+    /// Budget carrying this blob's byte charge: the producer, immutable
+    /// (ADR-3). Null on blobs made by `createUncharged`, which never held
+    /// a transport charge.
+    budget: ?*BlobBudget,
     /// Allocator that made this allocation. Recorded on the blob so the
-    /// last release frees correctly no matter which budget the charge
-    /// was moved to.
+    /// last release frees correctly on any thread.
     alloc: std.mem.Allocator,
     /// Payload length in bytes.
     len: u32,
@@ -170,53 +177,80 @@ pub const Blob = struct {
         return raw[@sizeOf(Blob) .. @sizeOf(Blob) + self.len];
     }
 
-    /// Take another reference (a new slot, mailbox entry or queue node).
+    /// Take a transport reference (a new slot, mailbox entry or actor
+    /// retry). The byte charge must still be live: a transport reference
+    /// taken after the last one ended would pin bytes no budget pays for.
     pub fn addRef(self: *Blob) void {
+        const prev = self.charge_refs.fetchAdd(1, .acq_rel);
+        std.debug.assert(prev > 0);
         _ = self.refs.fetchAdd(1, .monotonic);
     }
 
-    /// Drop a reference. The last one frees the allocation through `alloc`
-    /// and returns the byte charge to the current budget.
+    /// Take a retention reference (SM unacked entry, resume bundle). The
+    /// allocation stays alive; the producer's charge is unaffected, so
+    /// retention never starves a producing worker's transport budget.
+    pub fn retain(self: *Blob) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Drop a transport reference. When the last one ends the byte charge
+    /// returns to the producer's budget; the allocation itself frees on
+    /// the last reference of any kind.
     pub fn release(self: *Blob) void {
+        const prev = self.charge_refs.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+        if (prev == 1) {
+            const size = @sizeOf(Blob) + self.len;
+            _ = self.budget.?.bytes_in_flight.fetchSub(size, .acq_rel);
+        }
+        self.releaseRef();
+    }
+
+    /// Drop a retention reference.
+    pub fn releaseRetention(self: *Blob) void {
+        self.releaseRef();
+    }
+
+    fn releaseRef(self: *Blob) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-        const budget = self.budget.load(.acquire);
+        std.debug.assert(self.charge_refs.load(.acquire) == 0);
         const size = @sizeOf(Blob) + self.len;
         const raw: [*]align(@alignOf(Blob)) u8 = @ptrCast(@alignCast(self));
         self.alloc.free(raw[0..size]);
-        _ = budget.bytes_in_flight.fetchSub(size, .acq_rel);
     }
 
-    /// Move this blob's byte charge from its current budget onto `to`
-    /// (T-265C5A0E): detached SM queues transfer their retention off the
-    /// producing workers' ring budgets so a 300 s resume tail can never
-    /// starve a producer. The caller MUST hold a reference (a queue entry
-    /// counts): while one is held the freeing release cannot run, so the
-    /// charge cannot be returned twice. Returns false, changing nothing,
-    /// when `to` cannot take the charge.
-    pub fn transferChargeTo(self: *Blob, to: *BlobBudget) bool {
-        const size: u64 = @sizeOf(Blob) + self.len;
-        while (true) {
-            const cur = self.budget.load(.acquire);
-            if (cur == to) return true;
-            if (to.bytes_in_flight.fetchAdd(size, .acq_rel) + size > to.limit) {
-                _ = to.bytes_in_flight.fetchSub(size, .acq_rel);
-                return false;
-            }
-            if (self.budget.cmpxchgWeak(cur, to, .acq_rel, .acquire)) |_| {
-                _ = to.bytes_in_flight.fetchSub(size, .acq_rel);
-                continue;
-            }
-            _ = cur.bytes_in_flight.fetchSub(size, .acq_rel);
-            return true;
+    /// Copy `payload` into a blob that carries no transport charge
+    /// (`budget` null, `charge_refs` 0). SM unacked queues produce their
+    /// private entries here so retention bytes count only against the
+    /// holding session's bound, never a producing worker's budget. The
+    /// MAX_BLOB_SIZE cap still applies: a stanza that can never be a
+    /// transport payload cannot be replayed either.
+    pub fn createUncharged(allocator: std.mem.Allocator, payload: []const u8) !*Blob {
+        if (payload.len > MAX_BLOB_SIZE) {
+            _ = ring_drops_payload.fetchAdd(1, .monotonic);
+            return error.PayloadTooLarge;
         }
+        const size: usize = @sizeOf(Blob) + payload.len;
+        const raw = try allocator.alignedAlloc(u8, .fromByteUnits(@alignOf(Blob)), size);
+        const blob: *Blob = @ptrCast(raw.ptr);
+        blob.* = .{
+            .refs = std.atomic.Value(u32).init(1),
+            .charge_refs = std.atomic.Value(u32).init(0),
+            .budget = null,
+            .alloc = allocator,
+            .len = @intCast(payload.len),
+        };
+        @memcpy(raw.ptr[@sizeOf(Blob)..size], payload);
+        return blob;
     }
 };
 
-/// Per-producing-worker bound on blob bytes in flight (ADR-3). A producer
-/// that would exceed `limit` fails with error.BlobBudget, which takes the
-/// same QueueFull policy path as a full ring. Freeing from a consumer
-/// thread is safe: the allocator is the process allocator and the counter
-/// is atomic.
+/// Per-producing-worker bound on blob bytes in transport (ADR-3): ring
+/// slots, room mailboxes and actor retries. SM retention references do
+/// not charge it (see `Blob`). A producer that would exceed `limit`
+/// fails with error.BlobBudget, which takes the same QueueFull policy
+/// path as a full ring. Freeing from a consumer thread is safe: the
+/// allocator is the process allocator and the counter is atomic.
 pub const BlobBudget = struct {
     allocator: std.mem.Allocator,
     limit: u64,
@@ -225,16 +259,10 @@ pub const BlobBudget = struct {
     /// Default per-worker in-flight cap (ADR-3).
     pub const DEFAULT_LIMIT: u64 = 4 * 1024 * 1024;
 
-    /// Per-worker bound on blob charges retained by detached SM unacked
-    /// queues (T-265C5A0E). Detach moves every retained charge off the
-    /// producing ring budgets onto one retention budget, so the resume
-    /// tail is bounded here instead of starving producers. Larger than a
-    /// producer budget because a worker may hold many detached queues.
-    pub const SM_RETENTION_LIMIT: u64 = 16 * 1024 * 1024;
-
-    /// Copy `payload` into a new refcounted blob; the caller owns the
-    /// initial reference. Fails closed on budget exhaustion, allocation
-    /// failure, or payloads over MAX_BLOB_SIZE.
+    /// Copy `payload` into a new refcounted blob charged to this budget;
+    /// the caller owns the initial transport reference. Fails closed on
+    /// budget exhaustion, allocation failure, or payloads over
+    /// MAX_BLOB_SIZE.
     pub fn produce(self: *BlobBudget, payload: []const u8) !*Blob {
         if (payload.len > MAX_BLOB_SIZE) {
             _ = ring_drops_payload.fetchAdd(1, .monotonic);
@@ -252,7 +280,8 @@ pub const BlobBudget = struct {
         const blob: *Blob = @ptrCast(raw.ptr);
         blob.* = .{
             .refs = std.atomic.Value(u32).init(1),
-            .budget = std.atomic.Value(*BlobBudget).init(self),
+            .charge_refs = std.atomic.Value(u32).init(1),
+            .budget = self,
             .alloc = self.allocator,
             .len = @intCast(payload.len),
         };
