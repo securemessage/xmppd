@@ -398,6 +398,7 @@ test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path"
         .active = true,
         .touched_at = std.time.timestamp() - 2 * SCRAM_SLOT_STALE_SECONDS,
     };
+    metrics.scramActivated(); // mirror handleScramInit's pairing
 
     // A fresh login aliasing the same home slot (same low 16 bits = same
     // session slot, newer generation) must reclaim it, not fail.
@@ -413,10 +414,11 @@ test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path"
         .active = true,
         .touched_at = std.time.timestamp(),
     };
+    metrics.scramActivated();
     const blocked_conn: u32 = 43 + (1 << 16); // aliases neighbor slot 43
     const alt = handler.findOrCreateScramSlot(0, blocked_conn).?;
     try std.testing.expect(alt != dead_slot);
-    handler.scram_sessions[dead_slot].deinit();
+    releaseSession(&handler.scram_sessions[dead_slot]);
     handler.scram_sessions[alt].deinit();
 }
 
