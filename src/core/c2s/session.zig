@@ -530,15 +530,14 @@ pub const Session = struct {
     /// Initialize into the caller's `self` slot (out-param, same shape as
     /// Server.init: no Session-sized temporary on the caller's stack).
     pub fn init(self: *Session, fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) void {
-        var reader = xml.Reader.init(allocator);
-        // Pre-auth cap: negotiation elements are small, and an unauthenticated
-        // peer must not be able to spend the post-auth budget (H6).
-        reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
         self.* = .{
             .conn = Connection.init(fd, id, allocator),
-            .reader = reader,
+            .reader = xml.Reader.init(allocator),
             .stream = xmpp.Stream.init(server_host, direct_tls),
         };
+        // Pre-auth cap: negotiation elements are small, and an unauthenticated
+        // peer must not be able to spend the post-auth budget (H6).
+        self.reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
     }
 
     pub fn deinit(self: *Session) void {

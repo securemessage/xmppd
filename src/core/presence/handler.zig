@@ -1337,7 +1337,11 @@ fn deliverPresenceToSubscribers(
                 const target_session = ctx.server.sessionForEventToken(entry.token) orelse return;
                 fanout.deliverToSession(target_session, ctx.presence_xml, entry.token.index);
             } else if (ctx.server.delivery_system) |ds| {
-                ds.enqueue(ctx.server.worker_id, entry.worker_id, entry.token, ctx.presence_xml) catch return;
+                ds.enqueue(ctx.server.worker_id, entry.worker_id, entry.token, ctx.presence_xml) catch {
+                    // A full remote queue drops this copy; the worker is
+                    // not marked pending since nothing was enqueued.
+                    return;
+                };
                 if (entry.worker_id < metrics.MAX_WORKERS) ctx.pending_workers[entry.worker_id] = true;
             }
         }

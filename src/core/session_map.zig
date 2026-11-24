@@ -916,7 +916,9 @@ test "SessionMap: T254 OOM rollback at every bind allocation point" {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         // init itself allocates (the shard slice); an init failure consumed
         // this index without reaching bind.
-        var map = SessionMap.init(failing.allocator(), 1, 0) catch continue;
+        var map = SessionMap.init(failing.allocator(), 1, 0) catch {
+            continue;
+        };
         if (map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile")) |_| {
             map.deinit();
             break;
