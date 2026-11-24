@@ -14,26 +14,37 @@ T-684D1A21; subsumes T317 and V19; with C4 it closes T429/T430).
    atomic byte counter (ADR-3, already on the hot path since C4). The expiry
    wheel is worker-local and lock-free by ownership. No new shared state.
 3. **Shared resources.** `BlobBudget` is per producing worker
-   (`DeliverySystem.budgets[w]`), already sharded. Unacked-queue bytes now
-   charge that budget: replay memory is bounded the same way ring payloads
-   are, instead of living outside every bound.
+   (`DeliverySystem.budgets[w]`), already sharded, and bounds transport
+   only: ring slots, room mailboxes, actor retries. SM retention is
+   charged to the holder instead: each unacked entry counts `len` against
+   its own session's `sm_max_unacked_bytes` bound and refunds on ack,
+   discard or drain. A non-acking client cannot pin a producer's budget.
 4. **Nothing blocks a loop.** Replay and drain are the same memory writes
    they were (blob bytes are contiguous). Offline stores go through the
    existing `storeHeldPointer` path (no new I/O on the loop).
 5. **Connection economics.** A Blob is a reference (~24 B header), not a
    copy: a detached session with 256 unacked stanzas pins ~24 B per stanza
    header plus the shared payload once, rather than a private copy per
-   recipient. Wheel adds three words per session slot.
+   recipient. Retention is bounded per session by
+   `[core] sm_max_unacked_bytes` (default 4 MiB = 256 x 16 KiB), so a
+   worker's worst-case retention is `sessions_per_worker x
+   sm_max_unacked_bytes` — config-derived, no hidden worker ceiling.
+   Wheel adds three words per session slot.
 6. **Many requests per connection.** Unchanged (XEP-0198 already streams).
 7. **Beyond one host.** Cross-worker resume already hands off state; with
    Blobs the handoff transfers references instead of copies (same process,
    atomic refcounts make that safe).
 8. **Expensive operations priced.** No new expensive ops. The wheel turns a
-   30 s O(sessions) scan into O(due) work.
-9. **Overload behavior.** The unacked queue keeps its 256 bound; a produce
-   that hits the blob budget fails the session (same fail-closed class as
-   the existing `.alloc_failed`/`.overflow`). Offline refusals now bounce
-   to the sender instead of being counted-but-lost (the #81 gap).
+   30 s O(sessions) scan into O(due) work; its minimum recompute is an
+   O(buckets) head scan, never a node walk.
+9. **Overload behavior.** The unacked queue keeps its 256 bound plus the
+   per-session byte bound; a push that would exceed it returns
+   `.bytes_refused` and fails that session alone into the counted
+   section-5 drain (same fail-closed class as `.overflow`). A drain
+   bounce tracked in a sender's queue is charged to that sender's own
+   bound, so one victim's drain can only fail senders already over their
+   bound. Offline refusals now bounce to the sender instead of being
+   counted-but-lost (the #81 gap).
 10. **Measured.** R1/S1/C1/Z1 rig cells, 3 runs each on master and on this
     head, in the same session; R1 reports lost / stored-offline / bounced
     separately.
@@ -43,29 +54,44 @@ T-684D1A21; subsumes T317 and V19; with C4 it closes T429/T430).
 ### Unacked queue holds Blob references (item a)
 
 `SmUnackedQueue` entries become `?*delivery_queue.Blob` (atomic refcounted,
-ADR-3). `init` takes a `*BlobBudget` instead of an `Allocator`:
+ADR-3). Blob references come in two kinds:
 
-- `push(data)` produces a Blob on the queue's budget. Budget or allocation
-  failure maps to the existing `.alloc_failed` push result, which already
-  fails the session (T178 fail-closed).
-- `pushBlob(blob)` takes a reference on an existing Blob: cross-worker
-  deliveries share the ring slot's Blob instead of copying
+- **Transport references** (ring slots, room mailboxes, actor retries,
+  the producer's own handle) carry the producing worker's `BlobBudget`
+  charge. The charge ends when the last transport reference ends, whoever
+  still holds the bytes; `Blob.budget` is one immutable owner.
+- **Retention references** (unacked-queue entries, resume handoff
+  bundles) keep the allocation alive with no copy and no producer charge.
+  The holding session pays: `SmUnackedQueue.bytes` charges `len` on push
+  and refunds on ack, discard or drain, bounded by
+  `[core] sm_max_unacked_bytes` (schema key, default
+  `sm_state.DEFAULT_MAX_UNACKED_BYTES` = 4 MiB). Shared multicast
+  payloads count once per holder (over-counts, never under-counts).
+
+`init` takes `(allocator, byte_limit)`; `Server.sm_max_unacked_bytes`
+carries the configured bound from `[core]` through `WorkerCtx`:
+
+- `push(data)` copies into a private uncharged Blob
+  (`Blob.createUncharged`) and charges the session. A bound refusal maps
+  to `.bytes_refused`; oversize/OOM to `.alloc_failed`. Both fail the
+  session, and only that session (T178 fail-closed).
+- `pushBlob(blob)` takes a retention reference on an existing Blob:
+  cross-worker deliveries share the ring slot's Blob instead of copying
   (`drainDeliveryQueue` passes `queue.current_slot_blob` to
-  `Session.stanzaBlob`), and the cross-worker resume rebuild re-references
-  the handoff blobs instead of duplicating them.
-- `deinit`/`discardHead` release references; bytes return to whichever
-  worker's budget produced the blob. `UnackedIterator.next()` yields
-  `*Blob`; callers read `blob.bytes()`.
+  `Session.stanzaBlob`), and the cross-worker resume rebuild
+  re-references the handoff blobs instead of duplicating them. The same
+  bound check applies.
+- `deinit`/`discardHead` drop retention references and refund the
+  session's account. `UnackedIterator.next()` yields `*Blob`; callers
+  read `blob.bytes()`.
 
 `Session.smTrackOutbound` gains a `?*Blob` parameter; `stanza()` and
-`stanzaWithFlush()` route through `stanzaBlob(data, ?*Blob)`. `Server`
-gets `smBlobBudget()`: `delivery_system.budgets[worker_id]` when a
-delivery system exists, else a server-owned fallback `BlobBudget` (tests
-and single-worker rigs without a delivery system still get the bound).
+`stanzaWithFlush()` route through `stanzaBlob(data, ?*Blob)`.
 
-`ResumeBundle.stanzas` becomes `[]*Blob` (sm_handoff.zig). Blobs are
-process-lifetime safe across workers: refs are atomic and release() returns
-the charge to the producing worker's budget on any thread.
+`ResumeBundle.stanzas` becomes `[]*Blob` (sm_handoff.zig), held as
+retention references. Blobs are process-lifetime safe across workers:
+refs are atomic and the last release of either kind frees through the
+recorded allocator on any thread.
 
 ### Replay through the Outbox (item b)
 
@@ -96,6 +122,14 @@ revolution and each bucket's entries are all due at its tick). Intrusive
   (`armSmExpiry`); empty wheel disarms. The 30 s periodic registration and
   its whole-session-table scan go away. No per-session timers, no polling:
   the loop sleeps until the next deadline.
+- `scanMin` is O(buckets): linked deadlines all fall within one revolution
+  of the cursor and one bucket holds one deadline (asserted on insert),
+  so the minimum is the first non-empty bucket forward from `cursor + 1`.
+  At most 512 head checks, never a node walk.
+- `sm_detach_time`, wheel deadlines and `armSmExpiry` run on
+  `clock_gettime(CLOCK.MONOTONIC)`: a wall-clock step can neither stall
+  expiry nor mass-expire detached sessions. Wall clock remains only for
+  timestamps that leave the process (offline-store stamps, stanza ids).
 - `SM_EXPIRY_SWEEP_MS` is removed; worker test sites that used it as
   changelist filler use any other interval.
 
@@ -163,10 +197,22 @@ registration) and still reports `.sm_failed` with the drop count.
 
 ## Revert-check tests (each fails when its change is reverted)
 
-1. Unacked queue entries are `*Blob`: `pushBlob` shares, refcount counts
-   refs (queue entry + producer handle == 2), deinit releases.
-2. Cross-worker delivery to a resumable session shares the ring Blob:
-   `refs` reaches 2 during the drain handler, not a copy.
+1. Unacked queue entries are `*Blob` retention references: `pushBlob`
+   shares, refcount counts refs (queue entry + producer handle == 2),
+   deinit releases.
+2. Producer refund: a cross-worker delivery to a resumable session shares
+   the ring Blob, and after the slot's transport reference ends
+   `bytes_in_flight` returns to zero while the queue still holds the
+   bytes.
+2a. Isolation: a live session filled past `sm_max_unacked_bytes` fails
+    alone (`sm_overflow`, `.bytes_refused`) while a sibling session on
+    another worker still receives the same producer's deliveries; zero
+    `blob_budget_denials`, producer `bytes_in_flight` zero.
+2b. Holder bound: `push`/`pushBlob` past a session's `byte_limit` refuse
+    only that queue; a sibling queue retains the same Blob freely, and
+    ack refunds let the refused queue accept again.
+2c. Wheel `scanMin` is a bucket scan: unlinking the minimum recomputes
+    with `scan_node_visits == 0` and at most 512 bucket probes.
 3. Replay after resume delivers every unacked stanza exactly once through
    `stanzaReplay` (outbox), from a shared blob.
 4. `ResumeBundle` round-trip carries `*Blob` stanzas; rebuild via
