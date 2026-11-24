@@ -7,9 +7,9 @@
 //!
 //! ## Indexes
 //!
-//! - `full_map`: normalized full JID ("alice@host/mobile") -> *SessionEntry —
+//! - `full_map`: normalized full JID ("alice@host/mobile") -> *SessionEntry -
 //!   O(1) exact lookup; this is the one entry store.
-//! - `bare_map`: normalized bare JID ("alice@host") -> list of *SessionEntry —
+//! - `bare_map`: normalized bare JID ("alice@host") -> list of *SessionEntry -
 //!   O(1) multi-resource index into the same entries. Presence and priority
 //!   updates touch a single object; nothing is kept in sync by hand.
 //!
@@ -21,7 +21,7 @@
 //!
 //! All locking is internal. The map is sharded by bare-JID hash: every JID of
 //! one account resolves to one shard, each shard holds its own `RwLock` and
-//! index pair. A `multi_worker` flag gates lock acquisition — in
+//! index pair. A `multi_worker` flag gates lock acquisition - in
 //! single-worker mode there is exactly one shard and no lock overhead.
 //!
 //! - Read (shared) lock: findByFullJid, forEach, forEachAvailable,
@@ -253,7 +253,7 @@ pub const SessionMap = struct {
 
     /// `workers` is the configured core worker count. One shard when there is
     /// a single worker (locks then never taken); otherwise
-    /// pow2ceil(8 * workers) clamped to [8, 256] — 8 shards per worker keeps
+    /// pow2ceil(8 * workers) clamped to [8, 256] - 8 shards per worker keeps
     /// a fan-out's lock hold from colliding with a same-shard writer except
     /// on ~1/shard_count of accounts, and the clamp bounds the table cost.
     pub fn init(allocator: std.mem.Allocator, workers: usize, max_resources: usize) !SessionMap {
@@ -459,7 +459,7 @@ pub const SessionMap = struct {
     /// lock (S18, ADR-4 item 4). The entry list is stable for the call, so
     /// callers serialize and enqueue per entry instead of copying entries
     /// into a fixed result buffer. `visit(ctx, entry)` runs bounded work
-    /// only — leaf locks, no SessionMap calls (asserted via hold_depth).
+    /// only - leaf locks, no SessionMap calls (asserted via hold_depth).
     pub fn forEach(
         self: *SessionMap,
         local: []const u8,
@@ -556,7 +556,7 @@ pub const SessionMap = struct {
 
     /// Update presence availability and priority for a session under one
     /// exclusive hold (T268). The entry is one object behind both indexes,
-    /// so this is a single lookup and write — no re-lookup and nothing to
+    /// so this is a single lookup and write - no re-lookup and nothing to
     /// keep in sync.
     pub fn setPresenceState(
         self: *SessionMap,

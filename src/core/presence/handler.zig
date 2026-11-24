@@ -969,7 +969,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
 
         // Each owner resource needs its own stanza ('from' carries the
         // resource), and deliverPresenceToTarget resolves the contact's
-        // resources in the map itself — it must not run inside the visit,
+        // resources in the map itself - it must not run inside the visit,
         // where a nested map hold is a programmer error. Phase 1 builds the
         // stanzas under the visitor; phase 2 delivers them. The list is
         // bounded by the configured per-account resource cap.
@@ -1206,7 +1206,7 @@ fn sendOtherResourcesPresence(
 
         fn visit(ctx: *@This(), entry: *const SessionEntry) void {
             const entry_resource = entry.resource();
-            // Skip self — the new resource already knows its own presence.
+            // Skip self - the new resource already knows its own presence.
             if (std.mem.eql(u8, entry_resource, ctx.new_resource)) return;
 
             // Build presence from the existing resource with its current priority.

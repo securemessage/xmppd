@@ -311,12 +311,12 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
             if (sel.best_prio >= 0) single = sel.best;
         }
     } else {
-        // RFC 6121 §8.5.2: Stanza addressed to bare JID — deliver to available resources.
+        // RFC 6121 §8.5.2: Stanza addressed to bare JID - deliver to available resources.
         var sel: SelectCtx = .{};
         sm.forEachAvailable(to_jid.local, to_jid.domain, &sel, SelectCtx.visit);
         if (sel.count > 0) {
             if (session.stanza_kind == .iq) {
-                // RFC 6121 §8.5.2.1.3: IQ to bare JID — deliver to ONE best resource.
+                // RFC 6121 §8.5.2.1.3: IQ to bare JID - deliver to ONE best resource.
                 if (sel.best_prio >= 0) single = sel.best;
             } else if (session.stanza_kind == .message) {
                 // RFC 6121 §8.5.2.1.1: groupchat and error to bare JID MUST NOT be delivered.
