@@ -37,7 +37,7 @@ const crypto_pool_mod = @import("crypto_pool");
 const metrics = @import("auth_metrics");
 
 const plain_mech = @import("mech/plain.zig");
-const scram_mech = @import("mech/scram.zig");
+pub const scram_mech = @import("mech/scram.zig");
 const oauthbearer_mech = @import("mech/oauthbearer.zig");
 const account_mod = @import("account.zig");
 
@@ -228,6 +228,9 @@ pub fn AuthHandler(comptime Store: type) type {
             replay_capacity: usize = scram_mech.DEFAULT_REPLAY_CAPACITY,
             nonce_window_seconds: i64 = scram_mech.DEFAULT_NONCE_WINDOW_SECONDS,
             nonce_skew_seconds: i64 = scram_mech.DEFAULT_NONCE_SKEW_SECONDS,
+            /// The persisted {db}/auth fake-derivation key; null mints a
+            /// per-boot one (tests, OIDC daemon).
+            scram_secret: ?[32]u8 = null,
         };
 
         pub fn init(allocator: std.mem.Allocator, store: *Store, opts: InitOpts) Self {
@@ -242,7 +245,11 @@ pub fn AuthHandler(comptime Store: type) type {
                 handler.replay_entries = allocator.alloc(scram_mech.ReplayEntry, opts.replay_capacity) catch &.{};
                 for (handler.replay_entries) |*e| e.* = .{};
             }
-            std.crypto.random.bytes(&handler.scram_secret);
+            if (opts.scram_secret) |s| {
+                handler.scram_secret = s;
+            } else {
+                std.crypto.random.bytes(&handler.scram_secret);
+            }
             return handler;
         }
 
@@ -288,6 +295,7 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            std.crypto.secureZero(u8, &self.scram_secret);
             if (self.replay_entries.len > 0) self.allocator.free(self.replay_entries);
             var pend_it = self.pending_plain.iterator();
             while (pend_it.next()) |kv| {

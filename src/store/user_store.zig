@@ -96,7 +96,7 @@ pub fn UserStore(comptime Backend: type) type {
         /// second registration cannot slip between the checks and the
         /// write (T-52633E2B).
         pub fn addUser(self: *Self, allocator: std.mem.Allocator, username: []const u8, password: []const u8) !void {
-            const creds = try sasl.StoredCredentials.generate(password, 4096);
+            const creds = try sasl.StoredCredentials.generate(password, sasl.default_iteration_count);
             const value = serializeCredentials(creds);
 
             if (oidc_ids.claim_window_hook) |hook| hook();
@@ -152,7 +152,7 @@ pub fn UserStore(comptime Backend: type) type {
             } else {
                 return error.UserNotFound;
             }
-            const creds = try sasl.StoredCredentials.generate(password, 4096);
+            const creds = try sasl.StoredCredentials.generate(password, sasl.default_iteration_count);
             const value = serializeCredentials(creds);
             try self.backend.put(NAMESPACE, username, &value);
             log.info("changed password for: {s}", .{username});

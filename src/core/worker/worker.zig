@@ -204,8 +204,8 @@ const DIRTY_FLUSH_POPS_MAX: u32 = 256;
 
 /// The XMPP core server.
 /// Public SCRAM parameters (salt, iterations) cached per raw n= username
-/// (ADR-6). The values are public — the auth daemon returns deterministic
-/// fakes for unknown users, which cache identically — so an eviction only
+/// (ADR-6). The values are public: the auth daemon returns deterministic
+/// fakes for unknown users, which cache identically, so an eviction only
 /// costs one params round trip. Fixed direct-mapped table per worker; the
 /// TTL is checked at use, never swept.
 pub const SCRAM_PARAM_CACHE_SIZE = 1024;

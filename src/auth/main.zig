@@ -34,6 +34,7 @@ const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
 const crypto_pool_mod = @import("crypto_pool");
 const metrics = @import("auth_metrics");
+const scram_mech = handler_mod.scram_mech;
 const lock_store_mod = @import("lock_store");
 const LockStore = lock_store_mod.LockStore(OpBackendType);
 const LockChecker = handler_mod.LockChecker;
@@ -178,11 +179,26 @@ pub fn main() !void {
     // configured login-rate ceiling times the nonce freshness window
     // (ADR-6): a window sized for the declared ceiling can hold every live
     // nonce a compliant load produces, so inserts refuse before they evict.
+    // The fake-derivation key persists in {db}/auth (created once, 0600):
+    // a fake salt then survives restarts exactly like a real one.
+    var scram_secret: ?[32]u8 = null;
+    if (std.fs.cwd().openDir(auth_path, .{})) |d| {
+        var dir = d;
+        defer dir.close();
+        scram_secret = scram_mech.loadOrCreateSecret(dir) catch |err| blk: {
+            log.err("cannot load or create {s}/{s} ({}); fakes use a per-boot key", .{ auth_path, scram_mech.SECRET_FILE, err });
+            break :blk null;
+        };
+    } else |err| {
+        log.err("cannot open {s} for the scram secret ({}); fakes use a per-boot key", .{ auth_path, err });
+    }
+    defer if (scram_secret) |*s| std.crypto.secureZero(u8, s[0..]);
     const replay_capacity = @as(usize, v.auth.login_rate_ceiling) * @as(usize, v.auth.scram_nonce_window_seconds);
     var handler = AuthHandler.init(allocator, &store, .{
         .replay_capacity = replay_capacity,
         .nonce_window_seconds = v.auth.scram_nonce_window_seconds,
         .nonce_skew_seconds = v.auth.scram_nonce_skew_seconds,
+        .scram_secret = scram_secret,
     });
     if (handler.replay_entries.len == 0) {
         log.warn("replay cache alloc of {d} entries failed; every SCRAM verify refuses", .{replay_capacity});

@@ -1819,8 +1819,8 @@ fn processScramAuthComplete(self: *Server, session: *Session, client_first: []co
         return;
     }
 
-    // Cache miss: one lookup round trip. The raw n= name is enough — the
-    // daemon prepares it and answers a deterministic fake for unknown users.
+    // Cache miss: one lookup round trip. The raw n= name is enough for the
+    // daemon to prepare it and answer a deterministic fake for unknown users.
     self.ipc.send(.{ .scram_params_request = .{
         .conn_id = session.ipcConnId(),
         .username = session.scram_user_buf[0..session.scram_user_len],
@@ -1884,7 +1884,7 @@ pub fn sendScramChallenge(self: *Server, session: *Session, salt: []const u8, it
     return true;
 }
 
-/// Called when </response> is reached — the client-final for a parked v2
+/// Called when </response> is reached: the client-final for a parked v2
 /// SCRAM exchange goes to the auth daemon in one scram_verify.
 pub fn processSaslResponseComplete(self: *Server, session: *Session, changes: *ChangeList) void {
     session.sasl_collecting = .none;

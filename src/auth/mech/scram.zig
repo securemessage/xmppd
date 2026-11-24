@@ -43,7 +43,38 @@ pub const DEFAULT_NONCE_SKEW_SECONDS: i64 = 15;
 const REPLAY_PROBE = 8;
 /// Iteration count served for unknown users; the same constant the store
 /// derives at account creation so fakes are indistinguishable.
-const FAKE_ITERATIONS: u32 = 4096;
+const FAKE_ITERATIONS: u32 = sasl.scram.default_iteration_count;
+
+/// The persisted fake-derivation key inside {db}/auth: loaded at init or
+/// created once, so a fake salt is as stable across restarts as a real
+/// one (review 770 item 2).
+pub const SECRET_FILE = "scram_secret";
+
+/// Load the persisted secret from dir, or mint and store it once with
+/// mode 0600. dir is the opened {db}/auth directory; a concurrent creator
+/// wins and the loser reads what it wrote.
+pub fn loadOrCreateSecret(dir: std.fs.Dir) ![32]u8 {
+    if (dir.openFile(SECRET_FILE, .{})) |file| {
+        defer file.close();
+        var secret: [32]u8 = undefined;
+        const n = try file.readAll(&secret);
+        if (n != secret.len) return error.InvalidSecretFile;
+        return secret;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    var secret: [32]u8 = undefined;
+    std.crypto.random.bytes(&secret);
+    const file = dir.createFile(SECRET_FILE, .{ .mode = 0o600, .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => return loadOrCreateSecret(dir),
+        else => return err,
+    };
+    defer file.close();
+    try file.writeAll(&secret);
+    try file.sync();
+    return secret;
+}
 
 /// One replay-cache slot. The tag is HMAC(secret, nonce) truncated to 16 B:
 /// keyed, so an attacker cannot steer inserts into one probe window.
@@ -793,4 +824,51 @@ test "SCRAM v2: a full probe window refuses the verify rather than evicting a li
     try std.testing.expect(ex.verify_msg.? == .auth_failure);
     try std.testing.expectEqualStrings("temporary-auth-failure", ex.verify_msg.?.auth_failure.reason);
     try std.testing.expectEqual(@as(u64, 1), metrics.counters.replay_refusals.load(.monotonic));
+}
+
+test "SCRAM: persisted fake secret is created once and stable across loads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const first = try loadOrCreateSecret(tmp.dir);
+    const second = try loadOrCreateSecret(tmp.dir);
+    try std.testing.expectEqualSlices(u8, &first, &second);
+
+    const stat = try tmp.dir.statFile(SECRET_FILE);
+    try std.testing.expectEqual(@as(u64, 32), stat.size);
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode)) & 0o777);
+
+    // The same secret yields identical fake credentials, so a fake salt is
+    // as stable across daemon restarts as a real one.
+    const a = fakeCredentials(&first, "mallory");
+    const b = fakeCredentials(&second, "mallory");
+    try std.testing.expectEqualSlices(u8, &a.salt, &b.salt);
+    try std.testing.expectEqualSlices(u8, &a.stored_key, &b.stored_key);
+    try std.testing.expectEqual(a.iteration_count, b.iteration_count);
+}
+
+test "SCRAM: advertised iteration count is identical for real and fake accounts" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw");
+    var handler = TestHandler.init(allocator, &store, .{});
+    defer handler.deinit();
+
+    const real = handleSync(&handler, .{ .scram_params_request = .{
+        .conn_id = 1,
+        .username = "alice",
+        .client_ip = "10.0.0.1",
+    } }) orelse return error.NoResponse;
+    const fake = handleSync(&handler, .{ .scram_params_request = .{
+        .conn_id = 2,
+        .username = "mallory",
+        .client_ip = "10.0.0.2",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(real == .scram_params);
+    try std.testing.expect(fake == .scram_params);
+    try std.testing.expectEqual(real.scram_params.iteration_count, fake.scram_params.iteration_count);
+    try std.testing.expectEqual(sasl.scram.default_iteration_count, fake.scram_params.iteration_count);
 }
