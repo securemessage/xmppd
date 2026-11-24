@@ -40,9 +40,12 @@ pub const PushResult = enum {
     /// error; detached: destroy) because the client can no longer be told
     /// the truth about what was delivered.
     overflow,
-    /// Blob production for the stanza copy failed (budget or allocation),
-    /// or a detached queue could not move the shared blob's charge onto a
-    /// full SM retention budget: stanza not buffered.
+    /// Retained bytes would pass `byte_limit` ([core]
+    /// sm_max_unacked_bytes): stanza not buffered. The caller must fail
+    /// this session, and only this session (resource-constraint).
+    bytes_refused,
+    /// Blob allocation for the stanza copy failed (oversize or OOM):
+    /// stanza not buffered.
     alloc_failed,
 };
 
@@ -55,6 +58,21 @@ pub const SM_R_THRESHOLD: u32 = UNACKED_CAPACITY / 2;
 
 /// Default session resume timeout in seconds.
 pub const DEFAULT_RESUME_TIMEOUT: u32 = 300;
+
+/// Default per-session bound on retained unacked stanza bytes; the
+/// `[core] sm_max_unacked_bytes` schema key carries the same default.
+/// UNACKED_CAPACITY x 16 KiB mirrors the worst case the count bound
+/// alone allowed.
+pub const DEFAULT_MAX_UNACKED_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Monotonic seconds for in-process deadlines: SM detach times, the
+/// expiry wheel's cursor and deadlines, resume-window checks. A wall
+/// clock step must never stall or mass-expire retention; wall time is
+/// only for timestamps that leave the process.
+pub fn monotonicSeconds() i64 {
+    const ts = std.posix.clock_gettime(.MONOTONIC) catch unreachable;
+    return ts.sec;
+}
 
 /// SM-ID length in hex characters (16 bytes = 32 hex chars).
 pub const SM_ID_HEX_LEN: usize = 32;
@@ -80,19 +98,20 @@ pub const SmUnackedQueue = struct {
     /// 2^32, so a report counts as forward only when it is within 2^31 ahead
     /// of last_h; a duplicate or backwards report discards nothing.
     last_h: u32 = 0,
-    /// Producer budget charged for copies the queue makes itself. While
-    /// the session is live this is the owning worker's delivery budget;
-    /// `retainOn` points it at the worker's SM retention budget on
-    /// detach.
-    budget: *delivery_queue.BlobBudget,
-    /// True while the queue belongs to a detached session: every new
-    /// entry must charge the retention budget, so `pushBlob` moves each
-    /// shared blob's charge onto `budget` before retaining it and a full
-    /// budget reports `.alloc_failed` (T-265C5A0E).
-    detached: bool = false,
+    /// Allocator for private copies `push` makes. Worker-local: the queue
+    /// is owned by one worker thread at a time (a resume handoff moves
+    /// the whole object).
+    allocator: std.mem.Allocator,
+    /// Retained payload bytes (`blob.len` summed over entries). Charged
+    /// on push, refunded on ack, discard or drain.
+    bytes: u64 = 0,
+    /// Per-session bound on `bytes` ([core] sm_max_unacked_bytes). A
+    /// refusal fails this session only; shared multicast payloads count
+    /// once per holder (over-counts, never under-counts).
+    byte_limit: u64,
 
-    pub fn init(budget: *delivery_queue.BlobBudget) SmUnackedQueue {
-        return .{ .budget = budget };
+    pub fn init(allocator: std.mem.Allocator, byte_limit: u64) SmUnackedQueue {
+        return .{ .allocator = allocator, .byte_limit = byte_limit };
     }
 
     pub fn deinit(self: *SmUnackedQueue) void {
@@ -100,13 +119,15 @@ pub const SmUnackedQueue = struct {
         while (i < self.count) : (i += 1) {
             const idx = (self.head + i) % UNACKED_CAPACITY;
             if (self.entries[idx]) |blob| {
-                blob.release();
+                self.bytes -= blob.len;
+                blob.releaseRetention();
                 self.entries[idx] = null;
             }
         }
         self.count = 0;
         self.head = 0;
         self.tail = 0;
+        self.bytes = 0;
     }
 
     /// Make room for one entry. Reports `.overflow` when the oldest unacked
@@ -118,11 +139,16 @@ pub const SmUnackedQueue = struct {
         return .overflow;
     }
 
-    /// Copy `stanza` into a fresh blob on the queue's budget and buffer the
-    /// reference. Production failures (budget cap, oversize, allocation)
-    /// report `.alloc_failed`, the same fail-closed class as before (T178).
+    /// Copy `stanza` into a private uncharged blob and buffer the
+    /// reference, charging `len` to this queue's byte bound. A bound
+    /// refusal reports `.bytes_refused`; allocation failures (oversize,
+    /// OOM) report `.alloc_failed`, the same fail-closed class (T178).
     pub fn push(self: *SmUnackedQueue, stanza: []const u8) PushResult {
-        const blob = self.budget.produce(stanza) catch {
+        if (self.bytes + stanza.len > self.byte_limit) {
+            log.warn("SM unacked queue: byte bound reached ({d} + {d} > {d})", .{ self.bytes, stanza.len, self.byte_limit });
+            return .bytes_refused;
+        }
+        const blob = delivery_queue.Blob.createUncharged(self.allocator, stanza) catch {
             log.warn("SM unacked queue: blob refused ({d} bytes)", .{stanza.len});
             return .alloc_failed;
         };
@@ -130,22 +156,26 @@ pub const SmUnackedQueue = struct {
         self.entries[self.tail] = blob;
         self.tail = (self.tail + 1) % UNACKED_CAPACITY;
         self.count += 1;
+        self.bytes += blob.len;
         return result;
     }
 
-    /// Buffer a reference on an existing blob instead of copying (C11):
-    /// ring-slot payloads and handoff bundles share the one allocation.
-    /// A detached queue first moves the blob's charge onto the SM
-    /// retention budget, reporting `.alloc_failed` when that budget is
-    /// full; a live queue cannot fail beyond the bounded eviction, which
-    /// reports `.overflow`.
+    /// Buffer a retention reference on an existing blob instead of
+    /// copying (C11): ring-slot payloads and handoff bundles share the
+    /// one allocation. The entry charges `blob.len` to this queue's own
+    /// bound; the producing worker's transport charge ends with the last
+    /// transport reference and is never extended by SM retention.
     pub fn pushBlob(self: *SmUnackedQueue, blob: *delivery_queue.Blob) PushResult {
+        if (self.bytes + blob.len > self.byte_limit) {
+            log.warn("SM unacked queue: byte bound reached ({d} + {d} > {d})", .{ self.bytes, blob.len, self.byte_limit });
+            return .bytes_refused;
+        }
         const result = self.evictForPush();
-        if (self.detached and !blob.transferChargeTo(self.budget)) return .alloc_failed;
-        blob.addRef();
+        blob.retain();
         self.entries[self.tail] = blob;
         self.tail = (self.tail + 1) % UNACKED_CAPACITY;
         self.count += 1;
+        self.bytes += blob.len;
         return result;
     }
 
@@ -213,31 +243,11 @@ pub const SmUnackedQueue = struct {
         return self.count;
     }
 
-    /// Detach-time retention move (T-265C5A0E): transfer every retained
-    /// blob's charge onto `budget`, the worker's dedicated SM retention
-    /// budget, and mark the queue detached so later pushes charge there
-    /// too. A detached queue may hold blobs from several producers; each
-    /// charge moves individually. Returns false on the first refusal,
-    /// leaving earlier transfers in place: the caller then fails the
-    /// session so the whole queue reaches a counted drain instead of
-    /// pinning producer budgets for the resume tail.
-    pub fn retainOn(self: *SmUnackedQueue, budget: *delivery_queue.BlobBudget) bool {
-        var i: u32 = 0;
-        while (i < self.count) : (i += 1) {
-            const idx = (self.head + i) % UNACKED_CAPACITY;
-            if (self.entries[idx]) |blob| {
-                if (!blob.transferChargeTo(budget)) return false;
-            }
-        }
-        self.budget = budget;
-        self.detached = true;
-        return true;
-    }
-
     fn discardHead(self: *SmUnackedQueue) void {
         if (self.count == 0) return;
         if (self.entries[self.head]) |blob| {
-            blob.release();
+            self.bytes -= blob.len;
+            blob.releaseRetention();
             self.entries[self.head] = null;
         }
         self.head = (self.head + 1) % UNACKED_CAPACITY;
@@ -303,20 +313,8 @@ pub fn classifyAck(h: u32, last_h: u32, sent: u32) SmUnackedQueue.AckResult {
 // Tests
 // ============================================================================
 
-var test_budget_store: ?delivery_queue.BlobBudget = null;
-
-fn testBudget() *delivery_queue.BlobBudget {
-    if (test_budget_store == null) {
-        test_budget_store = .{
-            .allocator = std.testing.allocator,
-            .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT,
-        };
-    }
-    return &test_budget_store.?;
-}
-
 test "SmUnackedQueue: push and ack" {
-    var queue = SmUnackedQueue.init(testBudget());
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     _ = queue.push("<message>hello</message>");
@@ -348,7 +346,7 @@ test "SmUnackedQueue: pushBlob shares one allocation, deinit releases it (C11)" 
     const blob = try producer.produce("<message>shared</message>");
     defer blob.release();
 
-    var queue = SmUnackedQueue.init(testBudget());
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     try std.testing.expectEqual(PushResult.pushed, queue.pushBlob(blob));
     // Producer handle + queue entry share the one allocation.
     try std.testing.expectEqual(@as(u32, 2), blob.refs.load(.monotonic));
@@ -364,70 +362,73 @@ test "SmUnackedQueue: pushBlob shares one allocation, deinit releases it (C11)" 
     try std.testing.expectEqual(@as(u32, 1), blob.refs.load(.monotonic));
 }
 
-test "SmUnackedQueue: retainOn moves charges off the producer budget (T-265C5A0E)" {
+test "SmUnackedQueue: retention refs do not extend the producer's charge" {
+    // The producer budget pays for bytes in transport only: once the
+    // last transport reference ends the charge returns to the budget
+    // even while the queue's retention reference keeps the bytes alive.
     var producer = delivery_queue.BlobBudget{
         .allocator = std.testing.allocator,
         .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT,
     };
-    var retention = delivery_queue.BlobBudget{
-        .allocator = std.testing.allocator,
-        .limit = delivery_queue.BlobBudget.SM_RETENTION_LIMIT,
-    };
 
-    // A shared ring blob and a self-produced copy, both producer-charged.
     const blob = try producer.produce("<message>shared</message>");
-    var queue = SmUnackedQueue.init(&producer);
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
     try std.testing.expectEqual(PushResult.pushed, queue.pushBlob(blob));
-    blob.release(); // the queue now holds the only reference
+    try std.testing.expect(producer.bytes_in_flight.load(.monotonic) > 0);
+
+    // Transport handle gone: the producer is fully refunded while the
+    // queue still holds (and reads) the same allocation.
+    blob.release();
+    try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), blob.charge_refs.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), blob.refs.load(.monotonic));
+    var iter = queue.getUnacked();
+    try std.testing.expectEqualStrings("<message>shared</message>", iter.next().?.bytes());
+
+    // Private copies charge nothing at all: push() allocates outside
+    // every producer budget.
     try std.testing.expectEqual(PushResult.pushed, queue.push("<presence/>"));
-
-    const charged = producer.bytes_in_flight.load(.monotonic);
-    try std.testing.expect(charged > 0);
-    try std.testing.expect(queue.retainOn(&retention));
     try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
-    try std.testing.expectEqual(charged, retention.bytes_in_flight.load(.monotonic));
-    try std.testing.expect(queue.detached);
-    try std.testing.expect(queue.budget == &retention);
-
-    // Pushes after the move charge the retention budget too: the shared
-    // blob's charge transfers, the copy produces there directly.
-    const late = try producer.produce("<message>late</message>");
-    try std.testing.expectEqual(PushResult.pushed, queue.pushBlob(late));
-    late.release();
-    try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
-    try std.testing.expectEqual(PushResult.pushed, queue.push("<iq/>"));
-
-    // Ack and teardown releases return every charge to retention.
-    _ = queue.ack(4);
-    try std.testing.expectEqual(@as(u64, 0), retention.bytes_in_flight.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 25 + 11), queue.bytes);
 }
 
-test "SmUnackedQueue: a detached queue refuses blob pushes past the retention budget" {
+test "SmUnackedQueue: the byte bound refuses only the holder that hits it" {
     var producer = delivery_queue.BlobBudget{
         .allocator = std.testing.allocator,
         .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT,
     };
-    var retention = delivery_queue.BlobBudget{
-        .allocator = std.testing.allocator,
-        .limit = 1,
-    };
 
-    var queue = SmUnackedQueue.init(&retention);
-    queue.detached = true;
-    defer queue.deinit();
+    // One shared blob; the victim's 1-byte bound refuses it while a
+    // sibling queue retains it freely. Bound refusals fail the holder,
+    // never a bystander or the producer.
+    var victim = SmUnackedQueue.init(std.testing.allocator, 1);
+    defer victim.deinit();
+    var sibling = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
+    defer sibling.deinit();
 
     const blob = try producer.produce("<message>held</message>");
     defer blob.release();
-    try std.testing.expectEqual(PushResult.alloc_failed, queue.pushBlob(blob));
-    try std.testing.expectEqual(@as(u32, 0), queue.count);
-    // The refused blob's charge never left the producing budget and is
-    // returned when the caller's own reference drops.
-    try std.testing.expect(producer.bytes_in_flight.load(.monotonic) > 0);
+    try std.testing.expectEqual(PushResult.bytes_refused, victim.pushBlob(blob));
+    try std.testing.expectEqual(@as(u32, 0), victim.count);
+    try std.testing.expectEqual(@as(u64, 0), victim.bytes);
+    try std.testing.expectEqual(PushResult.pushed, sibling.pushBlob(blob));
+
+    // push() is bound by the same per-session account.
+    try std.testing.expectEqual(PushResult.bytes_refused, victim.push("ab"));
+    try std.testing.expectEqual(@as(u32, 0), victim.count);
+
+    // Ack/discard refunds let the same queue accept again later.
+    var small = SmUnackedQueue.init(std.testing.allocator, 16);
+    defer small.deinit();
+    try std.testing.expectEqual(PushResult.pushed, small.push("0123456789"));
+    try std.testing.expectEqual(PushResult.bytes_refused, small.push("overflow"));
+    _ = small.ack(1);
+    try std.testing.expectEqual(PushResult.pushed, small.push("fits"));
 }
 
 test "SmUnackedQueue: overflow discards oldest and reports it (T178)" {
-    var queue = SmUnackedQueue.init(testBudget());
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     // Fill to capacity — every push reports .pushed
@@ -452,7 +453,7 @@ test "SmUnackedQueue: overflow discards oldest and reports it (T178)" {
 }
 
 test "SmUnackedQueue: ack all" {
-    var queue = SmUnackedQueue.init(testBudget());
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     _ = queue.push("a");
@@ -465,7 +466,7 @@ test "SmUnackedQueue: ack all" {
 }
 
 test "SmUnackedQueue: ack above the sent count changes nothing (S24)" {
-    var queue = SmUnackedQueue.init(testBudget());
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     _ = queue.push("a");
@@ -484,7 +485,7 @@ test "SmUnackedQueue: ack above the sent count changes nothing (S24)" {
 }
 
 test "SmUnackedQueue: backwards or duplicate h discards nothing (S24)" {
-    var queue = SmUnackedQueue.init(testBudget());
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     var i: u32 = 0;
@@ -514,7 +515,7 @@ test "SmUnackedQueue: backwards or duplicate h discards nothing (S24)" {
 }
 
 test "SmUnackedQueue: ack across the u32 wrap (S24)" {
-    var queue = SmUnackedQueue.init(testBudget());
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     // Sequences wrap at 2^32: a forward h that numerically decreased must
@@ -577,7 +578,7 @@ test "classifyAck: reports too high and backwards without a queue (S24)" {
 }
 
 test "SmUnackedQueue: ack above the sent count across the u32 wrap (S24)" {
-    var queue = SmUnackedQueue.init(testBudget());
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     // One stanza outstanding at the top of the sequence space, client already
