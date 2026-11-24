@@ -18,8 +18,8 @@ v2 makes SCRAM a one-round-trip exchange like PLAIN:
    - Hit (and unexpired): core builds server-first itself: a fresh 24-byte
      server nonce, base64'd and appended to the client nonce,
      `r=<combined>,s=<salt-b64>,i=<iterations>`. It sends `<challenge>` and
-     keeps {client-first-bare, server-first, raw n= name} in bounded
-     per-session fields.
+     parks {client-first-bare, server-first, raw n= name} in a per-worker
+     exchange slot (section 7).
    - Miss or expired: core sends `scram_params_request` and parks the session
      in `awaiting_params`. On `scram_params` it caches the pair, builds
      server-first, sends `<challenge>`, same as above.
@@ -49,6 +49,7 @@ pub const Tag = enum(u8) {
     scram_params         = 0x0F, // Auth->Core
     // 0x10-0x12 s2s (unchanged)
     scram_verify         = 0x13, // Core->Auth
+    scram_stale          = 0x14, // Auth->Core
 };
 
 pub const ScramParamsRequest = struct {
@@ -92,7 +93,12 @@ pub const ScramVerify = struct {
 ```
 
 `scram_verify` answers reuse `auth_success`/`auth_failure` (`server_final`
-carries `v=<b64 ServerSignature>`). `sasl_response` and `auth_challenge`
+carries `v=<b64 ServerSignature>`) plus `scram_stale`: when the
+client-bound server-first (salt, iterations) no longer matches the stored
+credentials, the daemon replies `scram_stale{conn_id, username}` instead of
+a password failure; the core evicts its params-cache entry for that name,
+fails the attempt with temporary-auth-failure so the client's retry
+re-fetches, and counts `scram_stale`. `sasl_response` and `auth_challenge`
 become dead tags once v2 is the only SCRAM path; they stay reserved (the wire
 contract is versioned as a whole) but their handlers and the union members
 are deleted with the session table.
@@ -116,14 +122,20 @@ reasons stay identical:
 4. Parse server-first: `r=<combined>`, `s=`, `i=`. `combined` must start with
    the client nonce from step 1; the remainder is the server nonce. Salt and
    iterations must equal the looked-up credentials (real or fake) so a stale
-   or forged server-first can never be signed.
-5. Replay cache: server nonce present and unexpired -> `not_authorized`.
-6. Parse client-final: `c=` channel binding per the v1 rules, `r=` must equal
+   or forged server-first can never be signed. A salt/iteration mismatch
+   answers `scram_stale` (section 2) rather than `not_authorized`.
+5. Nonce freshness: the server nonce carries the core's issue time
+   (`b64(u64 unix seconds || 18 random bytes)`); the daemon refuses a nonce
+   older than the replay window or beyond clock-skew ahead. The timestamp
+   sits inside server-first, which the client proof covers, so a replayer
+   cannot refresh it.
+6. Replay cache: server nonce present and unexpired -> `not_authorized`.
+7. Parse client-final: `c=` channel binding per the v1 rules, `r=` must equal
    `combined`, `p=` decodes the proof. AuthMessage =
    bare + "," + server-first + "," + client-final-without-proof.
    HMAC verify vs StoredKey (timing-safe); failure -> recordOutcome +
    `not_authorized`.
-7. Insert the server nonce into the replay cache (consumed either way once
+8. Insert the server nonce into the replay cache (consumed either way once
    the exchange verifies as well-formed), recordOutcome, reply auth_success
    with `v=<b64 HMAC(ServerKey, AuthMessage)>`.
 
@@ -142,14 +154,15 @@ the same work and fails with the same `not_authorized` as a wrong password.
 
 ## 5. Deterministic fakes (no user enumeration)
 
-The daemon generates one 32-byte secret at startup (`std.crypto.random`). For
-an unknown user `u`:
+The daemon generates one 32-byte secret on first start and persists it in
+`{db}/auth/scram_secret` (0600, `secureZero` on teardown), so a fake salt is
+as stable across restarts as a real one. For an unknown user `u`:
 
 ```
 salt        = HMAC(secret, "a5-scram-salt"   | u)
 stored_key  = HMAC(secret, "a5-scram-stored" | u)
 server_key  = HMAC(secret, "a5-scram-server" | u)
-iterations  = <same constant the store derives at addUser>
+iterations  = sasl.default_iteration_count  // the one constant password-set uses
 ```
 
 Same secret + same name -> same fake, so repeated probes cannot tell a
@@ -160,18 +173,22 @@ wrong-password outcome byte for byte.
 
 ## 6. Replay cache (daemon)
 
-Fixed-capacity open-addressed table, no timer:
+Fixed-capacity open-addressed table, no timer, sized from configuration:
+the capacity derives from the configured login-rate ceiling times the
+nonce freshness window, so a full table means the rate limit was already
+exceeded, not that nonces expired early.
 
-- 16384 slots x 32 B (16 B keyed tag + 8 B timestamp + occupancy flag) =
-  512 KiB, sized for a 10k-login burst inside one 60 s nonce lifetime with
-  headroom; the expiry matches the v1 exchange deadline
-  (SCRAM_SLOT_STALE_SECONDS, 60 s).
 - The tag is HMAC(scram_secret, nonce) truncated to 16 B, so an attacker
   cannot steer inserts into one probe window; the daemon-side secret is
   drawn at init.
+- Freshness is covered by the proof: the server nonce embeds the core's
+  issue time (see step 5 of the verify), so the daemon refuses nonces
+  outside [now - window, now + skew] and a replayer cannot mint a fresh
+  timestamp without invalidating the client proof.
 - Insert: hash the tag, linear probe up to 8 slots, take the first free or
-  expired slot; if all 8 are live, evict the eldest `touched_at` in the
-  window. Bounded work, insert never blocks.
+  expired slot. If all 8 are live the verify is REFUSED with
+  temporary-auth-failure, counted: a live tag is never evicted, so a nonce
+  reads as seen for its whole window.
 - Lookup: an expired entry counts as absent and is reclaimed in place.
 - Occupancy moves `metrics.scramActivated`/`scramReleased`-style high water
   (the A1 counter block gains a replay-cache high water in place of the
@@ -192,12 +209,19 @@ Parameter cache (per worker, no atomics):
   overwrite on collision is safe. The name is stored so a hash collision can
   never serve the wrong params.
 
-Per-session fields (bounded, no allocation):
+Parked exchange state (per worker, bounded):
 
-- `scram_bare_buf[1024]` + len, `scram_cnonce_buf[256]` + len,
-  `scram_sfirst_buf[512]` + len, `scram_user_buf[256]` + len,
-  `scram_cb_buf[32]` + len + `scram_cb_type` + `scram_gs2_flag`:
-  ~2 KiB inline per session, freed by reuse.
+- Sessions carry no inline exchange buffers. The ~2 KiB of exchange state
+  (gs2 flag, raw n= name, bare client-first, client nonce, pending
+  server-first, channel binding) parks in a per-worker `ScramExchangePool`
+  (`scram_exchange.zig`): sessions hold a generation-checked token
+  (gen<<16|slot) into `core.scram_exchange_slots` (default 256) slots,
+  acquire reuses a live slot on retry, and lifecycle teardown returns it.
+  A full pool answers temporary-auth-failure and counts
+  `scram_exchange_full`.
+- The params-cache TTL handles most staleness; a password change inside it
+  is caught at verify time by the salt/iteration check and answered
+  `scram_stale`, which evicts the entry so the retry re-fetches.
 - New `AuthState` values `awaiting_params`, `awaiting_client_final` (the
   challenge is now sent by core, so `awaiting_challenge` becomes unused for
   SCRAM; PLAIN/OAUTHBEARER keep `awaiting_result` via `auth_request`).
@@ -218,8 +242,10 @@ Per-session fields (bounded, no allocation):
 4. Nothing blocks a loop: verify is ~us of HMAC on the loop; PBKDF2 remains
    on the crypto pool for PLAIN/register/passwd; LMDB reads are page-cache
    reads on the same footing as today.
-5. Connection economics: +~1.6 KiB per session for the two stashed messages;
-   the daemon drops ~8192 x sizeof(ScramSession) of table.
+5. Connection economics: no per-session exchange fields at all (a u32
+   token); the worker pre-allocates the slot pool once
+   (~2.1 KiB x scram_exchange_slots) and the daemon drops
+   ~8192 x sizeof(ScramSession) of table.
 6. Many requests per connection: IPC frames are independent and correlated;
    scram_verify interleaves freely on a lane.
 7. Beyond one host: unchanged; the daemon stays unix-socket-local per the
@@ -245,9 +271,19 @@ Per-session fields (bounded, no allocation):
 
 - RFC 7677 SCRAM-SHA-256 exchange through the v2 path against the published
   test vector.
-- A replayed client-final (same server nonce twice) is refused.
+- A replayed client-final (same server nonce twice) is refused; a nonce
+  replayed after the window is refused on freshness, and a future-dated
+  nonce beyond skew is refused.
+- A full probe window refuses the verify with temporary-auth-failure rather
+  than evicting a live tag, and the original nonce still reads as seen.
 - An unknown user's scram_params reply is indistinguishable in shape from a
-  known user's and deterministic across lookups.
+  known user's and deterministic across lookups; the advertised iteration
+  count matches what password-set derives for real accounts, and the fake
+  secret is stable across daemon restarts.
 - gs2 `p` with mismatched channel-binding data fails.
+- A password change between cached params and verify answers scram_stale,
+  the core evicts its cache entry, and the next attempt succeeds.
+- A full exchange pool refuses acquire with temporary-auth-failure, and the
+  slot is released after the verify sends.
 - After a scram_verify reply the handler exposes no per-exchange state
   (replay cache excepted): verified by the removed table plus a state probe.
