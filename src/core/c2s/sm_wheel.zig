@@ -41,6 +41,13 @@ pub const Wheel = struct {
     /// arms its one-shot timer at this value.
     min_deadline: i64 = 0,
 
+    /// Test instrumentation: bucket heads probed by scanMin, and list
+    /// nodes visited by any wheel scan (expireDue's drain is the only
+    /// legitimate node walk). Per-wheel fields, not globals: every worker
+    /// owns its own wheel, so shared counters would race across loops.
+    scan_bucket_probes: usize = 0,
+    scan_node_visits: usize = 0,
+
     fn bucketIndex(deadline: i64) usize {
         return @intCast(@mod(deadline, SLOT_COUNT));
     }
@@ -102,7 +109,7 @@ pub const Wheel = struct {
                 const b = bucketIndex(self.cursor + i + 1);
                 var node = self.buckets[b];
                 while (node) |session| {
-                    scan_node_visits += 1;
+                    self.scan_node_visits += 1;
                     const next = session.sm_expiry_next;
                     if (session.sm_expiry_deadline <= now) {
                         self.unlinkImpl(session);
@@ -139,10 +146,10 @@ pub const Wheel = struct {
     /// deadline, so the minimum is the first non-empty bucket scanning
     /// forward from `cursor + 1`: at most SLOT_COUNT head checks and no
     /// node walk: O(buckets), never O(sessions).
-    fn scanMin(self: *const Wheel) i64 {
+    fn scanMin(self: *Wheel) i64 {
         var i: usize = 1;
         while (i <= SLOT_COUNT) : (i += 1) {
-            scan_bucket_probes += 1;
+            self.scan_bucket_probes += 1;
             const b = bucketIndex(self.cursor + @as(i64, @intCast(i)));
             if (self.buckets[b]) |head| return head.sm_expiry_deadline;
         }
@@ -150,12 +157,6 @@ pub const Wheel = struct {
     }
 };
 
-/// Test instrumentation: bucket heads probed by scanMin, and list nodes
-/// visited by any wheel scan (expireDue's drain is the only legitimate
-/// node walk). A scanMin recompute is head checks only, so a test that
-/// snapshots the node counter around one must see no increase.
-pub var scan_bucket_probes: usize = 0;
-pub var scan_node_visits: usize = 0;
 
 fn testSession(allocator: std.mem.Allocator, id: usize) !*Session {
     const session = try allocator.create(Session);
@@ -291,18 +292,18 @@ test "wheel: scanMin finds the earliest bucket without visiting nodes" {
     try std.testing.expectEqual(@as(usize, n), wheel.count);
 
     // Unlinking the current minimum recomputes via scanMin.
-    scan_bucket_probes = 0;
-    scan_node_visits = 0;
+    wheel.scan_bucket_probes = 0;
+    wheel.scan_node_visits = 0;
     try std.testing.expect(wheel.unlink(sessions[0]));
     try std.testing.expectEqual(@as(?i64, 502), wheel.nextDeadline());
-    try std.testing.expectEqual(@as(usize, 0), scan_node_visits);
-    try std.testing.expect(scan_bucket_probes <= SLOT_COUNT);
+    try std.testing.expectEqual(@as(usize, 0), wheel.scan_node_visits);
+    try std.testing.expect(wheel.scan_bucket_probes <= SLOT_COUNT);
 
     // Unlinking a non-minimum entry does not rescan at all.
-    scan_bucket_probes = 0;
+    wheel.scan_bucket_probes = 0;
     try std.testing.expect(wheel.unlink(sessions[63]));
     try std.testing.expectEqual(@as(?i64, 502), wheel.nextDeadline());
-    try std.testing.expectEqual(@as(usize, 0), scan_bucket_probes);
+    try std.testing.expectEqual(@as(usize, 0), wheel.scan_bucket_probes);
 
     // Expiry draining to a later bucket still lands on the earliest
     // remaining deadline with no node walk.
@@ -311,10 +312,10 @@ test "wheel: scanMin finds the earliest bucket without visiting nodes" {
         fn run(_: *Ctx, _: *Session) void {}
     }.run;
     var ctx: Ctx = .{};
-    scan_node_visits = 0;
+    wheel.scan_node_visits = 0;
     wheel.expireDue(510, &ctx, cb);
     try std.testing.expectEqual(@as(?i64, 511), wheel.nextDeadline());
     // The drain itself walked exactly the nine due nodes (502..510); the
     // scanMin recompute it triggers added no node visits on top.
-    try std.testing.expectEqual(@as(usize, 9), scan_node_visits);
+    try std.testing.expectEqual(@as(usize, 9), wheel.scan_node_visits);
 }
