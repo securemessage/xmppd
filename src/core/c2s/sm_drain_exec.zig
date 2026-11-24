@@ -460,7 +460,7 @@ test "Executor: the writer thread commits and stop drains the queue" {
     // Bounded wait for the writer thread's completion push.
     var tries: usize = 0;
     while (completed.load(.acquire) == null and tries < 1_000_000) : (tries += 1) {
-        std.Thread.yield() catch {};
+        std.atomic.spinLoopHint();
     }
     const job = completed.load(.acquire).?;
     try std.testing.expect(job.stored);
