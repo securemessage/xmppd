@@ -55,6 +55,13 @@ pub const Wheel = struct {
     pub fn insert(self: *Wheel, session: *Session, deadline: i64) void {
         std.debug.assert(!session.sm_expiry_linked);
         const b = bucketIndex(deadline);
+        // One bucket holds one deadline: linked deadlines all fall within
+        // one revolution of the cursor, so a bucket head stamped with a
+        // different deadline would mean the wheel fell behind by more
+        // than SLOT_COUNT seconds.
+        if (self.buckets[b]) |head| {
+            std.debug.assert(head.sm_expiry_deadline == deadline);
+        }
         session.sm_expiry_deadline = deadline;
         session.sm_expiry_prev = null;
         session.sm_expiry_next = self.buckets[b];
@@ -126,18 +133,26 @@ pub const Wheel = struct {
         self.count -= 1;
     }
 
+    /// Earliest linked deadline. Linked deadlines all fall inside the open
+    /// revolution `(cursor, cursor + SLOT_COUNT]` and one bucket holds one
+    /// deadline, so the minimum is the first non-empty bucket scanning
+    /// forward from `cursor + 1`: at most SLOT_COUNT head checks and no
+    /// node walk — O(buckets), never O(sessions).
     fn scanMin(self: *const Wheel) i64 {
-        var min: i64 = std.math.maxInt(i64);
-        for (self.buckets) |head| {
-            var node = head;
-            while (node) |session| {
-                if (session.sm_expiry_deadline < min) min = session.sm_expiry_deadline;
-                node = session.sm_expiry_next;
-            }
+        var i: usize = 1;
+        while (i <= SLOT_COUNT) : (i += 1) {
+            scan_bucket_probes += 1;
+            const b = bucketIndex(self.cursor + @as(i64, @intCast(i)));
+            if (self.buckets[b]) |head| return head.sm_expiry_deadline;
         }
-        return min;
+        unreachable; // count > 0 guarantees a linked entry within the revolution
     }
 };
+
+/// Test instrumentation: bucket heads probed and list nodes visited by
+/// scanMin recomputations. The node counter must stay at zero.
+pub var scan_bucket_probes: usize = 0;
+pub var scan_node_visits: usize = 0;
 
 fn testSession(allocator: std.mem.Allocator, id: usize) !*Session {
     const session = try allocator.create(Session);
@@ -252,4 +267,49 @@ test "wheel: callback may destroy the expired session" {
     try std.testing.expectEqual(@as(usize, 1), ctx.freed);
     try std.testing.expect(s2.sm_expiry_linked);
     try std.testing.expectEqual(@as(?i64, 1001), wheel.nextDeadline());
+}
+
+test "wheel: scanMin finds the earliest bucket without visiting nodes" {
+    const allocator = std.testing.allocator;
+    var wheel: Wheel = .{};
+
+    // N sessions spread across one revolution, linked deadlines all in
+    // (cursor, cursor + SLOT_COUNT]: recomputing the minimum is a bucket
+    // scan, never a node walk (scan_node_visits stays 0). Deadlines wrap
+    // the bucket index so the scan wraps too.
+    wheel.cursor = 500;
+    const n = 64;
+    var sessions: [n]*Session = undefined;
+    for (&sessions, 0..) |*s, i| {
+        s.* = try testSession(allocator, i + 1);
+        wheel.insert(s.*, 501 + @as(i64, @intCast(i)));
+    }
+    defer for (sessions) |s| freeSession(allocator, s);
+    try std.testing.expectEqual(@as(usize, n), wheel.count);
+
+    // Unlinking the current minimum recomputes via scanMin.
+    scan_bucket_probes = 0;
+    scan_node_visits = 0;
+    try std.testing.expect(wheel.unlink(sessions[0]));
+    try std.testing.expectEqual(@as(?i64, 502), wheel.nextDeadline());
+    try std.testing.expectEqual(@as(usize, 0), scan_node_visits);
+    try std.testing.expect(scan_bucket_probes <= SLOT_COUNT);
+
+    // Unlinking a non-minimum entry does not rescan at all.
+    scan_bucket_probes = 0;
+    try std.testing.expect(wheel.unlink(sessions[63]));
+    try std.testing.expectEqual(@as(?i64, 502), wheel.nextDeadline());
+    try std.testing.expectEqual(@as(usize, 0), scan_bucket_probes);
+
+    // Expiry draining to a later bucket still lands on the earliest
+    // remaining deadline with no node walk.
+    const Ctx = struct {};
+    const cb = struct {
+        fn run(_: *Ctx, _: *Session) void {}
+    }.run;
+    var ctx: Ctx = .{};
+    scan_node_visits = 0;
+    wheel.expireDue(510, &ctx, cb);
+    try std.testing.expectEqual(@as(?i64, 511), wheel.nextDeadline());
+    try std.testing.expectEqual(@as(usize, 0), scan_node_visits);
 }
