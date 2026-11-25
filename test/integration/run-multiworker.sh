@@ -105,6 +105,9 @@ key = $tmp/key.pem
 socket = $tmp/auth.sock
 # Connect-heavy suites would trip per-account/IP auth limits otherwise.
 rate_limit = false
+# SCRAM refuses server nonces through verifier-start + skew after boot.
+# Keep that embargo short here; the boundary itself is covered by unit tests.
+scram_nonce_skew_seconds = 1
 EOF
 
 # NOTE: only one xmppd master per run-dir may run (PID file lock); this lane
@@ -137,6 +140,9 @@ if [ $ready -ne 1 ] || ! kill -0 "$srvpid" 2>/dev/null; then
     cat "$tmp/server.log" >&2
     exit 2
 fi
+
+# Let the deliberate post-boot SCRAM cutoff pass before a client can race it.
+sleep 2
 
 echo "=== multi-worker lane: workers=$workers port=$PORT ==="
 rc=0
