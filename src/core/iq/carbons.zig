@@ -42,14 +42,14 @@ test "carbons: a phone with carbons off on another worker gets only the routed m
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     var w1: Server = undefined;
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -110,7 +110,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     const desk_fds = try makeSocketPair();
@@ -128,7 +128,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -189,7 +189,7 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     const desk_fds = try makeSocketPair();
@@ -207,7 +207,7 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -275,7 +275,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
     w0.offline = &offline_store;
 
@@ -293,7 +293,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
     w1.offline = &offline_store;
 
@@ -367,14 +367,14 @@ test "carbons: a delivered resource gets no received copy on the same dispatch" 
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     var w1: Server = undefined;
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -433,7 +433,7 @@ test "carbons: the local received-carbon path skips a resource that got the orig
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -489,7 +489,7 @@ test "carbons: a resource the delivery loop skipped still gets the received carb
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
 
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
@@ -579,7 +579,7 @@ test "carbons: a nested private-looking payload does not suppress the carbon" {
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
 
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
@@ -647,7 +647,7 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     const desk_fds = try makeSocketPair();
@@ -665,7 +665,7 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();

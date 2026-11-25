@@ -312,11 +312,11 @@ pub const Server = struct {
     /// SessionMap.collectBound/collectAvailable fill it under a shared-lock
     /// hold that only selects and copies; delivery iterates the slice after
     /// the lock is released, so serialization, enqueues and logging never
-    /// extend a shard hold (ADR-4). Grown lazily to the session map's
-    /// resource cap - the same bound the map enforces on each account's
-    /// entry list, so the scratch can never truncate a fan-out. One live
-    /// iteration per call tree: a loop that reaches a nested collect on
-    /// this server must snapshot its entries elsewhere first.
+    /// extend a shard hold (ADR-4). Reserved to the session map's resource
+    /// cap when the map is configured - the same bound the map enforces on
+    /// each account's entry list, so the scratch can never truncate a
+    /// fan-out. One live iteration per call tree: a loop that reaches a
+    /// nested collect on this server must snapshot its entries elsewhere first.
     fanout_entries: []session_map_mod.SessionEntry = &.{},
 
     /// S18: per-worker heap scratch for stanza serialization, replacing the
@@ -882,21 +882,28 @@ pub const Server = struct {
         return self.delivered_targets;
     }
 
-    /// The fan-out scratch collectBound/collectAvailable copy into, grown
-    /// lazily to the session map's resource cap like delivered_targets.
-    /// On allocation failure the empty slice collects nothing and the
-    /// fan-out degrades to "no bound resources" rather than truncating
-    /// mid-list.
-    pub fn fanoutScratch(self: *Server) []session_map_mod.SessionEntry {
-        const sm = self.session_map orelse return &.{};
+    /// Attach the session map and reserve the bounded fan-out scratch before
+    /// the worker starts routing. Allocation failure propagates out of worker
+    /// startup: a worker that enters the loop without a full-capacity scratch
+    /// could mistake that internal failure for "no recipients" and suppress or
+    /// misroute fan-out traffic (R5). On failure the previous map, if any,
+    /// remains attached and the caller owns the startup decision.
+    pub fn configureSessionMap(self: *Server, sm: *SessionMap) !void {
         if (self.fanout_entries.len < sm.max_resources) {
+            const entries = try self.allocator.alloc(session_map_mod.SessionEntry, sm.max_resources);
             if (self.fanout_entries.len > 0) self.allocator.free(self.fanout_entries);
-            self.fanout_entries = self.allocator.alloc(session_map_mod.SessionEntry, sm.max_resources) catch {
-                log.err("fanout scratch alloc of {d} entries failed", .{sm.max_resources});
-                self.fanout_entries = &.{};
-                return self.fanout_entries;
-            };
+            self.fanout_entries = entries;
         }
+        self.session_map = sm;
+    }
+
+    /// Return the full-capacity fan-out scratch collectBound/collectAvailable
+    /// copy into. configureSessionMap owns the allocation, so an unreserved
+    /// or undersized scratch is a startup-contract violation, never a
+    /// zero-recipient routing result.
+    pub fn fanoutScratch(self: *Server) []session_map_mod.SessionEntry {
+        const sm = self.session_map orelse @panic("session map used before configureSessionMap");
+        if (self.fanout_entries.len < sm.max_resources) @panic("fanout scratch below session map capacity");
         return self.fanout_entries;
     }
 
@@ -1967,7 +1974,7 @@ pub const Server = struct {
                     // The collect copies bounded routing state under the
                     // shard lock; delivery and its logging run on the
                     // copies with the lock released (ADR-4).
-                    const n = s2s_sm.collectAvailable(to_jid.local, to_jid.domain, self.fanoutScratch());
+                    const n = s2s_sm.collectAvailable(to_jid.local, to_jid.domain, self.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
                     for (self.fanout_entries[0..n]) |*entry| dctx.deliver(entry.*);
                 }
                 log.info("S2S inbound from {s} delivered to {d} session(s)", .{ m.from_jid, dctx.delivered });
@@ -2013,7 +2020,7 @@ pub const Server = struct {
                 if (single_entry) |e| {
                     bctx.deliver(e);
                 } else {
-                    const n = fail_sm.collectAvailable(from_jid.local, from_jid.domain, self.fanoutScratch());
+                    const n = fail_sm.collectAvailable(from_jid.local, from_jid.domain, self.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
                     for (self.fanout_entries[0..n]) |*entry| bctx.deliver(entry.*);
                 }
                 log.info("S2S delivery failed: {s} → {s}: {s}", .{ m.from_jid, m.to_jid, m.error_type });
@@ -2126,6 +2133,38 @@ test "Server: init and deinit" {
 
     try std.testing.expect(server.listener.fd >= 0);
     try std.testing.expect(server.running);
+}
+
+test "Server: session map configuration reserves full-capacity fanout scratch" {
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var sm = try SessionMap.init(std.testing.allocator, 1, 0);
+    defer sm.deinit();
+
+    try server.configureSessionMap(&sm);
+    try std.testing.expectEqual(&sm, server.session_map.?);
+    try std.testing.expectEqual(sm.max_resources, server.fanout_entries.len);
+    try std.testing.expectEqual(server.fanout_entries.ptr, server.fanoutScratch().ptr);
+}
+
+test "Server: session map scratch allocation failure propagates" {
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    var sm = try SessionMap.init(std.testing.allocator, 1, 0);
+    defer sm.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    server.allocator = failing.allocator();
+    const result = server.configureSessionMap(&sm);
+    server.allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expect(server.session_map == null);
+    try std.testing.expectEqual(@as(usize, 0), server.fanout_entries.len);
 }
 test "Server: S18 byte scratch pool failure uses the heap fallback" {
     var server: Server = undefined;
@@ -2853,7 +2892,7 @@ test "Re-review 5.3: a buffer the server filled itself is flushed, not torn down
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
@@ -2919,7 +2958,7 @@ test "Server: a full recipient buffer is marked for teardown like the MUC path" 
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
@@ -2996,7 +3035,7 @@ test "Server: a non-archivable message stores offline with no archive" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.offline = &offline_store;
 
     const alice_fds = try makeSocketPair();
@@ -3053,7 +3092,7 @@ test "Re-review 5.2: an empty tail clears offline_pending instead of stranding i
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.offline = &offline_store;
 
     const target_fds = try makeSocketPair();
@@ -3215,7 +3254,7 @@ test "Re-review 7.6: a form over the write buffer but inside the bank does not m
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
@@ -3405,7 +3444,7 @@ test "Server: H4 an inbound S2S message lands behind an existing offline tail" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.offline = &offline_store;
     server.archive = &arch_store;
 
@@ -3482,7 +3521,7 @@ test "Server: H4 a type normal message lands behind an existing offline tail" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.offline = &offline_store;
     server.archive = &arch_store;
 
@@ -3575,7 +3614,7 @@ test "Server: S13 offline store delivers without a committed archive row" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -3664,7 +3703,7 @@ test "Server: E2d an oversized archive form is not stored offline" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -4452,7 +4491,7 @@ test "Server: R5 S2S cross-worker delivery drops are counted" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "mobile");
@@ -5279,7 +5318,7 @@ test "Server: H8 an inline offline archive failure on the c2s path is counted" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.offline = &offline_store;
     server.archive = &arch_store;
 
@@ -5341,7 +5380,7 @@ test "Server: H8 an inline offline archive failure on the S2S path is counted" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.offline = &offline_store;
     server.archive = &arch_store;
 

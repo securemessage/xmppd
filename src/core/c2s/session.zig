@@ -2548,7 +2548,7 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
@@ -2801,7 +2801,7 @@ pub fn f6WireSetup(allocator: std.mem.Allocator, server: *Server, sm: *SessionMa
 
 pub fn f6WireSetupBound(allocator: std.mem.Allocator, server: *Server, sm: *SessionMap, target_fds: [2]posix.fd_t, alice_fds: [2]posix.fd_t, bound_local: []const u8) !F6WirePair {
     server.worker_id = 0;
-    server.session_map = sm;
+    try server.configureSessionMap(sm);
     const target = try allocator.create(Session);
     target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
@@ -3778,7 +3778,7 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
@@ -4066,7 +4066,7 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;

@@ -365,7 +365,7 @@ test "multicast to N remote workers serializes the payload once" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     var room = room_registry_mod.Room.init(allocator);
@@ -420,7 +420,7 @@ test "cross-thread delivery: enqueue and drain" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     // Create a target session on worker 1 using a socketpair
@@ -475,7 +475,7 @@ test "V14: per-session filters apply to a remote target" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     const fds = try makeSocketPair();
@@ -639,7 +639,7 @@ test "S35: the cross-worker hold stamps the producer receipt time" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.worker_id = 1;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
 
@@ -685,7 +685,7 @@ test "cross-thread delivery: generation mismatch drops stanza" {
     try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     // Bind a session, then unbind (simulating disconnect); a token minted
@@ -732,7 +732,7 @@ test "Server: S13 message held behind a draining offline tail" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -814,7 +814,7 @@ test "Re-review 6.8: the router holds a bare-JID message once per worker" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
 
@@ -876,7 +876,7 @@ test "Re-review 6.8: the S2S hold asks the store once per worker" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
 
@@ -923,7 +923,7 @@ test "Server: G3 cross-worker delivery parks behind a draining offline tail" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
 
@@ -975,7 +975,7 @@ test "Server: G3 inbound S2S delivery parks behind a draining offline tail" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.offline = &offline_store;
 
     const target_fds = try makeSocketPair();
@@ -1029,7 +1029,7 @@ test "Server: G3 type normal parks behind a draining offline tail" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.offline = &offline_store;
 
     const target_fds = try makeSocketPair();
@@ -1105,7 +1105,7 @@ test "Server: H4 a cross-worker message lands behind an existing offline tail" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1198,7 +1198,7 @@ test "Server: E2b an inbound S2S stanza for an offline user holds its payload" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1272,7 +1272,7 @@ test "Server: H2 a cross-worker hold failure bounces to the sender on the same w
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     // No offline store at all: the hold cannot succeed.
 
@@ -1337,7 +1337,7 @@ test "Server: H2 a cross-worker hold failure bounces across workers" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     const bob_fds = try makeSocketPair();
@@ -1409,7 +1409,7 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
 
@@ -1488,7 +1488,7 @@ test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     try server.configureS2s(sock_path);
@@ -1586,7 +1586,7 @@ test "Server: E2b a full offline queue bounces the inbound S2S stanza" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1661,7 +1661,7 @@ test "Server: E2b an unstorable inbound S2S stanza bounces but an error stanza d
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     // No offline store, no archive: nothing here can hold the stanza.
     try server.configureS2s(sock_path);
@@ -1758,7 +1758,7 @@ test "Server: G7 an inbound id with an entity is escaped once in the bounce" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     // No offline store: the stanza bounces.
     try server.configureS2s(sock_path);
@@ -1820,7 +1820,7 @@ test "Server: G7 a storage error on the offline hold still bounces" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     try server.configureS2s(sock_path);
@@ -1881,7 +1881,7 @@ test "Server: S13 hold at quota bounces instead of dropping silently" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1970,7 +1970,7 @@ test "N1: two draining resources hold a bare-JID message once" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
 
@@ -2055,7 +2055,7 @@ test "N1: two identical stanza-less messages to a draining bare JID are two rows
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.offline = &offline_store;
 
     const desktop_fds = try makeSocketPair();
@@ -2125,7 +2125,7 @@ test "c2s: one routed message to two draining workers holds one row" {
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
     w1.offline = &offline_store;
 
@@ -2143,7 +2143,7 @@ test "c2s: one routed message to two draining workers holds one row" {
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
     w0.offline = &offline_store;
 
@@ -2219,7 +2219,7 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
     w1.offline = &offline_store;
 
@@ -2238,7 +2238,7 @@ test "S2S: one inbound stanza to two draining workers holds one row" {
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
     w0.offline = &offline_store;
 
@@ -2288,7 +2288,7 @@ test "N1: two workers draining one bare JID hold a message once" {
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
 

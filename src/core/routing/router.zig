@@ -189,7 +189,7 @@ const Selection = struct {
 /// of the copies. Ties resolve to the first entry seen, matching bind order.
 fn selectAvailable(sm: *SessionMap, to_jid: xmpp.Jid, out: []SessionEntry) Selection {
     var sel: Selection = .{};
-    const n = sm.collectAvailable(to_jid.local, to_jid.domain, out);
+    const n = sm.collectAvailable(to_jid.local, to_jid.domain, out) catch @panic("fanout scratch below session map capacity");
     for (out[0..n]) |*entry| {
         sel.count += 1;
         if (entry.priority > sel.best_prio) {
@@ -548,7 +548,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     if (single) |e| {
         dctx.routeOneRemote(e);
     } else if (fanout_bare) {
-        const n = sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch());
+        const n = sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
         for (server.fanout_entries[0..n]) |*entry| {
             if (dctx.routed(entry)) dctx.routeOneRemote(entry.*);
         }
@@ -709,7 +709,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     if (single) |e| {
         if (e.worker_id == server.worker_id) dctx.deliverLocal(e);
     } else if (fanout_bare) {
-        const n = sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch());
+        const n = sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
         for (server.fanout_entries[0..n]) |*entry| {
             if (dctx.routed(entry) and entry.worker_id == server.worker_id) dctx.deliverLocal(entry.*);
         }
@@ -1130,7 +1130,7 @@ fn sendCarbons(
         .delivered = delivered,
         .cbuf = carbon_lease.buf,
     };
-    const n = sm.collectAvailable(user_local, user_domain, server.fanoutScratch());
+    const n = sm.collectAvailable(user_local, user_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
     for (server.fanout_entries[0..n]) |*entry| carbon_ctx.deliver(entry);
 }
 
@@ -1332,7 +1332,7 @@ test "Server: an over-long sender bare JID still delivers live" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
@@ -1393,7 +1393,7 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
@@ -1456,7 +1456,7 @@ test "S14: failed cross-worker resource does not block local delivery" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     // bob has a local resource (worker 0, session 5) and a remote one
@@ -1516,7 +1516,7 @@ test "S14: a cross-worker stanza larger than the old slot cap is delivered" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "phone");
@@ -1588,7 +1588,7 @@ test "S14: a refused cross-worker stanza falls back to the offline store" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1640,7 +1640,7 @@ test "S14: a refused cross-worker stanza with no offline store bounces" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     // bob remote-only again, but no offline store: the bounce fallback
@@ -1685,7 +1685,7 @@ test "Server: G4 a near-limit online stanza is bounced when delivery cannot queu
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
@@ -1746,7 +1746,7 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     // bob has one resource here and one on worker 1, so this dispatch takes

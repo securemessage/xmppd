@@ -1755,7 +1755,7 @@ test "T152: rebind with same resource evicts stale session" {
 
     var sm = try SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);

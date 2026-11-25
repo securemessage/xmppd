@@ -511,7 +511,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, changes: *ChangeLi
 
             // The presence stanza is directed TO us (the session that just
             // became available). Deliver locally regardless of which worker
-            // the contact is on — we already have their resource from the
+            // the contact is on - we already have their resource from the
             // session map; no need to ask the remote worker.
             _ = ctx.session.stanza(presence_xml);
         }
@@ -554,7 +554,7 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, changes: *ChangeLi
 
         var ctx = ProbeCtx{ .server = server, .session = session, .to_str = to_str };
         for (parts_buf[0..parts_len]) |contact| {
-            const n = sm.collectAvailable(contact.local, contact.domain, server.fanoutScratch());
+            const n = sm.collectAvailable(contact.local, contact.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
             for (server.fanout_entries[0..n]) |*entry| ctx.deliver(contact, entry);
         }
 
@@ -818,7 +818,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
             }
         };
         var ctx: Ctx = .{ .server = server, .session = session, .to_jid = to_jid };
-        const n = sd_sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch());
+        const n = sd_sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
         for (server.fanout_entries[0..n]) |*pentry| ctx.deliver(pentry);
     }
 
@@ -974,7 +974,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
         // fan-out scratch mid-iteration. The owner list is a private copy,
         // bounded by the configured per-account resource cap.
         const owner_entries = blk: {
-            const n = unsub_sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch());
+            const n = unsub_sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
             break :blk server.allocator.dupe(SessionEntry, server.fanout_entries[0..n]) catch {
                 noteDrop("unavailable stanza fan-out for '{s}' not collected: out of memory", .{to_str});
                 break :blk @as([]SessionEntry, &.{});
@@ -1166,7 +1166,7 @@ fn broadcastToOwnResources(
         }
     };
     var own_ctx = OwnCtx{ .server = server, .presence_xml = presence_xml };
-    const n = sm.collectBound(bound.local, bound.domain, server.fanoutScratch());
+    const n = sm.collectBound(bound.local, bound.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
     for (server.fanout_entries[0..n]) |*entry| own_ctx.deliver(entry);
 }
 
@@ -1219,7 +1219,7 @@ fn sendOtherResourcesPresence(
         }
     };
     var other_ctx = OtherCtx{ .new_session = new_session, .bare = new_session.stream.boundBare(), .new_resource = bound.resource };
-    const n = sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch());
+    const n = sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
     for (server.fanout_entries[0..n]) |*entry| other_ctx.deliver(entry);
 }
 
@@ -1288,7 +1288,7 @@ pub fn dispatchDirectedPresenceToBareJid(
         }
     };
     var directed_ctx = DirectedCtx{ .server = server, .presence_xml = presence_xml };
-    const n = sm.collectAvailable(target_local, target_domain, server.fanoutScratch());
+    const n = sm.collectAvailable(target_local, target_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
     for (server.fanout_entries[0..n]) |*entry| directed_ctx.deliver(entry);
 }
 
@@ -1360,7 +1360,7 @@ fn deliverPresenceToSubscribers(
 
         var subs_ctx = SubsCtx{ .server = server, .presence_xml = presence_xml };
         for (parts_buf[0..parts_len]) |part| {
-            const n = sm.collectAvailable(part.local, part.domain, server.fanoutScratch());
+            const n = sm.collectAvailable(part.local, part.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
             for (server.fanout_entries[0..n]) |*entry| subs_ctx.deliver(entry);
         }
 
@@ -1402,7 +1402,7 @@ pub fn deliverPresenceToTarget(
         }
     };
     var target_ctx = TargetCtx{ .server = server, .presence_xml = presence_xml };
-    const n = sm.collectBound(target_local, target_domain, server.fanoutScratch());
+    const n = sm.collectBound(target_local, target_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
     for (server.fanout_entries[0..n]) |*entry| target_ctx.deliver(entry);
 }
 
@@ -1463,7 +1463,7 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
 
     var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     // Sender alice has two available resources. Only the sending one needs a
     // live session; the fan-out targets the contact.
@@ -1537,7 +1537,7 @@ test "S1: subscription presence escapes the owner bare JID" {
 
     var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     var owner_fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &owner_fds));
@@ -1680,7 +1680,7 @@ test "A62: block check sees a >256-byte recipient JID in full" {
 
     var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     // Sender alice, bound and live.
     var alice_fds: [2]posix.fd_t = undefined;
@@ -1761,7 +1761,7 @@ test "C6: an over-512-byte bound bare still sees its other resources' presence" 
 
     var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     // 612-byte bare JID: legal under RFC 7622 but wider than the stack
     // scratch this fan-out used to build the bare into, which skipped it.

@@ -2127,7 +2127,7 @@ fn sendPepNotification(
             .body_after_to = body_after_to,
             .msg_buf = self_msg_lease.buf,
         };
-        const n = sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch());
+        const n = sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
         for (server.fanout_entries[0..n]) |*entry| self_ctx.deliver(entry);
     }
 
@@ -2218,7 +2218,7 @@ fn sendPepNotification(
             .body_after_to = body_after_to,
             .msg_buf = sub_msg_lease.buf,
         };
-        const n = sm.collectAvailable(sub_local, sub_domain, server.fanoutScratch());
+        const n = sm.collectAvailable(sub_local, sub_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
         for (server.fanout_entries[0..n]) |*entry| sub_ctx.deliver(entry);
     }
 }
@@ -2431,7 +2431,7 @@ fn pushBlockPush(
         }
     };
     var push_ctx = PushCtx{ .server = server, .sender_session = sender_session, .user_local = user_local, .user_domain = user_domain, .action = action, .item_jid = item_jid };
-    const n = sm.collectAvailable(user_local, user_domain, server.fanoutScratch());
+    const n = sm.collectAvailable(user_local, user_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
     for (server.fanout_entries[0..n]) |*entry| push_ctx.deliver(entry);
 }
 
@@ -2630,7 +2630,7 @@ pub fn pushRosterItem(
         }
     };
     var roster_ctx = RosterPushCtx{ .server = server, .user_local = user_local, .user_domain = user_domain, .item_xml = item_xml };
-    const n = sm.collectBound(user_local, user_domain, server.fanoutScratch());
+    const n = sm.collectBound(user_local, user_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
     for (server.fanout_entries[0..n]) |*entry| roster_ctx.deliver(entry);
 }
 
@@ -3039,7 +3039,7 @@ test "R5: a roster push to a full remote queue is counted" {
     defer server.deinit();
     var sm = try session_map_mod.SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
     server.delivery_system = &delivery_sys;
@@ -3080,7 +3080,7 @@ test "R5: an unbuildable PEP self-notification is counted, never silent" {
     server.worker_id = 0;
     var sm = try session_map_mod.SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
     server.delivery_system = &delivery_sys;

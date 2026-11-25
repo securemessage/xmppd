@@ -17,8 +17,10 @@
 //! `collectAvailable`): under one shared-lock hold the map copies the
 //! account's `SessionEntry` values - the bounded routing state - into the
 //! caller's buffer, and the caller serializes, delivers and logs after the
-//! lock is released. A buffer of `max_resources` entries never truncates:
-//! the bind path caps each account's entry list there.
+//! lock is released. The caller must pass a buffer of at least
+//! `max_resources` entries, the same cap the bind path enforces on each
+//! account's entry list. The API reports `error.ScratchTooSmall` rather than
+//! truncating a fan-out into a partial recipient set.
 //!
 //! ## Thread Safety
 //!
@@ -464,13 +466,16 @@ pub const SessionMap = struct {
     /// stanza build, enqueue or log line ever extends a shard hold. `out`
     /// must have room for the per-account resource cap (`max_resources`):
     /// the bind path caps the entry list there, so a cap-sized buffer
-    /// always receives the complete fan-out. Returns the number copied.
+    /// always receives the complete fan-out. Returns the number copied, or
+    /// `error.ScratchTooSmall` when `out` cannot hold the capped worst case.
     pub fn collectBound(
         self: *SessionMap,
         local: []const u8,
         domain: []const u8,
         out: []SessionEntry,
-    ) usize {
+    ) error{ScratchTooSmall}!usize {
+        if (out.len < self.max_resources) return error.ScratchTooSmall;
+
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
         const key = Key.initBuf(&key_buf, local, domain, "") orelse return 0;
 
@@ -479,18 +484,21 @@ pub const SessionMap = struct {
         defer self.unlockShard(shard, false);
 
         const list = shard.bare_map.getPtr(key) orelse return 0;
-        const n = @min(list.len, out.len);
-        for (list.constSlice()[0..n], out[0..n]) |entry_ptr, *dst| dst.* = entry_ptr.*;
-        return n;
+        for (list.constSlice(), out[0..list.len]) |entry_ptr, *dst| dst.* = entry_ptr.*;
+        return list.len;
     }
 
-    /// `collectBound` restricted to presence-available resources.
+    /// `collectBound` restricted to presence-available resources. The same
+    /// full-capacity scratch contract applies even though presence filtering
+    /// can only shrink the copied set.
     pub fn collectAvailable(
         self: *SessionMap,
         local: []const u8,
         domain: []const u8,
         out: []SessionEntry,
-    ) usize {
+    ) error{ScratchTooSmall}!usize {
+        if (out.len < self.max_resources) return error.ScratchTooSmall;
+
         var key_buf: [MAX_JID_OCTETS]u8 = undefined;
         const key = Key.initBuf(&key_buf, local, domain, "") orelse return 0;
 
@@ -499,9 +507,8 @@ pub const SessionMap = struct {
         defer self.unlockShard(shard, false);
 
         const list = shard.bare_map.getPtr(key) orelse return 0;
-        const n = @min(list.len, out.len);
         var copied: usize = 0;
-        for (list.constSlice()[0..n]) |entry_ptr| {
+        for (list.constSlice()) |entry_ptr| {
             if (entry_ptr.presence_available) {
                 out[copied] = entry_ptr.*;
                 copied += 1;
@@ -612,11 +619,11 @@ pub const SessionMap = struct {
 // ============================================================================
 
 fn collectBound(map: *SessionMap, local: []const u8, domain: []const u8, out: []SessionEntry) usize {
-    return map.collectBound(local, domain, out);
+    return map.collectBound(local, domain, out) catch @panic("test scratch below session map capacity");
 }
 
 fn collectAvailable(map: *SessionMap, local: []const u8, domain: []const u8, out: []SessionEntry) usize {
-    return map.collectAvailable(local, domain, out);
+    return map.collectAvailable(local, domain, out) catch @panic("test scratch below session map capacity");
 }
 
 test "SessionMap: bind and findByFullJid" {
@@ -653,7 +660,7 @@ test "SessionMap: collectBound copies every bound resource" {
     _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "localhost", "desktop");
     _ = try map.bind(0, Token.init(3, 1, token_kinds.session), "bob", "localhost", "laptop");
 
-    var buf: [8]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     const count = collectBound(&map, "alice", "localhost", &buf);
     try std.testing.expectEqual(@as(usize, 2), count);
 }
@@ -670,10 +677,26 @@ test "SessionMap: collectAvailable" {
     map.setPresenceAvailable("alice", "localhost", "mobile", true);
     try std.testing.expect(map.isAvailable("alice", "localhost"));
 
-    var buf: [8]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     const count = collectAvailable(&map, "alice", "localhost", &buf);
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(u32, 1), buf[0].token.index);
+}
+
+test "SessionMap: copy-out rejects a scratch below the resource cap" {
+    var map = try SessionMap.init(std.testing.allocator, 1, 0);
+    defer map.deinit();
+
+    _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
+    map.setPresenceAvailable("alice", "localhost", "mobile", true);
+
+    var small: [1]SessionEntry = undefined;
+    try std.testing.expectError(error.ScratchTooSmall, map.collectBound("alice", "localhost", &small));
+    try std.testing.expectError(error.ScratchTooSmall, map.collectAvailable("alice", "localhost", &small));
+
+    var full: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try map.collectBound("alice", "localhost", &full));
+    try std.testing.expectEqual(@as(usize, 1), try map.collectAvailable("alice", "localhost", &full));
 }
 
 test "SessionMap: per-JID collects resolve many JIDs, grouped per JID" {
@@ -698,12 +721,12 @@ test "SessionMap: per-JID collects resolve many JIDs, grouped per JID" {
     };
     // T130 callers collect per JID; the results stay grouped in request
     // order when each collect's output is appended to one buffer.
-    var buf: [8]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     var idxs: [8]usize = undefined;
-    var scratch: [8]SessionEntry = undefined;
+    var scratch: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     var total: usize = 0;
     for (&jids, 0..) |jid, jid_idx| {
-        const n = map.collectAvailable(jid.local, jid.domain, &scratch);
+        const n = collectAvailable(&map, jid.local, jid.domain, &scratch);
         for (scratch[0..n]) |e| {
             buf[total] = e;
             idxs[total] = jid_idx;
@@ -740,14 +763,14 @@ test "SessionMap: S18 fan-out over 32 accounts does not truncate at the old boun
 
     // Per-JID collect into a cap-sized scratch never truncates; entries
     // stay grouped by JID in request order.
-    var scratch: [64]SessionEntry = undefined;
+    var scratch: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     const buf = try std.testing.allocator.alloc(SessionEntry, 640);
     defer std.testing.allocator.free(buf);
     const idxs = try std.testing.allocator.alloc(usize, 640);
     defer std.testing.allocator.free(idxs);
     var total: usize = 0;
     for (&jid_storage, 0..) |jid, jid_idx| {
-        const n = map.collectAvailable(jid.local, jid.domain, &scratch);
+        const n = collectAvailable(&map, jid.local, jid.domain, &scratch);
         try std.testing.expectEqual(@as(usize, 20), n);
         for (scratch[0..n]) |e| {
             buf[total] = e;
@@ -781,7 +804,7 @@ test "SessionMap: resource cap is configurable (T198)" {
     // The failed bind must not leave a dangling full_map entry
     try std.testing.expect(map.findByFullJid("u", "localhost", "d") == null);
     // Cap messages come from the bare list staying consistent
-    var buf: [8]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 3), collectBound(&map, "u", "localhost", &buf));
 
     // After eviction a new bind lands
@@ -800,7 +823,7 @@ test "SessionMap: default cap no longer hits the old inline-16 wall (T198)" {
         const res = std.fmt.bufPrint(&res_buf, "r{d}", .{i}) catch unreachable;
         _ = try map.bind(0, Token.init(100 + i, 1, token_kinds.session), "many", "localhost", res);
     }
-    var buf: [64]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 40), collectBound(&map, "many", "localhost", &buf));
 
     // and leaves cleanly
@@ -809,7 +832,7 @@ test "SessionMap: default cap no longer hits the old inline-16 wall (T198)" {
         const res = std.fmt.bufPrint(&res_buf, "r{d}", .{i}) catch unreachable;
         _ = map.unbind("many", "localhost", res);
     }
-    var probe: [4]SessionEntry = undefined;
+    var probe: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 0), collectBound(&map, "many", "localhost", &probe));
     try std.testing.expectEqual(@as(usize, 0), map.shards[0].bare_map.count());
 }
@@ -842,7 +865,7 @@ test "SessionMap: bare_map cleaned on last unbind" {
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "localhost", "mobile");
     _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "localhost", "desktop");
 
-    var buf: [8]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 2), collectBound(&map, "alice", "localhost", &buf));
 
     _ = map.unbind("alice", "localhost", "mobile");
@@ -860,7 +883,7 @@ test "SessionMap: T254 resource cap rejection keeps maps consistent" {
     _ = try map.bind(0, Token.init(2, 1, token_kinds.session), "alice", "localhost", "b");
     try std.testing.expectError(error.TooManyResources, map.bind(0, Token.init(3, 1, token_kinds.session), "alice", "localhost", "c"));
 
-    var buf: [4]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 2), collectBound(&map, "alice", "localhost", &buf));
     try std.testing.expect(map.findByFullJid("alice", "localhost", "c") == null);
 
@@ -886,7 +909,7 @@ test "SessionMap: T254 OOM rollback at every bind allocation point" {
             map.deinit();
             break;
         } else |_| {
-            var buf: [4]SessionEntry = undefined;
+            var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
             try std.testing.expectEqual(@as(usize, 0), collectBound(&map, "alice", "localhost", &buf));
             try std.testing.expect(map.findByFullJid("alice", "localhost", "mobile") == null);
             map.deinit();
@@ -923,7 +946,7 @@ test "SessionMap: resource stored in entry" {
     map.setPresenceAvailable("alice", "host", "mobile", true);
     map.setPresenceAvailable("alice", "host", "desktop", true);
 
-    var buf: [8]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     const count = collectAvailable(&map, "alice", "host", &buf);
     try std.testing.expectEqual(@as(usize, 2), count);
 
@@ -950,7 +973,7 @@ test "SessionMap: a 320-octet localpart binds and resolves" {
     const entry = map.findByFullJid(&local, "localhost", "res");
     try std.testing.expect(entry != null);
 
-    var buf: [1]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 1), collectAvailable(&map, &local, "localhost", &buf));
     try std.testing.expect(map.unbind(&local, "localhost", "res") != null);
 }
@@ -967,7 +990,7 @@ test "SessionMap: setPresenceState updates both fields under one hold (T268)" {
     try std.testing.expectEqual(@as(i8, 42), entry.priority);
 
     // The bare index sees the same object: no second copy to keep in sync.
-    var buf: [4]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 1), collectAvailable(&map, "alice", "localhost", &buf));
     try std.testing.expectEqual(@as(i8, 42), buf[0].priority);
 }
@@ -981,7 +1004,7 @@ test "SessionMap: domain is case-folded for keys (T305)" {
     // Any case spelling of the domain resolves to the same entry.
     const folded = map.findByFullJid("Alice", "example.com", "Mobile");
     try std.testing.expect(folded != null);
-    var buf: [4]SessionEntry = undefined;
+    var buf: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 1), collectBound(&map, "Alice", "EXAMPLE.com", &buf));
 
     // Localpart and resource keep their case: different localpart is a
@@ -1039,7 +1062,7 @@ test "SessionMap: every JID of one account lands on one shard" {
 
     _ = try map.bind(0, Token.init(1, 1, token_kinds.session), "alice", "example.com", "mobile");
     _ = try map.bind(1, Token.init(2, 1, token_kinds.session), "alice", "example.com", "desk");
-    var found: [4]SessionEntry = undefined;
+    var found: [DEFAULT_MAX_RESOURCES]SessionEntry = undefined;
     try std.testing.expectEqual(@as(usize, 2), collectBound(&map, "alice", "example.com", &found));
 }
 

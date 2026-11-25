@@ -134,8 +134,8 @@ shard_mask: usize, // shard_count - 1, shard_count is a power of two
 ### Copy-out fan-out API (ADR-4 item 4, S18)
 
 ```zig
-pub fn collectBound(self, local, domain, out: []SessionEntry) usize
-pub fn collectAvailable(self, local, domain, out: []SessionEntry) usize
+pub fn collectBound(self, local, domain, out: []SessionEntry) error{ScratchTooSmall}!usize
+pub fn collectAvailable(self, local, domain, out: []SessionEntry) error{ScratchTooSmall}!usize
 ```
 
 - Under one shared-lock hold the map copies the account's `SessionEntry`
@@ -145,9 +145,12 @@ pub fn collectAvailable(self, local, domain, out: []SessionEntry) usize
   and its failure paths never extend a shard hold.
 - `out` must have room for the per-account resource cap: the bind path
   caps each account's entry list there, so a `max_resources` buffer always
-  receives the complete fan-out. Each Server keeps a lazily grown
-  `fanout_entries` scratch at that bound for its fan-out sites, grown on
-  the `delivered_targets` pattern.
+  receives the complete fan-out. Smaller scratch is rejected with
+  `error.ScratchTooSmall` before the shard lock rather than truncated into
+  a partial recipient set. Each Server reserves its `fanout_entries`
+  scratch at that bound when the SessionMap is configured during startup;
+  allocation failure propagates, so no worker enters routing without the
+  full-capacity copy-out buffer.
 - The token in a copied entry stays authoritative: the owning worker still
   validates generations at delivery (`sessionForEventToken`, cross-worker
   slot dispatch), so an unbind between copy and delivery resolves to a
