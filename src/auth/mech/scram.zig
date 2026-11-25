@@ -71,7 +71,10 @@ fn secretTempName(buf: *[SECRET_TMP_LEN]u8) []const u8 {
 /// file, then published with link(2), which fails if the name exists, so
 /// the first starter wins and every reader sees either a complete file or
 /// none. A loser of the publish race re-reads the winner's bytes, so all
-/// concurrent starters agree on one secret.
+/// concurrent starters agree on one secret. A corrupt published file is
+/// left in place and fails startup explicitly: unlinking the pathname after
+/// reading an older inode could remove a valid replacement published by a
+/// concurrent starter.
 pub fn loadOrCreateSecret(dir: std.fs.Dir) ![32]u8 {
     var secret: [32]u8 = undefined;
     var tmp_buf: [SECRET_TMP_LEN]u8 = undefined;
@@ -79,15 +82,10 @@ pub fn loadOrCreateSecret(dir: std.fs.Dir) ![32]u8 {
     while (attempt < SECRET_PUBLISH_ATTEMPTS) : (attempt += 1) {
         if (dir.openFile(SECRET_FILE, .{})) |file| {
             defer file.close();
-            if (try file.readAll(&secret) == secret.len) return secret;
-            // A short SECRET_FILE predates atomic publication (or was
-            // corrupted out of band); it can never become a valid secret,
-            // so it is removed and the create path below republishes. A
-            // racing startup doing the same gives FileNotFound.
-            dir.deleteFile(SECRET_FILE) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return err,
-            };
+            const stat = try file.stat();
+            if (stat.size != secret.len) return error.InvalidSecretFile;
+            if (try file.readAll(&secret) != secret.len) return error.InvalidSecretFile;
+            return secret;
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
@@ -376,10 +374,13 @@ pub fn handleScramVerify(comptime Store: type, self: *handler_mod.AuthHandler(St
         self.policy.recordOutcome(account_username, req.client_ip, .failure);
         return authFailure(req.conn_id, .not_authorized);
     };
-    // A nonce minted before this daemon booted predates the replay table:
-    // a restarted verifier cannot prove it was never consumed, so it is
-    // refused outright and the client restarts for a post-boot challenge.
-    if (issued < self.replay_floor_seconds) {
+    // A nonce minted before this daemon booted predates the replay table.
+    // The startup second itself is ambiguous, and a pre-restart nonce may
+    // carry up to skew seconds of future-dating while still passing
+    // freshness, so the empty-table cutoff is floor + skew inclusive. The
+    // client restarts for a challenge outside that cutoff.
+    const restart_cutoff = self.replay_floor_seconds +| self.nonce_skew_seconds;
+    if (issued <= restart_cutoff) {
         log.info("SCRAM auth failed: server nonce predates this boot conn={d}", .{req.conn_id});
         self.policy.recordOutcome(account_username, req.client_ip, .failure);
         return authFailure(req.conn_id, .not_authorized);
@@ -446,6 +447,17 @@ fn testSnonce(buf: *[testkit.SNONCE_B64_LEN]u8) []const u8 {
     return testkit.mintSnonce(buf, std.time.timestamp());
 }
 
+/// Drive one correct alice/pw exchange whose server nonce carries `issued`.
+fn verifyAliceAt(handler: *TestHandler, conn_id: u32, client_ip: []const u8, issued: i64) !?protocol.Message {
+    const allocator = std.testing.allocator;
+    var client = sasl.ScramClient.init(allocator, "alice", "pw");
+    defer client.deinit();
+    var sf: [512]u8 = undefined;
+    var nb: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const ex = try testkit.scramV2Exchange(handler, &client, conn_id, client_ip, "pw", testkit.mintSnonce(&nb, issued), &sf);
+    return ex.verify_msg;
+}
+
 test "SCRAM v2: full login verifies a proof computed independently of the library" {
     const allocator = std.testing.allocator;
 
@@ -453,7 +465,7 @@ test "SCRAM v2: full login verifies a proof computed independently of the librar
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "user", "pencil");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     const params = handleSync(&handler, .{ .scram_params_request = .{
@@ -535,7 +547,7 @@ test "SCRAM v2: a replayed client-final is refused by the nonce cache" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     // Drive one real exchange, capturing the verify message byte for byte.
@@ -582,7 +594,7 @@ test "SCRAM v2: unknown user's params are deterministic and same-shaped" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     // Reply slices borrow a threadlocal buffer that the next reply reuses:
@@ -628,7 +640,7 @@ test "SCRAM v2: a mismatched channel binding fails the exchange" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     var client = sasl.ScramClient.init(allocator, "alice", "pw");
@@ -677,7 +689,7 @@ test "SCRAM v2: the daemon holds no per-exchange state after a reply" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     var client = sasl.ScramClient.init(allocator, "alice", "pw");
@@ -700,7 +712,7 @@ test "SCRAM v2: prepared account name is returned while the exchange keeps the w
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "testuser", "testpassword");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     var client = sasl.ScramClient.init(allocator, "TestUser", "testpassword");
@@ -719,7 +731,7 @@ test "SCRAM v2: an unformattable account name fails not-authorized" {
     var db = try MemoryBackend.open("", .{});
     defer db.close();
     var store = TestUserStore.init(&db);
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     // U+E000 is prohibited by OpaqueString; the verify must refuse
@@ -745,7 +757,7 @@ test "SCRAM v2: unknown user verify fails the same way a wrong password does" {
     var db = try MemoryBackend.open("", .{});
     defer db.close();
     var store = TestUserStore.init(&db);
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     var client = sasl.ScramClient.init(allocator, "ghost", "pw");
@@ -765,7 +777,7 @@ test "SCRAM v2: credential cache is invalidated on password change" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "old-pass");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     var c1 = sasl.ScramClient.init(allocator, "alice", "old-pass");
@@ -803,7 +815,7 @@ test "SCRAM v2: replay cache expires entries lazily and stays bounded" {
     var db = try MemoryBackend.open("", .{});
     defer db.close();
     var store = TestUserStore.init(&db);
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     const now = std.time.timestamp();
@@ -849,7 +861,7 @@ test "SCRAM v2: a server nonce older than the freshness window is refused" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     // The exchange is otherwise well-formed: proof, params and binding all
@@ -872,7 +884,7 @@ test "SCRAM v2: a future-dated server nonce beyond skew is refused" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     var client = sasl.ScramClient.init(allocator, "alice", "pw");
@@ -894,7 +906,7 @@ test "SCRAM v2: a full probe window refuses the verify rather than evicting a li
     try store.addUser(allocator, "alice", "pw");
     // Capacity equal to the probe window: every nonce's window covers the
     // whole table, so a full table is a full probe window by construction.
-    var handler = try TestHandler.init(allocator, &store, .{ .replay_capacity = REPLAY_PROBE });
+    var handler = try TestHandler.init(allocator, &store, .{ .replay_capacity = REPLAY_PROBE, .nonce_floor_seconds = 1 });
     defer handler.deinit();
 
     const now = std.time.timestamp();
@@ -995,9 +1007,8 @@ test "SCRAM: concurrent starters publish one secret and all agree on it" {
 }
 
 test "SCRAM: incomplete secret staging does not block startup" {
-    // A crash between staging and publication leaves a .tmp file, and a
-    // truncated SECRET_FILE can only be a leftover from before atomic
-    // publication. Startup must publish a complete 0600 secret either way.
+    // A crash between staging and publication leaves only a .tmp file;
+    // startup ignores it and publishes a complete 0600 secret.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1005,22 +1016,31 @@ test "SCRAM: incomplete secret staging does not block startup" {
     try leftover.writeAll("short");
     leftover.close();
 
-    const first = try loadOrCreateSecret(tmp.dir);
+    _ = try loadOrCreateSecret(tmp.dir);
     const stat = try tmp.dir.statFile(SECRET_FILE);
     try std.testing.expectEqual(@as(u64, 32), stat.size);
     try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode)) & 0o777);
+}
 
-    // A truncated published file is republished, never fatal.
+test "SCRAM: corrupt published secret fails closed and stays in place" {
+    // A corrupt published file is operator-visible damage, not input for
+    // automatic repair. It must remain for offline diagnosis/repair, and no
+    // racing starter may unlink a valid replacement after inspecting it.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     const trunc = try tmp.dir.createFile(SECRET_FILE, .{});
     try trunc.writeAll("12345");
     trunc.close();
-    const second = try loadOrCreateSecret(tmp.dir);
-    const restat = try tmp.dir.statFile(SECRET_FILE);
-    try std.testing.expectEqual(@as(u64, 32), restat.size);
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(restat.mode)) & 0o777);
-    try std.testing.expect(!std.mem.eql(u8, &first, &second));
-    const third = try loadOrCreateSecret(tmp.dir);
-    try std.testing.expectEqualSlices(u8, &second, &third);
+
+    try std.testing.expectError(error.InvalidSecretFile, loadOrCreateSecret(tmp.dir));
+    const stat = try tmp.dir.statFile(SECRET_FILE);
+    try std.testing.expectEqual(@as(u64, 5), stat.size);
+    var bytes: [5]u8 = undefined;
+    const file = try tmp.dir.openFile(SECRET_FILE, .{});
+    defer file.close();
+    try std.testing.expectEqual(@as(usize, 5), try file.readAll(&bytes));
+    try std.testing.expectEqualStrings("12345", &bytes);
 }
 
 test "SCRAM v2: a consumed nonce stays consumed through its whole validity interval" {
@@ -1028,7 +1048,7 @@ test "SCRAM v2: a consumed nonce stays consumed through its whole validity inter
     var db = try MemoryBackend.open("", .{});
     defer db.close();
     var store = TestUserStore.init(&db);
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     const now = std.time.timestamp();
@@ -1079,6 +1099,51 @@ test "SCRAM v2: a server nonce minted before this boot is refused" {
     try std.testing.expectEqualStrings("not-authorized", ex.verify_msg.?.auth_failure.reason);
 }
 
+test "SCRAM v2: a server nonce stamped in the boot second is refused" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw");
+    // Pin boot one second back so the first second past floor + skew is a
+    // fresh control at test time. Equality with the floor itself is still
+    // ambiguous with a pre-restart challenge and must fail closed.
+    const boot = std.time.timestamp() - 1;
+    var handler = try TestHandler.init(allocator, &store, .{
+        .nonce_floor_seconds = boot,
+    });
+    defer handler.deinit();
+
+    const boundary = try verifyAliceAt(&handler, 18, "10.0.0.18", boot);
+    try std.testing.expect(boundary.? == .auth_failure);
+    try std.testing.expectEqualStrings("not-authorized", boundary.?.auth_failure.reason);
+
+    const control = try verifyAliceAt(&handler, 19, "10.0.0.19", boot + handler.nonce_skew_seconds + 1);
+    try std.testing.expect(control.? == .auth_success);
+}
+
+test "SCRAM v2: a pre-restart nonce at the forward-skew boundary is refused" {
+    const allocator = std.testing.allocator;
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw");
+    // boot + skew is the most future-dated stamp a pre-restart challenge
+    // can carry while remaining inside the freshness check at startup.
+    const boot = std.time.timestamp() - 1;
+    var handler = try TestHandler.init(allocator, &store, .{
+        .nonce_floor_seconds = boot,
+    });
+    defer handler.deinit();
+
+    const boundary = try verifyAliceAt(&handler, 20, "10.0.0.20", boot + handler.nonce_skew_seconds);
+    try std.testing.expect(boundary.? == .auth_failure);
+    try std.testing.expectEqualStrings("not-authorized", boundary.?.auth_failure.reason);
+
+    const control = try verifyAliceAt(&handler, 21, "10.0.0.21", boot + handler.nonce_skew_seconds + 1);
+    try std.testing.expect(control.? == .auth_success);
+}
+
 test "SCRAM v2: handler init fails when the replay table cannot be allocated" {
     var db = try MemoryBackend.open("", .{});
     defer db.close();
@@ -1097,7 +1162,7 @@ test "SCRAM: advertised iteration count is identical for real and fake accounts"
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     const real = handleSync(&handler, .{ .scram_params_request = .{
@@ -1123,7 +1188,7 @@ test "SCRAM v2: params stale after a password change answer scram_stale; next at
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "pw1");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     // The pair the core cached before the password change.

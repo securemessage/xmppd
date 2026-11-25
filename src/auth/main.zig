@@ -186,6 +186,10 @@ pub fn main() !void {
         var dir = d;
         defer dir.close();
         scram_secret = scram_mech.loadOrCreateSecret(dir) catch |err| blk: {
+            if (err == error.InvalidSecretFile) {
+                log.err("corrupt published SCRAM secret {s}/{s}; refusing to start; repair or replace it offline", .{ auth_path, scram_mech.SECRET_FILE });
+                return err;
+            }
             log.err("cannot load or create {s}/{s} ({}); fakes use a per-boot key", .{ auth_path, scram_mech.SECRET_FILE, err });
             break :blk null;
         };
@@ -387,6 +391,43 @@ test "auth startup: main applies --users-scan-limit" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "startup scan bound") != null);
+}
+
+test "auth startup: a corrupt published SCRAM secret refuses startup" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const auth_path = try std.fs.path.join(allocator, &.{ base, "auth" });
+    defer allocator.free(auth_path);
+
+    var db = try OpBackendType.open(auth_path, .{});
+    db.close();
+    const secret_path = try std.fs.path.join(allocator, &.{ auth_path, scram_mech.SECRET_FILE });
+    defer allocator.free(secret_path);
+    var secret = try std.fs.cwd().createFile(secret_path, .{});
+    defer secret.close();
+    try secret.writeAll("short");
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "zig-out/bin/xmppd-auth",
+            "--db",
+            base,
+            "--socket",
+            "/nonexistent-secret-test/auth.sock",
+        },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "corrupt published SCRAM secret") != null);
 }
 
 test "auth startup: a pending migrate-precis marker refuses startup" {

@@ -128,7 +128,11 @@ reasons stay identical:
    (`b64(u64 unix seconds || 18 random bytes)`); the daemon refuses a nonce
    older than the replay window or beyond clock-skew ahead. The timestamp
    sits inside server-first, which the client proof covers, so a replayer
-   cannot refresh it.
+   cannot refresh it. Across a verifier restart the replay table is empty,
+   so a nonce issued through verifier-start + skew inclusive is also
+   refused: the startup second is ambiguous and a pre-restart nonce can be
+   future-dated up to that bound. The client must restart with a later
+   challenge.
 6. Replay cache: server nonce present and unexpired -> `not_authorized`.
 7. Parse client-final: `c=` channel binding per the v1 rules, `r=` must equal
    `combined`, `p=` decodes the proof. AuthMessage =
@@ -156,7 +160,11 @@ the same work and fails with the same `not_authorized` as a wrong password.
 
 The daemon generates one 32-byte secret on first start and persists it in
 `{db}/auth/scram_secret` (0600, `secureZero` on teardown), so a fake salt is
-as stable across restarts as a real one. For an unknown user `u`:
+as stable across restarts as a real one. Publication is atomic and durable:
+write and fsync a unique temporary file, link it into place, then fsync the
+directory. A corrupt published file is left untouched and fails startup for
+offline repair; it is never unlinked or replaced, even when startups race.
+For an unknown user `u`:
 
 ```
 salt        = HMAC(secret, "a5-scram-salt"   | u)
@@ -186,9 +194,10 @@ exceeded, not that nonces expired early.
   outside [now - window, now + skew] and a replayer cannot mint a fresh
   timestamp without invalidating the client proof.
 - Insert: hash the tag, linear probe up to 8 slots, take the first free or
-  expired slot. If all 8 are live the verify is REFUSED with
-  temporary-auth-failure, counted: a live tag is never evicted, so a nonce
-  reads as seen for its whole window.
+  expired slot. Expiry is the nonce's issue second + window inclusive, so
+  the tag outlives the whole freshness interval including forward skew. If
+  all 8 are live the verify is REFUSED with temporary-auth-failure, counted:
+  a live tag is never evicted, so a nonce reads as seen for its whole window.
 - Lookup: an expired entry counts as absent and is reclaimed in place.
 - Occupancy moves `metrics.scramActivated`/`scramReleased`-style high water
   (the A1 counter block gains a replay-cache high water in place of the
@@ -273,13 +282,17 @@ Parked exchange state (per worker, bounded):
   test vector.
 - A replayed client-final (same server nonce twice) is refused; a nonce
   replayed after the window is refused on freshness, and a future-dated
-  nonce beyond skew is refused.
+  nonce beyond skew is refused. Restart-floor tests cover a stamp equal to
+  verifier startup and a future-dated stamp at the skew boundary, with a
+  post-cutoff control succeeding in both.
 - A full probe window refuses the verify with temporary-auth-failure rather
   than evicting a live tag, and the original nonce still reads as seen.
 - An unknown user's scram_params reply is indistinguishable in shape from a
   known user's and deterministic across lookups; the advertised iteration
   count matches what password-set derives for real accounts, and the fake
-  secret is stable across daemon restarts.
+  secret is stable across daemon restarts. Concurrent starters publish one
+  secret; a corrupt published secret fails startup and remains in place for
+  offline repair.
 - gs2 `p` with mismatched channel-binding data fails.
 - A password change between cached params and verify answers scram_stale,
   the core evicts its cache entry, and the next attempt succeeds.

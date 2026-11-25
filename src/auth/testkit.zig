@@ -17,6 +17,10 @@ pub const TestUserStore = user_store_mod.UserStore(MemoryBackend);
 pub const TestHandler = handler_mod.AuthHandler(TestUserStore);
 pub const TestCryptoPool = crypto_pool_mod.CryptoPool;
 
+/// Move the verifier restart cutoff behind every current test nonce; the
+/// boundary tests pin their own floors explicitly.
+pub const test_handler_opts: TestHandler.InitOpts = .{ .nonce_floor_seconds = 1 };
+
 /// Test helper: drive the synchronous variant of handleMessage.
 pub fn handleSync(handler: anytype, msg: protocol.Message) ?protocol.Message {
     return switch (handler.handleMessage(msg, 0, 1)) {

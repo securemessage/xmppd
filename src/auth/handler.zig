@@ -194,10 +194,11 @@ pub fn AuthHandler(comptime Store: type) type {
         /// tolerance (auth.scram_nonce_skew_seconds).
         replay_window_seconds: i64 = scram_mech.DEFAULT_NONCE_WINDOW_SECONDS,
         nonce_skew_seconds: i64 = scram_mech.DEFAULT_NONCE_SKEW_SECONDS,
-        /// Server nonces issued before this wall second are refused: set
-        /// to boot time, so a restarted verifier whose replay table is
-        /// empty cannot let a pre-boot challenge pass when the table
-        /// cannot prove it was never consumed.
+        /// Verifier startup wall second. Timed server nonces through
+        /// floor + nonce_skew_seconds inclusive are refused: the startup
+        /// second is ambiguous, future-dated pre-restart nonces can reach
+        /// that bound, and an empty replay table cannot prove either kind
+        /// was never consumed.
         replay_floor_seconds: i64 = 0,
         /// Admission policy: permanent locks and the rate limiter.
         policy: policy_mod.Policy = .{},
@@ -233,8 +234,9 @@ pub fn AuthHandler(comptime Store: type) type {
             replay_capacity: usize = scram_mech.DEFAULT_REPLAY_CAPACITY,
             nonce_window_seconds: i64 = scram_mech.DEFAULT_NONCE_WINDOW_SECONDS,
             nonce_skew_seconds: i64 = scram_mech.DEFAULT_NONCE_SKEW_SECONDS,
-            /// Boot-time floor for timed server nonces; null stamps the
-            /// init timestamp. Tests set it to pin the boundary.
+            /// Verifier startup second for the timed-nonce restart cutoff;
+            /// null stamps the init timestamp. Tests set it to pin the
+            /// boundary.
             nonce_floor_seconds: ?i64 = null,
             /// The persisted {db}/auth fake-derivation key; null mints a
             /// per-boot one (tests, OIDC daemon).
@@ -486,7 +488,7 @@ test "AuthMetrics: SCRAM v2 counts one exchange per verify" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "secret123");
-    var handler = try TestHandler.init(allocator, &store, .{});
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
     defer handler.deinit();
 
     const c = &metrics.counters;
