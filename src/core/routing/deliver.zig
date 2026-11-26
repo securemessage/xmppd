@@ -1463,7 +1463,7 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
 test "Server: a cross-worker delivery to a resumable session shares the ring blob" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -1471,14 +1471,14 @@ test "Server: a cross-worker delivery to a resumable session shares the ring blo
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     const fds = try makeSocketPair();
     defer posix.close(fds[1]);
     const target = try allocator.create(Session);
     target.init(fds[0], 5, "localhost", false, allocator);
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.sm_enabled = true;
     target.sm_detached = true;
     target.sm_resume_enabled = true;
@@ -1522,7 +1522,7 @@ test "Server: a cross-worker delivery to a resumable session shares the ring blo
 test "Server: a session at its SM byte bound fails alone; deliveries still flow" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1531,7 +1531,7 @@ test "Server: a session at its SM byte bound fails alone; deliveries still flow"
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 1;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     const payload = "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>0123456789012345678901234567890123456789012345678901234567890123456789</body></message>";
@@ -1542,7 +1542,7 @@ test "Server: a session at its SM byte bound fails alone; deliveries still flow"
     defer posix.close(victim_fds[1]);
     const victim = try allocator.create(Session);
     victim.init(victim_fds[0], 5, "localhost", false, allocator);
-    victim.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    victim.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     victim.sm_enabled = true;
     victim.sm_resume_enabled = true;
     victim.sm_id_len = sm_state.SM_ID_HEX_LEN;
@@ -1558,7 +1558,7 @@ test "Server: a session at its SM byte bound fails alone; deliveries still flow"
     defer posix.close(bystander_fds[1]);
     const bystander = try allocator.create(Session);
     bystander.init(bystander_fds[0], 6, "localhost", false, allocator);
-    bystander.stream.bound_jid = xmpp.Jid.parse("carol@localhost/desktop") catch null;
+    bystander.stream.setBoundJid(xmpp.Jid.parse("carol@localhost/desktop") catch null);
     bystander.sm_enabled = true;
     bystander.sm_resume_enabled = true;
     bystander.sm_id_len = sm_state.SM_ID_HEX_LEN;

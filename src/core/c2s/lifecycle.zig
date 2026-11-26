@@ -3238,7 +3238,7 @@ test "C11: SM retention never charges the producer's transport budget" {
 
     const session = try makeAuthenticatedSession(&server, 1, "alice");
     session.stream.state = .active;
-    session.stream.bound_jid = xmpp_lib.Jid.parse("alice@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp_lib.Jid.parse("alice@localhost/res") catch null);
     session.sm_resume_enabled = true;
     session.sm_id_len = sm_state.SM_ID_HEX_LEN;
     @memcpy(&session.sm_id, "aaaa1111bbbb2222cccc3333dddd4444");
@@ -3287,26 +3287,26 @@ test "C11: the session byte bound fails only the holder into a counted drain" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, false, 0);
+    var sm = try SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
     const bob = try makeAuthenticatedSession(&server, 3, "bob");
-    bob.stream.bound_jid = xmpp_lib.Jid.parse("bob@localhost/res") catch null;
+    bob.stream.setBoundJid(xmpp_lib.Jid.parse("bob@localhost/res") catch null);
     try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
     server.free_count -= 1;
 
     const session = try makeAuthenticatedSession(&server, 1, "alice");
     session.stream.state = .active;
-    session.stream.bound_jid = xmpp_lib.Jid.parse("alice@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp_lib.Jid.parse("alice@localhost/res") catch null);
     session.sm_enabled = true;
     session.sm_resume_enabled = true;
     session.sm_id_len = sm_state.SM_ID_HEX_LEN;
@@ -3393,9 +3393,7 @@ fn makeDetachedWithStanzas(
     stanzas: []const []const u8,
 ) !*Session {
     const session = try makeAuthenticatedSession(server, id, local);
-    // bound_full_jid must outlive the session (Jid fields slice it):
-    // callers pass string literals, never a stack buffer.
-    session.stream.bound_jid = xmpp_lib.Jid.parse(bound_full_jid) catch null;
+    session.stream.setBoundJid(xmpp_lib.Jid.parse(bound_full_jid) catch null);
     session.sm_resume_enabled = true;
     session.sm_detached = true;
     session.sm_detach_time = sm_state.monotonicSeconds();
@@ -3424,21 +3422,21 @@ test "C11: expiry drain stores messages offline and bounces IQs" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, false, 0);
+    var sm = try SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
     // Live sender bound in the session map on this worker.
     const bob = try makeAuthenticatedSession(&server, 3, "bob");
-    bob.stream.bound_jid = xmpp_lib.Jid.parse("bob@localhost/res") catch null;
+    bob.stream.setBoundJid(xmpp_lib.Jid.parse("bob@localhost/res") catch null);
     try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
     server.free_count -= 1;
 
@@ -3477,20 +3475,20 @@ test "C11: offline-quota refusal bounces the message to its sender" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, false, 0);
+    var sm = try SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
     const bob = try makeAuthenticatedSession(&server, 3, "bob");
-    bob.stream.bound_jid = xmpp_lib.Jid.parse("bob@localhost/res") catch null;
+    bob.stream.setBoundJid(xmpp_lib.Jid.parse("bob@localhost/res") catch null);
     try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
     server.free_count -= 1;
 
@@ -3534,20 +3532,20 @@ test "C11: error, result and groupchat unacked stanzas drop counted, never bounc
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, false, 0);
+    var sm = try SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
     const bob = try makeAuthenticatedSession(&server, 3, "bob");
-    bob.stream.bound_jid = xmpp_lib.Jid.parse("bob@localhost/res") catch null;
+    bob.stream.setBoundJid(xmpp_lib.Jid.parse("bob@localhost/res") catch null);
     try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
     server.free_count -= 1;
 
@@ -3628,20 +3626,20 @@ test "C11: a full drain-store ring refuses and bounces, never commits inline" {
     defer op_db.close();
     var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, false, 0);
+    var sm = try SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
     server.offline = &offline_store;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
     const bob = try makeAuthenticatedSession(&server, 3, "bob");
-    bob.stream.bound_jid = xmpp_lib.Jid.parse("bob@localhost/res") catch null;
+    bob.stream.setBoundJid(xmpp_lib.Jid.parse("bob@localhost/res") catch null);
     try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
     server.free_count -= 1;
 
@@ -3703,7 +3701,7 @@ test "C11: parked drains bound nodes and bytes; overflow drains inline counted" 
     // detour is counted once per queue.
     const overflow0 = delivery_queue_mod.sm_drain_park_overflow.load(.monotonic);
     const session = try makeAuthenticatedSession(&server, 5, "dave");
-    session.stream.bound_jid = xmpp_lib.Jid.parse("dave@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp_lib.Jid.parse("dave@localhost/res") catch null);
     server.free_count -= 1;
     const big_queue = try allocator.create(sm_state.SmUnackedQueue);
     big_queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);

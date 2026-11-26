@@ -1775,9 +1775,9 @@ test "T317: local resume re-bind failure fails and closes both slots" {
     // One other live resource fills the per-account cap (max 1): the
     // re-bind of alice@localhost/res fails and, before T317, left the
     // resumed session live but unroutable.
-    var sm = SessionMap.init(std.testing.allocator, false, 1);
+    var sm = try SessionMap.init(std.testing.allocator, 1, 1);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     try sm.bind(0, server.sessionToken(9), "alice", "localhost", "res2");
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -1829,9 +1829,9 @@ test "T317: cross-worker resume re-bind failure fails and closes the session" {
     defer server.deinit();
     sm_handoff.resetForTesting();
 
-    var sm = SessionMap.init(std.testing.allocator, false, 1);
+    var sm = try SessionMap.init(std.testing.allocator, 1, 1);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     try sm.bind(0, server.sessionToken(9), "alice", "localhost", "res2");
 
     var change_buf: [16]posix.Kevent = undefined;
