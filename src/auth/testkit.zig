@@ -5,6 +5,7 @@
 //! builders. Imported only by test code; production never reaches it.
 
 const std = @import("std");
+const sasl = @import("sasl");
 const protocol = @import("ipc_protocol");
 const backend_mod = @import("backend");
 const user_store_mod = @import("user_store");
@@ -15,6 +16,10 @@ pub const MemoryBackend = backend_mod.MemoryBackend;
 pub const TestUserStore = user_store_mod.UserStore(MemoryBackend);
 pub const TestHandler = handler_mod.AuthHandler(TestUserStore);
 pub const TestCryptoPool = crypto_pool_mod.CryptoPool;
+
+/// Move the verifier restart cutoff behind every current test nonce; the
+/// boundary tests pin their own floors explicitly.
+pub const test_handler_opts: TestHandler.InitOpts = .{ .nonce_floor_seconds = 1 };
 
 /// Test helper: drive the synchronous variant of handleMessage.
 pub fn handleSync(handler: anytype, msg: protocol.Message) ?protocol.Message {
@@ -94,4 +99,80 @@ pub fn plainRequest(conn_id: u32, ip: []const u8, payload: []const u8) protocol.
         .username = "",
         .payload = payload,
     } };
+}
+
+/// Buffer length for a minted server nonce (b64).
+pub const SNONCE_B64_LEN = sasl.scram.server_nonce_b64_len;
+
+/// Mint a timed server nonce (v2 freshness layout) issued at `now`.
+pub fn mintSnonce(buf: *[SNONCE_B64_LEN]u8, now: i64) []const u8 {
+    return sasl.scram.mintServerNonce(buf, now);
+}
+
+/// Test helper: build the server-first-message exactly the way core does
+/// under protocol v2 (ADR-6): combined nonce = client nonce + server nonce,
+/// then the cached (salt, iterations).
+pub fn serverFirst(buf: []u8, client_nonce: []const u8, server_nonce_b64: []const u8, salt: []const u8, iterations: u32) []const u8 {
+    const encoder = std.base64.standard.Encoder;
+    var salt_b64: [64]u8 = undefined;
+    const enc = encoder.encode(salt_b64[0..encoder.calcSize(salt.len)], salt);
+    var fbs = std.io.fixedBufferStream(buf);
+    fbs.writer().print("r={s}{s},s={s},i={d}", .{ client_nonce, server_nonce_b64, enc, iterations }) catch unreachable;
+    return fbs.getWritten();
+}
+
+/// One driven v2 exchange against the handler: params lookup (as core does
+/// on a cache miss), server-first build, client-final, scram_verify. The
+/// caller keeps client parsed fields for assertions.
+pub const V2Exchange = struct {
+    first: @import("sasl").scram.ClientFirst,
+    server_first: []const u8,
+    params_msg: ?protocol.Message,
+    verify_msg: ?protocol.Message,
+};
+
+pub fn scramV2Exchange(
+    handler: anytype,
+    client: anytype,
+    conn_id: u32,
+    client_ip: []const u8,
+    password: []const u8,
+    server_nonce_b64: []const u8,
+    sf_buf: []u8,
+) !V2Exchange {
+    const cf = try client.clientFirst();
+    const first = try sasl.scram.parseClientFirst(cf);
+
+    var ex = V2Exchange{
+        .first = first,
+        .server_first = "",
+        .params_msg = null,
+        .verify_msg = null,
+    };
+
+    ex.params_msg = handleSync(handler, .{ .scram_params_request = .{
+        .conn_id = conn_id,
+        .username = first.raw_name,
+        .client_ip = client_ip,
+    } });
+    const params = ex.params_msg orelse return error.NoResponse;
+    if (params != .scram_params) return error.UnexpectedReply;
+
+    ex.server_first = serverFirst(sf_buf, first.client_nonce, server_nonce_b64, params.scram_params.salt, params.scram_params.iteration_count);
+    try client.parseServerFirst(ex.server_first);
+    var salted: [32]u8 = undefined;
+    sasl.scram.pbkdf2(password, client.salt_raw[0..client.salt_raw_len], client.iteration_count, &salted);
+    const final = try client.clientFinal(salted);
+
+    ex.verify_msg = handleSync(handler, .{ .scram_verify = .{
+        .conn_id = conn_id,
+        .client_ip = client_ip,
+        .cb_type = 0,
+        .cb_data = "",
+        .gs2_flag = first.gs2_flag,
+        .client_first_bare = first.bare,
+        .server_first = ex.server_first,
+        .client_final = final,
+    } });
+    return ex;
 }

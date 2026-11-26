@@ -1,18 +1,19 @@
 //! # Auth Handler — SASL authentication request processor
 //!
-//! Handles IPC auth requests from xmppd-core. Maintains per-connection
-//! SCRAM state for multi-step exchanges.
+//! Handles IPC auth requests from xmppd-core. Protocol v2: SCRAM is a
+//! stateless one-round-trip verify (ADR-6), so the only per-mechanism state
+//! left is the bounded server-nonce replay cache.
 //!
 //! ## Flow
 //!
 //! **PLAIN:** AuthRequest → lookup → AuthSuccess/AuthFailure (one step)
 //!
-//! **SCRAM-SHA-256:** AuthRequest → ScramServer.handleClientFirst → AuthChallenge
-//!                    SaslResponse → ScramServer.handleClientFinal → AuthSuccess/AuthFailure
+//! **SCRAM-SHA-256:** ScramParamsRequest → ScramParams (cache-miss lookup)
+//!                    ScramVerify → verify vs StoredKey → AuthSuccess/AuthFailure
 //!
 //! ## Layout
 //!
-//! The handler owns the shared state (SCRAM session table, credential
+//! The handler owns the shared state (replay cache, credential
 //! cache, deferred PLAIN jobs) and dispatches each request to the module
 //! that owns the concern: mech/plain.zig, mech/scram.zig,
 //! mech/oauthbearer.zig and account.zig. Admission policy lives in
@@ -33,13 +34,21 @@ const protocol = @import("ipc_protocol");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const policy_mod = @import("policy");
 const crypto_pool_mod = @import("crypto_pool");
+const metrics = @import("auth_metrics");
 
 const plain_mech = @import("mech/plain.zig");
-const scram_mech = @import("mech/scram.zig");
+pub const scram_mech = @import("mech/scram.zig");
 const oauthbearer_mech = @import("mech/oauthbearer.zig");
 const account_mod = @import("account.zig");
 
 const log = std.log.scoped(.auth_handler);
+
+// The metrics API takes u8 ids so it can stay a leaf shared by both auth
+// module graphs; pin the index space to the enums here.
+comptime {
+    std.debug.assert(@typeInfo(protocol.MechanismId).@"enum".fields.len == metrics.MECH_COUNT);
+    std.debug.assert(@typeInfo(FailureReason).@"enum".fields.len == metrics.REASON_COUNT);
+}
 
 /// The lock and failure types live in the policy module; these aliases keep
 /// the daemon and test call sites stable.
@@ -172,8 +181,25 @@ pub fn AuthHandler(comptime Store: type) type {
     return struct {
         store: *Store,
         allocator: std.mem.Allocator,
-        /// Active SCRAM sessions indexed by slot.
-        scram_sessions: [scram_mech.MAX_SCRAM_SESSIONS]scram_mech.ScramSession = undefined,
+        /// Secret for the deterministic fake credentials and the keyed
+        /// replay-cache tags (ADR-6); drawn at init or loaded from the
+        /// persisted {db}/auth key, never leaves the daemon.
+        scram_secret: [32]u8 = undefined,
+        /// Server-nonce replay cache, capacity sized from config at init
+        /// (mech/scram.zig owns the probe rules). Empty slice means every
+        /// insert refuses. The only SCRAM state the daemon holds.
+        replay_entries: []scram_mech.ReplayEntry = &.{},
+        /// Freshness window for the timestamp inside server nonces
+        /// (auth.scram_nonce_window_seconds) and the forward skew
+        /// tolerance (auth.scram_nonce_skew_seconds).
+        replay_window_seconds: i64 = scram_mech.DEFAULT_NONCE_WINDOW_SECONDS,
+        nonce_skew_seconds: i64 = scram_mech.DEFAULT_NONCE_SKEW_SECONDS,
+        /// Verifier startup wall second. Timed server nonces through
+        /// floor + nonce_skew_seconds inclusive are refused: the startup
+        /// second is ambiguous, future-dated pre-restart nonces can reach
+        /// that bound, and an empty replay table cannot prove either kind
+        /// was never consumed.
+        replay_floor_seconds: i64 = 0,
         /// Admission policy: permanent locks and the rate limiter.
         policy: policy_mod.Policy = .{},
         /// Registration configuration.
@@ -200,14 +226,43 @@ pub fn AuthHandler(comptime Store: type) type {
         /// The store's declared capabilities, resolved by capabilitiesOf.
         pub const capabilities = caps;
 
-        pub fn init(allocator: std.mem.Allocator, store: *Store) Self {
+        /// Replay-cache sizing and nonce freshness, derived from config by
+        /// the daemon main (auth.login_rate_ceiling x
+        /// auth.scram_nonce_window_seconds entries; the window and skew
+        /// bound the embedded timestamp check).
+        pub const InitOpts = struct {
+            replay_capacity: usize = scram_mech.DEFAULT_REPLAY_CAPACITY,
+            nonce_window_seconds: i64 = scram_mech.DEFAULT_NONCE_WINDOW_SECONDS,
+            nonce_skew_seconds: i64 = scram_mech.DEFAULT_NONCE_SKEW_SECONDS,
+            /// Verifier startup second for the timed-nonce restart cutoff;
+            /// null stamps the init timestamp. Tests set it to pin the
+            /// boundary.
+            nonce_floor_seconds: ?i64 = null,
+            /// The persisted {db}/auth fake-derivation key; null mints a
+            /// per-boot one (tests, OIDC daemon).
+            scram_secret: ?[32]u8 = null,
+        };
+
+        /// The replay table is required for SCRAM when replay_capacity is
+        /// nonzero: failing its allocation fails init, so the daemon
+        /// cannot start up silently refusing every verify.
+        pub fn init(allocator: std.mem.Allocator, store: *Store, opts: InitOpts) !Self {
             var handler = Self{
                 .store = store,
                 .allocator = allocator,
-                .scram_sessions = undefined,
+                .scram_secret = undefined,
+                .replay_window_seconds = opts.nonce_window_seconds,
+                .nonce_skew_seconds = opts.nonce_skew_seconds,
+                .replay_floor_seconds = opts.nonce_floor_seconds orelse std.time.timestamp(),
             };
-            for (&handler.scram_sessions) |*s| {
-                s.active = false;
+            if (opts.replay_capacity > 0) {
+                handler.replay_entries = try allocator.alloc(scram_mech.ReplayEntry, opts.replay_capacity);
+                for (handler.replay_entries) |*e| e.* = .{};
+            }
+            if (opts.scram_secret) |s| {
+                handler.scram_secret = s;
+            } else {
+                std.crypto.random.bytes(&handler.scram_secret);
             }
             return handler;
         }
@@ -254,9 +309,8 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            for (&self.scram_sessions) |*s| {
-                if (s.active) s.deinit();
-            }
+            std.crypto.secureZero(u8, &self.scram_secret);
+            if (self.replay_entries.len > 0) self.allocator.free(self.replay_entries);
             var pend_it = self.pending_plain.iterator();
             while (pend_it.next()) |kv| {
                 self.allocator.free(kv.value_ptr.username);
@@ -276,7 +330,14 @@ pub fn AuthHandler(comptime Store: type) type {
         /// job id is unknown (stale/abandoned). Rate-limit bookkeeping runs
         /// here on the loop thread, same as the inline path.
         pub fn takeCryptoReply(self: *Self, completion: crypto_pool_mod.Completion) ?DeferredReply {
-            return plain_mech.takeCryptoReply(Store, self, completion);
+            metrics.poolJobDone(completion.latency_us);
+            const reply = plain_mech.takeCryptoReply(Store, self, completion) orelse return null;
+            switch (reply.msg) {
+                .auth_success => metrics.exchangeCompleted(@intFromEnum(protocol.MechanismId.plain), true),
+                .auth_failure => metrics.exchangeCompleted(@intFromEnum(protocol.MechanismId.plain), false),
+                else => {},
+            }
+            return reply;
         }
 
         /// Process an incoming IPC message. slot/slot_gen identify the IPC
@@ -284,14 +345,18 @@ pub fn AuthHandler(comptime Store: type) type {
         pub fn handleMessage(self: *Self, msg: protocol.Message, slot: u32, slot_gen: u32) HandleResult {
             return switch (msg) {
                 .auth_request => |req| self.handleAuthRequest(req, slot, slot_gen),
-                .sasl_response => |resp| .{ .reply = scram_mech.handleSaslResponse(Store, self, @intCast(slot), resp) },
-                .auth_abort => |a| blk: {
-                    // The XMPP connection vanished mid-exchange; release its
-                    // SCRAM slot immediately instead of waiting for the stale
-                    // sweep — the core may already be reusing the conn.id.
-                    scram_mech.cleanupSession(Store, self, @intCast(slot), a.conn_id);
-                    break :blk .none;
+                .scram_params_request => |req| .{ .reply = scram_mech.handleScramParams(Store, self, req) },
+                .scram_verify => |req| blk: {
+                    metrics.exchangeStarted(@intFromEnum(protocol.MechanismId.scram_sha_256));
+                    const reply = scram_mech.handleScramVerify(Store, self, req);
+                    switch (reply) {
+                        .auth_success => metrics.exchangeCompleted(@intFromEnum(protocol.MechanismId.scram_sha_256), true),
+                        .auth_failure => metrics.exchangeCompleted(@intFromEnum(protocol.MechanismId.scram_sha_256), false),
+                        else => {},
+                    }
+                    break :blk .{ .reply = reply };
                 },
+                .auth_abort => .none,
                 .password_change_request => |req| .{ .reply = account_mod.handlePasswordChange(Store, self, req) },
                 .account_delete_request => |req| .{ .reply = account_mod.handleAccountDelete(Store, self, req) },
                 .register_request => |req| .{ .reply = account_mod.handleRegisterRequest(Store, self, req) },
@@ -300,14 +365,24 @@ pub fn AuthHandler(comptime Store: type) type {
         }
 
         fn handleAuthRequest(self: *Self, req: protocol.AuthRequest, slot: u32, slot_gen: u32) HandleResult {
+            metrics.exchangeStarted(@intFromEnum(req.mechanism));
+            const result = self.dispatchAuth(req, slot, slot_gen);
+            if (result == .reply) switch (result.reply) {
+                .auth_success => metrics.exchangeCompleted(@intFromEnum(req.mechanism), true),
+                .auth_failure => metrics.exchangeCompleted(@intFromEnum(req.mechanism), false),
+                // A challenge leaves the exchange open; it completes at the
+                // scram_verify or dies abandoned.
+                else => {},
+            };
+            return result;
+        }
+
+        fn dispatchAuth(self: *Self, req: protocol.AuthRequest, slot: u32, slot_gen: u32) HandleResult {
             // Each mechanism admits the IP before doing work and the account
             // once the identity is known, so every key is counted once.
             return switch (req.mechanism) {
                 .plain => plain_mech.handlePlainAuth(Store, self, req, slot, slot_gen),
-                .scram_sha_256 => if (comptime caps.lookup)
-                    .{ .reply = scram_mech.handleScramInit(Store, self, req, slot) }
-                else
-                    .{ .reply = authFailure(req.conn_id, .mechanism_not_supported) },
+                .scram_sha_256 => .{ .reply = authFailure(req.conn_id, .mechanism_not_supported) },
                 .oauthbearer => if (comptime caps.validate_token)
                     .{ .reply = oauthbearer_mech.handleOAuthBearerAuth(Store, self, req) }
                 else
@@ -320,36 +395,13 @@ pub fn AuthHandler(comptime Store: type) type {
         pub fn pendingFor(self: *Self, username: []const u8) usize {
             return plain_mech.pendingFor(Store, self, username);
         }
-
-        /// Find or create a session slot for (lane, conn_id); null when the
-        /// table is genuinely full (mech/scram.zig owns the probe rules).
-        pub fn findOrCreateScramSlot(self: *Self, lane: u16, conn_id: u32) ?usize {
-            return scram_mech.findOrCreateScramSlot(Store, self, lane, conn_id);
-        }
-
-        /// Find the live session slot for (lane, conn_id), or null.
-        pub fn findScramSlot(self: *Self, lane: u16, conn_id: u32) ?usize {
-            return scram_mech.findScramSlot(Store, self, lane, conn_id);
-        }
-
-        /// Clean up a SCRAM session after the response has been sent.
-        /// Lookup is keyed on (lane, conn_id): conn_id alone collides
-        /// across core worker lanes each numbering from 1 (T279).
-        pub fn cleanupSession(self: *Self, lane: u16, conn_id: u32) void {
-            scram_mech.cleanupSession(Store, self, lane, conn_id);
-        }
-
-        /// Deinit every in-flight SCRAM session the given IPC lane owns;
-        /// called before closing that IPC client so dead lanes cannot wedge
-        /// sessions into the 60 s stale probe (T279).
-        pub fn closeLaneSessions(self: *Self, lane: usize) void {
-            scram_mech.closeLaneSessions(Store, self, lane);
-        }
     };
 }
 
-/// Render an auth_failure message for a wire reason.
+/// Render an auth_failure message for a wire reason. The one constructor
+/// every mechanism shares, so the outcome counter lives here.
 pub fn authFailure(conn_id: u32, reason: FailureReason) protocol.Message {
+    metrics.failure(@intFromEnum(reason));
     return protocol.Message{ .auth_failure = .{
         .conn_id = conn_id,
         .reason = reason.text(),
@@ -373,4 +425,319 @@ comptime {
     _ = scram_mech;
     _ = oauthbearer_mech;
     _ = account_mod;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testkit = @import("testkit.zig");
+const backend_mod = @import("backend");
+const user_store_mod = @import("user_store");
+const MemoryBackend = backend_mod.MemoryBackend;
+const TestUserStore = user_store_mod.UserStore(MemoryBackend);
+const TestHandler = AuthHandler(TestUserStore);
+const handleSync = testkit.handleSync;
+
+fn counterValue(c: *const std.atomic.Value(u64)) u64 {
+    return c.load(.monotonic);
+}
+
+test "AuthMetrics: PLAIN moves the started, completed and outcome counters" {
+    const allocator = std.testing.allocator;
+    metrics.reset();
+    defer metrics.reset();
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+    var handler = try TestHandler.init(allocator, &store, .{});
+    defer handler.deinit();
+
+    const c = &metrics.counters;
+    const plain: usize = @intFromEnum(protocol.MechanismId.plain) - 1;
+
+    var ok_buf: [64]u8 = undefined;
+    const ok = handleSync(&handler, testkit.plainRequest(1, "10.0.0.1", testkit.plainPayload(&ok_buf, "alice", "secret123"))) orelse return error.NoResponse;
+    try std.testing.expect(ok == .auth_success);
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.exchanges_started[plain]));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.exchanges_completed[plain]));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.auth_success));
+
+    var bad_buf: [64]u8 = undefined;
+    const bad = handleSync(&handler, testkit.plainRequest(2, "10.0.0.2", testkit.plainPayload(&bad_buf, "alice", "wrong"))) orelse return error.NoResponse;
+    try std.testing.expect(bad == .auth_failure);
+    try std.testing.expectEqual(@as(u64, 2), counterValue(&c.exchanges_started[plain]));
+    try std.testing.expectEqual(@as(u64, 2), counterValue(&c.exchanges_completed[plain]));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.auth_success));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.outcomes[@intFromEnum(FailureReason.not_authorized)]));
+
+    const malformed = handleSync(&handler, testkit.plainRequest(3, "10.0.0.3", "noseparators")) orelse return error.NoResponse;
+    try std.testing.expect(malformed == .auth_failure);
+    try std.testing.expectEqual(@as(u64, 3), counterValue(&c.exchanges_completed[plain]));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.outcomes[@intFromEnum(FailureReason.invalid_encoding)]));
+}
+
+test "AuthMetrics: SCRAM v2 counts one exchange per verify" {
+    const allocator = std.testing.allocator;
+    metrics.reset();
+    defer metrics.reset();
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+    var handler = try TestHandler.init(allocator, &store, testkit.test_handler_opts);
+    defer handler.deinit();
+
+    const c = &metrics.counters;
+    const scram: usize = @intFromEnum(protocol.MechanismId.scram_sha_256) - 1;
+
+    var client = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer client.deinit();
+    var sf1: [512]u8 = undefined;
+    var nb1: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const ok = try testkit.scramV2Exchange(&handler, &client, 5, "10.0.0.5", "secret123", testkit.mintSnonce(&nb1, std.time.timestamp()), &sf1);
+    try std.testing.expect(ok.verify_msg.? == .auth_success);
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.exchanges_started[scram]));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.exchanges_completed[scram]));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.auth_success));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.replay_occupied));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.replay_high_water));
+
+    // A failed exchange completes the same counters, minus auth_success.
+    var bad = sasl.ScramClient.init(allocator, "alice", "wrong-pass");
+    defer bad.deinit();
+    var sf2: [512]u8 = undefined;
+    var nb2: [testkit.SNONCE_B64_LEN]u8 = undefined;
+    const ko = try testkit.scramV2Exchange(&handler, &bad, 6, "10.0.0.6", "wrong-pass", testkit.mintSnonce(&nb2, std.time.timestamp()), &sf2);
+    try std.testing.expect(ko.verify_msg.? == .auth_failure);
+    try std.testing.expectEqual(@as(u64, 2), counterValue(&c.exchanges_started[scram]));
+    try std.testing.expectEqual(@as(u64, 2), counterValue(&c.exchanges_completed[scram]));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.auth_success));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.outcomes[@intFromEnum(FailureReason.not_authorized)]));
+}
+
+test "AuthMetrics: OAUTHBEARER moves its own mechanism counters" {
+    const allocator = std.testing.allocator;
+    metrics.reset();
+    defer metrics.reset();
+
+    var store = testkit.TestIdpStore{ .token_user = "bob@idp.example" };
+    var handler = try testkit.TestIdpHandler.init(allocator, &store, .{});
+    defer handler.deinit();
+
+    const c = &metrics.counters;
+    const oauth: usize = @intFromEnum(protocol.MechanismId.oauthbearer) - 1;
+
+    const result = handleSync(&handler, .{ .auth_request = .{
+        .conn_id = 43,
+        .mechanism = .oauthbearer,
+        .client_ip = "127.0.0.1",
+        .cb_type = 0,
+        .cb_data = "",
+        .username = "",
+        .payload = "n,,\x01auth=Bearer tok123\x01\x01",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(result == .auth_success);
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.exchanges_started[oauth]));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.exchanges_completed[oauth]));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.auth_success));
+    try std.testing.expectEqual(@as(u64, 0), counterValue(&c.exchanges_started[0]));
+    try std.testing.expectEqual(@as(u64, 0), counterValue(&c.exchanges_started[1]));
+}
+
+test "AuthMetrics: limiter admits, refusals and lockouts move under driven exchanges" {
+    const allocator = std.testing.allocator;
+    metrics.reset();
+    defer metrics.reset();
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw");
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 1,
+        .max_per_ip = 100,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = try TestHandler.init(allocator, &store, .{});
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    const c = &metrics.counters;
+
+    // First attempt: both keys admitted.
+    var buf1: [64]u8 = undefined;
+    const ok = handleSync(&handler, testkit.plainRequest(1, "10.0.0.1", testkit.plainPayload(&buf1, "alice", "pw"))) orelse return error.NoResponse;
+    try std.testing.expect(ok == .auth_success);
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.ip_admits));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.account_admits));
+    try std.testing.expectEqual(@as(u64, 0), counterValue(&c.ip_refusals));
+    try std.testing.expectEqual(@as(u64, 0), counterValue(&c.account_refusals));
+
+    // Second attempt inside the window: the account key refuses (not a lock).
+    var buf2: [64]u8 = undefined;
+    const refused = handleSync(&handler, testkit.plainRequest(2, "10.0.0.2", testkit.plainPayload(&buf2, "alice", "pw"))) orelse return error.NoResponse;
+    try std.testing.expect(refused == .auth_failure);
+    try std.testing.expectEqualStrings("policy-violation", refused.auth_failure.reason);
+    try std.testing.expectEqual(@as(u64, 2), counterValue(&c.ip_admits));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.account_refusals));
+    try std.testing.expectEqual(@as(u64, 0), counterValue(&c.lockout_refusals));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.outcomes[@intFromEnum(FailureReason.policy_violation)]));
+
+    // One recorded failure meets the threshold and locks the account.
+    limiter.recordOutcome("alice", "10.0.0.9", false);
+    var buf3: [64]u8 = undefined;
+    const locked = handleSync(&handler, testkit.plainRequest(3, "10.0.0.3", testkit.plainPayload(&buf3, "alice", "pw"))) orelse return error.NoResponse;
+    try std.testing.expect(locked == .auth_failure);
+    try std.testing.expectEqualStrings("account-disabled", locked.auth_failure.reason);
+    try std.testing.expectEqual(@as(u64, 2), counterValue(&c.account_refusals));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.lockout_refusals));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.outcomes[@intFromEnum(FailureReason.account_disabled)]));
+}
+
+test "AuthMetrics: a locked account's verify counts the refusal and lockout" {
+    const allocator = std.testing.allocator;
+    metrics.reset();
+    defer metrics.reset();
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "secret123");
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 100,
+        .window_seconds = 120,
+        .lockout_duration = 300,
+        .lockout_threshold = 1,
+        .ip_lockout_threshold = 100,
+    });
+    defer limiter.deinit();
+    var handler = try TestHandler.init(allocator, &store, .{});
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    const c = &metrics.counters;
+
+    // The account locks before the verify; admission denies as locked and
+    // counts the account refusal plus its lockout split.
+    limiter.recordOutcome("alice", "10.0.0.60", false);
+
+    var client = sasl.ScramClient.init(allocator, "alice", "secret123");
+    defer client.deinit();
+    var sf: [512]u8 = undefined;
+    const ex = try testkit.scramV2Exchange(&handler, &client, 60, "10.0.0.60", "secret123", "srvnonceCCC=", &sf);
+    try std.testing.expect(ex.verify_msg.? == .auth_failure);
+    try std.testing.expectEqualStrings("account-disabled", ex.verify_msg.?.auth_failure.reason);
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.account_refusals));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.lockout_refusals));
+}
+
+test "AuthMetrics: an IP window denial and IP lockout move their counters" {
+    const allocator = std.testing.allocator;
+    metrics.reset();
+    defer metrics.reset();
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw");
+    var limiter = try RateLimiter.init(allocator, .{
+        .max_per_account = 100,
+        .max_per_ip = 1,
+        .window_seconds = 60,
+        .lockout_duration = 300,
+        .lockout_threshold = 100,
+        .ip_lockout_threshold = 1,
+    });
+    defer limiter.deinit();
+    var handler = try TestHandler.init(allocator, &store, .{});
+    handler.setRateLimiter(&limiter);
+    defer handler.deinit();
+
+    const c = &metrics.counters;
+
+    // First attempt from the IP is admitted; the second spends the window.
+    var buf1: [64]u8 = undefined;
+    const ok = handleSync(&handler, testkit.plainRequest(1, "10.0.9.1", testkit.plainPayload(&buf1, "alice", "pw"))) orelse return error.NoResponse;
+    try std.testing.expect(ok == .auth_success);
+    var buf2: [64]u8 = undefined;
+    const refused = handleSync(&handler, testkit.plainRequest(2, "10.0.9.1", testkit.plainPayload(&buf2, "alice", "pw"))) orelse return error.NoResponse;
+    try std.testing.expect(refused == .auth_failure);
+    try std.testing.expectEqualStrings("policy-violation", refused.auth_failure.reason);
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.ip_admits));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.ip_refusals));
+    try std.testing.expectEqual(@as(u64, 0), counterValue(&c.lockout_refusals));
+
+    // A recorded failure meets the IP lockout threshold; the next request
+    // from that IP is denied as locked, not rate limited.
+    limiter.recordOutcome("alice", "10.0.9.9", false);
+    var buf3: [64]u8 = undefined;
+    const locked = handleSync(&handler, testkit.plainRequest(3, "10.0.9.9", testkit.plainPayload(&buf3, "alice", "pw"))) orelse return error.NoResponse;
+    try std.testing.expect(locked == .auth_failure);
+    try std.testing.expectEqual(@as(u64, 2), counterValue(&c.ip_refusals));
+    try std.testing.expectEqual(@as(u64, 1), counterValue(&c.lockout_refusals));
+}
+
+test "AuthMetrics: crypto-pool completions move jobs, high-water and latency" {
+    const allocator = std.testing.allocator;
+    metrics.reset();
+    defer metrics.reset();
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "pooler", "pw");
+
+    var pool = crypto_pool_mod.CryptoPool{ .allocator = allocator };
+    try pool.start(1);
+    defer pool.stop();
+    var handler = try TestHandler.init(allocator, &store, .{});
+    handler.enableCryptoPool(&pool);
+    defer handler.deinit();
+
+    const c = &metrics.counters;
+    const plain: usize = @intFromEnum(protocol.MechanismId.plain) - 1;
+
+    var conn: u32 = 1;
+    while (conn <= 8) : (conn += 1) {
+        var buf: [64]u8 = undefined;
+        const reply = handleSync(&handler, testkit.plainRequest(conn, "10.0.0.8", testkit.plainPayload(&buf, "pooler", "pw")));
+        try std.testing.expect(reply == null); // deferred to the pool
+    }
+    try std.testing.expectEqual(@as(u64, 8), counterValue(&c.exchanges_started[plain]));
+    try std.testing.expect(counterValue(&c.pool_queue_high_water) >= 1);
+
+    var done: usize = 0;
+    while (done < 8) {
+        testkit.waitForPoolWake(&pool) catch |err| switch (err) {
+            error.PoolWakeTimeout => break,
+            else => return err,
+        };
+        pool.drainPipe();
+        while (pool.popCompletion()) |comp| {
+            var reply = handler.takeCryptoReply(comp) orelse return error.UnknownJob;
+            defer reply.deinit(allocator);
+            try std.testing.expect(reply.msg == .auth_success);
+            done += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 8), done);
+    try std.testing.expectEqual(@as(u64, 8), counterValue(&c.pool_jobs));
+    try std.testing.expectEqual(@as(u64, 8), counterValue(&c.exchanges_completed[plain]));
+    try std.testing.expectEqual(@as(u64, 8), counterValue(&c.auth_success));
+    var latency_total: u64 = 0;
+    for (&c.pool_latency_us) |*b| latency_total += counterValue(b);
+    try std.testing.expectEqual(@as(u64, 8), latency_total);
+    // A PBKDF2 derive cannot finish inside 2 us, so an all-bucket-0
+    // histogram means the latency stamp was dropped, not measured.
+    try std.testing.expect(counterValue(&c.pool_latency_us[0]) < 8);
 }

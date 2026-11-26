@@ -28,6 +28,7 @@ const event_loop_mod = @import("event_loop");
 const EventLoop = event_loop_mod.EventLoop;
 const ChangeList = event_loop_mod.ChangeList;
 const handler_mod = @import("handler");
+const metrics = @import("auth_metrics");
 
 /// Sentinel value for the listener fd in kqueue udata.
 pub const LISTENER_UDATA: usize = std.math.maxInt(usize);
@@ -254,12 +255,10 @@ pub fn Runner(comptime Store: type, comptime Hooks: type) type {
             if (conn.hasPendingSend()) self.flush_pending[slot] = true;
         }
 
-        /// Close an IPC client lane: its sessions die with it (T279) instead
-        /// of waiting for the 60 s stale probe, its staged changes are
-        /// dropped, and the daemon's own teardown runs before closeClient.
+        /// Close an IPC client lane: protocol v2 SCRAM holds no lane state,
+        /// so this is staged-change drop, teardown hooks, and closeClient.
         pub fn closeLane(self: *Self, slot: usize) void {
             if (self.ipc.getClient(slot)) |conn| self.batch.purgeFd(conn.fd);
-            self.handler.closeLaneSessions(slot);
             self.hooks.onLaneClose(slot);
             self.ipc.closeClient(slot);
             self.read_paused[slot] = false;
@@ -293,6 +292,7 @@ pub fn Runner(comptime Store: type, comptime Hooks: type) type {
                     self.closeLane(slot);
                     return;
                 };
+                metrics.ipcPaused();
                 Hooks.log.warn("IPC client {d}: {d}B outbound backlog > {d}B -- pausing intake until drained", .{ slot, pend, self.rx_pause_at });
             } else if (self.read_paused[slot] and pend < self.rx_resume_at) {
                 self.read_paused[slot] = false;
@@ -343,15 +343,6 @@ pub fn Runner(comptime Store: type, comptime Hooks: type) type {
                             self.closeLane(slot);
                             return;
                         };
-
-                        // Clean up SCRAM session after sending
-                        // success/failure (lane, conn_id) keyed: lanes
-                        // share conn_id numbers (T279).
-                        switch (response) {
-                            .auth_success => |s| self.handler.cleanupSession(@intCast(slot), s.conn_id),
-                            .auth_failure => |f| self.handler.cleanupSession(@intCast(slot), f.conn_id),
-                            else => {},
-                        }
 
                         // Deferred flush: the lane writes once at end of
                         // iteration (S22).

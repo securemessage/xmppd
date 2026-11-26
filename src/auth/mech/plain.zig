@@ -303,7 +303,7 @@ test "AuthHandler: PLAIN auth success" {
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "secret123");
 
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     // Build PLAIN payload: \0alice\0secret123
@@ -336,7 +336,7 @@ test "AuthHandler: PLAIN prepares the authcid for lookup and the bound identity"
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "naplestb", "pw");
 
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var buf: [64]u8 = undefined;
@@ -364,7 +364,7 @@ test "AuthHandler: PLAIN invalid names are indistinguishable from a wrong passwo
         .ip_lockout_threshold = 1,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -390,7 +390,7 @@ test "AuthHandler: PLAIN auth wrong password" {
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "bob", "correct");
 
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     // Build PLAIN payload with wrong password
@@ -421,7 +421,7 @@ test "AuthHandler: locked account rejected at PLAIN regardless of credentials (T
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "lockeduser", "secret123");
 
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var dummy: u8 = 0;
@@ -458,7 +458,7 @@ test "AuthHandler: lock store error fails closed (T352)" {
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "alice", "secret123");
 
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var dummy: u8 = 0;
@@ -502,7 +502,7 @@ test "AuthHandler: locks catch case variants and full-JID authcids are invalid" 
     var locks = lock_store_mod.LockStore(MemoryBackend).init(&lock_db);
     try locks.lock("alice", .permanent);
 
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
     var lock_checker: LockStoreChecker(MemoryBackend) = undefined;
     lock_checker.init(&locks, allocator);
@@ -554,7 +554,7 @@ test "AuthHandler: IdP PLAIN admits the localpart of the returned identity" {
     const allocator = std.testing.allocator;
 
     var store = TestIdpStore{ .password_user = "alice@idp.example" };
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     const user = "alice";
@@ -589,7 +589,7 @@ test "AuthHandler: a lock on the IdP identity rejects PLAIN" {
     // The IdP hands the identity back with a domain and mixed case: the
     // admission check runs on its localpart, not on the requested name.
     var store = TestIdpStore{ .password_user = "Alice@idp.example" };
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     defer handler.deinit();
     var lock_checker: LockStoreChecker(MemoryBackend) = undefined;
     lock_checker.init(&locks, allocator);
@@ -635,7 +635,7 @@ test "AuthHandler: IdP PLAIN prepares the supplied and returned identities" {
         .ip_lockout_threshold = 1,
     });
     defer limiter.deinit();
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -658,7 +658,7 @@ test "AuthHandler: IdP PLAIN accepts an email or JID authcid" {
         .password_user = "alice@idp.example",
         .password_secret = "right",
     };
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var buf: [96]u8 = undefined;
@@ -679,7 +679,7 @@ test "AuthHandler: unlimited attempts when rate limiter is not attached" {
     try store.addUser(allocator, "hammer", "pass");
 
     // No setRateLimiter call: the [auth] rate_limit = false configuration.
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var payload: [12]u8 = undefined;
@@ -715,7 +715,7 @@ test "AuthHandler: PLAIN auth defers to crypto pool and completes (T121)" {
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "dave", "pw123");
 
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var pool = TestCryptoPool{ .allocator = std.testing.allocator };
@@ -763,7 +763,7 @@ test "AuthHandler: PLAIN per-account rate limit engages on parsed username" {
         .lockout_threshold = 100,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -795,7 +795,7 @@ test "AuthHandler: PLAIN account lockout engages on parsed username" {
         .lockout_threshold = 2,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -827,7 +827,7 @@ test "AuthHandler: PLAIN crypto-pool admission counts before the job" {
         .ip_lockout_threshold = 100,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -869,7 +869,7 @@ test "AuthHandler: PLAIN counts the IP before the lookup" {
         .ip_lockout_threshold = 100,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -896,7 +896,7 @@ test "AuthHandler: PLAIN-IdP rejects a locked supplied name before the IdP" {
         .password_user = "alice@idp.example",
         .password_secret = "right",
     };
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     defer handler.deinit();
     var lock_checker: LockStoreChecker(MemoryBackend) = undefined;
     lock_checker.init(&locks, allocator);
@@ -929,7 +929,7 @@ test "AuthHandler: crypto-pool pending jobs count against the lockout threshold"
         .ip_lockout_threshold = 100,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -963,7 +963,7 @@ test "AuthHandler: a PLAIN prep failure completes and replies" {
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "dave", "pw123");
 
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var pool = TestCryptoPool{ .allocator = std.testing.allocator };
@@ -999,7 +999,7 @@ test "AuthHandler: a locked IdP alias gets the wrong-password reply" {
         .password_user = "alice@idp.example",
         .password_secret = "right",
     };
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     defer handler.deinit();
     var lock_checker: LockStoreChecker(MemoryBackend) = undefined;
     lock_checker.init(&locks, allocator);
@@ -1035,7 +1035,7 @@ test "AuthHandler: an alias failure charges the typed name" {
     // A temporary lock on the identity, which the alias path resolves to.
     limiter.recordOutcome("alice", "10.0.0.1", false);
 
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -1072,7 +1072,7 @@ test "AuthHandler: an alias failure does not charge the locked identity" {
     });
     defer limiter.deinit();
 
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     var lock_checker: LockStoreChecker(MemoryBackend) = undefined;
     lock_checker.init(&locks, allocator);
@@ -1114,7 +1114,7 @@ test "AuthHandler: an alias failure charges the IP once" {
     });
     defer limiter.deinit();
 
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     var lock_checker: LockStoreChecker(MemoryBackend) = undefined;
     lock_checker.init(&locks, allocator);
@@ -1139,7 +1139,7 @@ test "AuthHandler: a failed crypto-pool completion leaves no pending entry" {
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "dave", "pw123");
 
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     var pool = TestCryptoPool{ .allocator = std.testing.allocator };
@@ -1182,7 +1182,7 @@ test "AuthHandler: PLAIN-IdP pre-check sees a temporary lock" {
     defer limiter.deinit();
     limiter.recordOutcome("alice", "10.0.0.1", false);
 
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -1208,7 +1208,7 @@ test "AuthHandler: a permanently locked IdP identity rejects the Kelvin-sign ali
         .password_user = "kate@idp.example",
         .password_secret = "right",
     };
-    var handler = TestIdpHandler.init(allocator, &store);
+    var handler = try TestIdpHandler.init(allocator, &store, .{});
     defer handler.deinit();
     var lock_checker: LockStoreChecker(MemoryBackend) = undefined;
     lock_checker.init(&locks, allocator);

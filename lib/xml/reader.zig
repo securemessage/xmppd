@@ -1623,3 +1623,113 @@ test "reader: event spans never overshoot the segment end under adversarial spli
     }
     try std.testing.expectEqual(doc.len, consumed);
 }
+
+// ---------------------------------------------------------------------------
+// R7: fuzz target and split-feed coverage
+// ---------------------------------------------------------------------------
+
+fn fuzzXmlReader(_: void, input: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    // Split the input at a byte it supplies so one pass exercises both
+    // the whole-buffer path and the carry-the-tail incremental path.
+    const split = if (input.len == 0) 0 else input[0] % (input.len + 1);
+    var consumed: usize = 0;
+    for ([_]usize{ split, input.len }) |end| {
+        const segment = input[consumed..end];
+        var pos: usize = 0;
+        while (true) {
+            const ev: ?Event = if (reader.next(segment, &pos)) |opt| opt else |_| return;
+            if (ev == null) break;
+        }
+        consumed += pos;
+    }
+}
+
+test "fuzz: XML reader accepts arbitrary bytes without crashing" {
+    try std.testing.fuzz({}, fuzzXmlReader, .{ .corpus = &.{
+        "<?xml version='1.0'?><stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'><message to='a' from='b'><body>hi</body></message></stream:stream>",
+        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams'>",
+        "<a xmlns:p='u' p:x='1'><p:b>t &amp; u</p:b></a>",
+        "\x00\xff\x80 <unclosed xmlns='",
+    } });
+}
+
+fn appendSpanKey(trace: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(s.len), .little);
+    try trace.appendSlice(allocator, &len_buf);
+    try trace.appendSlice(allocator, s);
+}
+
+fn appendEventKey(trace: *std.ArrayList(u8), allocator: std.mem.Allocator, ev: Event) !void {
+    switch (ev) {
+        .xml_declaration => try trace.append(allocator, 'X'),
+        .stream_close => try trace.append(allocator, 'S'),
+        .stream_open, .element_start => |el| {
+            try trace.append(allocator, if (ev == .stream_open) 'O' else 'E');
+            try appendSpanKey(trace, allocator, el.name);
+            try appendSpanKey(trace, allocator, el.namespace_uri);
+            for (el.attributes) |attr| {
+                try appendSpanKey(trace, allocator, attr.name);
+                try appendSpanKey(trace, allocator, attr.value);
+            }
+            try trace.append(allocator, if (el.self_closing) '/' else '>');
+        },
+        .element_end => |name| {
+            try trace.append(allocator, 'C');
+            try appendSpanKey(trace, allocator, name);
+        },
+        .text => |txt| {
+            try trace.append(allocator, 'T');
+            try appendSpanKey(trace, allocator, txt);
+        },
+    }
+}
+
+/// Feed `doc` in two segments split at `split` and return a canonical
+/// fingerprint of the emitted events. The unconsumed tail of the first
+/// segment is carried into the second feed, as a stream consumer does.
+fn collectEventTrace(
+    allocator: std.mem.Allocator,
+    doc: []const u8,
+    split: usize,
+) !std.ArrayList(u8) {
+    var reader = Reader.init(allocator);
+    defer reader.deinit();
+    var trace: std.ArrayList(u8) = .empty;
+    errdefer trace.deinit(allocator);
+    var consumed: usize = 0;
+    for ([_]usize{ split, doc.len }) |end| {
+        const input = doc[consumed..end];
+        var pos: usize = 0;
+        while (true) {
+            const ev = try reader.next(input, &pos);
+            if (ev == null) break;
+            try appendEventKey(&trace, allocator, ev.?);
+        }
+        consumed += pos;
+    }
+    try std.testing.expectEqual(doc.len, consumed);
+    return trace;
+}
+
+test "reader: a two-part feed split at every byte boundary emits the one-shot trace" {
+    const allocator = std.testing.allocator;
+    const doc = "<?xml version='1.0'?>" ++
+        "<stream:stream xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>" ++
+        "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>" ++
+        "<iq type='set' id='b1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>r&amp;x</resource></bind></iq>" ++
+        "<message to='a@b' from='c@d'><body>hello &lt;world&gt;</body></message>" ++
+        "<presence/>" ++
+        "</stream:stream>";
+
+    var want = try collectEventTrace(allocator, doc, doc.len);
+    defer want.deinit(allocator);
+    for (0..doc.len + 1) |split| {
+        var got = try collectEventTrace(allocator, doc, split);
+        defer got.deinit(allocator);
+        try std.testing.expectEqualStrings(want.items, got.items);
+    }
+}

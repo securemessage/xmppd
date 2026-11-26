@@ -67,6 +67,14 @@ pub const Sections = struct {
         crypto_threads: u32 = 4,
         registration: bool = false,
         require_invite: bool = true,
+        /// Sustained SCRAM logins/second the replay cache is sized for:
+        /// capacity = login_rate_ceiling x scram_nonce_window_seconds.
+        login_rate_ceiling: u32 = 512,
+        /// A server nonce stays consumable this long after the core mints
+        /// it (freshness check + replay-cache entry TTL).
+        scram_nonce_window_seconds: u32 = 60,
+        /// Forward clock tolerance for nonce timestamps ahead of now.
+        scram_nonce_skew_seconds: u32 = 15,
     } = .{},
     s2s: struct {
         socket: []const u8 = "/var/run/xmppd/s2s.sock",
@@ -85,6 +93,9 @@ pub const Sections = struct {
         max_sessions: usize = 4096,
         fan_out_batch_size: u8 = 32,
         max_resources_per_account: usize = 256,
+        /// Parked SCRAM exchanges per worker: bounds concurrent in-flight
+        /// logins; a full pool answers temporary-auth-failure.
+        scram_exchange_slots: usize = 256,
         workers: conf.IntOr(enum { auto }, u16) = .{ .kw = .auto },
         listen_fd: [][]const u8 = &.{},
         log_level: enum { debug, info, warn, err } = .info,
@@ -187,6 +198,12 @@ pub const file_spec = [_]conf.FieldSpec{
         .doc = "In-band registration (XEP-0077)" },
     .{ .section = "auth", .field = "require_invite", .help = "registration needs invite", .used_by = "auth",
         .doc = "Require invitation code for registration" },
+    .{ .section = "auth", .field = "login_rate_ceiling", .help = "sustained logins/s ceiling", .used_by = "auth",
+        .doc = "Sustained SCRAM login rate the replay cache is sized for (capacity = ceiling x nonce window)" },
+    .{ .section = "auth", .field = "scram_nonce_window_seconds", .help = "server nonce freshness window", .used_by = "auth",
+        .doc = "Seconds a core-minted server nonce stays consumable; also the replay-cache entry TTL" },
+    .{ .section = "auth", .field = "scram_nonce_skew_seconds", .help = "nonce future-dating tolerance", .used_by = "auth",
+        .doc = "Seconds of forward clock skew tolerated on server-nonce timestamps" },
     .{ .section = "s2s", .field = "socket", .help = "s2s IPC socket", .used_by = "master, core, s2s",
         .doc = "IPC socket between core and xmppd-s2s" },
     .{ .section = "s2s", .field = "port", .help = "s2s listen port", .used_by = "master, s2s",
@@ -206,6 +223,8 @@ pub const file_spec = [_]conf.FieldSpec{
         .doc = "MUC occupants delivered per loop tick before yielding" },
     .{ .section = "core", .field = "max_resources_per_account", .help = "resource cap", .used_by = "core",
         .doc = "Maximum resources per account" },
+    .{ .section = "core", .field = "scram_exchange_slots", .help = "parked SCRAM exchanges", .used_by = "core",
+        .doc = "Concurrent in-flight SCRAM logins per worker; a full pool answers temporary-auth-failure" },
     .{ .section = "core", .field = "workers", .help = "worker count", .used_by = "master",
         .doc = "C2S listener count; `auto` detects CPUs" },
     .{ .section = "core", .field = "listen_fd", .in_file = false, .help = "inherited listen fd" },

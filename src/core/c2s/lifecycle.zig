@@ -101,6 +101,7 @@ pub fn acceptConnections(server: *Server, changes: *ChangeList) void {
 /// the same deinit/destroy/slot/id release destroySession does before its
 /// stream-state cleanup, which does not exist yet at accept.
 fn failAcceptedSession(server: *Server, session: *Session, id: usize) void {
+    server.scramExchangeRelease(session);
     session.deinit();
     server.allocator.destroy(session);
     server.sessions[id] = null;
@@ -349,6 +350,8 @@ pub fn forceCloseSession(server: *Server, id: usize, changes: *ChangeList) void 
 fn abortAuthIfInFlight(server: *Server, session: *Session) void {
     if (session.auth_state == .none) return;
     session.auth_state = .none;
+    // A parked SCRAM exchange dies with the connection that carried it.
+    server.scramExchangeRelease(session);
     if (!server.ipc.connected) return;
     server.ipc.send(.{ .auth_abort = .{ .conn_id = session.ipcConnId() } }) catch return;
     // Write interest is armed by reconcileIpcWriteInterest, once per loop
@@ -433,6 +436,7 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
     // whichever connection reuses the fd number in this iteration (T238).
     changes.purgeFd(session.conn.fd);
 
+    server.scramExchangeRelease(session);
     session.deinit();
     server.allocator.destroy(session);
     server.sessions[id] = null;

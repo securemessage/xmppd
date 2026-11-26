@@ -291,6 +291,7 @@ pub fn main() !void {
         .session_map = &session_map,
         .delivery_system = if (delivery_sys) |*ds| ds else null,
         .oidc_import_avatar = oidc_import_avatar,
+        .scram_exchange_slots = v.core.scram_exchange_slots,
         .allocator = allocator,
     };
 
@@ -421,6 +422,7 @@ const WorkerCtx = struct {
     session_map: *SessionMap,
     delivery_system: ?*DeliverySystem,
     oidc_import_avatar: bool,
+    scram_exchange_slots: usize,
     allocator: std.mem.Allocator,
 };
 
@@ -476,6 +478,7 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) !void {
     if (ctx.roster) |r| server.configureRoster(r);
     if (ctx.vcard) |v| server.configureVcard(v);
     server.oidc_import_avatar = ctx.oidc_import_avatar;
+    server.scram_exchange_slots = ctx.scram_exchange_slots;
     if (ctx.offline != null and ctx.archive != null) {
         server.configureOffline(ctx.offline.?, ctx.archive.?);
     }

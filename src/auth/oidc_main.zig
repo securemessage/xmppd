@@ -42,6 +42,7 @@ const protocol = @import("ipc_protocol");
 const runner_mod = @import("runner");
 const conf = @import("conf");
 const schema = @import("schema");
+const metrics = @import("auth_metrics");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
 const policy_mod = @import("policy");
@@ -68,7 +69,8 @@ const log = std.log.scoped(.xmppd_auth_oidc);
 
 /// In-flight IdP exchange caps: a queued or running exchange spends pool
 /// capacity, so one account or one client IP may only park so many before
-/// the newest request is answered temporary-auth-failure, uncounted.
+/// the newest request is answered temporary-auth-failure with no
+/// rate-limiter outcome recorded.
 const max_inflight_per_account: usize = 4;
 const max_inflight_per_ip: usize = 16;
 
@@ -101,6 +103,10 @@ noinline fn loadOidcConfig(loaded: *schema.OidcLoader, gpa: Allocator, argv: []c
 }
 
 pub fn main() !void {
+    // A1: block SIGUSR1 before any thread exists so the IdP pool inherits
+    // the mask; the loop's EVFILT_SIGNAL knote records it for the dump.
+    metrics.blockUsr1();
+
     var root = root_allocator.Root.init();
     defer root.deinit();
     const allocator = root.allocator();
@@ -201,8 +207,9 @@ pub fn main() !void {
     var rate_limiter = try RateLimiter.init(allocator, rate_cfg.policy);
     defer rate_limiter.deinit();
 
-    // Initialize auth handler (generic over OidcStore)
-    var handler = AuthHandler.init(allocator, &oidc_store);
+    // Initialize auth handler (generic over OidcStore). No SCRAM here, so
+    // the replay cache stays empty.
+    var handler = try AuthHandler.init(allocator, &oidc_store, .{ .replay_capacity = 0 });
     if (rate_cfg.enabled) {
         handler.setRateLimiter(&rate_limiter);
         log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} account / {d} ip failures", .{
@@ -535,7 +542,7 @@ pub const Daemon = struct {
             // verdict, exactly as the handler's own lock check would have
             // for a direct request.
             if (self.handler.policy.check("", client_ip)) |reason| {
-                self.replyAuthFailure(pend.conn_id, pend.slot, reason);
+                self.replyAuthFailure(pend.conn_id, pend.slot, pend.mechanism, reason);
                 continue;
             }
 
@@ -575,21 +582,12 @@ pub const Daemon = struct {
                         else => {},
                     }
                     runner.replyToLane(slot, response);
-                    // Clean up session after the send; a lane the send
-                    // closed already dropped its sessions.
-                    if (runner.ipc.getClient(slot) != null) {
-                        switch (response) {
-                            .auth_success => |s| self.handler.cleanupSession(pend.slot, s.conn_id),
-                            .auth_failure => |f| self.handler.cleanupSession(pend.slot, f.conn_id),
-                            else => {},
-                        }
-                    }
                 },
                 .deferred, .none => {
                     // Unreachable for a real mechanism, but a replay that
                     // produced no reply must never leave the client hanging.
                     Daemon.log.err("IdP replay produced no reply for conn_id {d}", .{pend.conn_id});
-                    self.replyTemporary(pend.conn_id, pend.slot);
+                    self.replyTemporary(pend.conn_id, pend.slot, pend.mechanism);
                 },
             }
         }
@@ -607,6 +605,7 @@ pub const Daemon = struct {
     }
 
     pub fn onSigusr1(self: *Daemon) void {
+        metrics.dump();
         self.store.dumpResolverCounters();
     }
 
@@ -628,11 +627,11 @@ pub const Daemon = struct {
                 // count the IP attempt, then re-check the locks. A denial
                 // is answered here because the replay no longer re-counts.
                 if (self.handler.policy.admitIp(req.client_ip)) |reason| {
-                    self.replyAuthFailure(req.conn_id, slot, reason);
+                    self.replyAuthFailure(req.conn_id, slot, req.mechanism, reason);
                     return true;
                 }
                 if (self.checkAccountAdmission(creds.username, req.client_ip)) |reason| {
-                    self.replyAuthFailure(req.conn_id, slot, reason);
+                    self.replyAuthFailure(req.conn_id, slot, req.mechanism, reason);
                     return true;
                 }
                 cred = .{ .password = .{
@@ -645,11 +644,11 @@ pub const Daemon = struct {
                 // The handler admits the IP before parsing, so a malformed
                 // payload still spends one attempt.
                 if (self.handler.policy.admitIp(req.client_ip)) |reason| {
-                    self.replyAuthFailure(req.conn_id, slot, reason);
+                    self.replyAuthFailure(req.conn_id, slot, req.mechanism, reason);
                     return true;
                 }
                 const token = oidc.bearerToken(req.payload) orelse {
-                    self.replyAuthFailure(req.conn_id, slot, .invalid_encoding);
+                    self.replyAuthFailure(req.conn_id, slot, req.mechanism, .invalid_encoding);
                     return true;
                 };
                 cred = .{ .token = token };
@@ -681,7 +680,7 @@ pub const Daemon = struct {
             if (std.mem.eql(u8, pend.clientIp(), req.client_ip)) same_ip += 1;
         }
         if (same_account >= max_inflight_per_account or same_ip >= max_inflight_per_ip) {
-            self.replyTemporary(req.conn_id, slot);
+            self.replyTemporary(req.conn_id, slot, req.mechanism);
             return true;
         }
 
@@ -690,7 +689,7 @@ pub const Daemon = struct {
         // orphan job running against the IdP.
         const owned_len = req.client_ip.len + req.username.len + req.payload.len + req.cb_data.len;
         const owned = self.allocator.alloc(u8, owned_len) catch {
-            self.replyTemporary(req.conn_id, slot);
+            self.replyTemporary(req.conn_id, slot, req.mechanism);
             return true;
         };
         var off: usize = 0;
@@ -720,7 +719,7 @@ pub const Daemon = struct {
         const job_id = self.pool.put(cred) catch {
             std.crypto.secureZero(u8, owned);
             self.allocator.free(owned);
-            self.replyTemporary(req.conn_id, slot);
+            self.replyTemporary(req.conn_id, slot, req.mechanism);
             return true;
         };
 
@@ -744,8 +743,13 @@ pub const Daemon = struct {
 
     /// Answer a request with an auth_failure reason without handler
     /// involvement. Pre-gate denials carry the policy's own reason so the
-    /// client sees what a direct request would have seen.
-    fn replyAuthFailure(self: *Daemon, conn_id: u32, slot: u16, reason: policy_mod.FailureReason) void {
+    /// client sees what a direct request would have seen. An intercepted
+    /// exchange never reaches the handler's dispatch, so its terminal
+    /// counters land here.
+    fn replyAuthFailure(self: *Daemon, conn_id: u32, slot: u16, mech: protocol.MechanismId, reason: policy_mod.FailureReason) void {
+        metrics.exchangeStarted(@intFromEnum(mech));
+        metrics.exchangeCompleted(@intFromEnum(mech), false);
+        metrics.failure(@intFromEnum(reason));
         self.runner.replyToLane(slot, .{ .auth_failure = .{
             .conn_id = conn_id,
             .reason = reason.text(),
@@ -754,9 +758,9 @@ pub const Daemon = struct {
 
     /// Answer a request temporary-auth-failure without handler involvement:
     /// in-flight caps and a full pool are transport backpressure, not a
-    /// failed credential, so nothing is counted or recorded.
-    fn replyTemporary(self: *Daemon, conn_id: u32, slot: u16) void {
-        self.replyAuthFailure(conn_id, slot, .temporary_auth_failure);
+    /// failed credential, so the rate limiter records no outcome.
+    fn replyTemporary(self: *Daemon, conn_id: u32, slot: u16, mech: protocol.MechanismId) void {
+        self.replyAuthFailure(conn_id, slot, mech, .temporary_auth_failure);
     }
 
     fn freePending(self: *Daemon, pend: Pending) void {
@@ -1221,7 +1225,7 @@ const DaemonFixture = struct {
         self.limiter = try RateLimiter.init(allocator, limiter_policy orelse .{});
         errdefer self.limiter.deinit();
 
-        self.handler = AuthHandler.init(allocator, &self.store);
+        self.handler = try AuthHandler.init(allocator, &self.store, .{ .replay_capacity = 0 });
         self.handler.setRateLimiter(&self.limiter);
         errdefer self.handler.deinit();
 
@@ -2252,6 +2256,9 @@ test "a closed lane keeps its in-flight cap until the completions drain" {
 
 test "sixteen in-flight exchanges on one IP deny the seventeenth" {
     const allocator = std.testing.allocator;
+    metrics.reset();
+    defer metrics.reset();
+
     var port = std.atomic.Value(u16).init(0);
     const stub = try startHangingStub(&port, 8000);
     defer stub.join();
@@ -2293,6 +2300,13 @@ test "sixteen in-flight exchanges on one IP deny the seventeenth" {
     try std.testing.expectEqualStrings("temporary-auth-failure", reply.auth_failure.reason);
     try std.testing.expectEqual(@as(u32, 17), reply.auth_failure.conn_id);
     try std.testing.expectEqual(max_inflight_per_ip, fx.daemon.pending.count());
+
+    // A1: an intercept denial is a terminal exchange the handler never
+    // saw, so its counters land in replyAuthFailure (PLAIN index 0).
+    const ctr = &metrics.counters;
+    try std.testing.expectEqual(@as(u64, 1), ctr.exchanges_started[0].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), ctr.exchanges_completed[0].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), ctr.outcomes[@intFromEnum(policy_mod.FailureReason.temporary_auth_failure)].load(.monotonic));
 }
 
 test "four in-flight exchanges on one account deny the fifth" {
@@ -2895,6 +2909,7 @@ test "the runner pauses lane intake at the high watermark and resumes on drain" 
     // Shrink the window: the assertion is about behavior, not capacity.
     fx.daemon.runner.rx_pause_at = 4096;
     fx.daemon.runner.rx_resume_at = 512;
+    const pauses_before = metrics.counters.ipc_intake_pauses.load(.monotonic);
 
     const req = protocol.Message{ .auth_request = .{
         .conn_id = 1,
@@ -2916,6 +2931,8 @@ test "the runner pauses lane intake at the high watermark and resumes on drain" 
     }
     try std.testing.expect(fx.daemon.runner.read_paused[slot]);
     try std.testing.expectEqual(slot, clientSlot(&fx).?);
+    // A1: the pause edge moved the intake-pause counter.
+    try std.testing.expect(metrics.counters.ipc_intake_pauses.load(.monotonic) > pauses_before);
 
     // Draining the replies lets the backlog fall under the resume mark;
     // the lane's write handling then re-enables intake.

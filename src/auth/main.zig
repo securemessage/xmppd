@@ -33,6 +33,8 @@ const runner_mod = @import("runner");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
 const crypto_pool_mod = @import("crypto_pool");
+const metrics = @import("auth_metrics");
+const scram_mech = handler_mod.scram_mech;
 const lock_store_mod = @import("lock_store");
 const LockStore = lock_store_mod.LockStore(OpBackendType);
 const LockChecker = handler_mod.LockChecker;
@@ -70,6 +72,12 @@ fn verifyUsersAtStartup(comptime Backend: type, backend: *Backend, max_keys: usi
 }
 
 pub fn main() !void {
+    // A1: block SIGUSR1 before any thread exists so every spawned thread
+    // inherits the mask. A process-directed USR1 can then never take its
+    // default terminate on an unblocked thread; the loop's EVFILT_SIGNAL
+    // knote still records it and dumps the counters.
+    metrics.blockUsr1();
+
     var root = root_allocator.Root.init();
     defer root.deinit();
     const allocator = root.allocator();
@@ -167,8 +175,45 @@ pub fn main() !void {
     var rate_limiter = try RateLimiter.init(allocator, rate_policy);
     defer rate_limiter.deinit();
 
-    // Initialize auth handler
-    var handler = AuthHandler.init(allocator, &store);
+    // Initialize auth handler. The replay cache is sized from the
+    // configured login-rate ceiling times the nonce freshness window
+    // (ADR-6): a window sized for the declared ceiling can hold every live
+    // nonce a compliant load produces, so inserts refuse before they evict.
+    // The fake-derivation key persists in {db}/auth (created once, 0600):
+    // a fake salt then survives restarts exactly like a real one.
+    var scram_secret: ?[32]u8 = null;
+    if (std.fs.cwd().openDir(auth_path, .{})) |d| {
+        var dir = d;
+        defer dir.close();
+        scram_secret = scram_mech.loadOrCreateSecret(dir) catch |err| blk: {
+            if (err == error.InvalidSecretFile) {
+                log.err("corrupt published SCRAM secret {s}/{s}; refusing to start; repair or replace it offline", .{ auth_path, scram_mech.SECRET_FILE });
+                return err;
+            }
+            log.err("cannot load or create {s}/{s} ({}); fakes use a per-boot key", .{ auth_path, scram_mech.SECRET_FILE, err });
+            break :blk null;
+        };
+    } else |err| {
+        log.err("cannot open {s} for the scram secret ({}); fakes use a per-boot key", .{ auth_path, err });
+    }
+    defer if (scram_secret) |*s| std.crypto.secureZero(u8, s[0..]);
+    const replay_capacity = @as(usize, v.auth.login_rate_ceiling) * @as(usize, v.auth.scram_nonce_window_seconds);
+    var handler = AuthHandler.init(allocator, &store, .{
+        .replay_capacity = replay_capacity,
+        .nonce_window_seconds = v.auth.scram_nonce_window_seconds,
+        .nonce_skew_seconds = v.auth.scram_nonce_skew_seconds,
+        .scram_secret = scram_secret,
+    }) catch |err| {
+        log.err("replay cache alloc of {d} entries failed ({s}); refusing to start", .{ replay_capacity, @errorName(err) });
+        return err;
+    };
+    if (handler.replay_entries.len == 0) {
+        log.warn("replay cache configured with 0 entries; every SCRAM verify refuses", .{});
+    } else {
+        log.info("replay cache: {d} entries ({d} logins/s ceiling x {d}s window), nonce skew {d}s", .{
+            handler.replay_entries.len, v.auth.login_rate_ceiling, v.auth.scram_nonce_window_seconds, v.auth.scram_nonce_skew_seconds,
+        });
+    }
     if (rate_limit_enabled) {
         handler.setRateLimiter(&rate_limiter);
         log.info("rate policy: {d}/account, {d}/ip, window={d}s, lockout={d}s after {d} account / {d} ip failures", .{
@@ -272,6 +317,7 @@ const AuthHooks = struct {
 
     pub fn onSigusr1(self: *AuthHooks) void {
         _ = self;
+        metrics.dump();
     }
 
     /// T121: send a finished crypto job's reply to its IPC client. The
@@ -345,6 +391,43 @@ test "auth startup: main applies --users-scan-limit" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "startup scan bound") != null);
+}
+
+test "auth startup: a corrupt published SCRAM secret refuses startup" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const auth_path = try std.fs.path.join(allocator, &.{ base, "auth" });
+    defer allocator.free(auth_path);
+
+    var db = try OpBackendType.open(auth_path, .{});
+    db.close();
+    const secret_path = try std.fs.path.join(allocator, &.{ auth_path, scram_mech.SECRET_FILE });
+    defer allocator.free(secret_path);
+    var secret = try std.fs.cwd().createFile(secret_path, .{});
+    defer secret.close();
+    try secret.writeAll("short");
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "zig-out/bin/xmppd-auth",
+            "--db",
+            base,
+            "--socket",
+            "/nonexistent-secret-test/auth.sock",
+        },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "corrupt published SCRAM secret") != null);
 }
 
 test "auth startup: a pending migrate-precis marker refuses startup" {
