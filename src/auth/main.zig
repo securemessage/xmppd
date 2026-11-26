@@ -33,6 +33,7 @@ const runner_mod = @import("runner");
 const RateLimiter = @import("rate_limiter").RateLimiter;
 const RatePolicy = @import("rate_limiter").RatePolicy;
 const crypto_pool_mod = @import("crypto_pool");
+const metrics = @import("auth_metrics");
 const lock_store_mod = @import("lock_store");
 const LockStore = lock_store_mod.LockStore(OpBackendType);
 const LockChecker = handler_mod.LockChecker;
@@ -70,6 +71,12 @@ fn verifyUsersAtStartup(comptime Backend: type, backend: *Backend, max_keys: usi
 }
 
 pub fn main() !void {
+    // A1: block SIGUSR1 before any thread exists so every spawned thread
+    // inherits the mask. A process-directed USR1 can then never take its
+    // default terminate on an unblocked thread; the loop's EVFILT_SIGNAL
+    // knote still records it and dumps the counters.
+    metrics.blockUsr1();
+
     var root = root_allocator.Root.init();
     defer root.deinit();
     const allocator = root.allocator();
@@ -272,6 +279,7 @@ const AuthHooks = struct {
 
     pub fn onSigusr1(self: *AuthHooks) void {
         _ = self;
+        metrics.dump();
     }
 
     /// T121: send a finished crypto job's reply to its IPC client. The

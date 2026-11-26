@@ -9,6 +9,7 @@
 const std = @import("std");
 const sasl = @import("sasl");
 const protocol = @import("ipc_protocol");
+const metrics = @import("auth_metrics");
 const handler_mod = @import("../handler.zig");
 
 const log = std.log.scoped(.auth_handler);
@@ -60,6 +61,15 @@ pub const ScramSession = struct {
     }
 };
 
+/// Release a live session slot: deinit and drop the occupancy gauge.
+/// Every production deinit of a slot activated by handleScramInit runs
+/// here so scram_active stays exact.
+pub fn releaseSession(s: *ScramSession) void {
+    if (!s.active) return;
+    s.deinit();
+    metrics.scramReleased();
+}
+
 /// Handle SCRAM-SHA-256 mechanism (multi-step challenge-response).
 pub fn handleScramInit(comptime Store: type, self: *handler_mod.AuthHandler(Store), req: protocol.AuthRequest, ipc_slot: usize) protocol.Message {
     const caps = handler_mod.AuthHandler(Store).capabilities;
@@ -80,11 +90,12 @@ pub fn handleScramInit(comptime Store: type, self: *handler_mod.AuthHandler(Stor
         var session = &self.scram_sessions[slot];
         // Re-auth on an already-live conn_id: the previous exchange's
         // ScramServer must go before we overwrite it (T279).
-        if (session.active) session.deinit();
+        releaseSession(session);
         session.server = sasl.ScramServer.init(self.allocator);
         session.conn_id = req.conn_id;
         session.lane = @intCast(ipc_slot);
         session.active = true;
+        metrics.scramActivated();
         session.touched_at = std.time.timestamp();
 
         // Set channel binding data from TLS session
@@ -92,7 +103,7 @@ pub fn handleScramInit(comptime Store: type, self: *handler_mod.AuthHandler(Stor
 
         // Process client-first-message
         const username = session.server.handleClientFirst(req.payload) catch {
-            session.deinit();
+            releaseSession(session);
             return authFailure(req.conn_id, .invalid_encoding);
         };
 
@@ -105,14 +116,14 @@ pub fn handleScramInit(comptime Store: type, self: *handler_mod.AuthHandler(Stor
         ) catch {
             log.info("SCRAM auth failed: invalid account name", .{});
             self.policy.recordOutcome("", req.client_ip, .failure);
-            session.deinit();
+            releaseSession(session);
             return authFailure(req.conn_id, .not_authorized);
         };
 
         // Count the account attempt and enforce the lock before any
         // store lookup or challenge work.
         if (self.policy.admitAccount(account_username)) |reason| {
-            session.deinit();
+            releaseSession(session);
             return authFailure(req.conn_id, reason);
         }
         session.setClientIp(req.client_ip);
@@ -122,7 +133,7 @@ pub fn handleScramInit(comptime Store: type, self: *handler_mod.AuthHandler(Stor
         const now = std.time.timestamp();
         const creds = self.cacheLookup(name_hash, now) orelse blk: {
             const maybe_creds = self.store.lookup(self.allocator, account_username) catch {
-                session.deinit();
+                releaseSession(session);
                 return authFailure(req.conn_id, .temporary_auth_failure);
             };
             const c = maybe_creds orelse {
@@ -130,7 +141,7 @@ pub fn handleScramInit(comptime Store: type, self: *handler_mod.AuthHandler(Stor
                 // The attempt was counted at admission; an unknown
                 // user is still a failed authentication.
                 self.policy.recordOutcome(account_username, req.client_ip, .failure);
-                session.deinit();
+                releaseSession(session);
                 return authFailure(req.conn_id, .not_authorized);
             };
             self.cacheStore(name_hash, now, c);
@@ -141,7 +152,7 @@ pub fn handleScramInit(comptime Store: type, self: *handler_mod.AuthHandler(Stor
 
         // Generate server-first-message
         const server_first = session.server.serverFirst() catch {
-            session.deinit();
+            releaseSession(session);
             return authFailure(req.conn_id, .temporary_auth_failure);
         };
 
@@ -175,7 +186,7 @@ pub fn handleSaslResponse(comptime Store: type, self: *handler_mod.AuthHandler(S
         username,
     ) catch {
         self.policy.recordOutcome("", session.clientIp(), .failure);
-        session.deinit();
+        releaseSession(session);
         return authFailure(resp.conn_id, .not_authorized);
     };
 
@@ -183,7 +194,7 @@ pub fn handleSaslResponse(comptime Store: type, self: *handler_mod.AuthHandler(S
     // verified, so a lock that arrived between challenge and final
     // gets the same reply for a right and a wrong password.
     if (self.policy.check(account_username, session.clientIp())) |reason| {
-        session.deinit();
+        releaseSession(session);
         return authFailure(resp.conn_id, reason);
     }
 
@@ -191,7 +202,7 @@ pub fn handleSaslResponse(comptime Store: type, self: *handler_mod.AuthHandler(S
     const server_final = session.server.handleClientFinal(resp.payload) catch {
         log.info("SCRAM auth failed: proof verification for conn={d}", .{resp.conn_id});
         self.policy.recordOutcome(account_username, session.clientIp(), .failure);
-        session.deinit();
+        releaseSession(session);
         return authFailure(resp.conn_id, .not_authorized);
     };
 
@@ -216,7 +227,7 @@ pub fn handleSaslResponse(comptime Store: type, self: *handler_mod.AuthHandler(S
 /// across core worker lanes each numbering from 1 (T279).
 pub fn cleanupSession(comptime Store: type, self: *handler_mod.AuthHandler(Store), lane: u16, conn_id: u32) void {
     if (self.findScramSlot(lane, conn_id)) |slot| {
-        self.scram_sessions[slot].deinit();
+        releaseSession(&self.scram_sessions[slot]);
     }
 }
 
@@ -226,7 +237,7 @@ pub fn cleanupSession(comptime Store: type, self: *handler_mod.AuthHandler(Store
 pub fn closeLaneSessions(comptime Store: type, self: *handler_mod.AuthHandler(Store), lane: usize) void {
     const lane_u16: u16 = @intCast(lane);
     for (&self.scram_sessions) |*s| {
-        if (s.active and s.lane == lane_u16) s.deinit();
+        if (s.active and s.lane == lane_u16) releaseSession(s);
     }
 }
 
@@ -249,7 +260,7 @@ pub fn findOrCreateScramSlot(comptime Store: type, self: *handler_mod.AuthHandle
         // Reclaim slots abandoned by connections that died before a
         // final auth response; otherwise they leak until restart.
         if (now - s.touched_at > SCRAM_SLOT_STALE_SECONDS) {
-            s.deinit();
+            releaseSession(s);
             return slot;
         }
     }
@@ -387,6 +398,7 @@ test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path"
         .active = true,
         .touched_at = std.time.timestamp() - 2 * SCRAM_SLOT_STALE_SECONDS,
     };
+    metrics.scramActivated(); // mirror handleScramInit's pairing
 
     // A fresh login aliasing the same home slot (same low 16 bits = same
     // session slot, newer generation) must reclaim it, not fail.
@@ -402,10 +414,11 @@ test "AuthHandler: abandoned SCRAM slots are reclaimed lazily on the probe path"
         .active = true,
         .touched_at = std.time.timestamp(),
     };
+    metrics.scramActivated();
     const blocked_conn: u32 = 43 + (1 << 16); // aliases neighbor slot 43
     const alt = handler.findOrCreateScramSlot(0, blocked_conn).?;
     try std.testing.expect(alt != dead_slot);
-    handler.scram_sessions[dead_slot].deinit();
+    releaseSession(&handler.scram_sessions[dead_slot]);
     handler.scram_sessions[alt].deinit();
 }
 

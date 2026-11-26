@@ -71,6 +71,15 @@ pub fn build(b: *std.Build) void {
     });
     sasl_mod.addImport("unicode", unicode_mod);
 
+    // A1: per-daemon auth counters (T405). A leaf module (std/posix only)
+    // shared by the auth and oidc module graphs so one Counters block has
+    // a single identity inside each daemon.
+    const auth_metrics_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/metrics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // T121: crypto offload thread pool (auth daemon, handler tests). Created
     // early because both binary and test module sections import it.
     const crypto_pool_mod = b.createModule(.{
@@ -79,6 +88,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     crypto_pool_mod.addImport("sasl", sasl_mod);
+    crypto_pool_mod.addImport("auth_metrics", auth_metrics_mod);
 
     // T87: async archive write queue — no deps beyond std
     const archive_queue_mod = b.createModule(.{
@@ -510,6 +520,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     pool_bench_pool_mod.addImport("sasl", pool_bench_sasl_mod);
+    pool_bench_pool_mod.addImport("auth_metrics", auth_metrics_mod);
     pool_bench_mod.addImport("crypto_pool", pool_bench_pool_mod);
     pool_bench_mod.addImport("sasl", pool_bench_sasl_mod);
     const pool_bench = b.addExecutable(.{
@@ -951,6 +962,7 @@ pub fn build(b: *std.Build) void {
     policy_test_mod.addImport("rate_limiter", rate_limiter_test_mod);
     policy_test_mod.addImport("lock_store", lock_store_test_mod);
     policy_test_mod.addImport("backend", backend_test_mod);
+    policy_test_mod.addImport("auth_metrics", auth_metrics_mod);
 
     const policy_tests = b.addTest(.{
         .name = "policy-tests",
@@ -973,6 +985,7 @@ pub fn build(b: *std.Build) void {
     auth_handler_test_mod.addImport("backend", backend_test_mod);
     auth_handler_test_mod.addImport("crypto_pool", crypto_pool_mod);
     auth_handler_test_mod.addImport("policy", policy_test_mod);
+    auth_handler_test_mod.addImport("auth_metrics", auth_metrics_mod);
 
     // T121 crypto-pool tests live in the module itself
     const crypto_pool_tests = b.addTest(.{
@@ -980,6 +993,13 @@ pub fn build(b: *std.Build) void {
         .root_module = crypto_pool_mod,
     });
     const run_crypto_pool_tests = b.addRunArtifact(crypto_pool_tests);
+
+    // A1 auth-daemon counters, unit-tested in the module itself
+    const auth_metrics_tests = b.addTest(.{
+        .name = "auth-metrics-tests",
+        .root_module = auth_metrics_mod,
+    });
+    const run_auth_metrics_tests = b.addRunArtifact(auth_metrics_tests);
 
     const auth_handler_tests = b.addTest(.{
         .name = "auth-handler-tests",
@@ -1870,6 +1890,7 @@ pub fn build(b: *std.Build) void {
     auth_policy_mod.addImport("rate_limiter", auth_rate_limiter_mod);
     auth_policy_mod.addImport("lock_store", auth_lock_store_mod);
     auth_policy_mod.addImport("backend", auth_backend_mod);
+    auth_policy_mod.addImport("auth_metrics", auth_metrics_mod);
 
     auth_handler_mod.addImport("sasl", sasl_mod);
     auth_handler_mod.addImport("precis_username", precis_username_mod);
@@ -1878,6 +1899,7 @@ pub fn build(b: *std.Build) void {
     auth_handler_mod.addImport("lock_store", auth_lock_store_mod);
     auth_handler_mod.addImport("crypto_pool", crypto_pool_mod);
     auth_handler_mod.addImport("policy", auth_policy_mod);
+    auth_handler_mod.addImport("auth_metrics", auth_metrics_mod);
 
     const auth_invite_store_mod = b.createModule(.{
         .root_source_file = b.path("src/store/invite_store.zig"),
@@ -1904,6 +1926,7 @@ pub fn build(b: *std.Build) void {
     auth_runner_mod.addImport("ipc_server", auth_ipc_server_mod);
     auth_runner_mod.addImport("event_loop", auth_event_loop_mod);
     auth_runner_mod.addImport("handler", auth_handler_mod);
+    auth_runner_mod.addImport("auth_metrics", auth_metrics_mod);
 
     const auth_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/main.zig"),
@@ -1926,6 +1949,7 @@ pub fn build(b: *std.Build) void {
     auth_mod.addImport("schema", schema_mod);
     auth_mod.addImport("backend", auth_backend_mod);
     auth_mod.addImport("runner", auth_runner_mod);
+    auth_mod.addImport("auth_metrics", auth_metrics_mod);
     auth_mod.addImport("xmppd_log", xmppd_log_mod);
     auth_mod.addImport("root_allocator", root_allocator_mod);
 
@@ -2006,6 +2030,7 @@ pub fn build(b: *std.Build) void {
     oidc_policy_mod.addImport("rate_limiter", oidc_rate_limiter_mod);
     oidc_policy_mod.addImport("lock_store", auth_lock_store_mod);
     oidc_policy_mod.addImport("backend", auth_backend_mod);
+    oidc_policy_mod.addImport("auth_metrics", auth_metrics_mod);
 
     oidc_handler_mod.addImport("sasl", sasl_mod);
     oidc_handler_mod.addImport("precis_username", precis_username_mod);
@@ -2015,6 +2040,7 @@ pub fn build(b: *std.Build) void {
     oidc_handler_mod.addImport("crypto_pool", crypto_pool_mod);
     oidc_handler_mod.addImport("invite_store", auth_invite_store_mod);
     oidc_handler_mod.addImport("policy", oidc_policy_mod);
+    oidc_handler_mod.addImport("auth_metrics", auth_metrics_mod);
 
     const oidc_event_loop_mod = b.createModule(.{
         .root_source_file = b.path("src/core/worker/loop.zig"),
@@ -2034,6 +2060,7 @@ pub fn build(b: *std.Build) void {
     oidc_runner_mod.addImport("ipc_server", oidc_ipc_server_mod);
     oidc_runner_mod.addImport("event_loop", oidc_event_loop_mod);
     oidc_runner_mod.addImport("handler", oidc_handler_mod);
+    oidc_runner_mod.addImport("auth_metrics", auth_metrics_mod);
 
     const oidc_main_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/oidc_main.zig"),
@@ -2056,6 +2083,7 @@ pub fn build(b: *std.Build) void {
     oidc_main_mod.addImport("archive_backend", auth_archive_backend_mod);
     oidc_main_mod.addImport("backend", auth_backend_mod);
     oidc_main_mod.addImport("oidc_identity_store", oidc_ids_mod);
+    oidc_main_mod.addImport("auth_metrics", auth_metrics_mod);
     oidc_main_mod.addImport("xmppd_log", xmppd_log_mod);
     oidc_main_mod.addImport("root_allocator", root_allocator_mod);
     oidc_main_mod.linkSystemLibrary("ssl", .{});
@@ -2532,6 +2560,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_oidc_store_tests.step);
     test_step.dependOn(&run_oidc_main_tests.step);
     test_step.dependOn(&run_crypto_pool_tests.step);
+    test_step.dependOn(&run_auth_metrics_tests.step);
     test_step.dependOn(&run_archive_queue_tests.step);
     test_step.dependOn(&run_migrate_precis_tests.step);
     test_step.dependOn(&run_migrate_precis_backend_tests.step);

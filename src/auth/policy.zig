@@ -17,6 +17,7 @@ const std = @import("std");
 const rate_limiter = @import("rate_limiter");
 const lock_store_mod = @import("lock_store");
 const backend_mod = @import("backend");
+const metrics = @import("auth_metrics");
 
 const log = std.log.scoped(.auth_policy);
 
@@ -137,12 +138,22 @@ pub const Policy = struct {
     pub fn admitIp(self: Policy, client_ip: []const u8) ?FailureReason {
         const limiter = self.limiter orelse return null;
         return switch (limiter.admitIp(client_ip)) {
-            .allowed => null,
-            .locked, .rate_limited => blk: {
+            .allowed => blk: {
+                metrics.ipAdmitted();
+                break :blk null;
+            },
+            .locked => blk: {
+                metrics.ipRefused(true);
+                log.info("auth rejected: IP '{s}' is rate limited", .{client_ip});
+                break :blk .policy_violation;
+            },
+            .rate_limited => blk: {
+                metrics.ipRefused(false);
                 log.info("auth rejected: IP '{s}' is rate limited", .{client_ip});
                 break :blk .policy_violation;
             },
             .unavailable => blk: {
+                metrics.ipRefused(false);
                 log.warn("rate state cannot track the request: failing closed", .{});
                 break :blk .temporary_auth_failure;
             },
@@ -154,23 +165,32 @@ pub const Policy = struct {
     pub fn admitAccount(self: Policy, username: []const u8) ?FailureReason {
         if (username.len == 0) return null;
         if (self.lock_checker) |checker| {
-            if (permanentLockReason(checker, username)) |reason| return reason;
+            if (permanentLockReason(checker, username)) |reason| {
+                metrics.accountRefused(reason == .account_disabled);
+                return reason;
+            }
         }
 
         const limiter = self.limiter orelse return null;
         var buf: [account_key_max]u8 = undefined;
         const account = accountKey(username, &buf);
         return switch (limiter.admitAccount(account)) {
-            .allowed => null,
+            .allowed => blk: {
+                metrics.accountAdmitted();
+                break :blk null;
+            },
             .locked => blk: {
+                metrics.accountRefused(true);
                 log.info("auth rejected: account '{s}' is locked", .{username});
                 break :blk .account_disabled;
             },
             .rate_limited => blk: {
+                metrics.accountRefused(false);
                 log.info("auth rejected: account '{s}' is rate limited", .{username});
                 break :blk .policy_violation;
             },
             .unavailable => blk: {
+                metrics.accountRefused(false);
                 log.warn("rate state cannot track the request: failing closed", .{});
                 break :blk .temporary_auth_failure;
             },
@@ -183,23 +203,32 @@ pub const Policy = struct {
     pub fn admitAccountPending(self: Policy, username: []const u8, pending: usize) ?FailureReason {
         if (username.len == 0) return null;
         if (self.lock_checker) |checker| {
-            if (permanentLockReason(checker, username)) |reason| return reason;
+            if (permanentLockReason(checker, username)) |reason| {
+                metrics.accountRefused(reason == .account_disabled);
+                return reason;
+            }
         }
 
         const limiter = self.limiter orelse return null;
         var buf: [account_key_max]u8 = undefined;
         const account = accountKey(username, &buf);
         return switch (limiter.admitAccountPending(account, pending)) {
-            .allowed => null,
+            .allowed => blk: {
+                metrics.accountAdmitted();
+                break :blk null;
+            },
             .locked => blk: {
+                metrics.accountRefused(true);
                 log.info("auth rejected: account '{s}' is locked", .{username});
                 break :blk .account_disabled;
             },
             .rate_limited => blk: {
+                metrics.accountRefused(false);
                 log.info("auth rejected: account '{s}' is rate limited", .{username});
                 break :blk .policy_violation;
             },
             .unavailable => blk: {
+                metrics.accountRefused(false);
                 log.warn("rate state cannot track the request: failing closed", .{});
                 break :blk .temporary_auth_failure;
             },
@@ -218,10 +247,15 @@ pub const Policy = struct {
     /// verification and before IdP password validation, so a locked account
     /// gets the same reply whether or not the password is right and an
     /// in-flight attempt is not denied by a filled window.
+    /// Lock denials move only lockout_refusals: a re-check is not an
+    /// admission, so no admit/refuse pair exists for it.
     pub fn check(self: Policy, username: []const u8, client_ip: []const u8) ?FailureReason {
         if (username.len > 0) {
             if (self.lock_checker) |checker| {
-                if (permanentLockReason(checker, username)) |reason| return reason;
+                if (permanentLockReason(checker, username)) |reason| {
+                    if (reason == .account_disabled) metrics.checkLockout();
+                    return reason;
+                }
             }
         }
 
@@ -231,10 +265,12 @@ pub const Policy = struct {
         return switch (limiter.checkLock(account, client_ip)) {
             .allowed => null,
             .account_locked => blk: {
+                metrics.checkLockout();
                 log.info("auth rejected: account '{s}' is locked", .{username});
                 break :blk .account_disabled;
             },
             .ip_locked => blk: {
+                metrics.checkLockout();
                 log.info("auth rejected: IP '{s}' is locked", .{client_ip});
                 break :blk .policy_violation;
             },
