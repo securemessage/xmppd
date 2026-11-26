@@ -176,6 +176,30 @@ fn hasPrivateHint(allocator: std.mem.Allocator, inner_xml: []const u8) bool {
     return false;
 }
 
+/// Selection pass state: the available-resource count and the
+/// highest-priority entry, which is all the single-target picks need.
+const Selection = struct {
+    count: usize = 0,
+    best: ?SessionEntry = null,
+    best_prio: i8 = std.math.minInt(i8),
+};
+
+/// Copy an account's available routing entries into `out` (one shared-lock
+/// hold that only selects and copies) and pick the highest-priority one out
+/// of the copies. Ties resolve to the first entry seen, matching bind order.
+fn selectAvailable(sm: *SessionMap, to_jid: xmpp.Jid, out: []SessionEntry) Selection {
+    var sel: Selection = .{};
+    const n = sm.collectAvailable(to_jid.local, to_jid.domain, out) catch @panic("fanout scratch below session map capacity");
+    for (out[0..n]) |*entry| {
+        sel.count += 1;
+        if (entry.priority > sel.best_prio) {
+            sel.best_prio = entry.priority;
+            sel.best = entry.*;
+        }
+    }
+    return sel;
+}
+
 /// Route a fully accumulated stanza to target session(s).
 /// Reconstructs the opening tag with the sender's full JID as 'from',
 /// appends the accumulated child XML, and closes the stanza.
@@ -272,90 +296,50 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         return;
     }
 
-    // Route: find target session(s) via unified session map.
+    // Route: resolve the target resource set via the unified session map.
+    // A full JID or a best-resource pick yields one copied entry; a bare-JID
+    // fan-out collects the routing entries under one shard-lock hold per
+    // pass, and selection, remote enqueue and local delivery all iterate
+    // the copies with the lock already released (ADR-4).
     const sm = server.session_map orelse return;
-    var lease_a = server.leaseScratch(.a);
-    defer lease_a.release();
-    const entries_buf = lease_a.entries;
-    const local_ids = server.scratchIdsA();
-    var target_count: usize = 0;
 
-    var remote_delivered: bool = false;
+    var single: ?SessionEntry = null;
+    var fanout_bare = false;
 
-    // The resources the stanza is actually handed to, so a <received> carbon
-    // later skips exactly those. Bank .c is free for the whole dispatch:
-    // sendCarbons nests under .b and nothing else down here claims .c.
-    var lease_c = server.leaseScratch(.c);
-    defer lease_c.release();
-    const delivered_buf = lease_c.entries;
-    var delivered_count: usize = 0;
-
-    const route_count = if (to_jid.resource.len > 0) blk: {
+    if (to_jid.resource.len > 0) {
         // RFC 6121 §8.5.3: Message addressed to full JID — deliver to that resource only.
         if (sm.findByFullJid(to_jid.local, to_jid.domain, to_jid.resource)) |e| {
-            entries_buf[0] = e;
-            break :blk @as(usize, 1);
+            single = e;
+        } else if (session.stanza_kind == .message and std.mem.eql(u8, type_str, "chat")) {
+            // Resource not found (§8.5.3.2): type='chat' falls back to the
+            // best available resource (§8.5.3.2.1). Other kinds store offline
+            // or bounce below.
+            const sel = selectAvailable(sm, to_jid, server.fanoutScratch());
+            if (sel.best_prio >= 0) single = sel.best;
         }
-        // Resource not found (§8.5.3.2). For type='chat', fall back to best
-        // available resource (§8.5.3.2.1). For others, store offline or bounce.
-        if (session.stanza_kind == .message and std.mem.eql(u8, type_str, "chat")) {
-            const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, entries_buf);
-            if (avail_count > 0) {
-                var best_idx: usize = 0;
-                var best_prio: i8 = -128;
-                for (entries_buf[0..avail_count], 0..) |entry, i| {
-                    if (entry.priority >= 0 and entry.priority > best_prio) {
-                        best_prio = entry.priority;
-                        best_idx = i;
+    } else {
+        // RFC 6121 §8.5.2: Stanza addressed to bare JID - deliver to available resources.
+        const sel = selectAvailable(sm, to_jid, server.fanoutScratch());
+        if (sel.count > 0) {
+            if (session.stanza_kind == .iq) {
+                // RFC 6121 §8.5.2.1.3: IQ to bare JID - deliver to ONE best resource.
+                if (sel.best_prio >= 0) single = sel.best;
+            } else if (session.stanza_kind == .message) {
+                // RFC 6121 §8.5.2.1.1: groupchat and error to bare JID MUST NOT be delivered.
+                if (std.mem.eql(u8, type_str, "groupchat") or std.mem.eql(u8, type_str, "error")) {
+                    if (std.mem.eql(u8, type_str, "groupchat")) {
+                        sendServiceUnavailable(session, id_str, to_str, from_str);
                     }
+                    // type='error' to bare JID: silently drop (no error response for error stanzas)
+                    return;
                 }
-                if (best_prio >= 0) {
-                    entries_buf[0] = entries_buf[best_idx];
-                    break :blk @as(usize, 1);
-                }
+                // All-negative priorities: do not deliver (§8.5.2.1.1).
+                fanout_bare = sel.best_prio >= 0;
+            } else {
+                fanout_bare = true;
             }
         }
-        break :blk @as(usize, 0);
-    } else blk: {
-        // RFC 6121 §8.5.2: Stanza addressed to bare JID — deliver to available resources.
-        const avail_count = sm.findAvailableByBareJid(to_jid.local, to_jid.domain, entries_buf);
-        if (avail_count == 0) break :blk @as(usize, 0);
-
-        if (session.stanza_kind == .iq) {
-            // RFC 6121 §8.5.2.1.3: IQ to bare JID — deliver to ONE best resource.
-            var best_idx: usize = 0;
-            var best_prio: i8 = -128;
-            for (entries_buf[0..avail_count], 0..) |entry, i| {
-                if (entry.priority > best_prio) {
-                    best_prio = entry.priority;
-                    best_idx = i;
-                }
-            }
-            if (best_prio < 0) break :blk @as(usize, 0);
-            entries_buf[0] = entries_buf[best_idx];
-            break :blk @as(usize, 1);
-        }
-
-        // For messages, select best resource(s) by priority (§8.5.2.1.1).
-        if (session.stanza_kind == .message) {
-            // RFC 6121 §8.5.2.1.1: groupchat and error to bare JID MUST NOT be delivered.
-            if (std.mem.eql(u8, type_str, "groupchat") or std.mem.eql(u8, type_str, "error")) {
-                if (std.mem.eql(u8, type_str, "groupchat")) {
-                    sendServiceUnavailable(session, id_str, to_str, from_str);
-                }
-                // type='error' to bare JID: silently drop (no error response for error stanzas)
-                return;
-            }
-            // Find highest non-negative priority
-            var best_prio: i8 = -128;
-            for (entries_buf[0..avail_count]) |entry| {
-                if (entry.priority > best_prio) best_prio = entry.priority;
-            }
-            // If all priorities are negative, don't deliver (§8.5.2.1.1)
-            if (best_prio < 0) break :blk @as(usize, 0);
-        }
-        break :blk avail_count;
-    };
+    }
 
     // XEP-0334: Message Processing Hints
     const has_no_store = std.mem.indexOf(u8, inner_xml, "urn:xmpp:hints") != null and
@@ -403,39 +387,170 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
     // also the receipt time carried into cross-worker slots for the stamp.
     const archive_timestamp: u64 = @intCast(std.time.timestamp());
 
-    var delivery_failed = false;
-    for (entries_buf[0..route_count], 0..) |entry, ei| {
-        // RFC 6121 §8.5.2.1.1: Skip resources with negative priority for bare-JID messages.
-        if (session.stanza_kind == .message and to_jid.resource.len == 0 and entry.priority < 0) continue;
+    // Per-dispatch delivery state shared by the visitor passes and the
+    // single-target path. Remote enqueue runs before the offline/bounce
+    // decision; local delivery runs after the delivery stanza is built.
+    const RouteCtx = struct {
+        server: *Server,
+        session: *Session,
+        to_jid: xmpp.Jid,
+        from_str: []const u8,
+        to_str: []const u8,
+        type_str: []const u8,
+        id_str: []const u8,
+        delivery_inner_xml: []const u8,
+        hold_token: offline_store_mod.HoldToken,
+        archive_timestamp: u64,
+        /// RFC 6121 §8.5.2.1.1: bare-JID messages skip negative-priority resources.
+        skip_neg_prio: bool,
+        is_archivable: bool,
+        /// The resources the stanza is actually handed to, so a <received>
+        /// carbon later skips exactly those (bounded by the resource cap).
+        delivered: []session_map_mod.RouteRef,
+        built: ?[]const u8 = null,
+        is_typing_only: bool = false,
+        sender_bare: ?[]const u8 = null,
+        archive_stanza_id: []const u8 = "",
+        local_routed: usize = 0,
+        remote_delivered: bool = false,
+        delivery_failed: bool = false,
+        local_delivery_succeeded: bool = false,
+        hold_bounced: bool = false,
+        hold_stored: bool = false,
+        delivered_count: usize = 0,
 
-        if (entry.worker_id == server.worker_id) {
-            if (target_count < local_ids.len) {
-                local_ids[target_count] = ei;
-                target_count += 1;
+        fn routed(ctx: *const @This(), entry: *const SessionEntry) bool {
+            return !ctx.skip_neg_prio or entry.priority >= 0;
+        }
+
+        fn appendDelivered(ctx: *@This(), entry: *const SessionEntry) void {
+            if (ctx.delivered_count < ctx.delivered.len) {
+                ctx.delivered[ctx.delivered_count] = .{ .worker_id = entry.worker_id, .token = entry.token };
+                ctx.delivered_count += 1;
             }
-        } else {
+        }
+
+        /// Remote enqueue for one routed entry; local entries are counted
+        /// here and delivered in the second pass. Runs on a copied entry
+        /// after the collect's lock hold has ended.
+        fn routeOneRemote(ctx: *@This(), entry: SessionEntry) void {
+            if (entry.worker_id == ctx.server.worker_id) {
+                ctx.local_routed += 1;
+                return;
+            }
             if (enqueueCrossThreadStanza(
-                server,
+                ctx.server,
                 entry,
-                from_str,
-                to_str,
-                type_str,
-                id_str,
-                delivery_inner_xml,
-                session.stanza_kind,
-                hold_token,
-                archive_timestamp,
+                ctx.from_str,
+                ctx.to_str,
+                ctx.type_str,
+                ctx.id_str,
+                ctx.delivery_inner_xml,
+                ctx.session.stanza_kind,
+                ctx.hold_token,
+                ctx.archive_timestamp,
             )) {
-                remote_delivered = true;
-                if (delivered_count < delivered_buf.len) {
-                    delivered_buf[delivered_count] = entry;
-                    delivered_count += 1;
-                }
+                ctx.remote_delivered = true;
+                ctx.appendDelivered(&entry);
             } else {
                 // Other local and remote resources still get their copies;
                 // the sender gets an error if no resource accepts the stanza.
-                delivery_failed = true;
+                ctx.delivery_failed = true;
             }
+        }
+
+        /// Local delivery to the resolved session: offline-tail hold when the
+        /// recipient is draining, else a queue-and-flush into its outbox.
+        fn deliverLocal(ctx: *@This(), entry: SessionEntry) void {
+            const srv = ctx.server;
+            const tid = entry.token.index;
+            const target_session = srv.sessionForEventToken(entry.token) orelse return;
+            if (ctx.is_typing_only and !target_session.csi_active) return;
+            const sent_data = ctx.built orelse {
+                ctx.delivery_failed = true;
+                return;
+            };
+            // A session whose offline tail is still draining must not be overtaken.
+            if (target_session.offline_pending and ctx.session.stanza_kind == .message and
+                !std.mem.eql(u8, ctx.type_str, "error"))
+            {
+                // The tail is per bare JID, so one message is held once however
+                // many local resources are draining it. A second hold here would
+                // add a second row, and the drain would then deliver both.
+                if (ctx.hold_stored) {
+                    ctx.local_delivery_succeeded = true;
+                    ctx.appendDelivered(&entry);
+                    return;
+                }
+                const hold_id = if (ctx.is_archivable)
+                    ctx.archive_stanza_id
+                else if (ctx.id_str.len > 0)
+                    ctx.id_str
+                else
+                    "offline";
+                if (ctx.sender_bare != null and deliver.holdBehindOfflineTail(srv, target_session, ctx.to_jid.local, ctx.to_jid.domain, ctx.sender_bare.?, hold_id, ctx.archive_timestamp, sent_data, ctx.hold_token)) {
+                    ctx.hold_stored = true;
+                    ctx.local_delivery_succeeded = true;
+                    ctx.appendDelivered(&entry);
+                    log.info("message to {s} held behind draining offline tail (S13)", .{ctx.to_str});
+                    return;
+                }
+                // No offline store, or the recipient's queue is at quota. The
+                // stanza can neither be held nor sent without overtaking the
+                // tail, so tell the sender instead of dropping it silently.
+                if (!ctx.hold_bounced) {
+                    ctx.hold_bounced = true;
+                    _ = delivery_queue_mod.offline_hold_bounces.fetchAdd(1, .monotonic);
+                    log.info("connection {d} message to {s} not held, offline queue unavailable or full", .{ ctx.session.conn.id, ctx.to_str });
+                    sendServiceUnavailable(ctx.session, ctx.id_str, ctx.to_str, ctx.from_str);
+                }
+                return;
+            }
+            // Apply the MUC fan-out policy here too. A stanza that fits an empty
+            // buffer but not the current one means the peer is not reading, so
+            // mark it for the slow-reader teardown, as the MUC path does. A stanza
+            // larger than the whole buffer can never be delivered to anyone.
+            // stanzaWithFlush covers the T153 detached case itself: tracked_
+            // detached is delivered-for-replay, counted like a queued send.
+            if (target_session.stanzaWithFlush(sent_data) == .failed_closed) {
+                ctx.delivery_failed = true;
+                if (target_session.conn.isClosed()) {
+                    noteDrop("connection {d} could not queue stanza for {s}: ConnectionClosed", .{ tid, ctx.to_str });
+                } else if (sent_data.len <= target_session.conn.outbox.spill_limit) {
+                    target_session.sm_overflow = true;
+                    noteDrop("connection {d} outbound buffer full for {s}; marking the session for overflow teardown", .{ tid, ctx.to_str });
+                } else {
+                    _ = delivery_queue_mod.oversize_queue_drops.fetchAdd(1, .monotonic);
+                    noteDrop("connection {d} stanza for {s} of {d} bytes exceeds the write buffer", .{ tid, ctx.to_str, sent_data.len });
+                }
+                return;
+            }
+            ctx.local_delivery_succeeded = true;
+            ctx.appendDelivered(&entry);
+        }
+    };
+    var dctx = RouteCtx{
+        .server = server,
+        .session = session,
+        .to_jid = to_jid,
+        .from_str = from_str,
+        .to_str = to_str,
+        .type_str = type_str,
+        .id_str = id_str,
+        .delivery_inner_xml = delivery_inner_xml,
+        .hold_token = hold_token,
+        .archive_timestamp = archive_timestamp,
+        .skip_neg_prio = session.stanza_kind == .message and to_jid.resource.len == 0,
+        .is_archivable = is_archivable,
+        .delivered = server.deliveredTargets(),
+    };
+
+    if (single) |e| {
+        dctx.routeOneRemote(e);
+    } else if (fanout_bare) {
+        const n = sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+        for (server.fanout_entries[0..n]) |*entry| {
+            if (dctx.routed(entry)) dctx.routeOneRemote(entry.*);
         }
     }
 
@@ -483,7 +598,7 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         }
     }
 
-    if (target_count == 0 and !remote_delivered) {
+    if (dctx.local_routed == 0 and !dctx.remote_delivered) {
         // RFC 6121 §8.5.2.1a: Presence stanzas to non-existent users are silently ignored.
         if (session.stanza_kind == .presence) return;
 
@@ -584,91 +699,25 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         noteDrop("connection {d} stanza to {s} exceeds the delivery buffer, not routed", .{ session.conn.id, to_str });
     }
 
-    var hold_bounced = false;
-    var hold_stored = false;
-    var local_delivery_succeeded = false;
-    // Forward to each local target session. local_ids indexes entries_buf so
-    // each resource that accepts the stanza can join the delivered set.
-    for (local_ids[0..target_count]) |ei| {
-        const entry = entries_buf[ei];
-        const tid = entry.token.index;
-        const target_session = server.sessionForEventToken(entry.token) orelse continue;
-        if (is_typing_only and !target_session.csi_active) continue;
-        const sent_data = built orelse {
-            delivery_failed = true;
-            continue;
-        };
-        // A session whose offline tail is still draining must not be overtaken.
-        if (target_session.offline_pending and session.stanza_kind == .message and
-            !std.mem.eql(u8, type_str, "error"))
-        {
-            // The tail is per bare JID, so one message is held once however
-            // many local resources are draining it. A second hold here would
-            // add a second row, and the drain would then deliver both.
-            if (hold_stored) {
-                local_delivery_succeeded = true;
-                if (delivered_count < delivered_buf.len) {
-                    delivered_buf[delivered_count] = entry;
-                    delivered_count += 1;
-                }
-                continue;
-            }
-            const hold_id = if (is_archivable)
-                archive_stanza_id
-            else if (id_str.len > 0)
-                id_str
-            else
-                "offline";
-            if (sender_bare != null and deliver.holdBehindOfflineTail(server, target_session, to_jid.local, to_jid.domain, sender_bare.?, hold_id, archive_timestamp, sent_data, hold_token)) {
-                hold_stored = true;
-                local_delivery_succeeded = true;
-                if (delivered_count < delivered_buf.len) {
-                    delivered_buf[delivered_count] = entry;
-                    delivered_count += 1;
-                }
-                log.info("message to {s} held behind draining offline tail (S13)", .{to_str});
-                continue;
-            }
-            // No offline store, or the recipient's queue is at quota. The
-            // stanza can neither be held nor sent without overtaking the
-            // tail, so tell the sender instead of dropping it silently.
-            if (!hold_bounced) {
-                hold_bounced = true;
-                _ = delivery_queue_mod.offline_hold_bounces.fetchAdd(1, .monotonic);
-                log.info("connection {d} message to {s} not held, offline queue unavailable or full", .{ session.conn.id, to_str });
-                sendServiceUnavailable(session, id_str, to_str, from_str);
-            }
-            continue;
-        }
-        // Apply the MUC fan-out policy here too. A stanza that fits an empty
-        // buffer but not the current one means the peer is not reading, so
-        // mark it for the slow-reader teardown, as the MUC path does. A stanza
-        // larger than the whole buffer can never be delivered to anyone.
-        // stanzaWithFlush covers the T153 detached case itself: tracked_
-        // detached is delivered-for-replay, counted like a queued send.
-        if (target_session.stanzaWithFlush(sent_data) == .failed_closed) {
-            delivery_failed = true;
-            if (target_session.conn.isClosed()) {
-                noteDrop("connection {d} could not queue stanza for {s}: ConnectionClosed", .{ tid, to_str });
-            } else if (sent_data.len <= target_session.conn.outbox.spill_limit) {
-                target_session.sm_overflow = true;
-                noteDrop("connection {d} outbound buffer full for {s}; marking the session for overflow teardown", .{ tid, to_str });
-            } else {
-                _ = delivery_queue_mod.oversize_queue_drops.fetchAdd(1, .monotonic);
-                noteDrop("connection {d} stanza for {s} of {d} bytes exceeds the write buffer", .{ tid, to_str, sent_data.len });
-            }
-            continue;
-        }
-        local_delivery_succeeded = true;
-        if (delivered_count < delivered_buf.len) {
-            delivered_buf[delivered_count] = entry;
-            delivered_count += 1;
+    // Forward to each local target session; the loop re-applies the routing
+    // filter so each resource that accepts the stanza can join the
+    // delivered set.
+    dctx.built = built;
+    dctx.is_typing_only = is_typing_only;
+    dctx.sender_bare = sender_bare;
+    dctx.archive_stanza_id = archive_stanza_id;
+    if (single) |e| {
+        if (e.worker_id == server.worker_id) dctx.deliverLocal(e);
+    } else if (fanout_bare) {
+        const n = sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+        for (server.fanout_entries[0..n]) |*entry| {
+            if (dctx.routed(entry) and entry.worker_id == server.worker_id) dctx.deliverLocal(entry.*);
         }
     }
 
     const bounceable = (session.stanza_kind == .message and !std.mem.eql(u8, type_str, "error")) or
         (session.stanza_kind == .iq and (std.mem.eql(u8, type_str, "get") or std.mem.eql(u8, type_str, "set")));
-    if (delivery_failed and !local_delivery_succeeded and !remote_delivered and !hold_bounced and bounceable) {
+    if (dctx.delivery_failed and !dctx.local_delivery_succeeded and !dctx.remote_delivered and !dctx.hold_bounced and bounceable) {
         log.info("connection {d} stanza to {s} could not be delivered to any resource", .{ session.conn.id, to_str });
         sendServiceUnavailable(session, id_str, to_str, from_str);
     }
@@ -689,8 +738,8 @@ pub fn dispatchStanza(server: *Server, session: *Session, changes: *ChangeList) 
         // loops above actually handed off, queued, held or tracked, not a
         // recomputation of the routing rule: when the routed set filters on
         // more than priority the two stay in lockstep.
-        sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, &[_]SessionEntry{}, changes);
-        sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, delivered_buf[0..delivered_count], changes);
+        sendCarbons(server, "sent", session, from_jid.local, from_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, &[_]session_map_mod.RouteRef{}, changes);
+        sendCarbons(server, "received", session, to_jid.local, to_jid.domain, from_str, to_str, type_str, id_str, delivery_inner_xml, dctx.delivered[0..dctx.delivered_count], changes);
     }
 }
 
@@ -949,16 +998,11 @@ fn sendCarbons(
     type_str: []const u8,
     id_str: []const u8,
     delivery_inner_xml: []const u8,
-    delivered: []const SessionEntry,
+    delivered: []const session_map_mod.RouteRef,
     changes: *ChangeList,
 ) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
-    var lease_b = server.leaseScratch(.b);
-    defer lease_b.release();
-    const entries = lease_b.entries;
-    const count = sm.findAvailableByBareJid(user_local, user_domain, entries);
-    if (count == 0) return;
 
     // Reuse one serialization buffer across resources: each carbon is fully
     // consumed by queueSend or the MPSC delivery before the next iteration.
@@ -968,145 +1012,126 @@ fn sendCarbons(
         return;
     };
     defer carbon_lease.release();
-    const cbuf = carbon_lease.buf;
 
-    for (entries[0..count]) |entry| {
-        // A resource that already received the original gets no <received>
-        // copy of it (XEP-0280 section 7).
-        var was_delivered = false;
-        for (delivered) |t| {
-            if (t.worker_id == entry.worker_id and
-                t.token.eql(entry.token))
-            {
-                was_delivered = true;
-                break;
+    const CarbonCtx = struct {
+        server: *Server,
+        carbon_type: []const u8,
+        sender_session: *const Session,
+        user_local: []const u8,
+        user_domain: []const u8,
+        from_str: []const u8,
+        to_str: []const u8,
+        type_str: []const u8,
+        id_str: []const u8,
+        delivery_inner_xml: []const u8,
+        delivered: []const session_map_mod.RouteRef,
+        cbuf: []u8,
+
+        /// Serialize the carbon wrapper for one resource; the bytes live in
+        /// cbuf until the next visit.
+        fn build(ctx: *@This(), entry: *const SessionEntry) ?[]const u8 {
+            var cfbs = std.io.fixedBufferStream(ctx.cbuf);
+            const cw = cfbs.writer();
+            return stanza: {
+                cw.writeAll("<message from='") catch break :stanza null;
+                xml.escapeWrite(cw, ctx.user_local) catch break :stanza null;
+                cw.writeByte('@') catch break :stanza null;
+                xml.escapeWrite(cw, ctx.user_domain) catch break :stanza null;
+                cw.writeAll("' to='") catch break :stanza null;
+                xml.escapeWrite(cw, ctx.user_local) catch break :stanza null;
+                cw.writeByte('@') catch break :stanza null;
+                xml.escapeWrite(cw, ctx.user_domain) catch break :stanza null;
+                cw.writeByte('/') catch break :stanza null;
+                xml.escapeWrite(cw, entry.resource()) catch break :stanza null;
+                cw.writeAll("' type='chat'>") catch break :stanza null;
+
+                cw.writeByte('<') catch break :stanza null;
+                cw.writeAll(ctx.carbon_type) catch break :stanza null;
+                cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch break :stanza null;
+
+                cw.writeAll("<message from='") catch break :stanza null;
+                xml.escapeWrite(cw, ctx.from_str) catch break :stanza null;
+                cw.writeAll("' to='") catch break :stanza null;
+                xml.escapeWrite(cw, ctx.to_str) catch break :stanza null;
+                cw.writeByte('\'') catch break :stanza null;
+                if (ctx.type_str.len > 0) {
+                    cw.writeAll(" type='") catch break :stanza null;
+                    xml.escapeWrite(cw, ctx.type_str) catch break :stanza null;
+                    cw.writeByte('\'') catch break :stanza null;
+                }
+                if (ctx.id_str.len > 0) {
+                    cw.writeAll(" id='") catch break :stanza null;
+                    xml.escapeWrite(cw, ctx.id_str) catch break :stanza null;
+                    cw.writeByte('\'') catch break :stanza null;
+                }
+                if (ctx.delivery_inner_xml.len == 0) {
+                    cw.writeAll("/>") catch break :stanza null;
+                } else {
+                    cw.writeByte('>') catch break :stanza null;
+                    cw.writeAll(ctx.delivery_inner_xml) catch break :stanza null;
+                    cw.writeAll("</message>") catch break :stanza null;
+                }
+
+                cw.writeAll("</forwarded></") catch break :stanza null;
+                cw.writeAll(ctx.carbon_type) catch break :stanza null;
+                cw.writeAll("></message>") catch break :stanza null;
+                break :stanza cfbs.getWritten();
+            };
+        }
+
+        /// Serialize and deliver the carbon for one collected entry. Runs
+        /// after the collect's lock hold has ended: the skip checks,
+        /// serialization, enqueue and drop logging all stay off the lock.
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
+            // A resource that already received the original gets no <received>
+            // copy of it (XEP-0280 section 7).
+            for (ctx.delivered) |t| {
+                if (t.worker_id == entry.worker_id and t.token.eql(entry.token)) return;
+            }
+            if (entry.worker_id == ctx.server.worker_id) {
+                const target = ctx.server.sessionForEventToken(entry.token) orelse return;
+                if (&target.conn == &ctx.sender_session.conn) return;
+                if (!target.carbons_enabled) return;
+                const carbon_data = ctx.build(entry) orelse {
+                    noteDrop("{s} carbon for session {d} exceeds {d} bytes; skipped", .{ ctx.carbon_type, entry.token.index, ctx.cbuf.len });
+                    return;
+                };
+                fanout.deliverToSession(target, carbon_data, entry.token.index);
+            } else {
+                // T89: Cross-thread carbon delivery via MPSC
+                const ds = ctx.server.delivery_system orelse {
+                    noteCrossWorkerDrop("{s} carbon for worker {d} session {d} not deliverable: no delivery system", .{ ctx.carbon_type, entry.worker_id, entry.token.index });
+                    return;
+                };
+                const carbon_xml = ctx.build(entry) orelse {
+                    noteCrossWorkerDrop("{s} carbon for worker {d} session {d} exceeds {d} bytes; skipped", .{ ctx.carbon_type, entry.worker_id, entry.token.index, ctx.cbuf.len });
+                    return;
+                };
+                // The slot carries the carbon class so the receiving worker can
+                // apply carbons_enabled and the live-only rules; this worker
+                // cannot see them on the remote Session.
+                ds.deliverDelivery(ctx.server.worker_id, entry.worker_id, entry.token, carbon_xml, 0, 0, .carbon) catch |err| {
+                    noteCrossWorkerDrop("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
+                };
             }
         }
-        if (was_delivered) continue;
-        if (entry.worker_id == server.worker_id) {
-            const target = server.sessionForEventToken(entry.token) orelse continue;
-            if (&target.conn == &sender_session.conn) continue;
-            if (!target.carbons_enabled) continue;
-
-            var cfbs = std.io.fixedBufferStream(cbuf);
-            const cw = cfbs.writer();
-
-            const carbon_data = stanza: {
-                cw.writeAll("<message from='") catch break :stanza null;
-                xml.escapeWrite(cw, user_local) catch break :stanza null;
-                cw.writeByte('@') catch break :stanza null;
-                xml.escapeWrite(cw, user_domain) catch break :stanza null;
-                cw.writeAll("' to='") catch break :stanza null;
-                xml.escapeWrite(cw, user_local) catch break :stanza null;
-                cw.writeByte('@') catch break :stanza null;
-                xml.escapeWrite(cw, user_domain) catch break :stanza null;
-                cw.writeByte('/') catch break :stanza null;
-                xml.escapeWrite(cw, entry.resource()) catch break :stanza null;
-                cw.writeAll("' type='chat'>") catch break :stanza null;
-
-                cw.writeByte('<') catch break :stanza null;
-                cw.writeAll(carbon_type) catch break :stanza null;
-                cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch break :stanza null;
-
-                cw.writeAll("<message from='") catch break :stanza null;
-                xml.escapeWrite(cw, from_str) catch break :stanza null;
-                cw.writeAll("' to='") catch break :stanza null;
-                xml.escapeWrite(cw, to_str) catch break :stanza null;
-                cw.writeByte('\'') catch break :stanza null;
-                if (type_str.len > 0) {
-                    cw.writeAll(" type='") catch break :stanza null;
-                    xml.escapeWrite(cw, type_str) catch break :stanza null;
-                    cw.writeByte('\'') catch break :stanza null;
-                }
-                if (id_str.len > 0) {
-                    cw.writeAll(" id='") catch break :stanza null;
-                    xml.escapeWrite(cw, id_str) catch break :stanza null;
-                    cw.writeByte('\'') catch break :stanza null;
-                }
-                if (delivery_inner_xml.len == 0) {
-                    cw.writeAll("/>") catch break :stanza null;
-                } else {
-                    cw.writeByte('>') catch break :stanza null;
-                    cw.writeAll(delivery_inner_xml) catch break :stanza null;
-                    cw.writeAll("</message>") catch break :stanza null;
-                }
-
-                cw.writeAll("</forwarded></") catch break :stanza null;
-                cw.writeAll(carbon_type) catch break :stanza null;
-                cw.writeAll("></message>") catch break :stanza null;
-                break :stanza cfbs.getWritten();
-            } orelse {
-                noteDrop("{s} carbon for session {d} exceeds {d} bytes; skipped", .{ carbon_type, entry.token.index, cbuf.len });
-                continue;
-            };
-            fanout.deliverToSession(target, carbon_data, entry.token.index);
-        } else {
-            // T89: Cross-thread carbon delivery via MPSC
-            const ds = server.delivery_system orelse {
-                noteCrossWorkerDrop("{s} carbon for worker {d} session {d} not deliverable: no delivery system", .{ carbon_type, entry.worker_id, entry.token.index });
-                continue;
-            };
-
-            var cfbs = std.io.fixedBufferStream(cbuf);
-            const cw = cfbs.writer();
-
-            const carbon_xml = stanza: {
-                cw.writeAll("<message from='") catch break :stanza null;
-                xml.escapeWrite(cw, user_local) catch break :stanza null;
-                cw.writeByte('@') catch break :stanza null;
-                xml.escapeWrite(cw, user_domain) catch break :stanza null;
-                cw.writeAll("' to='") catch break :stanza null;
-                xml.escapeWrite(cw, user_local) catch break :stanza null;
-                cw.writeByte('@') catch break :stanza null;
-                xml.escapeWrite(cw, user_domain) catch break :stanza null;
-                cw.writeByte('/') catch break :stanza null;
-                xml.escapeWrite(cw, entry.resource()) catch break :stanza null;
-                cw.writeAll("' type='chat'>") catch break :stanza null;
-
-                cw.writeByte('<') catch break :stanza null;
-                cw.writeAll(carbon_type) catch break :stanza null;
-                cw.writeAll(" xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>") catch break :stanza null;
-
-                cw.writeAll("<message from='") catch break :stanza null;
-                xml.escapeWrite(cw, from_str) catch break :stanza null;
-                cw.writeAll("' to='") catch break :stanza null;
-                xml.escapeWrite(cw, to_str) catch break :stanza null;
-                cw.writeByte('\'') catch break :stanza null;
-                if (type_str.len > 0) {
-                    cw.writeAll(" type='") catch break :stanza null;
-                    xml.escapeWrite(cw, type_str) catch break :stanza null;
-                    cw.writeByte('\'') catch break :stanza null;
-                }
-                if (id_str.len > 0) {
-                    cw.writeAll(" id='") catch break :stanza null;
-                    xml.escapeWrite(cw, id_str) catch break :stanza null;
-                    cw.writeByte('\'') catch break :stanza null;
-                }
-                if (delivery_inner_xml.len == 0) {
-                    cw.writeAll("/>") catch break :stanza null;
-                } else {
-                    cw.writeByte('>') catch break :stanza null;
-                    cw.writeAll(delivery_inner_xml) catch break :stanza null;
-                    cw.writeAll("</message>") catch break :stanza null;
-                }
-
-                cw.writeAll("</forwarded></") catch break :stanza null;
-                cw.writeAll(carbon_type) catch break :stanza null;
-                cw.writeAll("></message>") catch break :stanza null;
-                break :stanza cfbs.getWritten();
-            } orelse {
-                noteCrossWorkerDrop("{s} carbon for worker {d} session {d} exceeds {d} bytes; skipped", .{ carbon_type, entry.worker_id, entry.token.index, cbuf.len });
-                continue;
-            };
-
-            // The slot carries the carbon class so the receiving worker can
-            // apply carbons_enabled and the live-only rules; this worker
-            // cannot see them on the remote Session.
-            ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, carbon_xml, 0, 0, .carbon) catch |err| {
-                noteCrossWorkerDrop("cross-thread carbon delivery failed to worker {d}: {}", .{ entry.worker_id, err });
-            };
-        }
-    }
+    };
+    var carbon_ctx = CarbonCtx{
+        .server = server,
+        .carbon_type = carbon_type,
+        .sender_session = sender_session,
+        .user_local = user_local,
+        .user_domain = user_domain,
+        .from_str = from_str,
+        .to_str = to_str,
+        .type_str = type_str,
+        .id_str = id_str,
+        .delivery_inner_xml = delivery_inner_xml,
+        .delivered = delivered,
+        .cbuf = carbon_lease.buf,
+    };
+    const n = sm.collectAvailable(user_local, user_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+    for (server.fanout_entries[0..n]) |*entry| carbon_ctx.deliver(entry);
 }
 
 /// Send a not-authorized error for a stanza received before resource
@@ -1222,7 +1247,7 @@ test "dispatchStanza: domain-only mixed-case 'to' stays local" {
     session.stanza_to = "LOCALHOST";
     session.stanza_type = "chat";
     session.stanza_id = "m1";
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -1245,7 +1270,7 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     var session: Session = undefined;
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     session.iq_to = "localhost";
     // A reply longer than the outbound bound: the append refuses it even
     // with the outbox empty, so this is oversize, not a slow reader.
@@ -1300,14 +1325,14 @@ test "R-385: a full buffer on a deliverable stanza still flags overflow teardown
 test "Server: an over-long sender bare JID still delivers live" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
@@ -1328,7 +1353,7 @@ test "Server: an over-long sender bare JID still delivers live" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = .{ .local = &long_local, .domain = "localhost", .resource = "mobile" };
+    alice.stream.setBoundJid(.{ .local = &long_local, .domain = "localhost", .resource = "mobile" });
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1362,13 +1387,13 @@ test "Server: an over-long sender bare JID still delivers live" {
 test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sender" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
@@ -1376,7 +1401,7 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
     bob.init(bob_fds[0], 5, "localhost", false, allocator);
     bob.stream.state = .active;
     bob.stream.authenticated = true;
-    bob.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desk" };
+    bob.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desk" });
     server.sessions[5] = bob;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desk");
     sm.setPresenceAvailable("bob", "localhost", "desk", true);
@@ -1394,7 +1419,7 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
     @memset(&local_buf, '&');
     var res_buf: [400]u8 = undefined;
     @memset(&res_buf, '&');
-    alice.stream.bound_jid = .{ .local = &local_buf, .domain = "localhost", .resource = &res_buf };
+    alice.stream.setBoundJid(.{ .local = &local_buf, .domain = "localhost", .resource = &res_buf });
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1422,7 +1447,7 @@ test "Re-review 6.8: an undeliverable oversized delivery form bounces to the sen
 test "S14: failed cross-worker resource does not block local delivery" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1431,7 +1456,7 @@ test "S14: failed cross-worker resource does not block local delivery" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     // bob has a local resource (worker 0, session 5) and a remote one
@@ -1453,7 +1478,7 @@ test "S14: failed cross-worker resource does not block local delivery" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1482,7 +1507,7 @@ test "S14: failed cross-worker resource does not block local delivery" {
 test "S14: a cross-worker stanza larger than the old slot cap is delivered" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1491,7 +1516,7 @@ test "S14: a cross-worker stanza larger than the old slot cap is delivered" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     _ = try sm.bind(1, Token.init(7, 1, token_kinds.session), "bob", "localhost", "phone");
@@ -1502,7 +1527,7 @@ test "S14: a cross-worker stanza larger than the old slot cap is delivered" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1553,7 +1578,7 @@ test "S14: a refused cross-worker stanza falls back to the offline store" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1563,7 +1588,7 @@ test "S14: a refused cross-worker stanza falls back to the offline store" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -1579,7 +1604,7 @@ test "S14: a refused cross-worker stanza falls back to the offline store" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1605,7 +1630,7 @@ test "S14: a refused cross-worker stanza falls back to the offline store" {
 test "S14: a refused cross-worker stanza with no offline store bounces" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1615,7 +1640,7 @@ test "S14: a refused cross-worker stanza with no offline store bounces" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     // bob remote-only again, but no offline store: the bounce fallback
@@ -1628,7 +1653,7 @@ test "S14: a refused cross-worker stanza with no offline store bounces" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1653,14 +1678,14 @@ test "S14: a refused cross-worker stanza with no offline store bounces" {
 // requesting worker resend a tail the resumed client already has.
 test "Server: G4 a near-limit online stanza is bounced when delivery cannot queue it" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const bob_fds = try makeSocketPair();
     defer posix.close(bob_fds[1]);
@@ -1677,7 +1702,7 @@ test "Server: G4 a near-limit online stanza is bounced when delivery cannot queu
     const alice = try allocator.create(Session);
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     server.sessions[9] = alice;
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+    alice.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "mobile" });
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -1712,7 +1737,7 @@ test "Server: G4 a near-limit online stanza is bounced when delivery cannot queu
 test "Router: the local and cross-worker delivery forms are byte-identical" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -1721,7 +1746,7 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
 
     // bob has one resource here and one on worker 1, so this dispatch takes
@@ -1732,7 +1757,7 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     local.init(local_fds[0], 5, "localhost", false, allocator);
     local.stream.state = .active;
     local.stream.authenticated = true;
-    local.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desk") catch null;
+    local.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desk") catch null);
     server.sessions[5] = local;
     _ = try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desk");
     sm.setPresenceAvailable("bob", "localhost", "desk", true);
@@ -1743,7 +1768,7 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     remote.init(remote_fds[0], 6, "localhost", false, allocator);
     remote.stream.state = .active;
     remote.stream.authenticated = true;
-    remote.stream.bound_jid = xmpp.Jid.parse("bob@localhost/phone") catch null;
+    remote.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/phone") catch null);
     server.sessions[6] = remote;
     _ = try sm.bind(1, Token.init(6, 1, token_kinds.session), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
@@ -1753,7 +1778,7 @@ test "Router: the local and cross-worker delivery forms are byte-identical" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     // A JID that needs escaping, so the two forms would differ if either
     // serializer handled it differently.

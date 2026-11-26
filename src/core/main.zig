@@ -252,7 +252,7 @@ pub fn main() !void {
     };
 
     // Session map — single JID-keyed routing table (multi_worker flag gates lock overhead)
-    var session_map = SessionMap.init(allocator, worker_count > 1, max_resources_per_account);
+    var session_map = try SessionMap.init(allocator, worker_count, max_resources_per_account);
     defer session_map.deinit();
     log.info("session map allocated (multi_worker={s})", .{if (worker_count > 1) "true" else "false"});
 
@@ -305,7 +305,7 @@ pub fn main() !void {
         server.fanout_queue.batch_size = fan_out_batch_size;
         defer server.deinit();
 
-        configureServer(&server, &ctx, 0);
+        try configureServer(&server, &ctx, 0);
 
         log.info("listening on {s}:{d} (single worker)", .{ address, port });
         try server.run();
@@ -335,7 +335,7 @@ pub fn main() !void {
         try server.initFromFdOpts(host, listen_fds[listen_fd_count - 1], allocator, per_worker_sessions, ctx.skip_tls);
         server.fanout_queue.batch_size = fan_out_batch_size;
         defer server.deinit();
-        configureServer(&server, &ctx, @intCast(listen_fd_count - 1));
+        try configureServer(&server, &ctx, @intCast(listen_fd_count - 1));
         server.run() catch |err| {
             log.err("main worker error: {}", .{err});
         };
@@ -444,9 +444,9 @@ fn archiveWriterMain(queue: *ArchiveWriteQueue, store: *archive_store_mod.Archiv
 }
 
 /// Configure a Server instance with TLS, auth, S2S, roster, offline, archive, vcard, MUC, and session map.
-fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) void {
+fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) !void {
     server.worker_id = worker_id;
-    server.session_map = ctx.session_map;
+    try server.configureSessionMap(ctx.session_map);
     const caps = @import("worker/worker.zig").caps_mod;
     server.server_caps = caps.computeServerCaps();
     if (ctx.delivery_system) |ds| {
@@ -524,7 +524,10 @@ fn workerThread(args: *WorkerArgs) void {
     server.fanout_queue.batch_size = args.ctx.fan_out_batch_size;
     defer server.deinit();
 
-    configureServer(&server, args.ctx, @intCast(args.worker_id));
+    configureServer(&server, args.ctx, @intCast(args.worker_id)) catch |err| {
+        log.err("worker {d} configuration failed: {}", .{ args.worker_id, err });
+        return;
+    };
 
     server.run() catch |err| {
         log.err("worker {d} error: {}", .{ args.worker_id, err });

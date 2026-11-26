@@ -33,7 +33,7 @@ const routing_deliver = @import("../routing/deliver.zig");
 test "carbons: a phone with carbons off on another worker gets only the routed message" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -42,14 +42,14 @@ test "carbons: a phone with carbons off on another worker gets only the routed m
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     var w1: Server = undefined;
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -58,7 +58,7 @@ test "carbons: a phone with carbons off on another worker gets only the routed m
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     w1.sessions[6] = phone;
     _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
@@ -68,7 +68,7 @@ test "carbons: a phone with carbons off on another worker gets only the routed m
     var alice: Session = undefined;
     alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -101,7 +101,7 @@ test "carbons: a phone with carbons off on another worker gets only the routed m
 test "carbons: a Carbons-enabled resource on another worker gets exactly one carbon" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -110,7 +110,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     const desk_fds = try makeSocketPair();
@@ -119,7 +119,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.stream.state = .active;
     desk.stream.authenticated = true;
-    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    desk.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desktop" });
     w0.sessions[5] = desk;
     _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
@@ -128,7 +128,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -137,7 +137,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     phone.carbons_enabled = true;
     w1.sessions[6] = phone;
     _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
@@ -148,7 +148,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
     var alice: Session = undefined;
     alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost/desktop";
     alice.stanza_type = "chat";
@@ -180,7 +180,7 @@ test "carbons: a Carbons-enabled resource on another worker gets exactly one car
 test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -189,7 +189,7 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     const desk_fds = try makeSocketPair();
@@ -198,7 +198,7 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.stream.state = .active;
     desk.stream.authenticated = true;
-    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    desk.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desktop" });
     w0.sessions[5] = desk;
     _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
@@ -207,7 +207,7 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -216,7 +216,7 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     phone.carbons_enabled = false;
     w1.sessions[6] = phone;
     _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
@@ -227,7 +227,7 @@ test "carbons: a cross-worker carbon to a disabled resource is dropped" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost/desktop";
     alice.stanza_type = "chat";
@@ -266,7 +266,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     defer op_db.close();
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -275,7 +275,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
     w0.offline = &offline_store;
 
@@ -284,7 +284,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     const desk = try allocator.create(Session);
     desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.offline_pending = true;
-    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    desk.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desktop" });
     w0.sessions[5] = desk;
     _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
@@ -293,7 +293,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
     w1.offline = &offline_store;
 
@@ -303,7 +303,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.offline_pending = true;
     phone.carbons_enabled = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     w1.sessions[6] = phone;
     _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
     sm.setPresenceAvailable("bob", "localhost", "phone", true);
@@ -313,7 +313,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
     var alice: Session = undefined;
     alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost/desktop";
     alice.stanza_type = "chat";
@@ -358,7 +358,7 @@ test "carbons: a draining worker delivers the carbon live and stores no carbon r
 test "carbons: a delivered resource gets no received copy on the same dispatch" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -367,14 +367,14 @@ test "carbons: a delivered resource gets no received copy on the same dispatch" 
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     var w1: Server = undefined;
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -383,7 +383,7 @@ test "carbons: a delivered resource gets no received copy on the same dispatch" 
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     phone.carbons_enabled = true;
     w1.sessions[6] = phone;
     _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
@@ -394,7 +394,7 @@ test "carbons: a delivered resource gets no received copy on the same dispatch" 
     var alice: Session = undefined;
     alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -424,7 +424,7 @@ test "carbons: a delivered resource gets no received copy on the same dispatch" 
 test "carbons: the local received-carbon path skips a resource that got the original" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -433,7 +433,7 @@ test "carbons: the local received-carbon path skips a resource that got the orig
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -442,7 +442,7 @@ test "carbons: the local received-carbon path skips a resource that got the orig
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     phone.carbons_enabled = true;
     w0.sessions[6] = phone;
     _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
@@ -453,7 +453,7 @@ test "carbons: the local received-carbon path skips a resource that got the orig
     var alice: Session = undefined;
     alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -482,14 +482,14 @@ test "carbons: the local received-carbon path skips a resource that got the orig
 test "carbons: a resource the delivery loop skipped still gets the received carbon" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var w0: Server = undefined;
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
 
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
@@ -497,7 +497,7 @@ test "carbons: a resource the delivery loop skipped still gets the received carb
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     phone.carbons_enabled = true;
     phone.csi_active = false;
     w0.sessions[6] = phone;
@@ -510,7 +510,7 @@ test "carbons: a resource the delivery loop skipped still gets the received carb
     laptop.init(laptop_fds[0], 5, "localhost", false, allocator);
     laptop.stream.state = .active;
     laptop.stream.authenticated = true;
-    laptop.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "laptop" };
+    laptop.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "laptop" });
     laptop.carbons_enabled = true;
     w0.sessions[5] = laptop;
     _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "laptop");
@@ -521,7 +521,7 @@ test "carbons: a resource the delivery loop skipped still gets the received carb
     var alice: Session = undefined;
     alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -572,14 +572,14 @@ test "carbons: a resource the delivery loop skipped still gets the received carb
 test "carbons: a nested private-looking payload does not suppress the carbon" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var w0: Server = undefined;
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
 
     const phone_fds = try makeSocketPair();
     defer posix.close(phone_fds[1]);
@@ -587,7 +587,7 @@ test "carbons: a nested private-looking payload does not suppress the carbon" {
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     phone.carbons_enabled = true;
     w0.sessions[6] = phone;
     _ = try sm.bind(0, w0.sessionToken(6), "bob", "localhost", "phone");
@@ -599,7 +599,7 @@ test "carbons: a nested private-looking payload does not suppress the carbon" {
     watch.init(watch_fds[0], 5, "localhost", false, allocator);
     watch.stream.state = .active;
     watch.stream.authenticated = true;
-    watch.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "watch" };
+    watch.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "watch" });
     watch.carbons_enabled = true;
     w0.sessions[5] = watch;
     _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "watch");
@@ -611,7 +611,7 @@ test "carbons: a nested private-looking payload does not suppress the carbon" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -638,7 +638,7 @@ test "carbons: a nested private-looking payload does not suppress the carbon" {
 test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
@@ -647,7 +647,7 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     try w0.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w0.deinit();
     w0.worker_id = 0;
-    w0.session_map = &sm;
+    try w0.configureSessionMap(&sm);
     w0.delivery_system = &delivery_sys;
 
     const desk_fds = try makeSocketPair();
@@ -656,7 +656,7 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     desk.init(desk_fds[0], 5, "localhost", false, allocator);
     desk.stream.state = .active;
     desk.stream.authenticated = true;
-    desk.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "desktop" };
+    desk.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "desktop" });
     w0.sessions[5] = desk;
     _ = try sm.bind(0, w0.sessionToken(5), "bob", "localhost", "desktop");
     sm.setPresenceAvailable("bob", "localhost", "desktop", true);
@@ -665,7 +665,7 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     try w1.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer w1.deinit();
     w1.worker_id = 1;
-    w1.session_map = &sm;
+    try w1.configureSessionMap(&sm);
     w1.delivery_system = &delivery_sys;
 
     const phone_fds = try makeSocketPair();
@@ -674,7 +674,7 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     phone.init(phone_fds[0], 6, "localhost", false, allocator);
     phone.stream.state = .active;
     phone.stream.authenticated = true;
-    phone.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "phone" };
+    phone.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "phone" });
     phone.carbons_enabled = true;
     w1.sessions[6] = phone;
     _ = try sm.bind(1, w1.sessionToken(6), "bob", "localhost", "phone");
@@ -685,7 +685,7 @@ test "carbons: private and no-copy hints suppress the cross-worker carbon" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 7, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_type = "chat";
 

@@ -405,13 +405,8 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
     }
 
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
-    if (session.stream.bound_jid) |bound| close_cleanup: {
-        var close_jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-        const close_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &close_jid_buf) catch {
-            noteDrop("session {d} close: full JID exceeds {d} bytes; room cleanup skipped", .{ id, router.FULL_JID_MAX });
-            break :close_cleanup;
-        };
-        muc_handler.handleSessionClose(server, close_jid, changes);
+    if (session.stream.bound_jid != null) {
+        muc_handler.handleSessionClose(server, session.stream.boundFull(), changes);
     }
 
     // Unregister from session map and broadcast unavailable presence
@@ -420,16 +415,15 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
             const removed = sm.unbind(bound.local, bound.domain, bound.resource);
             if (removed) |entry| {
                 if (entry.presence_available) {
-                    presence_handler.broadcastUnavailable(server, bound.local, bound.domain, bound.resource, changes);
+                    presence_handler.broadcastUnavailable(server, session, changes);
                 }
             }
             // T164: when the account's last resource tears down, record when it
             // went offline (XEP-0012). Written to the shared op DB so any
             // worker answers last-activity without cross-worker routing.
-            var probe_buf: [1]@import("session_map").SessionEntry = undefined;
-            if (sm.findByBareJid(bound.local, bound.domain, &probe_buf) == 0) {
+            if (!sm.hasBound(bound.local, bound.domain)) {
                 if (server.roster) |roster| {
-                    recordLastOffline(roster, bound);
+                    recordLastOffline(roster, session.stream.boundBare());
                 }
             }
         }
@@ -454,15 +448,10 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
 
 /// T164: write the account's last-offline timestamp after its final resource
 /// unbound (best-effort; on error the next teardown retries).
-fn recordLastOffline(roster: anytype, bound: anytype) void {
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteDrop("last-activity record skipped for {s}@{s}: bare JID exceeds {d} bytes", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-        return;
-    };
+fn recordLastOffline(roster: anytype, bare_jid: []const u8) void {
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
     lastact_store.record(roster.backend, bare_jid, now) catch |err| {
-        log.warn("last-activity record failed for {s}@{s}: {}", .{ bound.local, bound.domain, err });
+        log.warn("last-activity record failed for {s}: {}", .{ bare_jid, err });
     };
 }
 
@@ -507,12 +496,8 @@ pub noinline fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void
 fn drainUnackedToOffline(server: *Server, session: *Session) void {
     const store = server.offline orelse return;
     const queue = session.sm_unacked orelse return;
-    const bound = session.stream.bound_jid orelse return;
-    var recipient_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const recipient = router.buildBareJid(bound.local, bound.domain, &recipient_buf) catch {
-        noteDrop("session {d} unacked drain skipped: bare JID exceeds {d} bytes", .{ session.conn.id, router.BARE_JID_MAX });
-        return;
-    };
+    if (session.stream.bound_jid == null) return;
+    const recipient = session.stream.boundBare();
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
     var iter = queue.getUnacked();
     while (iter.next()) |stanza| {
@@ -561,17 +546,16 @@ pub fn expireDetachedSessions(server: *Server, changes: *ChangeList) void {
 }
 
 /// Deliver queued offline messages to a user who just became available.
-pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
+/// The drain keys on the session's own bound bare JID; unbound sessions
+/// have nothing queued for them.
+pub fn deliverOfflineMessages(server: *Server, session: *Session, changes: *ChangeList) void {
     const store = server.offline orelse return;
     // The archive is a fallback for pointers that carry no held copy, not a
     // precondition: a deployment without one still drains what it stored.
     const archive = server.archive;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        noteDrop("offline delivery for {s}@{s} skipped: bare JID exceeds {d} bytes", .{ local, domain, router.BARE_JID_MAX });
-        return;
-    };
+    if (session.stream.bound_jid == null) return;
+    const bare_jid = session.stream.boundBare();
 
     // A failed count is a store failure like any other: without a staged
     // retry the session stays parked with nothing armed to drain it.
@@ -660,7 +644,7 @@ pub fn deliverOfflineMessages(server: *Server, session: *Session, local: []const
             var delay_buf: [64]u8 = undefined;
             if (muc_handler.formatDelayStamp(&delay_buf, ptr.timestamp)) |stamp| {
                 if (delay_lease) |*lease| {
-                    wire = stampOfflineDelay(xml_data, domain, stamp, lease.buf) catch |err| blk: {
+                    wire = stampOfflineDelay(xml_data, session.stream.bound_jid.?.domain, stamp, lease.buf) catch |err| blk: {
                         noteDrop("offline delay stamp for {s} skipped: {s}", .{ bare_jid, @errorName(err) });
                         break :blk xml_data;
                     };
@@ -1098,8 +1082,7 @@ pub fn retryStalledOfflineDrains(server: *Server, changes: *ChangeList) void {
 /// presence or reconnect.
 pub fn drainOfflinePending(server: *Server, session: *Session, changes: *ChangeList) void {
     if (!session.offline_pending) return;
-    const bound = session.stream.bound_jid orelse return;
-    deliverOfflineMessages(server, session, bound.local, bound.domain, changes);
+    deliverOfflineMessages(server, session, changes);
 }
 
 /// Allocate a free session ID slot. O(1) via free-list stack (T128).
@@ -1276,7 +1259,8 @@ test "offline delivery drains a store with no archive configured" {
     const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><body>held</body></message>";
     _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(session.conn.hasPendingWrite());
@@ -1333,7 +1317,8 @@ test "S13: a failed pointer delete stops the drain instead of reordering" {
         destroySession(&server, 1, session, &changes);
     }
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     // The drain stopped rather than moving on to m2.
     _ = session.conn.flushSend() catch {};
@@ -1384,7 +1369,7 @@ test "S13: a row stored mid-drain is re-armed for rather than stranded" {
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
-    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = server.server_host, .resource = "res" });
     server.sessions[1] = session;
     server.free_count -= 1;
     defer {
@@ -1396,7 +1381,8 @@ test "S13: a row stored mid-drain is re-armed for rather than stranded" {
     _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "m2", 1001, "<message id='m2'><body>two</body></message>");
 
     server.test_after_offline_pointers = &storeMidDrainRow;
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
     server.test_after_offline_pointers = null;
 
     // The late row survives and the drain stays pending.
@@ -1483,7 +1469,8 @@ test "S13: offline delivery keeps undelivered messages when the send buffer fill
         _ = try offline_store.storePointer("bob@localhost", "alice@localhost", stanza_id, ts);
     }
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     // Delivery must have stopped at the buffer limit: some messages were
     // handed to the connection and deleted, the rest are still queued.
@@ -1541,7 +1528,7 @@ test "S13: stalled offline drain resumes via drainOfflinePending" {
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
-    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = server.server_host, .resource = "res" });
     server.sessions[1] = session;
     server.free_count -= 1;
     defer {
@@ -1564,7 +1551,8 @@ test "S13: stalled offline drain resumes via drainOfflinePending" {
 
     // Bound the outbox at the ring so the backlog stalls mid-drain.
     session.conn.outbox.spill_limit = connection_mod.WRITE_BUF_SIZE;
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
     try std.testing.expect(session.offline_pending);
     try std.testing.expect(try offline_store.countMessages("bob@localhost") > 0);
 
@@ -1619,7 +1607,7 @@ test "S15: an overflowed session drains unacked messages to offline storage" {
     session.init(fds[0], 1, server.server_host, false, server.allocator);
     session.stream.state = .active;
     session.stream.authenticated = true;
-    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = server.server_host, .resource = "res" });
     server.sessions[1] = session;
     server.free_count -= 1;
     // Owned by session.deinit once assigned.
@@ -1688,7 +1676,8 @@ test "S13: dangling offline pointer is dropped, not skipped forever" {
     _ = try offline_store.storePointer("bob@localhost", "alice@localhost", "gone", 1000);
     _ = try offline_store.storePointer("bob@localhost", "alice@localhost", "s1", 1001);
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("bob@localhost"));
     try std.testing.expect(!session.offline_pending);
@@ -1768,9 +1757,9 @@ test "T152: rebind with same resource evicts stale session" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
     defer server.deinit();
 
-    var sm = SessionMap.init(allocator, false, 0);
+    var sm = try SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
@@ -1897,7 +1886,7 @@ test "S13: held stanza is delivered before the archive row is committed" {
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
-    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = server.server_host, .resource = "res" });
     server.sessions[1] = session;
     server.free_count -= 1;
     defer {
@@ -1913,7 +1902,8 @@ test "S13: held stanza is delivered before the archive row is committed" {
     defer offline_store.freePointers(pointers);
     try std.testing.expectEqual(@as(usize, 1), pointers.len);
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     _ = session.conn.flushSend() catch {};
     var buf: [4096]u8 = undefined;
@@ -1962,7 +1952,7 @@ test "G2: a legacy offline row drains before newly sequenced rows" {
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
-    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = server.server_host, .resource = "res" });
     server.sessions[1] = session;
     server.free_count -= 1;
     defer {
@@ -1992,7 +1982,8 @@ test "G2: a legacy offline row drains before newly sequenced rows" {
     try std.testing.expectEqualStrings("new", ordered[1].stanza_id);
     try std.testing.expectEqual(@as(u64, 3000), ordered[0].timestamp);
     try std.testing.expectEqual(@as(u64, 1000), ordered[1].timestamp);
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     _ = session.conn.flushSend() catch {};
     var buf: [4096]u8 = undefined;
@@ -2044,7 +2035,7 @@ test "S13: store-error stall with an empty buffer re-arms the drain" {
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
-    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = server.server_host, .resource = "res" });
     server.sessions[1] = session;
     server.free_count -= 1;
     defer {
@@ -2056,7 +2047,8 @@ test "S13: store-error stall with an empty buffer re-arms the drain" {
     const oversized_id = [_]u8{'x'} ** 600;
     _ = try offline_store.storePointer("bob@localhost", "alice@localhost", &oversized_id, 1001);
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     // Still pending, and the pointer survives for the retry.
     try std.testing.expect(session.offline_pending);
@@ -2126,7 +2118,7 @@ test "S13: store-error retries are bounded, then a one-shot timer resumes" {
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "bob", .domain = server.server_host };
-    session.stream.bound_jid = .{ .local = "bob", .domain = server.server_host, .resource = "res" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = server.server_host, .resource = "res" });
     server.sessions[1] = session;
     server.free_count -= 1;
     defer {
@@ -2141,7 +2133,8 @@ test "S13: store-error retries are bounded, then a one-shot timer resumes" {
     var stalls: usize = 0;
     while (stalls < 40) : (stalls += 1) {
         changes.reset();
-        deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+        session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+        deliverOfflineMessages(&server, session, &changes);
 
         var armed = false;
         for (changes.slice()) |ev| {
@@ -2255,7 +2248,8 @@ test "S35: offline delivery stamps the queue time once (XEP-0203)" {
     const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><body>held</body></message>";
     _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     var buf: [2048]u8 = undefined;
     const wire = readSent(fds, session, &buf);
@@ -2301,7 +2295,8 @@ test "S35: a foreign delay stamp is kept and ours is added once" {
     const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><body>held</body><delay xmlns='urn:xmpp:delay' from='other.example' stamp='2020-06-06T00:00:00Z'/></message>";
     _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     var buf: [2048]u8 = undefined;
     const wire = readSent(fds, session, &buf);
@@ -2351,7 +2346,8 @@ test "S35: a stale stamp of ours is replaced by the queue time" {
     const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><delay xmlns='urn:xmpp:delay' from='localhost' stamp='1999-12-31T23:59:59Z'/><body>held</body></message>";
     _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     var buf: [2048]u8 = undefined;
     const wire = readSent(fds, session, &buf);
@@ -2400,7 +2396,8 @@ test "S35: a forged top-level delay from our domain is stripped" {
     const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><body>backdated</body><delay xmlns='urn:xmpp:delay' from='localhost' stamp='2001-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' from='localhost' stamp='2002-02-02T00:00:00Z'></delay></message>";
     _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     var buf: [2048]u8 = undefined;
     const wire = readSent(fds, session, &buf);
@@ -2452,7 +2449,8 @@ test "S35: SM replay resends the stamped stanza unchanged" {
     const stanza = "<message from='alice@localhost' to='bob@localhost' id='n1'><body>held</body></message>";
     _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "n1", 1000, stanza);
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     var buf: [2048]u8 = undefined;
     const wire = readSent(fds, session, &buf);
@@ -2506,7 +2504,7 @@ test "S35: a message held behind the tail (cross-worker path) is stamped on drai
 
     // The cross-worker dispatch holds a live message behind the draining
     // tail as a held pointer; it reaches the wire through the same drain.
-    session.stream.bound_jid = .{ .local = "bob", .domain = "localhost", .resource = "res" };
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "res" });
     session.offline_pending = true;
     const stanza = "<message from='alice@localhost' to='bob@localhost' id='n2'><body>queued</body></message>";
     const held = try offline_store.storeHeldPointerOnce("bob@localhost", "alice@localhost", "n2", 2000, stanza, 42);
@@ -2657,7 +2655,8 @@ test "S35: a stanza that only fits unstamped is sent without a stamp" {
     @memcpy(stanza[total - tail.len ..], tail);
     _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "big", 1000, stanza);
 
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     // The stored bytes went out untouched and the pointer is gone: the drain
     // neither stalls on the stamp nor loses the message.
@@ -2715,7 +2714,8 @@ test "S35: an unsendable stored stanza is dropped and the drain continues" {
     _ = try offline_store.storeHeldPointer("bob@localhost", "alice@localhost", "s1", 2000, small);
 
     const drops_before = delivery_queue_mod.offline_drain_drops.load(.monotonic);
-    deliverOfflineMessages(&server, session, "bob", "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost" });
+    deliverOfflineMessages(&server, session, &changes);
 
     // The oversized pointer is counted and deleted, and the message behind it
     // was still delivered: one bad row cannot park the queue.

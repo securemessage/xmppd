@@ -167,15 +167,9 @@ pub noinline fn answerOversizeIq(session: *Session, stanza: []const u8) void {
         w.writeAll("<iq type='error' from='") catch break :out null;
         xml.escapeWrite(w, if (session.iq_to.len > 0) session.iq_to else session.stream.server_host) catch break :out null;
         w.writeByte('\'') catch break :out null;
-        if (session.stream.bound_jid) |bound| {
+        if (session.stream.bound_jid != null) {
             w.writeAll(" to='") catch break :out null;
-            xml.escapeWrite(w, bound.local) catch break :out null;
-            w.writeByte('@') catch break :out null;
-            xml.escapeWrite(w, bound.domain) catch break :out null;
-            if (bound.resource.len > 0) {
-                w.writeByte('/') catch break :out null;
-                xml.escapeWrite(w, bound.resource) catch break :out null;
-            }
+            xml.escapeWrite(w, session.stream.boundFull()) catch break :out null;
             w.writeByte('\'') catch break :out null;
         }
         w.writeAll(" id='") catch break :out null;
@@ -545,15 +539,14 @@ pub const Session = struct {
     /// Initialize into the caller's `self` slot (out-param, same shape as
     /// Server.init: no Session-sized temporary on the caller's stack).
     pub fn init(self: *Session, fd: posix.fd_t, id: usize, server_host: []const u8, direct_tls: bool, allocator: std.mem.Allocator) void {
-        var reader = xml.Reader.init(allocator);
-        // Pre-auth cap: negotiation elements are small, and an unauthenticated
-        // peer must not be able to spend the post-auth budget (H6).
-        reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
         self.* = .{
             .conn = Connection.init(fd, id, allocator),
-            .reader = reader,
+            .reader = xml.Reader.init(allocator),
             .stream = xmpp.Stream.init(server_host, direct_tls),
         };
+        // Pre-auth cap: negotiation elements are small, and an unauthenticated
+        // peer must not be able to spend the post-auth budget (H6).
+        self.reader.setMaxItemBytes(xml.max_item_bytes_pre_auth);
     }
 
     pub fn deinit(self: *Session) void {
@@ -2199,7 +2192,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
             writer.writeAll("/></failure>") catch return;
             if (session.nonza(fbs.getWritten()) == .failed_closed) return;
         },
-        .send_bind_result => |bound_jid| {
+        .send_bind_result => {
             writer.writeAll("<iq type='result'") catch return;
             if (session.bind_iq_id.len > 0) {
                 writer.writeAll(" id='") catch return;
@@ -2207,15 +2200,7 @@ pub fn executeAction(self: *Server, session: *Session, action: xmpp.StreamAction
                 writer.writeByte('\'') catch return;
             }
             writer.writeAll("><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>") catch return;
-            if (bound_jid.local.len > 0) {
-                xml.escapeWrite(writer, bound_jid.local) catch return;
-                writer.writeByte('@') catch return;
-            }
-            xml.escapeWrite(writer, bound_jid.domain) catch return;
-            if (bound_jid.resource.len > 0) {
-                writer.writeByte('/') catch return;
-                xml.escapeWrite(writer, bound_jid.resource) catch return;
-            }
+            xml.escapeWrite(writer, session.stream.boundFull()) catch return;
             writer.writeAll("</jid></bind></iq>") catch return;
             if (session.stanza(fbs.getWritten()) == .failed_closed) return;
         },
@@ -2577,7 +2562,7 @@ test "H6: a broken stanza closes the stream before its close tag arrives" {
     session.stream.authenticated = true;
     session.stream.state = .active;
     session.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "mobile" });
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -2715,14 +2700,14 @@ test "Server: pre-bind stanza to the domain in another case is server-addressed"
 test "F6: ingress preparation folds the local 'to' before routing" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
@@ -2730,7 +2715,7 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
-    target.stream.bound_jid = xmpp.Jid.parse("naplestb@localhost/desk") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("naplestb@localhost/desk") catch null);
     // A bodiless message is typing-only under XEP-0352 and is skipped for
     // CSI-inactive sessions.
     target.csi_active = true;
@@ -2744,7 +2729,7 @@ test "F6: ingress preparation folds the local 'to' before routing" {
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     alice.stream.state = .active;
     alice.stream.authenticated = true;
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mob") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mob") catch null);
     server.sessions[9] = alice;
     // Stand in for the reader state at a self-closing top-level stanza's
     // element_start: depth was incremented and restored before the event.
@@ -2914,7 +2899,7 @@ test "F6: malformed local 'to' gets jid-malformed for message and iq" {
     server.sessions[1] = session;
     session.stream.state = .active;
     session.stream.authenticated = true;
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mob") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mob") catch null);
     session.reader.depth = 1;
 
     var change_buf: [16]posix.Kevent = undefined;
@@ -2975,12 +2960,12 @@ pub fn f6WireSetup(allocator: std.mem.Allocator, server: *Server, sm: *SessionMa
 
 pub fn f6WireSetupBound(allocator: std.mem.Allocator, server: *Server, sm: *SessionMap, target_fds: [2]posix.fd_t, alice_fds: [2]posix.fd_t, bound_local: []const u8) !F6WirePair {
     server.worker_id = 0;
-    server.session_map = sm;
+    try server.configureSessionMap(sm);
     const target = try allocator.create(Session);
     target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
-    target.stream.bound_jid = .{ .local = bound_local, .domain = "localhost", .resource = "desk" };
+    target.stream.setBoundJid(.{ .local = bound_local, .domain = "localhost", .resource = "desk" });
     target.csi_active = true;
     server.sessions[5] = target;
     _ = try sm.bind(0, server.sessionToken(5), bound_local, "localhost", "desk");
@@ -2999,7 +2984,7 @@ pub fn f6WireSetupBound(allocator: std.mem.Allocator, server: *Server, sm: *Sess
     alice.stream.state = .active;
     alice.stream.authenticated = true;
     alice.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mob" };
+    alice.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "mob" });
     return .{ .target = target, .alice = alice };
 }
 
@@ -3018,7 +3003,7 @@ pub fn f6Read(fd: posix.fd_t, buf: []u8) []const u8 {
 
 test "F6: self-closing top-level message with malformed 'to' gets jid-malformed" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3038,7 +3023,7 @@ test "F6: self-closing top-level message with malformed 'to' gets jid-malformed"
 
 test "F6: self-closing top-level message to a mixed-case local JID is routed folded" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3059,7 +3044,7 @@ test "F6: self-closing top-level message to a mixed-case local JID is routed fol
 
 test "F6: a non-ASCII localpart reaches the account under its prepared spelling" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3084,7 +3069,7 @@ test "F6: a non-ASCII localpart reaches the account under its prepared spelling"
 
 test "F6: a migrated account receives mail addressed to its legacy spelling" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3108,7 +3093,7 @@ test "F6: a migrated account receives mail addressed to its legacy spelling" {
 
 test "F6: self-closing presence subscribe to a mixed-case local JID is routed folded" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3139,7 +3124,7 @@ test "F6: self-closing presence subscribe to a mixed-case local JID is routed fo
 
 test "F6: a self-closing stanza-named child inside an IQ is not prepared" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3161,7 +3146,7 @@ test "F6: a self-closing stanza-named child inside an IQ is not prepared" {
 
 test "F6: type=error stanza with malformed 'to' is dropped without a reply" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3182,7 +3167,7 @@ test "F6: type=error stanza with malformed 'to' is dropped without a reply" {
 
 test "F6: presence with malformed 'to' gets a jid-malformed reply to the full JID" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3205,7 +3190,7 @@ test "F6: presence with malformed 'to' gets a jid-malformed reply to the full JI
 
 test "F6: a malformed 'from' gets jid-malformed" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3225,7 +3210,7 @@ test "F6: a malformed 'from' gets jid-malformed" {
 
 test "F6: jid-malformed reply echoes the offending 'to' in its 'from'" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3275,7 +3260,7 @@ test "F6: pre-auth stanza with a malformed 'to' closes the stream not-authorized
 
 test "F6: groupchat message to the MUC host in another case stays local" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -3301,7 +3286,7 @@ test "F6: groupchat message to the MUC host in another case stays local" {
 
 test "F6: directed presence to the MUC host in another case joins the room" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var registry = RoomRegistry.init(allocator);
     defer registry.deinit();
@@ -3327,7 +3312,7 @@ test "F6: directed presence to the MUC host in another case joins the room" {
 
 test "F6: disco info to the MUC host in another case is the conference service" {
     const allocator = std.testing.allocator;
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
@@ -3945,14 +3930,14 @@ test "S15: queueSendStanza counts the stanza for XEP-0198" {
 test "S15: live router delivery tracks the stanza for XEP-0198" {
     const allocator = std.testing.allocator;
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
 
     var server: Server = undefined;
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     const target_fds = try makeSocketPair();
     defer posix.close(target_fds[1]);
@@ -3960,7 +3945,7 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     target.init(target_fds[0], 5, "localhost", false, allocator);
     target.stream.state = .active;
     target.stream.authenticated = true;
-    target.stream.bound_jid = xmpp.Jid.parse("bob@localhost/desktop") catch null;
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.sm_enabled = true;
     const queue = try allocator.create(sm_state.SmUnackedQueue);
     queue.* = sm_state.SmUnackedQueue.init(allocator);
@@ -3975,7 +3960,7 @@ test "S15: live router delivery tracks the stanza for XEP-0198" {
     var alice: Session = undefined;
     alice.init(alice_fds[0], 9, "localhost", false, allocator);
     defer alice.deinit();
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -4046,7 +4031,7 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     var session: Session = undefined;
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/mobile") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/mobile") catch null);
     session.iq_to = "localhost";
     // A reply longer than the outbound bound: the append refuses it even
     // with the outbox empty, so this is oversize, not a slow reader.
@@ -4231,7 +4216,7 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     var offline_store = GenericOfflineStore(OpBackendType).init(&op_db, allocator);
     var arch_store = archive_store_mod.ArchiveStore(ArchiveBackendType).init(&arch_db, allocator);
 
-    var sm = SessionMap.init(allocator, true, 0);
+    var sm = try SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
     var delivery_sys = try DeliverySystem.init(allocator, 1);
     defer delivery_sys.deinit();
@@ -4240,7 +4225,7 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
     defer server.deinit();
     server.worker_id = 0;
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     server.delivery_system = &delivery_sys;
     server.offline = &offline_store;
     server.archive = &arch_store;
@@ -4263,7 +4248,7 @@ test "Server: E5 an oversized body is not delivered and fails the stream" {
     alice.stream.state = .active;
     alice.stream.authenticated = true;
     alice.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
-    alice.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+    alice.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "mobile" });
     alice.stanza_kind = .message;
     alice.stanza_to = "bob@localhost";
     alice.stanza_type = "chat";
@@ -4339,7 +4324,7 @@ test "Server: G4 an oversized vCard is rejected without replacing the stored val
     session.stream.state = .active;
     session.stream.authenticated = true;
     session.stream.authenticated_jid = .{ .local = "alice", .domain = "localhost" };
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "mobile" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "mobile" });
 
     const prefix = "<iq type='set' id='v1'><vCard xmlns='vcard-temp'><FN>";
     const suffix = "</FN></vCard></iq>";
@@ -4444,7 +4429,7 @@ test "Server: S4 jid-malformed subscription escapes the stanza id" {
     const session = try allocator.create(Session);
     session.init(fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = session;
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     session.stream.authenticated_jid = session.stream.bound_jid;
 
     var to_buf: [600]u8 = undefined;

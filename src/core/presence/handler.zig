@@ -37,6 +37,7 @@ const router = @import("../routing/router.zig");
 const sub_cache_mod = server_mod.sub_cache_mod;
 const presence_sub = @import("subscription.zig");
 const presence_bcast = @import("broadcast.zig");
+const metrics = @import("../worker/metrics.zig");
 
 const log = std.log.scoped(.presence);
 
@@ -229,12 +230,8 @@ pub fn dispatchSubscription(server: *Server, session: *Session, ptype: xmpp.Pres
     // An over-long target would overflow the bounded roster key and fail
     // silently downstream (S4): reject it at ingress.
     if (to_str.len > 0) {
-        const bound = session.stream.bound_jid orelse return;
-        var ob_buf: [router.BARE_JID_MAX]u8 = undefined;
-        const owner_jid = router.buildBareJid(bound.local, bound.domain, &ob_buf) catch {
-            noteJidOverflow("subscription owner JID '{s}@{s}' exceeds {d} bytes; stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-            return;
-        };
+        if (session.stream.bound_jid == null) return;
+        const owner_jid = session.stream.boundBare();
         if (!store_keys.fits2(owner_jid, session.stanza_to)) {
             rejectOversizeSubscriptionTo(session, session.stanza_to, changes);
             return;
@@ -270,8 +267,7 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
     if (type_str.len == 0) {
         // Available presence
         if (server.session_map) |sm| {
-            sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, true);
-            sm.setPriority(bound.local, bound.domain, bound.resource, prio);
+            sm.setPresenceState(bound.local, bound.domain, bound.resource, true, prio);
         }
         const inner_xml = session.stanza_buf[0..session.stanza_buf_len];
 
@@ -290,13 +286,8 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
             // If this ver hash is not in the cache, send a disco#info query
             // to the client to discover its features (XEP-0115 §5.3).
             if (server.caps_cache.lookup(ver) == null) {
-                if (caps_mod.extractNodeFromPresence(inner_xml)) |node| caps_query: {
-                    // Build the full JID for the query target
-                    var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-                    const full_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
-                        noteJidOverflow("connection {d} bound full JID exceeds {d} bytes; caps query skipped", .{ session.conn.id, router.FULL_JID_MAX });
-                        break :caps_query;
-                    };
+                if (caps_mod.extractNodeFromPresence(inner_xml)) |node| {
+                    const full_jid = session.stream.boundFull();
 
                     var query_buf: [1024]u8 = undefined;
                     if (caps_mod.buildCapsQuery(&query_buf, server.server_host, full_jid, node, ver, @intCast(session.conn.id))) |query_xml| {
@@ -306,54 +297,44 @@ pub fn dispatchPresence(server: *Server, session: *Session, changes: *ChangeList
             }
         }
 
-        broadcastPresence(server, bound.local, bound.domain, bound.resource, inner_xml, changes);
+        broadcastPresence(server, session, inner_xml, changes);
 
         // RFC 6121 §4.4.2: Send presence to all of the user's own available resources.
-        broadcastToOwnResources(server, session, bound.local, bound.domain, bound.resource, changes);
+        broadcastToOwnResources(server, session, changes);
 
         // RFC 6121 §4.4.2: Send the user's other available resources' presence to this new resource.
-        sendOtherResourcesPresence(server, session, bound.local, bound.domain, bound.resource, changes);
+        sendOtherResourcesPresence(server, session, changes);
 
         // Send presence probes to contacts we're subscribed to
-        sendPresenceProbes(server, session, bound.local, bound.domain, changes);
+        sendPresenceProbes(server, session, changes);
 
         // Deliver any offline messages queued for this user
-        session_lifecycle.deliverOfflineMessages(server, session, bound.local, bound.domain, changes);
+        session_lifecycle.deliverOfflineMessages(server, session, changes);
 
         // RFC 6121 §3.1.3 rule 4: Deliver pending subscription requests
-        deliverPendingSubscriptions(server, session, bound.local, bound.domain, changes);
+        deliverPendingSubscriptions(server, session, changes);
 
         logAvailable(session.conn.id, bound.local, bound.domain, bound.resource, prio);
     } else if (std.mem.eql(u8, type_str, "unavailable")) {
         if (server.session_map) |sm| {
-            sm.setPresenceAvailable(bound.local, bound.domain, bound.resource, false);
-            sm.setPriority(bound.local, bound.domain, bound.resource, -128);
+            sm.setPresenceState(bound.local, bound.domain, bound.resource, false, -128);
         }
-        broadcastUnavailable(server, bound.local, bound.domain, bound.resource, changes);
+        broadcastUnavailable(server, session, changes);
 
         // RFC 6121 §4.4.2: Send unavailable presence to user's own remaining resources.
-        broadcastToOwnResources(server, session, bound.local, bound.domain, bound.resource, changes);
+        broadcastToOwnResources(server, session, changes);
     }
 }
 
 /// Broadcast available presence to all roster subscribers.
 /// inner_xml contains child elements (priority, show, status) serialized from the client stanza.
-pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8, resource: []const u8, inner_xml: []const u8, changes: *ChangeList) void {
+pub fn broadcastPresence(server: *Server, session: *Session, inner_xml: []const u8, changes: *ChangeList) void {
     const roster = server.roster orelse return;
+    _ = session.stream.bound_jid orelse return;
 
-    // Build the from JID string
-    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const from_str = router.buildFullJid(local, domain, resource, &from_buf) catch {
-        noteJidOverflow("presence from '{s}@{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, resource, router.FULL_JID_MAX });
-        return;
-    };
-
-    // Build bare JID for roster lookup
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        noteJidOverflow("presence bare JID '{s}@{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, router.BARE_JID_MAX });
-        return;
-    };
+    // The bound strings were formatted once at bind; no per-call build.
+    const from_str = session.stream.boundFull();
+    const bare_jid = session.stream.boundBare();
 
     // Find subscribers (contacts with "from" or "both" in our roster) — cached (T129)
     //
@@ -407,20 +388,12 @@ pub fn broadcastPresence(server: *Server, local: []const u8, domain: []const u8,
 }
 
 /// Broadcast unavailable presence to roster subscribers.
-pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const u8, resource: []const u8, changes: *ChangeList) void {
+pub fn broadcastUnavailable(server: *Server, session: *Session, changes: *ChangeList) void {
     const roster = server.roster orelse return;
+    const bound = session.stream.bound_jid orelse return;
 
-    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const from_str = router.buildFullJid(local, domain, resource, &from_buf) catch {
-        noteJidOverflow("unavailable from '{s}@{s}/{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, resource, router.FULL_JID_MAX });
-        return;
-    };
-
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        noteJidOverflow("unavailable bare JID '{s}@{s}' exceeds {d} bytes; broadcast skipped", .{ local, domain, router.BARE_JID_MAX });
-        return;
-    };
+    const from_str = session.stream.boundFull();
+    const bare_jid = session.stream.boundBare();
 
     // Subscriber JID pointers index into this buffer and stay live through
     // delivery, so it is leased rather than taken on the stack (S18). The
@@ -456,21 +429,18 @@ pub fn broadcastUnavailable(server: *Server, local: []const u8, domain: []const 
 
     deliverPresenceToSubscribers(server, subscriber_jids, bare_jid, presence_xml, changes);
 
-    logUnavailable(local, domain, resource);
+    logUnavailable(bound.local, bound.domain, bound.resource);
 }
 
 /// Send presence probes to contacts we're subscribed to (to get their current status).
 /// For each available contact resource, sends a per-resource full-JID presence.
 /// Cross-thread contacts receive delivery via MPSC queue.
-pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
+pub fn sendPresenceProbes(server: *Server, session: *Session, changes: *ChangeList) void {
     const roster = server.roster orelse return;
     const sm = server.session_map orelse return;
+    if (session.stream.bound_jid == null) return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        noteJidOverflow("probe source '{s}@{s}' exceeds {d} bytes; probes skipped", .{ local, domain, router.BARE_JID_MAX });
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     // Get contacts whose presence we should receive (to/both) — cached (T129)
     // Contact JID pointers index into this buffer and stay live across the
@@ -491,19 +461,61 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
     };
     const contact_jids = probe_jid_ptrs[0..probe_count];
 
-    // Build our full JID as the 'to' attribute for cross-thread deliveries
-    const bound = session.stream.bound_jid orelse return;
-    var to_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const to_str = router.buildFullJid(bound.local, bound.domain, bound.resource, &to_buf) catch {
-        noteJidOverflow("bound full JID '{s}@{s}/{s}' exceeds {d} bytes; probes skipped", .{ bound.local, bound.domain, bound.resource, router.FULL_JID_MAX });
-        return;
-    };
+    // Our full JID is the 'to' attribute for cross-thread deliveries.
+    const to_str = session.stream.boundFull();
 
     // For each subscribed contact, check if local or remote. T130: local
-    // contacts resolve in chunks of one lock hold instead of one per JID.
-    // S18: chunk scratch lives on the heap, sized to the session map's
-    // resource cap (SUBS_PER_CHUNK * cap), so a chunk cannot truncate.
-    const SUBS_PER_CHUNK = Server.SCRATCH_CHUNK_JIDS;
+    // contacts resolve in chunks, one shared-lock hold per JID's shard.
+    // The collect only copies the account's routing entries; each contact's
+    // presence stanza is built and delivered after the lock is released.
+    const SUBS_PER_CHUNK = Server.PRESENCE_CHUNK_JIDS;
+
+    const ProbeCtx = struct {
+        server: *Server,
+        session: *Session,
+        to_str: []const u8,
+
+        fn deliver(ctx: *@This(), contact: session_map_mod.JidParts, entry: *const SessionEntry) void {
+            // Retrieve the contact's stored presence inner XML (status/show/priority)
+            const contact_inner = if (entry.worker_id == ctx.server.worker_id) blk: {
+                const contact_sess = ctx.server.sessionForEventToken(entry.token) orelse break :blk @as([]const u8, "");
+                break :blk contact_sess.last_presence_inner[0..contact_sess.last_presence_inner_len];
+            } else @as([]const u8, "");
+
+            // Build presence from the contact's full JID (per-resource)
+            var pres_buf: [4608]u8 = undefined;
+            var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+            const ppw = pres_fbs.writer();
+            const presence_xml = stanza: {
+                ppw.writeAll("<presence from='") catch break :stanza null;
+                xml.escapeWrite(ppw, contact.local) catch break :stanza null;
+                ppw.writeByte('@') catch break :stanza null;
+                xml.escapeWrite(ppw, contact.domain) catch break :stanza null;
+                ppw.writeByte('/') catch break :stanza null;
+                xml.escapeWrite(ppw, entry.resource()) catch break :stanza null;
+                ppw.writeAll("' to='") catch break :stanza null;
+                xml.escapeWrite(ppw, ctx.to_str) catch break :stanza null;
+                ppw.writeByte('\'') catch break :stanza null;
+                if (contact_inner.len > 0) {
+                    ppw.writeByte('>') catch break :stanza null;
+                    ppw.writeAll(contact_inner) catch break :stanza null;
+                    ppw.writeAll("</presence>") catch break :stanza null;
+                } else {
+                    ppw.writeAll("/>") catch break :stanza null;
+                }
+                break :stanza pres_fbs.getWritten();
+            } orelse {
+                noteJidOverflow("contact presence for '{s}@{s}' exceeds {d} bytes; skipped", .{ contact.local, contact.domain, pres_buf.len });
+                return;
+            };
+
+            // The presence stanza is directed TO us (the session that just
+            // became available). Deliver locally regardless of which worker
+            // the contact is on - we already have their resource from the
+            // session map; no need to ask the remote worker.
+            _ = ctx.session.stanza(presence_xml);
+        }
+    };
 
     var contact_i: usize = 0;
     while (contact_i < contact_jids.len) {
@@ -540,53 +552,10 @@ pub fn sendPresenceProbes(server: *Server, session: *Session, local: []const u8,
             parts_len += 1;
         }
 
-        var lease_a = server.leaseScratch(.a);
-        defer lease_a.release();
-        const entries = lease_a.entries;
-        const jid_idxs = server.scratchJidIdxsA();
-        const target_count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], entries, jid_idxs);
-
-        for (entries[0..target_count], jid_idxs[0..target_count]) |entry, idx| {
-            const contact = parts_buf[idx];
-
-            // Retrieve the contact's stored presence inner XML (status/show/priority)
-            const contact_inner = if (entry.worker_id == server.worker_id) blk: {
-                const contact_sess = server.sessionForEventToken(entry.token) orelse break :blk @as([]const u8, "");
-                break :blk contact_sess.last_presence_inner[0..contact_sess.last_presence_inner_len];
-            } else @as([]const u8, "");
-
-            // Build presence from the contact's full JID (per-resource)
-            var pres_buf: [4608]u8 = undefined;
-            var pres_fbs = std.io.fixedBufferStream(&pres_buf);
-            const ppw = pres_fbs.writer();
-            const presence_xml = stanza: {
-                ppw.writeAll("<presence from='") catch break :stanza null;
-                xml.escapeWrite(ppw, contact.local) catch break :stanza null;
-                ppw.writeByte('@') catch break :stanza null;
-                xml.escapeWrite(ppw, contact.domain) catch break :stanza null;
-                ppw.writeByte('/') catch break :stanza null;
-                xml.escapeWrite(ppw, entry.resource()) catch break :stanza null;
-                ppw.writeAll("' to='") catch break :stanza null;
-                xml.escapeWrite(ppw, to_str) catch break :stanza null;
-                ppw.writeByte('\'') catch break :stanza null;
-                if (contact_inner.len > 0) {
-                    ppw.writeByte('>') catch break :stanza null;
-                    ppw.writeAll(contact_inner) catch break :stanza null;
-                    ppw.writeAll("</presence>") catch break :stanza null;
-                } else {
-                    ppw.writeAll("/>") catch break :stanza null;
-                }
-                break :stanza pres_fbs.getWritten();
-            } orelse {
-                noteJidOverflow("contact presence for '{s}@{s}' exceeds {d} bytes; skipped", .{ contact.local, contact.domain, pres_buf.len });
-                continue;
-            };
-
-            // The presence stanza is directed TO us (the session that just
-            // became available). Deliver locally regardless of which worker
-            // the contact is on — we already have their resource from the
-            // session map; no need to ask the remote worker.
-            if (session.stanza(presence_xml) == .failed_closed) continue;
+        var ctx = ProbeCtx{ .server = server, .session = session, .to_str = to_str };
+        for (parts_buf[0..parts_len]) |contact| {
+            const n = sm.collectAvailable(contact.local, contact.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+            for (server.fanout_entries[0..n]) |*entry| ctx.deliver(contact, entry);
         }
 
         contact_i = end;
@@ -637,12 +606,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
     const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
-    // Build owner bare JID
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-        return;
-    };
+    const owner_bare = session.stream.boundBare();
 
     // Update owner's roster: set ask='subscribe' (preserve existing name/subscription)
     var result_sub: Subscription = .none;
@@ -701,12 +665,7 @@ fn handleSubscribe(server: *Server, session: *Session, inner_xml: []const u8, ch
             log.info("{s} subscribing to {s}", .{ owner_bare, to_str });
             return;
         };
-        const target_count = blk: {
-            var lease_b = server.leaseScratch(.b);
-            defer lease_b.release();
-            break :blk sm.findAvailableByBareJid(to_jid.local, to_jid.domain, lease_b.entries);
-        };
-        if (target_count > 0) {
+        if (sm.isAvailable(to_jid.local, to_jid.domain)) {
             deliverPresenceToTarget(server, to_jid.local, to_jid.domain, sub_pres_xml, changes);
         } else {
             // Target is offline: store for deferred delivery.
@@ -726,12 +685,7 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
-    // Build owner bare JID
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-        return;
-    };
+    const owner_bare = session.stream.boundBare();
 
     // Update our roster: contact's subscription gains "from" direction
     var owner_new_sub: Subscription = .from;
@@ -817,50 +771,55 @@ fn handleSubscribed(server: *Server, session: *Session, inner_xml: []const u8, c
     if (sd_sm.findByFullJid(bound.local, bound.domain, bound.resource)) |ent| {
         if (ent.presence_available) {
             const own_inner = session.last_presence_inner[0..session.last_presence_inner_len];
-            broadcastPresence(server, bound.local, bound.domain, bound.resource, own_inner, changes);
+            broadcastPresence(server, session, own_inner, changes);
         }
     }
 
     // RFC 6121 §3.1.5: Send the contact's current presence to the approver.
     // The approver now has 'from' the contact = contact's presence should be visible.
     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
-        var lease_b = server.leaseScratch(.b);
-        defer lease_b.release();
-        const probe_entries = lease_b.entries;
-        const probe_count = sd_sm.findAvailableByBareJid(to_jid.local, to_jid.domain, probe_entries);
-        for (probe_entries[0..probe_count]) |pentry| {
-            // Look up the contact's session to retrieve their stored presence inner XML.
-            const contact_inner = if (pentry.worker_id == server.worker_id) blk: {
-                const contact_sess = server.sessionForEventToken(pentry.token) orelse break :blk @as([]const u8, "");
-                break :blk contact_sess.last_presence_inner[0..contact_sess.last_presence_inner_len];
-            } else @as([]const u8, "");
+        const Ctx = struct {
+            server: *Server,
+            session: *Session,
+            to_jid: xmpp.Jid,
 
-            var cpres_buf: [4608]u8 = undefined;
-            var cpres_fbs = std.io.fixedBufferStream(&cpres_buf);
-            const cpw = cpres_fbs.writer();
-            const cpres_xml = stanza: {
-                cpw.writeAll("<presence from='") catch break :stanza null;
-                xml.escapeWrite(cpw, to_jid.local) catch break :stanza null;
-                cpw.writeByte('@') catch break :stanza null;
-                xml.escapeWrite(cpw, to_jid.domain) catch break :stanza null;
-                cpw.writeByte('/') catch break :stanza null;
-                xml.escapeWrite(cpw, pentry.resource()) catch break :stanza null;
-                cpw.writeByte('\'') catch break :stanza null;
-                if (contact_inner.len > 0) {
-                    cpw.writeByte('>') catch break :stanza null;
-                    cpw.writeAll(contact_inner) catch break :stanza null;
-                    cpw.writeAll("</presence>") catch break :stanza null;
-                } else {
-                    cpw.writeAll("/>") catch break :stanza null;
-                }
-                break :stanza cpres_fbs.getWritten();
-            } orelse {
-                noteJidOverflow("contact presence '{s}@{s}' exceeds {d} bytes; skipped", .{ to_jid.local, to_jid.domain, cpres_buf.len });
-                continue;
-            };
             // Deliver to the approver's session
-            if (session.stanza(cpres_xml) == .failed_closed) continue;
-        }
+            fn deliver(ctx: *@This(), pentry: *const session_map_mod.SessionEntry) void {
+                // Look up the contact's session to retrieve their stored presence inner XML.
+                const contact_inner = if (pentry.worker_id == ctx.server.worker_id) blk: {
+                    const contact_sess = ctx.server.sessionForEventToken(pentry.token) orelse break :blk @as([]const u8, "");
+                    break :blk contact_sess.last_presence_inner[0..contact_sess.last_presence_inner_len];
+                } else @as([]const u8, "");
+
+                var cpres_buf: [4608]u8 = undefined;
+                var cpres_fbs = std.io.fixedBufferStream(&cpres_buf);
+                const cpw = cpres_fbs.writer();
+                const cpres_xml = stanza: {
+                    cpw.writeAll("<presence from='") catch break :stanza null;
+                    xml.escapeWrite(cpw, ctx.to_jid.local) catch break :stanza null;
+                    cpw.writeByte('@') catch break :stanza null;
+                    xml.escapeWrite(cpw, ctx.to_jid.domain) catch break :stanza null;
+                    cpw.writeByte('/') catch break :stanza null;
+                    xml.escapeWrite(cpw, pentry.resource()) catch break :stanza null;
+                    cpw.writeByte('\'') catch break :stanza null;
+                    if (contact_inner.len > 0) {
+                        cpw.writeByte('>') catch break :stanza null;
+                        cpw.writeAll(contact_inner) catch break :stanza null;
+                        cpw.writeAll("</presence>") catch break :stanza null;
+                    } else {
+                        cpw.writeAll("/>") catch break :stanza null;
+                    }
+                    break :stanza cpres_fbs.getWritten();
+                } orelse {
+                    noteJidOverflow("contact presence '{s}@{s}' exceeds {d} bytes; skipped", .{ ctx.to_jid.local, ctx.to_jid.domain, cpres_buf.len });
+                    return;
+                };
+                _ = ctx.session.stanza(cpres_xml);
+            }
+        };
+        var ctx: Ctx = .{ .server = server, .session = session, .to_jid = to_jid };
+        const n = sd_sm.collectAvailable(to_jid.local, to_jid.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+        for (server.fanout_entries[0..n]) |*pentry| ctx.deliver(pentry);
     }
 
     log.info("{s} approved subscription from {s}", .{ owner_bare, to_str });
@@ -875,11 +834,7 @@ fn handleUnsubscribe(server: *Server, session: *Session, inner_xml: []const u8, 
     const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-        return;
-    };
+    const owner_bare = session.stream.boundBare();
 
     // Update our roster: remove "to" direction
     var owner_new_sub: Subscription = .none;
@@ -961,11 +916,7 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     const to_str = session.stanza_to;
     if (to_str.len == 0) return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const owner_bare = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("owner bare JID '{s}@{s}' exceeds {d} bytes; subscription stanza dropped", .{ bound.local, bound.domain, router.BARE_JID_MAX });
-        return;
-    };
+    const owner_bare = session.stream.boundBare();
 
     // Update our roster: remove "from" direction
     var owner_new_sub: Subscription = .none;
@@ -1016,11 +967,22 @@ fn handleUnsubscribed(server: *Server, session: *Session, inner_xml: []const u8,
     const to_jid = to_jid_parsed;
     if (std.mem.eql(u8, to_jid.domain, server.server_host)) {
         const unsub_sm = server.session_map orelse return;
-        var lease_b = server.leaseScratch(.b);
-        defer lease_b.release();
-        const owner_entries = lease_b.entries;
-        const owner_count = unsub_sm.findAvailableByBareJid(bound.local, bound.domain, owner_entries);
-        for (owner_entries[0..owner_count]) |oent| {
+
+        // Each owner resource needs its own stanza ('from' carries the
+        // resource), and deliverPresenceToTarget resolves the contact's
+        // resources with its own collect, which would overwrite the shared
+        // fan-out scratch mid-iteration. The owner list is a private copy,
+        // bounded by the configured per-account resource cap.
+        const owner_entries = blk: {
+            const n = unsub_sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+            break :blk server.allocator.dupe(SessionEntry, server.fanout_entries[0..n]) catch {
+                noteDrop("unavailable stanza fan-out for '{s}' not collected: out of memory", .{to_str});
+                break :blk @as([]SessionEntry, &.{});
+            };
+        };
+        defer if (owner_entries.len > 0) server.allocator.free(owner_entries);
+
+        for (owner_entries) |*oent| {
             var unavail_buf: [router.JID_STANZA_MAX]u8 = undefined;
             var unavail_fbs = std.io.fixedBufferStream(&unavail_buf);
             const uw = unavail_fbs.writer();
@@ -1105,15 +1067,12 @@ fn storePendingSubscription(server: *Server, contact_bare: []const u8, sub_pres_
 
 /// Deliver any pending subscription requests to a user who just became available.
 /// Called from dispatchPresence on initial available presence.
-pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []const u8, domain: []const u8, changes: *ChangeList) void {
+pub fn deliverPendingSubscriptions(server: *Server, session: *Session, changes: *ChangeList) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const roster = server.roster orelse return;
+    if (session.stream.bound_jid == null) return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(local, domain, &bare_buf) catch {
-        noteDrop("deliverPendingSubscriptions: bare JID too long for {s}@{s}", .{ local, domain });
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     // Prefix scan: all keys starting with "contact_bare\x00"
     var prefix_buf: [store_keys.MAX_KEY_LEN]u8 = undefined;
@@ -1150,20 +1109,13 @@ pub fn deliverPendingSubscriptions(server: *Server, session: *Session, local: []
 fn broadcastToOwnResources(
     server: *Server,
     sender_session: *Session,
-    local: []const u8,
-    domain: []const u8,
-    resource: []const u8,
     changes: *ChangeList,
 ) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
+    const bound = sender_session.stream.bound_jid orelse return;
 
-    // Build the from full JID
-    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const from_str = router.buildFullJid(local, domain, resource, &from_buf) catch {
-        noteJidOverflow("own-resources presence from '{s}@{s}/{s}' exceeds {d} bytes; skipped", .{ local, domain, resource, router.FULL_JID_MAX });
-        return;
-    };
+    const from_str = sender_session.stream.boundFull();
 
     // Build presence stanza including inner XML (priority, show, status, etc.)
     // Stays live across the delivery loop below, so it is leased (S18).
@@ -1197,22 +1149,25 @@ fn broadcastToOwnResources(
         return;
     };
 
-    var lease_b = server.leaseScratch(.b);
-    defer lease_b.release();
-    const entries = lease_b.entries;
-    const count = sm.findByBareJid(local, domain, entries);
+    const OwnCtx = struct {
+        server: *Server,
+        presence_xml: []const u8,
 
-    for (entries[0..count]) |entry| {
-        if (entry.worker_id == server.worker_id) {
-            const target = server.sessionForEventToken(entry.token) orelse continue;
-            // stanza() handles the T153 detached case: it tracks for
-            // resume replay and reports tracked_detached.
-            if (target.stanza(presence_xml) == .failed_closed) continue;
-            _ = target.conn.flushSend() catch {};
-        } else if (server.delivery_system) |ds| {
-            ds.deliver(server.worker_id, entry.worker_id, entry.token, presence_xml) catch {};
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
+            if (entry.worker_id == ctx.server.worker_id) {
+                const target = ctx.server.sessionForEventToken(entry.token) orelse return;
+                // stanza() handles the T153 detached case: it tracks for
+                // resume replay and reports tracked_detached.
+                if (target.stanza(ctx.presence_xml) == .failed_closed) return;
+                _ = target.conn.flushSend() catch {};
+            } else if (ctx.server.delivery_system) |ds| {
+                ds.deliver(ctx.server.worker_id, entry.worker_id, entry.token, ctx.presence_xml) catch {};
+            }
         }
-    }
+    };
+    var own_ctx = OwnCtx{ .server = server, .presence_xml = presence_xml };
+    const n = sm.collectBound(bound.local, bound.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+    for (server.fanout_entries[0..n]) |*entry| own_ctx.deliver(entry);
 }
 
 /// RFC 6121 §4.4.2 (reverse direction): When a new resource becomes available,
@@ -1221,51 +1176,51 @@ fn broadcastToOwnResources(
 fn sendOtherResourcesPresence(
     server: *Server,
     new_session: *Session,
-    local: []const u8,
-    domain: []const u8,
-    new_resource: []const u8,
     changes: *ChangeList,
 ) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
+    const bound = new_session.stream.bound_jid orelse return;
 
-    var lease_b = server.leaseScratch(.b);
-    defer lease_b.release();
-    const entries = lease_b.entries;
-    const count = sm.findAvailableByBareJid(local, domain, entries);
+    const OtherCtx = struct {
+        new_session: *Session,
+        bare: []const u8,
+        new_resource: []const u8,
 
-    for (entries[0..count]) |entry| {
-        const entry_resource = entry.resource();
-        // Skip self — the new resource already knows its own presence.
-        if (std.mem.eql(u8, entry_resource, new_resource)) continue;
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
+            const entry_resource = entry.resource();
+            // Skip self - the new resource already knows its own presence.
+            if (std.mem.eql(u8, entry_resource, ctx.new_resource)) return;
 
-        // Build presence from the existing resource with its current priority.
-        var pres_buf: [router.JID_STANZA_MAX]u8 = undefined;
-        var pres_fbs = std.io.fixedBufferStream(&pres_buf);
-        const pw = pres_fbs.writer();
-        const presence_xml = stanza: {
-            pw.writeAll("<presence from='") catch break :stanza null;
-            xml.escapeWrite(pw, local) catch break :stanza null;
-            pw.writeByte('@') catch break :stanza null;
-            xml.escapeWrite(pw, domain) catch break :stanza null;
-            pw.writeByte('/') catch break :stanza null;
-            xml.escapeWrite(pw, entry_resource) catch break :stanza null;
-            pw.writeByte('\'') catch break :stanza null;
-            if (entry.priority != 0) {
-                pw.writeAll("><priority>") catch break :stanza null;
-                pw.print("{d}", .{entry.priority}) catch break :stanza null;
-                pw.writeAll("</priority></presence>") catch break :stanza null;
-            } else {
-                pw.writeAll("/>") catch break :stanza null;
-            }
-            break :stanza pres_fbs.getWritten();
-        } orelse {
-            noteJidOverflow("other-resource presence '{s}@{s}/{s}' exceeds {d} bytes; skipped", .{ local, domain, entry_resource, router.JID_STANZA_MAX });
-            continue;
-        };
+            // Build presence from the existing resource with its current priority.
+            var pres_buf: [router.JID_STANZA_MAX]u8 = undefined;
+            var pres_fbs = std.io.fixedBufferStream(&pres_buf);
+            const pw = pres_fbs.writer();
+            const presence_xml = stanza: {
+                pw.writeAll("<presence from='") catch break :stanza null;
+                xml.escapeWrite(pw, ctx.bare) catch break :stanza null;
+                pw.writeByte('/') catch break :stanza null;
+                xml.escapeWrite(pw, entry_resource) catch break :stanza null;
+                pw.writeByte('\'') catch break :stanza null;
+                if (entry.priority != 0) {
+                    pw.writeAll("><priority>") catch break :stanza null;
+                    pw.print("{d}", .{entry.priority}) catch break :stanza null;
+                    pw.writeAll("</priority></presence>") catch break :stanza null;
+                } else {
+                    pw.writeAll("/>") catch break :stanza null;
+                }
+                break :stanza pres_fbs.getWritten();
+            } orelse {
+                noteJidOverflow("other-resource presence '{s}/{s}' exceeds {d} bytes; skipped", .{ ctx.bare, entry_resource, router.JID_STANZA_MAX });
+                return;
+            };
 
-        if (new_session.stanza(presence_xml) == .failed_closed) continue;
-    }
+            _ = ctx.new_session.stanza(presence_xml);
+        }
+    };
+    var other_ctx = OtherCtx{ .new_session = new_session, .bare = new_session.stream.boundBare(), .new_resource = bound.resource };
+    const n = sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+    for (server.fanout_entries[0..n]) |*entry| other_ctx.deliver(entry);
 }
 
 /// RFC 6121 §8.5.2.1.2: Dispatch directed presence to all available resources
@@ -1282,14 +1237,9 @@ pub fn dispatchDirectedPresenceToBareJid(
     defer sender_session.resetStanza();
 
     const sm = server.session_map orelse return;
-    const bound = sender_session.stream.bound_jid orelse return;
+    if (sender_session.stream.bound_jid == null) return;
 
-    // Build the from full JID
-    var from_buf: [router.FULL_JID_MAX]u8 = undefined;
-    const from_str = router.buildFullJid(bound.local, bound.domain, bound.resource, &from_buf) catch {
-        noteJidOverflow("directed presence from '{s}@{s}/{s}' exceeds {d} bytes; dropped", .{ bound.local, bound.domain, bound.resource, router.FULL_JID_MAX });
-        return;
-    };
+    const from_str = sender_session.stream.boundFull();
 
     // Build presence stanza with inner XML. Stays live across the delivery
     // loop below, so it is leased (S18).
@@ -1324,30 +1274,34 @@ pub fn dispatchDirectedPresenceToBareJid(
     };
 
     // Deliver to all available resources of the target bare JID
-    var lease_b = server.leaseScratch(.b);
-    defer lease_b.release();
-    const entries = lease_b.entries;
-    const count = sm.findAvailableByBareJid(target_local, target_domain, entries);
+    const DirectedCtx = struct {
+        server: *Server,
+        presence_xml: []const u8,
 
-    for (entries[0..count]) |entry| {
-        if (entry.worker_id == server.worker_id) {
-            const target = server.sessionForEventToken(entry.token) orelse continue;
-            fanout.deliverToSession(target, presence_xml, entry.token.index);
-        } else if (server.delivery_system) |ds| {
-            ds.deliver(server.worker_id, entry.worker_id, entry.token, presence_xml) catch {};
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
+            if (entry.worker_id == ctx.server.worker_id) {
+                const target = ctx.server.sessionForEventToken(entry.token) orelse return;
+                fanout.deliverToSession(target, ctx.presence_xml, entry.token.index);
+            } else if (ctx.server.delivery_system) |ds| {
+                ds.deliver(ctx.server.worker_id, entry.worker_id, entry.token, ctx.presence_xml) catch {};
+            }
         }
-    }
+    };
+    var directed_ctx = DirectedCtx{ .server = server, .presence_xml = presence_xml };
+    const n = sm.collectAvailable(target_local, target_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+    for (server.fanout_entries[0..n]) |*entry| directed_ctx.deliver(entry);
 }
 
 /// Deliver a presence stanza to all available sessions of subscriber JIDs.
 /// Handles local delivery + cross-thread MPSC + S2S forwarding.
 ///
 /// T130 batching: subscribers are processed in fixed-size chunks. Per chunk,
-/// the session-map resolution happens in ONE shared-lock hold
-/// (findAvailableByBareJidBatch) and each remote worker's MPSC queue gets a
+/// each JID resolves under one shared-lock hold on its own shard
+/// (collectAvailable copies the routing entries; delivery then runs on the
+/// copies) and each remote worker's MPSC queue gets a
 /// single pipe wake regardless of how many target sessions it has
 /// (enqueue + one wakeWorker), instead of a lock per JID and a pipe write
-/// per session. Chunking caps stack usage at 32 subscribers x 16 resources.
+/// per session. Chunking caps stack usage at 32 subscriber JIDs.
 fn deliverPresenceToSubscribers(
     server: *Server,
     subscriber_jids: []const []const u8,
@@ -1357,16 +1311,33 @@ fn deliverPresenceToSubscribers(
 ) void {
     const sm = server.session_map orelse return;
 
-    // S18: chunk scratch is heap, sized to the session map's resource
-    // cap (SUBS_PER_CHUNK * cap), so a chunk cannot truncate.
-    const SUBS_PER_CHUNK = Server.SCRATCH_CHUNK_JIDS;
+    const SubsCtx = struct {
+        server: *Server,
+        presence_xml: []const u8,
+        /// Remote workers that received at least one enqueue this chunk.
+        pending_workers: [metrics.MAX_WORKERS]bool = .{false} ** metrics.MAX_WORKERS,
+
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
+            if (entry.worker_id == ctx.server.worker_id) {
+                const target_session = ctx.server.sessionForEventToken(entry.token) orelse return;
+                fanout.deliverToSession(target_session, ctx.presence_xml, entry.token.index);
+            } else if (ctx.server.delivery_system) |ds| {
+                ds.enqueue(ctx.server.worker_id, entry.worker_id, entry.token, ctx.presence_xml) catch {
+                    // A full remote queue drops this copy; the worker is
+                    // not marked pending since nothing was enqueued.
+                    return;
+                };
+                if (entry.worker_id < metrics.MAX_WORKERS) ctx.pending_workers[entry.worker_id] = true;
+            }
+        }
+    };
 
     var i: usize = 0;
     while (i < subscriber_jids.len) {
         // Pass 1: blocklist filter, S2S split, collect local-domain JIDs.
-        var parts_buf: [SUBS_PER_CHUNK]session_map_mod.JidParts = undefined;
+        var parts_buf: [Server.PRESENCE_CHUNK_JIDS]session_map_mod.JidParts = undefined;
         var parts_len: usize = 0;
-        const end = @min(i + SUBS_PER_CHUNK, subscriber_jids.len);
+        const end = @min(i + Server.PRESENCE_CHUNK_JIDS, subscriber_jids.len);
         for (subscriber_jids[i..end]) |sub_bare_jid| {
             // XEP-0191: Skip subscribers who have blocked us
             if (server.block_store) |bs| {
@@ -1387,31 +1358,17 @@ fn deliverPresenceToSubscribers(
             parts_len += 1;
         }
 
-        // Resolve the whole chunk under one lock hold.
-        var lease_a = server.leaseScratch(.a);
-        defer lease_a.release();
-        const entries = lease_a.entries;
-        const count = sm.findAvailableByBareJidBatch(parts_buf[0..parts_len], entries, null);
-
-        // Local targets deliver inline.
-        for (entries[0..count]) |entry| {
-            if (entry.worker_id != server.worker_id) continue;
-            const target_session = server.sessionForEventToken(entry.token) orelse continue;
-            fanout.deliverToSession(target_session, presence_xml, entry.token.index);
+        var subs_ctx = SubsCtx{ .server = server, .presence_xml = presence_xml };
+        for (parts_buf[0..parts_len]) |part| {
+            const n = sm.collectAvailable(part.local, part.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+            for (server.fanout_entries[0..n]) |*entry| subs_ctx.deliver(entry);
         }
 
-        // Remote targets: bucket by worker, wake each worker once.
+        // Remote targets: wake each worker that got an enqueue, once.
         if (server.delivery_system) |ds| {
             var w: u16 = 0;
-            while (w < ds.worker_count) : (w += 1) {
-                if (w == server.worker_id) continue;
-                var pending = false;
-                for (entries[0..count]) |entry| {
-                    if (entry.worker_id != w) continue;
-                    ds.enqueue(server.worker_id, w, entry.token, presence_xml) catch continue;
-                    pending = true;
-                }
-                if (pending) ds.wakeWorker(w);
+            while (w < @min(ds.worker_count, metrics.MAX_WORKERS)) : (w += 1) {
+                if (w != server.worker_id and subs_ctx.pending_workers[w]) ds.wakeWorker(w);
             }
         }
 
@@ -1430,20 +1387,23 @@ pub fn deliverPresenceToTarget(
 ) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
-    // Leaf delivery: bank C so callers iterating bank B keep their results.
-    var lease_c = server.leaseScratch(.c);
-    defer lease_c.release();
-    const entries = lease_c.entries;
-    const count = sm.findByBareJid(target_local, target_domain, entries);
 
-    for (entries[0..count]) |ent| {
-        if (ent.worker_id == server.worker_id) {
-            const target_session = server.sessionForEventToken(ent.token) orelse continue;
-            fanout.deliverToSession(target_session, presence_xml, ent.token.index);
-        } else if (server.delivery_system) |ds| {
-            ds.deliver(server.worker_id, ent.worker_id, ent.token, presence_xml) catch {};
+    const TargetCtx = struct {
+        server: *Server,
+        presence_xml: []const u8,
+
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
+            if (entry.worker_id == ctx.server.worker_id) {
+                const target_session = ctx.server.sessionForEventToken(entry.token) orelse return;
+                fanout.deliverToSession(target_session, ctx.presence_xml, entry.token.index);
+            } else if (ctx.server.delivery_system) |ds| {
+                ds.deliver(ctx.server.worker_id, entry.worker_id, entry.token, ctx.presence_xml) catch {};
+            }
         }
-    }
+    };
+    var target_ctx = TargetCtx{ .server = server, .presence_xml = presence_xml };
+    const n = sm.collectBound(target_local, target_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+    for (server.fanout_entries[0..n]) |*entry| target_ctx.deliver(entry);
 }
 
 test "S4: subscription presence with an over-long to gets jid-malformed" {
@@ -1460,7 +1420,7 @@ test "S4: subscription presence with an over-long to gets jid-malformed" {
     const session = try allocator.create(Session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     server.sessions[0] = session;
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     session.stream.authenticated_jid = session.stream.bound_jid;
 
     // 600-byte target: inside the stanza budget but over a 511-byte store key.
@@ -1501,9 +1461,9 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
     var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
     server.roster = &roster;
 
-    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     // Sender alice has two available resources. Only the sending one needs a
     // live session; the fan-out targets the contact.
@@ -1513,7 +1473,7 @@ test "S18: unsubscribed fan-out keeps the owner's own resources" {
     const alice = try allocator.create(Session);
     alice.init(alice_fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = alice;
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/desk") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/desk") catch null);
     alice.stream.authenticated_jid = alice.stream.bound_jid;
 
     // Contact bob has two available resources. The second one is what an
@@ -1575,9 +1535,9 @@ test "S1: subscription presence escapes the owner bare JID" {
     var roster = generic_roster.RosterStore(server_mod.OpBackendType).init(&db);
     server.roster = &roster;
 
-    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     var owner_fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &owner_fds));
@@ -1585,7 +1545,7 @@ test "S1: subscription presence escapes the owner bare JID" {
     const owner = try allocator.create(Session);
     owner.init(owner_fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = owner;
-    owner.stream.bound_jid = .{ .local = "o'wner", .domain = "localhost", .resource = "desk" };
+    owner.stream.setBoundJid(.{ .local = "o'wner", .domain = "localhost", .resource = "desk" });
     owner.stanza_to = "bob@localhost";
 
     var bob_fds: [2]posix.fd_t = undefined;
@@ -1644,11 +1604,11 @@ test "A62: pending-subscription delivery for a 256-byte bare JID" {
     const session = try allocator.create(Session);
     session.init(fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = session;
-    session.stream.bound_jid = .{ .local = local, .domain = "localhost", .resource = "res" };
+    session.stream.setBoundJid(.{ .local = local, .domain = "localhost", .resource = "res" });
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
-    deliverPendingSubscriptions(&server, session, local, "localhost", &changes);
+    deliverPendingSubscriptions(&server, session, &changes);
 
     _ = try session.conn.flushSend();
     var rbuf: [2048]u8 = undefined;
@@ -1685,17 +1645,19 @@ test "A62: oversized bare JIDs skip pending-subscription delivery" {
     var changes = ChangeList.init(&change_buf);
     var rbuf: [64]u8 = undefined;
 
-    // 511-byte bare JID: builds, but the bare\x00 prefix exceeds MAX_KEY_LEN.
+    // 511-byte bare JID: binds, but the bare\x00 prefix exceeds MAX_KEY_LEN.
     var big_local: [1023]u8 = undefined;
     @memset(&big_local, 'l');
-    deliverPendingSubscriptions(&server, session, big_local[0..501], "localhost", &changes);
+    session.stream.setBoundJid(.{ .local = big_local[0..501], .domain = "localhost" });
+    deliverPendingSubscriptions(&server, session, &changes);
     const n1 = posix.read(fds[1], &rbuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n1);
 
-    // RFC 7622 maximum bare JID (2047 bytes) exceeds BARE_JID_MAX entirely.
+    // RFC 7622 maximum bare JID (2047 bytes) is far over the key bound too.
     var big_domain: [1023]u8 = undefined;
     @memset(&big_domain, 'd');
-    deliverPendingSubscriptions(&server, session, &big_local, &big_domain, &changes);
+    session.stream.setBoundJid(.{ .local = &big_local, .domain = &big_domain });
+    deliverPendingSubscriptions(&server, session, &changes);
     const n2 = posix.read(fds[1], &rbuf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n2);
 }
@@ -1716,9 +1678,9 @@ test "A62: block check sees a >256-byte recipient JID in full" {
     var bs = @import("block_store").BlockStore(server_mod.OpBackendType).init(&db);
     server.block_store = &bs;
 
-    var sm = session_map_mod.SessionMap.init(allocator, false, 0);
+    var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
 
     // Sender alice, bound and live.
     var alice_fds: [2]posix.fd_t = undefined;
@@ -1727,7 +1689,7 @@ test "A62: block check sees a >256-byte recipient JID in full" {
     const alice = try allocator.create(Session);
     alice.init(alice_fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = alice;
-    alice.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    alice.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
 
     // Two recipients with 300-byte bare JIDs (290-byte localpart).
     var rbuf: [290]u8 = undefined;
@@ -1788,4 +1750,45 @@ test "A62: block check sees a >256-byte recipient JID in full" {
     const n_open = posix.read(o_fds[1], &drain) catch 0;
     try std.testing.expect(n_open > 0);
     try std.testing.expect(std.mem.indexOf(u8, drain[0..n_open], "from='alice@localhost/res'") != null);
+}
+
+test "C6: an over-512-byte bound bare still sees its other resources' presence" {
+    const posix = std.posix;
+    const allocator = std.testing.allocator;
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var sm = try session_map_mod.SessionMap.init(allocator, 1, 0);
+    defer sm.deinit();
+    try server.configureSessionMap(&sm);
+
+    // 612-byte bare JID: legal under RFC 7622 but wider than the stack
+    // scratch this fan-out used to build the bare into, which skipped it.
+    var big_local: [600]u8 = undefined;
+    @memset(&big_local, 'l');
+    const local = big_local[0..];
+
+    // The already-present resource the new resource must be told about.
+    _ = try sm.bind(0, server.sessionToken(4), local, "localhost", "desk");
+    sm.setPresenceAvailable(local, "localhost", "desk", true);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds));
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.init(fds[0], 1, server.server_host, false, allocator);
+    server.sessions[1] = session;
+    session.stream.setBoundJid(.{ .local = local, .domain = "localhost", .resource = "phone" });
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    sendOtherResourcesPresence(&server, session, &changes);
+
+    _ = try session.conn.flushSend();
+    var rbuf: [2048]u8 = undefined;
+    const n = posix.read(fds[1], &rbuf) catch 0;
+    const got = rbuf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, got, "<presence from='") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "/desk'") != null);
 }

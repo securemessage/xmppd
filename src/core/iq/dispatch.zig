@@ -893,15 +893,10 @@ fn handleRosterGet(server: *Server, session: *Session, iq_id: []const u8, change
         return;
     };
 
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     // Build bare JID for roster lookup
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     // Get all roster items via the store's domain API
     const items = roster.getAllItems(server.allocator, bare_jid) catch {
@@ -1010,12 +1005,7 @@ fn handleRosterSet(server: *Server, session: *Session, iq_id: []const u8, change
     };
 
     // Build bare JID for roster lookup
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     // S4: the store key joins owner + contact into a bounded buffer; a
     // contact JID that cannot fit must be rejected at ingress instead of
@@ -1347,15 +1337,10 @@ fn handleMamQuery(server: *Server, session: *Session, iq_id: []const u8, changes
         return;
     };
 
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     // Build bare JID for archive lookup
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     // Parse max from text (default 50)
     const max: u32 = if (session.mam_max.len > 0)
@@ -1440,12 +1425,7 @@ fn handleMucMamQuery(server: *Server, session: *Session, room_local: []const u8,
     if (owner != server.worker_id) {
         // Route to owning worker — they have the archive data
         log.info("routing MAM query for room {s} to owning worker {d} (from {d})", .{ room_jid, owner, server.worker_id });
-        const bound = session.stream.bound_jid orelse return;
-        var jid_buf: [router.FULL_JID_MAX]u8 = undefined;
-        const requester_jid = router.buildFullJid(bound.local, bound.domain, bound.resource, &jid_buf) catch {
-            noteJidOverflow("connection {d} bound full JID exceeds {d} bytes; MAM forward skipped", .{ session.conn.id, router.FULL_JID_MAX });
-            return;
-        };
+        const requester_jid = session.stream.boundFull();
 
         // T173: capture the requester's ABA generation here, where its session
         // is live — the reply's ds.deliver() validates it.
@@ -1598,7 +1578,7 @@ fn handleLastActivitySelfOrServer(server: *Server, session: *Session, iq_id: []c
 /// resource teardown; no record (or no store) is indistinguishable from a
 /// nonexistent account per the vCard anti-harvesting precedent.
 fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, to_jid: @import("xmpp").Jid) void {
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     if (!std.ascii.eqlIgnoreCase(to_jid.domain, server.server_host)) {
         sendIqError(server, session, iq_id, "service-unavailable");
@@ -1612,12 +1592,7 @@ fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, 
         return;
     };
 
-    var requester_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const requester_bare = router.buildBareJid(bound.local, bound.domain, &requester_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const requester_bare = session.stream.boundBare();
 
     const roster = server.roster orelse {
         sendIqError(server, session, iq_id, "item-not-found");
@@ -1631,8 +1606,7 @@ fn handleLastActivityFor(server: *Server, session: *Session, iq_id: []const u8, 
 
     // Online anywhere (bound — SM-detached included) => 0.
     if (server.session_map) |sm| {
-        var probe: [1]SessionEntry = undefined;
-        if (sm.findByBareJid(to_jid.local, to_jid.domain, &probe) > 0) {
+        if (sm.hasBound(to_jid.local, to_jid.domain)) {
             sendLastActivityResult(server, session, iq_id, 0);
             return;
         }
@@ -1661,15 +1635,9 @@ pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []
     try xml.escapeWrite(w, from);
     try w.writeByte('\'');
     // to = client's full JID
-    if (session.stream.bound_jid) |bound| {
+    if (session.stream.bound_jid != null) {
         try w.writeAll(" to='");
-        try xml.escapeWrite(w, bound.local);
-        try w.writeByte('@');
-        try xml.escapeWrite(w, bound.domain);
-        if (bound.resource.len > 0) {
-            try w.writeByte('/');
-            try xml.escapeWrite(w, bound.resource);
-        }
+        try xml.escapeWrite(w, session.stream.boundFull());
         try w.writeByte('\'');
     }
     if (iq_id.len > 0) {
@@ -1683,15 +1651,10 @@ pub fn writeIqHeader(server: *Server, w: anytype, session: *Session, iq_type: []
 /// Uses multiple queueSend calls to avoid write_scratch overflow when
 /// the stored vCard XML is large (vcard_buf and write_scratch are both 4KB).
 fn handleVcardGet(server: *Server, session: *Session, iq_id: []const u8) void {
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     // Build bare JID
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     var fbs = std.io.fixedBufferStream(&session.write_scratch);
     const w = fbs.writer();
@@ -1799,7 +1762,7 @@ fn handleVcardGetFor(server: *Server, session: *Session, iq_id: []const u8, targ
 
 /// Handle vCard-temp SET — persist accumulated vCard XML from session.vcard_buf.
 fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
     if (session.vcard_overflow) {
         noteDrop("connection {d} vCard exceeds {d} bytes: not-acceptable", .{ session.conn.id, session.vcard_buf.len });
         sendIqErrorWithType(server, session, iq_id, "modify", "not-acceptable");
@@ -1807,12 +1770,7 @@ fn handleVcardSet(server: *Server, session: *Session, iq_id: []const u8) void {
     }
 
     // Build bare JID
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     const vcard_xml = session.vcard_buf[0..session.vcard_buf_len];
 
@@ -1847,15 +1805,10 @@ fn handlePepPublish(server: *Server, session: *Session, iq_id: []const u8, chang
         sendIqError(server, session, iq_id, "item-not-found");
         return;
     };
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
     // Build bare JID
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     const node = session.iq_pep_node;
     if (node.len == 0) {
@@ -1949,7 +1902,7 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
     }
 
     // The target user is the IQ 'to' attribute, or self if not specified
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
     var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
     const iq_to = session.iq_to;
     const bare_jid = jid: {
@@ -1973,11 +1926,7 @@ fn handlePepItems(server: *Server, session: *Session, iq_id: []const u8, changes
             };
         }
         // Query own PEP node
-        break :jid router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-            noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-            sendIqError(server, session, iq_id, "internal-server-error");
-            return;
-        };
+        break :jid session.stream.boundBare();
     };
 
     // Check if a specific item ID was requested
@@ -2062,15 +2011,9 @@ fn writePepIqHeader(w: anytype, from_bare: []const u8, session: *Session, iq_typ
     try w.writeAll(" from='");
     try xml.escapeWrite(w, from_bare);
     try w.writeByte('\'');
-    if (session.stream.bound_jid) |bound_val| {
+    if (session.stream.bound_jid != null) {
         try w.writeAll(" to='");
-        try xml.escapeWrite(w, bound_val.local);
-        try w.writeByte('@');
-        try xml.escapeWrite(w, bound_val.domain);
-        if (bound_val.resource.len > 0) {
-            try w.writeByte('/');
-            try xml.escapeWrite(w, bound_val.resource);
-        }
+        try xml.escapeWrite(w, session.stream.boundFull());
         try w.writeByte('\'');
     }
     if (iq_id.len > 0) {
@@ -2129,65 +2072,63 @@ fn sendPepNotification(
     // Deliver to the publisher's own resources (self-notification per XEP-0163 §4.3)
     const bound = session.stream.bound_jid orelse return;
     {
-        var lease_self = server.leaseScratch(.b);
-        defer lease_self.release();
-        const self_entries = lease_self.entries;
-        const self_count = sm.findAvailableByBareJid(bound.local, bound.domain, self_entries);
-
         // One buffer reused per resource: deliverToSession and ds.deliver both
         // copy, so a resource's stanza is dead before the next is built (S18).
         var self_msg_lease = server.leaseByteScratch() orelse return;
         defer self_msg_lease.release();
 
-        for (self_entries[0..self_count]) |entry| {
-            if (entry.worker_id == server.worker_id) {
-                const target = server.sessionForEventToken(entry.token) orelse continue;
-                // XEP-0163 section 4.3: notify ALL subscribed resources including the publisher
+        const SelfCtx = struct {
+            server: *Server,
+            publisher_bare: []const u8,
+            local: []const u8,
+            domain: []const u8,
+            body_prefix_1: []const u8,
+            body_prefix_2: []const u8,
+            body_after_to: []const u8,
+            msg_buf: []u8,
 
-                var mfbs = std.io.fixedBufferStream(self_msg_lease.buf);
+            fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
+                // XEP-0163 section 4.3: notify ALL subscribed resources including the publisher
+                var mfbs = std.io.fixedBufferStream(ctx.msg_buf);
                 const mw = mfbs.writer();
                 const notif_xml = stanza: {
-                    mw.writeAll(body_prefix_1) catch break :stanza null;
-                    xml.escapeWrite(mw, publisher_bare) catch break :stanza null;
-                    mw.writeAll(body_prefix_2) catch break :stanza null;
-                    xml.escapeWrite(mw, bound.local) catch break :stanza null;
+                    mw.writeAll(ctx.body_prefix_1) catch break :stanza null;
+                    xml.escapeWrite(mw, ctx.publisher_bare) catch break :stanza null;
+                    mw.writeAll(ctx.body_prefix_2) catch break :stanza null;
+                    xml.escapeWrite(mw, ctx.local) catch break :stanza null;
                     mw.writeByte('@') catch break :stanza null;
-                    xml.escapeWrite(mw, bound.domain) catch break :stanza null;
+                    xml.escapeWrite(mw, ctx.domain) catch break :stanza null;
                     mw.writeByte('/') catch break :stanza null;
                     xml.escapeWrite(mw, entry.resource()) catch break :stanza null;
-                    mw.writeAll(body_after_to) catch break :stanza null;
+                    mw.writeAll(ctx.body_after_to) catch break :stanza null;
                     break :stanza mfbs.getWritten();
                 } orelse {
-                    noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ bound.local, bound.domain, entry.resource(), self_msg_lease.buf.len });
-                    continue;
+                    noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ ctx.local, ctx.domain, entry.resource(), ctx.msg_buf.len });
+                    return;
                 };
-                fanout.deliverToSession(target, notif_xml, entry.token.index);
-            } else {
-                // Cross-thread: build full stanza and deliver via MPSC
-                if (server.delivery_system) |ds| {
-                    var mfbs = std.io.fixedBufferStream(self_msg_lease.buf);
-                    const mw = mfbs.writer();
-                    const notif_xml = stanza: {
-                        mw.writeAll(body_prefix_1) catch break :stanza null;
-                        xml.escapeWrite(mw, publisher_bare) catch break :stanza null;
-                        mw.writeAll(body_prefix_2) catch break :stanza null;
-                        xml.escapeWrite(mw, bound.local) catch break :stanza null;
-                        mw.writeByte('@') catch break :stanza null;
-                        xml.escapeWrite(mw, bound.domain) catch break :stanza null;
-                        mw.writeByte('/') catch break :stanza null;
-                        xml.escapeWrite(mw, entry.resource()) catch break :stanza null;
-                        mw.writeAll(body_after_to) catch break :stanza null;
-                        break :stanza mfbs.getWritten();
-                    } orelse {
-                        noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ bound.local, bound.domain, entry.resource(), self_msg_lease.buf.len });
-                        continue;
-                    };
-                    ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, notif_xml, 0, 0, .pep) catch |err| {
+                if (entry.worker_id == ctx.server.worker_id) {
+                    const target = ctx.server.sessionForEventToken(entry.token) orelse return;
+                    fanout.deliverToSession(target, notif_xml, entry.token.index);
+                } else if (ctx.server.delivery_system) |ds| {
+                    // Cross-thread: deliver via MPSC
+                    ds.deliverDelivery(ctx.server.worker_id, entry.worker_id, entry.token, notif_xml, 0, 0, .pep) catch |err| {
                         noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
                     };
                 }
             }
-        }
+        };
+        var self_ctx = SelfCtx{
+            .server = server,
+            .publisher_bare = publisher_bare,
+            .local = bound.local,
+            .domain = bound.domain,
+            .body_prefix_1 = body_prefix_1,
+            .body_prefix_2 = body_prefix_2,
+            .body_after_to = body_after_to,
+            .msg_buf = self_msg_lease.buf,
+        };
+        const n = sm.collectAvailable(bound.local, bound.domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+        for (server.fanout_entries[0..n]) |*entry| self_ctx.deliver(entry);
     }
 
     // Deliver to presence subscribers (contacts with "from" or "both" subscription) — cached (T129)
@@ -2229,57 +2170,56 @@ fn sendPepNotification(
         // Only deliver to local users for now (S2S PEP notifications are post-V1)
         if (!std.mem.eql(u8, sub_domain, server.server_host)) continue;
 
-        var lease_b = server.leaseScratch(.b);
-        defer lease_b.release();
-        const entries = lease_b.entries;
-        const count = sm.findAvailableByBareJid(sub_local, sub_domain, entries);
-        for (entries[0..count]) |entry| {
-            if (entry.worker_id == server.worker_id) {
-                const target = server.sessionForEventToken(entry.token) orelse continue;
+        const SubCtx = struct {
+            server: *Server,
+            publisher_bare: []const u8,
+            local: []const u8,
+            domain: []const u8,
+            body_prefix_1: []const u8,
+            body_prefix_2: []const u8,
+            body_after_to: []const u8,
+            msg_buf: []u8,
 
-                var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
+            fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
+                var mfbs = std.io.fixedBufferStream(ctx.msg_buf);
                 const mw = mfbs.writer();
                 const notif_xml = stanza: {
-                    mw.writeAll(body_prefix_1) catch break :stanza null;
-                    xml.escapeWrite(mw, publisher_bare) catch break :stanza null;
-                    mw.writeAll(body_prefix_2) catch break :stanza null;
-                    xml.escapeWrite(mw, sub_local) catch break :stanza null;
+                    mw.writeAll(ctx.body_prefix_1) catch break :stanza null;
+                    xml.escapeWrite(mw, ctx.publisher_bare) catch break :stanza null;
+                    mw.writeAll(ctx.body_prefix_2) catch break :stanza null;
+                    xml.escapeWrite(mw, ctx.local) catch break :stanza null;
                     mw.writeByte('@') catch break :stanza null;
-                    xml.escapeWrite(mw, sub_domain) catch break :stanza null;
+                    xml.escapeWrite(mw, ctx.domain) catch break :stanza null;
                     mw.writeByte('/') catch break :stanza null;
                     xml.escapeWrite(mw, entry.resource()) catch break :stanza null;
-                    mw.writeAll(body_after_to) catch break :stanza null;
+                    mw.writeAll(ctx.body_after_to) catch break :stanza null;
                     break :stanza mfbs.getWritten();
                 } orelse {
-                    noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ sub_local, sub_domain, entry.resource(), sub_msg_lease.buf.len });
-                    continue;
+                    noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ ctx.local, ctx.domain, entry.resource(), ctx.msg_buf.len });
+                    return;
                 };
-                fanout.deliverToSession(target, notif_xml, entry.token.index);
-            } else {
-                if (server.delivery_system) |ds| {
-                    var mfbs = std.io.fixedBufferStream(sub_msg_lease.buf);
-                    const mw = mfbs.writer();
-                    const notif_xml = stanza: {
-                        mw.writeAll(body_prefix_1) catch break :stanza null;
-                        xml.escapeWrite(mw, publisher_bare) catch break :stanza null;
-                        mw.writeAll(body_prefix_2) catch break :stanza null;
-                        xml.escapeWrite(mw, sub_local) catch break :stanza null;
-                        mw.writeByte('@') catch break :stanza null;
-                        xml.escapeWrite(mw, sub_domain) catch break :stanza null;
-                        mw.writeByte('/') catch break :stanza null;
-                        xml.escapeWrite(mw, entry.resource()) catch break :stanza null;
-                        mw.writeAll(body_after_to) catch break :stanza null;
-                        break :stanza mfbs.getWritten();
-                    } orelse {
-                        noteJidOverflow("PEP notification to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ sub_local, sub_domain, entry.resource(), sub_msg_lease.buf.len });
-                        continue;
-                    };
-                    ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, notif_xml, 0, 0, .pep) catch |err| {
+                if (entry.worker_id == ctx.server.worker_id) {
+                    const target = ctx.server.sessionForEventToken(entry.token) orelse return;
+                    fanout.deliverToSession(target, notif_xml, entry.token.index);
+                } else if (ctx.server.delivery_system) |ds| {
+                    ds.deliverDelivery(ctx.server.worker_id, entry.worker_id, entry.token, notif_xml, 0, 0, .pep) catch |err| {
                         noteCrossWorkerDrop("PEP notification to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
                     };
                 }
             }
-        }
+        };
+        var sub_ctx = SubCtx{
+            .server = server,
+            .publisher_bare = publisher_bare,
+            .local = sub_local,
+            .domain = sub_domain,
+            .body_prefix_1 = body_prefix_1,
+            .body_prefix_2 = body_prefix_2,
+            .body_after_to = body_after_to,
+            .msg_buf = sub_msg_lease.buf,
+        };
+        const n = sm.collectAvailable(sub_local, sub_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+        for (server.fanout_entries[0..n]) |*entry| sub_ctx.deliver(entry);
     }
 }
 
@@ -2290,14 +2230,9 @@ fn handleBlocklistGet(server: *Server, session: *Session, iq_id: []const u8, cha
         sendIqError(server, session, iq_id, "item-not-found");
         return;
     };
-    const bound = session.stream.bound_jid orelse return;
+    if (session.stream.bound_jid == null) return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     const items = bs.getBlockList(server.allocator, bare_jid) catch {
         sendIqError(server, session, iq_id, "internal-server-error");
@@ -2338,12 +2273,7 @@ fn handleBlock(server: *Server, session: *Session, iq_id: []const u8, changes: *
     };
     const bound = session.stream.bound_jid orelse return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     const item_jid_raw = session.iq_roster_item_jid;
     if (item_jid_raw.len == 0) {
@@ -2396,12 +2326,7 @@ fn handleUnblock(server: *Server, session: *Session, iq_id: []const u8, changes:
     };
     const bound = session.stream.bound_jid orelse return;
 
-    var bare_buf: [router.BARE_JID_MAX]u8 = undefined;
-    const bare_jid = router.buildBareJid(bound.local, bound.domain, &bare_buf) catch {
-        noteJidOverflow("connection {d} bound bare JID exceeds {d} bytes; IQ answered with error", .{ session.conn.id, router.BARE_JID_MAX });
-        sendIqError(server, session, iq_id, "internal-server-error");
-        return;
-    };
+    const bare_jid = session.stream.boundBare();
 
     var item_jid = session.iq_roster_item_jid;
     if (item_jid.len == 0) {
@@ -2460,49 +2385,54 @@ fn pushBlockPush(
 ) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
-    var lease_b = server.leaseScratch(.b);
-    defer lease_b.release();
-    const entries = lease_b.entries;
-    const count = sm.findAvailableByBareJid(user_local, user_domain, entries);
-    if (count == 0) return;
 
-    for (entries[0..count]) |entry| {
-        if (entry.worker_id == server.worker_id) {
-            const target = server.sessionForEventToken(entry.token) orelse continue;
+    const PushCtx = struct {
+        server: *Server,
+        sender_session: *const Session,
+        user_local: []const u8,
+        user_domain: []const u8,
+        action: []const u8,
+        item_jid: []const u8,
+
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
+            if (entry.worker_id != ctx.server.worker_id) return; // Cross-thread push: deferred to post-V1 (T89 pattern)
+            const target = ctx.server.sessionForEventToken(entry.token) orelse return;
             // Skip the originating session (it already got the IQ result)
-            if (&target.conn == &sender_session.conn) continue;
+            if (&target.conn == &ctx.sender_session.conn) return;
 
             var push_buf: [router.JID_STANZA_MAX]u8 = undefined;
             var pfbs = std.io.fixedBufferStream(&push_buf);
             const pw = pfbs.writer();
             const push_xml = stanza: {
                 pw.writeAll("<iq type='set' to='") catch break :stanza null;
-                xml.escapeWrite(pw, user_local) catch break :stanza null;
+                xml.escapeWrite(pw, ctx.user_local) catch break :stanza null;
                 pw.writeByte('@') catch break :stanza null;
-                xml.escapeWrite(pw, user_domain) catch break :stanza null;
+                xml.escapeWrite(pw, ctx.user_domain) catch break :stanza null;
                 pw.writeByte('/') catch break :stanza null;
                 xml.escapeWrite(pw, entry.resource()) catch break :stanza null;
                 pw.writeAll("'><") catch break :stanza null;
-                pw.writeAll(action) catch break :stanza null;
+                pw.writeAll(ctx.action) catch break :stanza null;
                 pw.writeAll(" xmlns='urn:xmpp:blocking'>") catch break :stanza null;
-                if (item_jid.len > 0) {
+                if (ctx.item_jid.len > 0) {
                     pw.writeAll("<item jid='") catch break :stanza null;
-                    xml.escapeWrite(pw, item_jid) catch break :stanza null;
+                    xml.escapeWrite(pw, ctx.item_jid) catch break :stanza null;
                     pw.writeAll("'/>") catch break :stanza null;
                 }
                 pw.writeAll("</") catch break :stanza null;
-                pw.writeAll(action) catch break :stanza null;
+                pw.writeAll(ctx.action) catch break :stanza null;
                 pw.writeAll("></iq>") catch break :stanza null;
                 break :stanza pfbs.getWritten();
             } orelse {
-                noteJidOverflow("block-push IQ to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ user_local, user_domain, entry.resource(), router.JID_STANZA_MAX });
-                continue;
+                noteJidOverflow("block-push IQ to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ ctx.user_local, ctx.user_domain, entry.resource(), router.JID_STANZA_MAX });
+                return;
             };
 
             fanout.deliverToSession(target, push_xml, entry.token.index);
         }
-        // Cross-thread push: deferred to post-V1 (T89 pattern)
-    }
+    };
+    var push_ctx = PushCtx{ .server = server, .sender_session = sender_session, .user_local = user_local, .user_domain = user_domain, .action = action, .item_jid = item_jid };
+    const n = sm.collectAvailable(user_local, user_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+    for (server.fanout_entries[0..n]) |*entry| push_ctx.deliver(entry);
 }
 
 pub fn sendIqError(server: *Server, session: *Session, iq_id: []const u8, condition: []const u8) void {
@@ -2599,11 +2529,6 @@ pub fn pushRosterItem(
 ) void {
     _ = changes; // Sends dirty-link the conn for the batch-tail flush (ADR-2).
     const sm = server.session_map orelse return;
-    var lease_b = server.leaseScratch(.b);
-    defer lease_b.release();
-    const entries = lease_b.entries;
-    const count = sm.findByBareJid(user_local, user_domain, entries);
-    if (count == 0) return;
 
     // Look up current item to get groups and name for the push.
     var groups_data: []const u8 = "";
@@ -2661,42 +2586,52 @@ pub fn pushRosterItem(
         return;
     };
 
-    for (entries[0..count]) |entry| {
-        // Build full push IQ per target (different 'to' and 'id')
-        var full_buf: [4096]u8 = undefined;
-        var ffbs = std.io.fixedBufferStream(&full_buf);
-        const fw = ffbs.writer();
-        var id_buf: [32]u8 = undefined;
-        const push_id = server.generateStanzaId(&id_buf);
+    const RosterPushCtx = struct {
+        server: *Server,
+        user_local: []const u8,
+        user_domain: []const u8,
+        item_xml: []const u8,
 
-        const full_xml = stanza: {
-            fw.writeAll("<iq type='set' to='") catch break :stanza null;
-            xml.escapeWrite(fw, user_local) catch break :stanza null;
-            fw.writeByte('@') catch break :stanza null;
-            xml.escapeWrite(fw, user_domain) catch break :stanza null;
-            fw.writeByte('/') catch break :stanza null;
-            xml.escapeWrite(fw, entry.resource()) catch break :stanza null;
-            fw.writeAll("' id='") catch break :stanza null;
-            xml.escapeWrite(fw, push_id) catch break :stanza null;
-            fw.writeAll("'><query xmlns='jabber:iq:roster'>") catch break :stanza null;
-            fw.writeAll(item_xml) catch break :stanza null;
-            fw.writeAll("</query></iq>") catch break :stanza null;
-            break :stanza ffbs.getWritten();
-        } orelse {
-            noteJidOverflow("roster push to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ user_local, user_domain, entry.resource(), full_buf.len });
-            continue;
-        };
+        fn deliver(ctx: *@This(), entry: *const SessionEntry) void {
+            // Build full push IQ per target (different 'to' and 'id')
+            var full_buf: [4096]u8 = undefined;
+            var ffbs = std.io.fixedBufferStream(&full_buf);
+            const fw = ffbs.writer();
+            var id_buf: [32]u8 = undefined;
+            const push_id = ctx.server.generateStanzaId(&id_buf);
 
-        if (entry.worker_id == server.worker_id) {
-            const target = server.sessionForEventToken(entry.token) orelse continue;
-            if (!target.roster_interested) continue;
-            fanout.deliverToSession(target, full_xml, entry.token.index);
-        } else if (server.delivery_system) |ds| {
-            ds.deliverDelivery(server.worker_id, entry.worker_id, entry.token, full_xml, 0, 0, .roster_push) catch |err| {
-                noteCrossWorkerDrop("roster push to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
+            const full_xml = stanza: {
+                fw.writeAll("<iq type='set' to='") catch break :stanza null;
+                xml.escapeWrite(fw, ctx.user_local) catch break :stanza null;
+                fw.writeByte('@') catch break :stanza null;
+                xml.escapeWrite(fw, ctx.user_domain) catch break :stanza null;
+                fw.writeByte('/') catch break :stanza null;
+                xml.escapeWrite(fw, entry.resource()) catch break :stanza null;
+                fw.writeAll("' id='") catch break :stanza null;
+                xml.escapeWrite(fw, push_id) catch break :stanza null;
+                fw.writeAll("'><query xmlns='jabber:iq:roster'>") catch break :stanza null;
+                fw.writeAll(ctx.item_xml) catch break :stanza null;
+                fw.writeAll("</query></iq>") catch break :stanza null;
+                break :stanza ffbs.getWritten();
+            } orelse {
+                noteJidOverflow("roster push to '{s}@{s}/{s}' exceeds {d} bytes; resource skipped", .{ ctx.user_local, ctx.user_domain, entry.resource(), full_buf.len });
+                return;
             };
+
+            if (entry.worker_id == ctx.server.worker_id) {
+                const target = ctx.server.sessionForEventToken(entry.token) orelse return;
+                if (!target.roster_interested) return;
+                fanout.deliverToSession(target, full_xml, entry.token.index);
+            } else if (ctx.server.delivery_system) |ds| {
+                ds.deliverDelivery(ctx.server.worker_id, entry.worker_id, entry.token, full_xml, 0, 0, .roster_push) catch |err| {
+                    noteCrossWorkerDrop("roster push to worker {d} session {d} dropped ({s})", .{ entry.worker_id, entry.token.index, @errorName(err) });
+                };
+            }
         }
-    }
+    };
+    var roster_ctx = RosterPushCtx{ .server = server, .user_local = user_local, .user_domain = user_domain, .item_xml = item_xml };
+    const n = sm.collectBound(user_local, user_domain, server.fanoutScratch()) catch @panic("fanout scratch below session map capacity");
+    for (server.fanout_entries[0..n]) |*entry| roster_ctx.deliver(entry);
 }
 
 /// Write the MD5 hex hash of a bare JID for Gravatar URL construction.
@@ -2782,7 +2717,7 @@ test "A62: roster get for a >256-byte owner bare JID" {
     const session = try allocator.create(Session);
     session.init(fds[0], 1, server.server_host, false, allocator);
     server.sessions[1] = session;
-    session.stream.bound_jid = .{ .local = owner_local, .domain = "localhost", .resource = "res" };
+    session.stream.setBoundJid(.{ .local = owner_local, .domain = "localhost", .resource = "res" });
 
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -2835,7 +2770,7 @@ test "F6: last-activity query for a mixed-case local domain is not remote" {
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     handleLastActivityFor(&server, session, "la2", .{ .local = "bob", .domain = "LOCALHOST" });
     _ = try session.conn.flushSend();
     var buf: [2048]u8 = undefined;
@@ -2871,7 +2806,7 @@ test "F6: roster set stores the contact under the configured local spelling" {
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     session.iq_roster_item_jid = "NaplesTB@LOCALHOST";
     session.iq_roster_item_count = 1;
 
@@ -2914,7 +2849,7 @@ test "F6: block and unblock use the configured local spelling for the store key"
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
 
     var scratch: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&scratch);
@@ -2958,7 +2893,7 @@ test "F6: MAM 'with' matches the folded archive contact key" {
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     session.mam_with = "NaplesTB@LOCALHOST";
 
     var scratch: [16]posix.Kevent = undefined;
@@ -3006,7 +2941,7 @@ test "F6: MUC MAM 'with' matches the folded archive contact key" {
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     session.mam_with = "NaplesTB@LOCALHOST";
 
     var scratch: [16]posix.Kevent = undefined;
@@ -3060,7 +2995,7 @@ test "F6: cross-worker MUC MAM forwards the prepared 'with'" {
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     session.mam_with = "NaplesTB@LOCALHOST";
     var scratch: [16]posix.Kevent = undefined;
     var changes = ChangeList.init(&scratch);
@@ -3083,12 +3018,13 @@ test "R5: an unaddressable IQ error reply is counted, never a truncated stanza" 
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
 
-    // A bound localpart wider than the 4 KiB scratch: the header cannot be
-    // written, so no reply can even be addressed. The drop must be counted
-    // (R5); a silently truncated stanza would leave bytes pending.
+    // A 'to' wider than the 4 KiB scratch: the header cannot be written,
+    // so no reply can even be addressed. The drop must be counted (R5); a
+    // silently truncated stanza would leave bytes pending.
     var big: [4096]u8 = undefined;
     @memset(&big, 'b');
-    session.stream.bound_jid = .{ .local = &big, .domain = "localhost", .resource = "res" };
+    session.iq_to = &big;
+    session.stream.setBoundJid(.{ .local = "bob", .domain = "localhost", .resource = "res" });
 
     const drops_before = router.jid_overflow_drops.load(.monotonic);
     sendIqErrorWithType(&server, session, "e1", "cancel", "internal-server-error");
@@ -3101,9 +3037,9 @@ test "R5: a roster push to a full remote queue is counted" {
     var server: Server = undefined;
     try server.init("localhost", "127.0.0.1", 0, allocator);
     defer server.deinit();
-    var sm = session_map_mod.SessionMap.init(allocator, true, 0);
+    var sm = try session_map_mod.SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
     server.delivery_system = &delivery_sys;
@@ -3142,9 +3078,9 @@ test "R5: an unbuildable PEP self-notification is counted, never silent" {
     defer server.deinit();
     server.roster = &roster;
     server.worker_id = 0;
-    var sm = session_map_mod.SessionMap.init(allocator, true, 0);
+    var sm = try session_map_mod.SessionMap.init(allocator, 2, 0);
     defer sm.deinit();
-    server.session_map = &sm;
+    try server.configureSessionMap(&sm);
     var delivery_sys = try delivery_queue.DeliverySystem.init(allocator, 2);
     defer delivery_sys.deinit();
     server.delivery_system = &delivery_sys;
@@ -3161,7 +3097,7 @@ test "R5: an unbuildable PEP self-notification is counted, never silent" {
     defer allocator.destroy(session);
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
 
     // A publisher JID wider than the 20 KiB bank: every per-resource
     // notification is unbuildable and the skip must be counted (R5).
@@ -3187,7 +3123,7 @@ test "R-385: an oversized queued iq result keeps the session and answers resourc
     var session: Session = undefined;
     session.init(fds[0], 0, server.server_host, false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = .{ .local = "alice", .domain = "localhost", .resource = "phone" };
+    session.stream.setBoundJid(.{ .local = "alice", .domain = "localhost", .resource = "phone" });
     session.iq_to = "localhost";
     // A reply longer than the outbound bound: the append refuses it even
     // with the outbox empty, so this is oversize, not a slow reader.
@@ -3343,7 +3279,7 @@ test "Server: every advertised pubsub feature is dispatched" {
     var session: Session = undefined;
     session.init(fds[0], 1, "localhost", false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
 
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
@@ -3441,7 +3377,7 @@ test "Server: pubsub set routes on the verb, not blindly to publish" {
     var session: Session = undefined;
     session.init(fds[0], 1, "localhost", false, allocator);
     defer session.deinit();
-    session.stream.bound_jid = xmpp.Jid.parse("alice@localhost/res") catch null;
+    session.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
 
     var change_buf: [64]posix.Kevent = undefined;
     var changes = ChangeList.init(&change_buf);
