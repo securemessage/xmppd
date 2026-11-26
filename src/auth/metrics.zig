@@ -58,9 +58,15 @@ pub const Counters = struct {
     pool_queue_high_water: Counter = .init(0),
     pool_jobs: Counter = .init(0),
     pool_latency_us: [HIST_BUCKETS]Counter = @splat(.init(0)),
-    /// SCRAM session table occupancy and its high-water mark.
-    scram_active: Counter = .init(0),
-    scram_high_water: Counter = .init(0),
+    /// SCRAM replay-cache occupancy and its high-water mark, plus the
+    /// count of verifies refused because the probe window was all live
+    /// (temporary-auth-failure; a live tag is never evicted).
+    replay_occupied: Counter = .init(0),
+    replay_high_water: Counter = .init(0),
+    replay_refusals: Counter = .init(0),
+    /// Verifies whose server-first params no longer matched the stored
+    /// credentials (password changed mid-cache); answered as scram_stale.
+    scram_stale: Counter = .init(0),
     /// Times a lane's intake paused on the outbound backlog watermark.
     ipc_intake_pauses: Counter = .init(0),
 };
@@ -135,19 +141,31 @@ pub inline fn poolJobDone(latency_us: u64) void {
 }
 
 /// A SCRAM session slot went active.
-pub inline fn scramActivated() void {
-    const n = counters.scram_active.load(.monotonic) + 1;
-    counters.scram_active.store(n, .monotonic);
-    const hw = counters.scram_high_water.load(.monotonic);
-    if (n > hw) counters.scram_high_water.store(n, .monotonic);
+pub inline fn replayInserted() void {
+    const n = counters.replay_occupied.load(.monotonic) + 1;
+    counters.replay_occupied.store(n, .monotonic);
+    const hw = counters.replay_high_water.load(.monotonic);
+    if (n > hw) counters.replay_high_water.store(n, .monotonic);
 }
 
-/// A SCRAM session slot went inactive; a release without a matching
-/// activation is a programmer error.
-pub inline fn scramReleased() void {
-    const n = counters.scram_active.load(.monotonic);
+/// An insert hit a probe window of all-live tags; the verify is refused
+/// with temporary-auth-failure rather than evicting a live tag.
+pub inline fn replayRefused() void {
+    bump(&counters.replay_refusals, 1);
+}
+
+/// A verify's (salt, iterations) no longer matched the stored credentials;
+/// answered scram_stale so the core evicts its params-cache entry.
+pub inline fn scramStale() void {
+    bump(&counters.scram_stale, 1);
+}
+
+/// A replay slot went inactive; a remove without a matching insert is a
+/// programmer error.
+pub inline fn replayRemoved() void {
+    const n = counters.replay_occupied.load(.monotonic);
     std.debug.assert(n > 0);
-    counters.scram_active.store(n - 1, .monotonic);
+    counters.replay_occupied.store(n - 1, .monotonic);
 }
 
 /// A lane's intake paused on the outbound backlog watermark.
@@ -208,8 +226,8 @@ pub fn dump() void {
         rw.print("{s}:{d}", .{ name, n }) catch break;
     }
     log.info("auth outcomes: {s}", .{rw.buffered()});
-    log.info("auth scram: active={d} high_water={d}; ipc_intake_pauses={d}", .{
-        read(&c.scram_active), read(&c.scram_high_water), read(&c.ipc_intake_pauses),
+    log.info("auth scram replay: occupied={d} high_water={d} refusals={d} stale={d}; ipc_intake_pauses={d}", .{
+        read(&c.replay_occupied), read(&c.replay_high_water), read(&c.replay_refusals), read(&c.scram_stale), read(&c.ipc_intake_pauses),
     });
     var hbuf: [HIST_BUCKETS * 24]u8 = undefined;
     var hw: std.Io.Writer = .fixed(&hbuf);
@@ -313,19 +331,19 @@ test "poolQueued keeps the high-water mark and poolJobDone assigns log2 buckets"
     try std.testing.expectEqual(@as(u64, 1), read(&c.pool_latency_us[HIST_BUCKETS - 1]));
 }
 
-test "scram occupancy tracks a high-water mark" {
+test "replay occupancy tracks a high-water mark" {
     reset();
     defer reset();
 
-    scramActivated();
-    scramActivated();
-    scramReleased();
-    try std.testing.expectEqual(@as(u64, 1), read(&counters.scram_active));
-    try std.testing.expectEqual(@as(u64, 2), read(&counters.scram_high_water));
+    replayInserted();
+    replayInserted();
+    replayRemoved();
+    try std.testing.expectEqual(@as(u64, 1), read(&counters.replay_occupied));
+    try std.testing.expectEqual(@as(u64, 2), read(&counters.replay_high_water));
 
-    scramReleased();
-    try std.testing.expectEqual(@as(u64, 0), read(&counters.scram_active));
-    try std.testing.expectEqual(@as(u64, 2), read(&counters.scram_high_water));
+    replayRemoved();
+    try std.testing.expectEqual(@as(u64, 0), read(&counters.replay_occupied));
+    try std.testing.expectEqual(@as(u64, 2), read(&counters.replay_high_water));
 }
 
 test "ipcPaused counts intake pauses" {
@@ -367,7 +385,7 @@ test "dump runs on a populated block" {
     failure(1);
     poolQueued(4);
     poolJobDone(900_000);
-    scramActivated();
+    replayInserted();
     ipcPaused();
     dump();
 }

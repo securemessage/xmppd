@@ -131,6 +131,7 @@ pub fn handleAccountDelete(comptime Store: type, self: *handler_mod.AuthHandler(
     // delete callback for cleanup. For now, locks are cleaned via xmppctl unlock
     // or naturally don't apply once the account is gone.
 
+    self.cacheInvalidate(account_username);
     log.info("account deleted (auth): '{s}'", .{account_username});
     return protocol.Message{ .account_delete_result = .{
         .conn_id = req.conn_id,
@@ -291,7 +292,7 @@ test "AuthHandler: denied registrations do not count as auth failures" {
         .ip_lockout_threshold = 2,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     defer handler.deinit();
 
@@ -333,7 +334,7 @@ test "AuthHandler: registration counts the IP before adding a user" {
         .ip_lockout_threshold = 100,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     handler.reg_config = .{ .enabled = true, .require_invite = false };
     defer handler.deinit();
@@ -374,7 +375,7 @@ test "AuthHandler: registration stores the PRECIS canonical name" {
         .ip_lockout_threshold = 2,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     handler.reg_config = .{ .enabled = true, .require_invite = false };
     defer handler.deinit();
@@ -410,7 +411,7 @@ test "AuthHandler: registration conflict is on the canonical name" {
         .ip_lockout_threshold = 2,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     handler.reg_config = .{ .enabled = true, .require_invite = false };
     defer handler.deinit();
@@ -479,7 +480,7 @@ test "AuthHandler: registration of an OIDC-bound localpart is refused" {
         .ip_lockout_threshold = 2,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     handler.reg_config = .{ .enabled = true, .require_invite = false };
     defer handler.deinit();
@@ -505,7 +506,7 @@ test "AuthHandler: password change resolves the RFC 7622 account name" {
     defer db.close();
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "naplestb", "oldpw");
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     const changed = handleSync(&handler, .{ .password_change_request = .{
@@ -536,7 +537,7 @@ test "AuthHandler: account delete resolves the RFC 7622 account name" {
     var store = TestUserStore.init(&db);
     try store.addUser(allocator, "naplestb", "pw");
     try store.addUser(allocator, "bad name", "pw");
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     defer handler.deinit();
 
     const deleted = handleSync(&handler, .{ .account_delete_request = .{
@@ -556,6 +557,43 @@ test "AuthHandler: account delete resolves the RFC 7622 account name" {
     try std.testing.expect((try store.lookup(allocator, "bad name")) != null);
 }
 
+test "AuthHandler: account delete drops the daemon credential cache entry" {
+    const allocator = std.testing.allocator;
+
+    var db = try MemoryBackend.open("", .{});
+    defer db.close();
+    var store = TestUserStore.init(&db);
+    try store.addUser(allocator, "alice", "pw");
+    var handler = try TestHandler.init(allocator, &store, .{});
+    defer handler.deinit();
+
+    // Populate the daemon cred cache with alice's real params.
+    const real = handleSync(&handler, .{ .scram_params_request = .{
+        .conn_id = 350,
+        .username = "alice",
+        .client_ip = "10.0.0.1",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(real == .scram_params);
+    var real_salt: [32]u8 = undefined;
+    @memcpy(&real_salt, real.scram_params.salt);
+
+    const deleted = handleSync(&handler, .{ .account_delete_request = .{
+        .conn_id = 351,
+        .username = "alice",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(deleted.account_delete_result.success);
+
+    // A params read after the delete must miss the cache: the deterministic
+    // fake salt differs from the real one that was cached.
+    const after = handleSync(&handler, .{ .scram_params_request = .{
+        .conn_id = 352,
+        .username = "alice",
+        .client_ip = "10.0.0.1",
+    } }) orelse return error.NoResponse;
+    try std.testing.expect(after == .scram_params);
+    try std.testing.expect(!std.mem.eql(u8, &real_salt, after.scram_params.salt));
+}
+
 test "AuthHandler: registration rejects PRECIS-invalid names with not-acceptable" {
     const allocator = std.testing.allocator;
 
@@ -571,7 +609,7 @@ test "AuthHandler: registration rejects PRECIS-invalid names with not-acceptable
         .ip_lockout_threshold = 2,
     });
     defer limiter.deinit();
-    var handler = TestHandler.init(allocator, &store);
+    var handler = try TestHandler.init(allocator, &store, .{});
     handler.setRateLimiter(&limiter);
     handler.reg_config = .{ .enabled = true, .require_invite = false };
     defer handler.deinit();

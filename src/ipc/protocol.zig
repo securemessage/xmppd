@@ -14,13 +14,14 @@
 //!
 //! ## Auth IPC messages
 //!
-//! | Tag  | Direction  | Message        |
-//! |------|------------|----------------|
-//! | 0x01 | Core→Auth  | AuthRequest    |
-//! | 0x02 | Auth→Core  | AuthChallenge  |
-//! | 0x03 | Auth→Core  | AuthSuccess    |
-//! | 0x04 | Auth→Core  | AuthFailure    |
-//! | 0x05 | Core→Auth  | SaslResponse   |
+//! | Tag  | Direction  | Message            |
+//! |------|------------|--------------------|
+//! | 0x01 | Core→Auth  | AuthRequest        |
+//! | 0x03 | Auth→Core  | AuthSuccess        |
+//! | 0x04 | Auth→Core  | AuthFailure        |
+//! | 0x0E | Core→Auth  | ScramParamsRequest |
+//! | 0x0F | Auth→Core  | ScramParams        |
+//! | 0x13 | Core→Auth  | ScramVerify        |
 
 const std = @import("std");
 const posix = std.posix;
@@ -57,12 +58,11 @@ pub const MAX_FRAME_SIZE: usize = MAX_PAYLOAD_SIZE + HEADER_SIZE;
 
 /// Message tags for the IPC protocol.
 pub const Tag = enum(u8) {
-    // Auth IPC (0x01–0x05)
+    // Auth IPC (0x01-0x04); 0x02/0x05 were the two-step SCRAM exchange
+    // and stay retired under protocol v2 (ADR-6).
     auth_request = 0x01,
-    auth_challenge = 0x02,
     auth_success = 0x03,
     auth_failure = 0x04,
-    sasl_response = 0x05,
 
     // Auth management IPC (0x06–0x0B)
     register_request = 0x06,
@@ -78,6 +78,12 @@ pub const Tag = enum(u8) {
     // Auth lifecycle (0x0D)
     /// Core→Auth: the connection died mid-exchange; drop any state.
     auth_abort = 0x0D,
+
+    // Auth protocol v2 stateless SCRAM (0x0E-0x0F, 0x13-0x14)
+    scram_params_request = 0x0E,
+    scram_params = 0x0F,
+    scram_verify = 0x13,
+    scram_stale = 0x14,
 
     // S2S IPC (0x10–0x12)
     s2s_deliver = 0x10,
@@ -111,14 +117,10 @@ pub const MechanismId = enum(u8) {
 pub const Message = union(enum) {
     /// Core→Auth: start authentication for a connection.
     auth_request: AuthRequest,
-    /// Auth→Core: SASL challenge (SCRAM server-first-message).
-    auth_challenge: AuthChallenge,
     /// Auth→Core: authentication succeeded.
     auth_success: AuthSuccess,
     /// Auth→Core: authentication failed.
     auth_failure: AuthFailure,
-    /// Core→Auth: SASL response (SCRAM client-final-message).
-    sasl_response: SaslResponse,
 
     /// Core→Auth: in-band registration request (pre-auth).
     register_request: RegisterRequest,
@@ -135,11 +137,21 @@ pub const Message = union(enum) {
 
     /// Auth→Core: supported SASL mechanisms (sent once on IPC connect).
     mechanism_list: MechanismList,
-    /// Core→Auth: connection died mid-exchange — drop its SCRAM slot now.
-    /// Without it, connections that vanish before a final response leaked
-    /// daemon state and their conn_id aliases poisoned the NEXT session on
-    /// the recycled slot (T32 load-driver finding).
+    /// Core→Auth: connection died mid-exchange; drop any state it left.
     auth_abort: AuthAbort,
+
+    /// Core→Auth: fetch (salt, iterations) for a SCRAM login on a core
+    /// cache miss; unknown users get a deterministic fake pair.
+    scram_params_request: ScramParamsRequest,
+    /// Auth→Core: the public SCRAM parameters for one username.
+    scram_params: ScramParams,
+    /// Core→Auth: one-round-trip stateless SCRAM verify (ADR-6).
+    scram_verify: ScramVerify,
+    /// Auth→Core: the verify's server-first carried (salt, iterations) that
+    /// no longer match the stored credentials (password changed after the
+    /// core cached its params). Core evicts its params-cache entry and the
+    /// client retries with fresh parameters.
+    scram_stale: ScramStale,
 
     /// Core→S2S: deliver a stanza to a remote domain.
     s2s_deliver: S2sDeliver,
@@ -166,11 +178,6 @@ pub const AuthRequest = struct {
     payload: []const u8,
 };
 
-pub const AuthChallenge = struct {
-    conn_id: u32,
-    challenge: []const u8,
-};
-
 pub const AuthSuccess = struct {
     conn_id: u32,
     username: []const u8,
@@ -184,13 +191,62 @@ pub const AuthFailure = struct {
     reason: []const u8,
 };
 
-pub const SaslResponse = struct {
-    conn_id: u32,
-    payload: []const u8,
-};
-
 pub const AuthAbort = struct {
     conn_id: u32,
+};
+
+// ============================================================================
+// Auth protocol v2 stateless SCRAM (ADR-6)
+// ============================================================================
+
+pub const ScramParamsRequest = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// Raw n= name from client-first-message-bare; the daemon applies the
+    /// RFC 7622 localpart prep, exactly as the v1 path did.
+    username: []const u8,
+    /// Client IP for the (non-counting) lock check.
+    client_ip: []const u8,
+};
+
+pub const ScramParams = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// SCRAM salt, binary (32 B today). Public data: every client that
+    /// starts SCRAM sees it in server-first-message. An unknown user gets a
+    /// deterministic fake so the reply shape never reveals an account.
+    salt: []const u8,
+    /// PBKDF2 iteration count.
+    iteration_count: u32,
+};
+
+pub const ScramVerify = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// Client IP address string (from accept()).
+    client_ip: []const u8,
+    /// Channel binding type: 0=none, 1=tls-server-end-point, 2=tls-exporter.
+    cb_type: u8,
+    /// Channel binding data (empty when cb_type=0).
+    cb_data: []const u8,
+    /// gs2 channel binding flag from client-first ('n', 'y' or 'p'). Kept
+    /// separate from the client-final's own c= claim so a 'p' offer cannot
+    /// be finished with an 'n' binding.
+    gs2_flag: u8,
+    /// client-first-message-bare: "n=<raw>,r=<cnonce>[,extensions]"
+    client_first_bare: []const u8,
+    /// The exact server-first-message the core sent to the client.
+    server_first: []const u8,
+    /// The full client-final-message: "c=<b64>,r=<combined>,p=<b64>"
+    client_final: []const u8,
+};
+
+pub const ScramStale = struct {
+    /// Connection ID for correlation.
+    conn_id: u32,
+    /// The raw n= name from client-first-message-bare: the core's
+    /// params-cache key for the entry to evict.
+    username: []const u8,
 };
 
 // ============================================================================
@@ -600,21 +656,33 @@ test "AuthRequest encode/decode roundtrip" {
     try std.testing.expectEqualStrings("n,,n=alice,r=rOprNGfwEbeRWgbNEkqO", req.payload);
 }
 
-test "AuthChallenge encode/decode roundtrip" {
+test "ScramVerify encode/decode roundtrip" {
     var buf: [1024]u8 = undefined;
 
-    const msg = Message{ .auth_challenge = .{
+    const msg = Message{ .scram_verify = .{
         .conn_id = 7,
-        .challenge = "r=combined,s=salt,i=4096",
+        .client_ip = "192.168.1.100",
+        .cb_type = 1,
+        .cb_data = "endpoint-data",
+        .gs2_flag = 'p',
+        .client_first_bare = "n=alice,r=rOprNGfwEbeRWgbNEkqO",
+        .server_first = "r=combined,s=c2FsdA==,i=4096",
+        .client_final = "c=eSws,r=combined,p=dHzmhGToJJFZ2v8wR0n/TN1Y0g==",
     } };
 
     const written = try encode(msg, &buf);
     const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
 
     const decoded = try decode(frame.payload);
-    const ch = decoded.auth_challenge;
-    try std.testing.expectEqual(@as(u32, 7), ch.conn_id);
-    try std.testing.expectEqualStrings("r=combined,s=salt,i=4096", ch.challenge);
+    const v = decoded.scram_verify;
+    try std.testing.expectEqual(@as(u32, 7), v.conn_id);
+    try std.testing.expectEqualStrings("192.168.1.100", v.client_ip);
+    try std.testing.expectEqual(@as(u8, 1), v.cb_type);
+    try std.testing.expectEqualStrings("endpoint-data", v.cb_data);
+    try std.testing.expectEqual(@as(u8, 'p'), v.gs2_flag);
+    try std.testing.expectEqualStrings("n=alice,r=rOprNGfwEbeRWgbNEkqO", v.client_first_bare);
+    try std.testing.expectEqualStrings("r=combined,s=c2FsdA==,i=4096", v.server_first);
+    try std.testing.expectEqualStrings("c=eSws,r=combined,p=dHzmhGToJJFZ2v8wR0n/TN1Y0g==", v.client_final);
 }
 
 test "AuthSuccess encode/decode roundtrip" {
@@ -653,21 +721,47 @@ test "AuthFailure encode/decode roundtrip" {
     try std.testing.expectEqualStrings("not-authorized", f.reason);
 }
 
-test "SaslResponse encode/decode roundtrip" {
+test "ScramParams exchange encode/decode roundtrip" {
     var buf: [1024]u8 = undefined;
 
-    const msg = Message{ .sasl_response = .{
+    const req = Message{ .scram_params_request = .{
         .conn_id = 42,
-        .payload = "c=biws,r=combined,p=dHzmhGToJJFZ2v8wR0n/TN1Y0g==",
+        .username = "alice",
+        .client_ip = "10.0.0.7",
     } };
+    var written = try encode(req, &buf);
+    var frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
+    const rq = (try decode(frame.payload)).scram_params_request;
+    try std.testing.expectEqual(@as(u32, 42), rq.conn_id);
+    try std.testing.expectEqualStrings("alice", rq.username);
+    try std.testing.expectEqualStrings("10.0.0.7", rq.client_ip);
 
+    const salt = [_]u8{0xAA} ** 32;
+    const rep = Message{ .scram_params = .{
+        .conn_id = 42,
+        .salt = &salt,
+        .iteration_count = 4096,
+    } };
+    written = try encode(rep, &buf);
+    frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
+    const rp = (try decode(frame.payload)).scram_params;
+    try std.testing.expectEqual(@as(u32, 42), rp.conn_id);
+    try std.testing.expectEqualSlices(u8, &salt, rp.salt);
+    try std.testing.expectEqual(@as(u32, 4096), rp.iteration_count);
+}
+
+test "ScramStale encode/decode roundtrip" {
+    var buf: [512]u8 = undefined;
+    const msg = Message{ .scram_stale = .{ .conn_id = 0x11223344, .username = "n=alice" } };
     const written = try encode(msg, &buf);
-    const frame = (try parseFrame(buf[0..written])) orelse return error.NoFrame;
-
-    const decoded = try decode(frame.payload);
-    const r = decoded.sasl_response;
-    try std.testing.expectEqual(@as(u32, 42), r.conn_id);
-    try std.testing.expectEqualStrings("c=biws,r=combined,p=dHzmhGToJJFZ2v8wR0n/TN1Y0g==", r.payload);
+    const frame = buf[0..written];
+    const payload_len = std.mem.readInt(u32, frame[0..HEADER_SIZE], .little);
+    try std.testing.expectEqual(written - HEADER_SIZE, payload_len);
+    const decoded = try decode(frame[HEADER_SIZE..]);
+    try std.testing.expect(decoded == .scram_stale);
+    const s = decoded.scram_stale;
+    try std.testing.expectEqual(@as(u32, 0x11223344), s.conn_id);
+    try std.testing.expectEqualStrings("n=alice", s.username);
 }
 
 test "AuthAbort encode/decode roundtrip" {
@@ -843,7 +937,7 @@ test "encode rejects overlong field and oversized payload" {
     var small: [8]u8 = undefined;
     // BufferTooSmall: frame does not fit.
     try std.testing.expectError(error.BufferTooSmall, encode(
-        Message{ .sasl_response = .{ .conn_id = 1, .payload = "x" } },
+        Message{ .scram_verify = .{ .conn_id = 1, .client_ip = "i", .cb_type = 0, .cb_data = "", .gs2_flag = 'n', .client_first_bare = "b", .server_first = "s", .client_final = "f" } },
         &small,
     ));
     const alloc = std.testing.allocator;
@@ -854,7 +948,7 @@ test "encode rejects overlong field and oversized payload" {
     // FieldTooLong: a []const u8 field past the u16 wire length.
     @memset(data[0..66000], 'a');
     try std.testing.expectError(error.FieldTooLong, encode(
-        Message{ .sasl_response = .{ .conn_id = 1, .payload = data[0..66000] } },
+        Message{ .scram_verify = .{ .conn_id = 1, .client_ip = "i", .cb_type = 0, .cb_data = "", .gs2_flag = 'n', .client_first_bare = "b", .server_first = "s", .client_final = data[0..66000] } },
         out,
     ));
     // PayloadTooLarge: fields individually under u16 but sum over 64 KiB.
@@ -880,12 +974,12 @@ test "max-size payload round-trips" {
     const buf = try alloc.alloc(u8, MAX_FRAME_SIZE);
     defer alloc.free(buf);
     @memset(data, 'z');
-    const msg = Message{ .sasl_response = .{ .conn_id = 1, .payload = data[0 .. MAX_PAYLOAD_SIZE - 1 - 4 - 2] } };
+    const msg = Message{ .scram_verify = .{ .conn_id = 1, .client_ip = "i", .cb_type = 0, .cb_data = "", .gs2_flag = 'n', .client_first_bare = "b", .server_first = "s", .client_final = data[0 .. MAX_PAYLOAD_SIZE - 20] } };
     const n = try encode(msg, buf);
     try std.testing.expectEqual(MAX_FRAME_SIZE, n);
     const fr = (try parseFrame(buf[0..n])).?;
     const back = try decode(fr.payload);
-    try std.testing.expectEqualStrings(data[0 .. MAX_PAYLOAD_SIZE - 7], back.sasl_response.payload);
+    try std.testing.expectEqualStrings(data[0 .. MAX_PAYLOAD_SIZE - 20], back.scram_verify.client_final);
 }
 
 test "MechanismId fromName/toName roundtrip" {

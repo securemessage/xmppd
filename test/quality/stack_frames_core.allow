@@ -36,17 +36,19 @@
 #   main.main      +192 Q1 203a49b (pre-rebase fc7d7de): Root.init union
 #                  wraps the DebugAllocator in Debug builds (-Dallocator
 #                  default debug)
+#   A5 re-baseline on the respun head (post-C3 out-param init, parked
+#     SCRAM exchanges moved to a heap pool): worker.Server.initFromFdOpts,
+#     initWithMaxSessions, main.configureServer and
+#     registry.RoomRegistry.createRoom all measure under the 16 KiB
+#     threshold so their rows are removed (any return is flagged as new);
+#     every remaining row is re-pinned at the -Dcpu=baseline measurement.
 archive_queue.ArchiveWriteQueue.init	186000
-c2s.lifecycle.acceptConnections	81344
+c2s.lifecycle.acceptConnections	17312
 listener.Listener.accept	25952
-main.configureServer	167696
-main.main	3067512
-main.workerThread	710912
+main.main	1301992
+main.workerThread	355680
 muc.fanout.longestEncodedRealJid	212224
-muc.handler.handleMucDiscoItems	179056
+muc.handler.handleMucDiscoItems	179040
 muc.handler.handleMucGroupchat	17048
-presence.handler.sendPresenceProbes	17040
-registry.RoomRegistry.createRoom	275920
-worker.worker.Server.initFromFdOpts	2132776
-worker.worker.Server.initWithMaxSessions	2488280
-worker.worker.Server.run	67056
+presence.handler.sendPresenceProbes	17008
+worker.worker.Server.run	67040
