@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const sm_state = @import("sm_state.zig");
+const delivery_queue = @import("delivery_queue");
 
 const log = std.log.scoped(.sm_handoff);
 
@@ -36,6 +37,8 @@ pub const MAX_BUNDLE_ROOMS: usize = 64;
 
 /// Deep-copied state of a detached SM session being transferred between
 /// workers. All slices are owned by the bundle (C allocator).
+/// `created` is a monotonic deadline: bundle expiry must not move with
+/// the wall clock.
 pub const ResumeBundle = struct {
     previd: [sm_state.SM_ID_HEX_LEN]u8,
     sm_in_h: u32,
@@ -49,7 +52,9 @@ pub const ResumeBundle = struct {
     resource: []u8,
     last_presence: []u8,
     /// Remaining unacked stanzas (source queue was ack()-trimmed first).
-    stanzas: std.ArrayListUnmanaged([]u8) = .{},
+    /// Blob references, not copies (C11): the producer's allocation crosses
+    /// workers under an atomic refcount.
+    stanzas: std.ArrayListUnmanaged(*delivery_queue.Blob) = .{},
     /// sm_out_seq value of stanzas[0], i.e. the source queue's base_seq.
     base_seq: u32,
     /// Source queue's last acked h (S24). Carried so a backwards h after the
@@ -74,7 +79,7 @@ pub const ResumeBundle = struct {
         allocator.free(self.username);
         allocator.free(self.resource);
         allocator.free(self.last_presence);
-        for (self.stanzas.items) |s| allocator.free(s);
+        for (self.stanzas.items) |s| s.releaseRetention();
         self.stanzas.deinit(allocator);
         for (self.rooms.items) |r| allocator.free(r);
         self.rooms.deinit(allocator);
@@ -94,7 +99,7 @@ pub fn put(previd: []const u8, bundle: *ResumeBundle) !void {
 
     if (previd.len != sm_state.SM_ID_HEX_LEN) return error.InvalidPrevid;
 
-    purgeExpiredLocked(std.time.timestamp());
+    purgeExpiredLocked(sm_state.monotonicSeconds());
 
     // A second extract for the same previd (double resume racing): evict the
     // older bundle — the newest extraction reflects the queue's final state.
@@ -190,10 +195,14 @@ fn testBundle(previd_suffix: u8) !*ResumeBundle {
         .resource = try allocator.dupe(u8, "phone"),
         .last_presence = try allocator.dupe(u8, "<show>away</show>"),
         .base_seq = 3,
-        .created = std.time.timestamp(),
+        .last_h = 5,
+        .created = sm_state.monotonicSeconds(),
     };
-    try b.stanzas.append(allocator, try allocator.dupe(u8, "<message/>"));
-    try b.stanzas.append(allocator, try allocator.dupe(u8, "<presence/>"));
+    // Bundle stanza refs are retention refs: uncharged blobs match the
+    // production path, where a carried blob's transport charge may already
+    // have ended.
+    try b.stanzas.append(allocator, try delivery_queue.Blob.createUncharged(allocator, "<message/>"));
+    try b.stanzas.append(allocator, try delivery_queue.Blob.createUncharged(allocator, "<presence/>"));
     try b.rooms.append(allocator, try allocator.dupe(u8, "dev@conference.example.com"));
     return b;
 }
@@ -207,8 +216,11 @@ test "handoff store: put and take roundtrip" {
     const got = take(&b.previd) orelse return error.Missing;
     try std.testing.expectEqual(@as(u32, 7), got.sm_in_h);
     try std.testing.expectEqual(@as(u32, 3), got.base_seq);
+    try std.testing.expectEqual(@as(u32, 5), got.last_h);
     try std.testing.expectEqualStrings("alice", got.username);
     try std.testing.expectEqual(@as(usize, 2), got.stanzas.items.len);
+    try std.testing.expectEqualStrings("<message/>", got.stanzas.items[0].bytes());
+    try std.testing.expectEqualStrings("<presence/>", got.stanzas.items[1].bytes());
     try std.testing.expectEqual(@as(usize, 1), got.rooms.items.len);
     try std.testing.expectEqualStrings("dev@conference.example.com", got.rooms.items[0]);
     release(got);
@@ -238,7 +250,7 @@ test "handoff store: re-put of same key replaces bundle" {
 test "handoff store: expired bundles are purged on put" {
     defer resetForTesting();
     const old = try testBundle('o');
-    old.created = std.time.timestamp() - (sm_state.DEFAULT_RESUME_TIMEOUT + 60);
+    old.created = sm_state.monotonicSeconds() - (sm_state.DEFAULT_RESUME_TIMEOUT + 60);
     try put(&old.previd, old);
     try std.testing.expectEqual(@as(usize, 1), count());
 

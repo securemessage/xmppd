@@ -1055,6 +1055,14 @@ pub const Session = struct {
                     pr.sm_stanza_count = if (self.fsm.sm_resumed) self.resume_h else 0;
                     pr.after_establishment = true;
                 }
+                // V19: a rejected <resume/> left the old id's unacked queue
+                // ownerless; drop it and report the discard count before the
+                // fresh enable below registers the replacement queue.
+                if (self.fsm.failed_sm_id.len > 0) {
+                    const failed_dropped = engine.smDrop(self.fsm.failed_sm_id);
+                    if (failed_dropped > 0) engine.dispatchEvent(self.handle, .{ .sm_failed = failed_dropped });
+                    self.fsm.failed_sm_id = "";
+                }
                 // Outbound side (T-9BC4D065). Fresh enable: start an empty
                 // unacked queue. Resume: drop the stanzas the server acked
                 // via <resumed h=.../> and replay the rest before the

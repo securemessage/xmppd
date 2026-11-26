@@ -81,6 +81,7 @@ pub const sub_cache_mod = @import("../subscription_cache.zig");
 pub const caps_mod = @import("../caps.zig");
 const router = @import("../routing/router.zig");
 const session_lifecycle = @import("../c2s/lifecycle.zig");
+const sm_drain_exec_mod = @import("../c2s/sm_drain_exec.zig");
 const stanza_writer = @import("../stanza/writer.zig");
 const stanza_facts = @import("../stanza/facts.zig");
 const room_registry_mod = @import("room_registry");
@@ -93,6 +94,7 @@ const FanoutQueue = fanout_mod.FanoutQueue;
 const actor_message = @import("../xworker/envelope.zig");
 pub const sm_state = @import("../c2s/sm_state.zig");
 const sm_handoff = @import("../c2s/sm_handoff.zig");
+const sm_wheel = @import("../c2s/sm_wheel.zig");
 const c2s_session = @import("../c2s/session.zig");
 const c2s_sm = @import("../c2s/sm.zig");
 const routing_deliver = @import("../routing/deliver.zig");
@@ -138,16 +140,16 @@ pub const IPC_S2S_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kin
 /// udata for the delivery system wake pipe knote.
 const WAKE_PIPE_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.wake_pipe }).toUdata();
 
-/// udata for the fixed periodic timers. Dispatch stays keyed on ident;
+/// udata for the fixed timers. Dispatch stays keyed on ident;
 /// the kind tag exists so a stale session token cannot impersonate one.
 const SM_EXPIRY_TIMER_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.timer_sm_expiry }).toUdata();
 const AUTH_RECONNECT_TIMER_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.timer_auth_reconnect }).toUdata();
 const OFFLINE_RETRY_TIMER_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.timer_offline_sweep }).toUdata();
 const S2S_RECONNECT_TIMER_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.timer_s2s_reconnect }).toUdata();
 
-/// Timer ident for periodic SM resume expiry sweep. Per-session retry
-/// timers use the session id as ident; the fixed idents live far above
-/// every possible session id.
+/// Timer ident for the single one-shot SM detached-session expiry timer
+/// (C11). Per-session retry timers use the session id as ident; the fixed
+/// idents live far above every possible session id.
 const SM_EXPIRY_TIMER_IDENT = std.math.maxInt(usize) - 10;
 
 /// Timer ident for auth-IPC reconnect retries.
@@ -158,9 +160,6 @@ const OFFLINE_RETRY_TIMER_IDENT = std.math.maxInt(usize) - 12;
 
 /// Timer ident for S2S-IPC reconnect retries (S10).
 const S2S_RECONNECT_TIMER_IDENT = std.math.maxInt(usize) - 13;
-
-/// Interval for SM detached session expiry sweep (milliseconds).
-const SM_EXPIRY_SWEEP_MS: u32 = 30_000;
 
 /// Auth-IPC reconnect backoff (milliseconds). One-shot timer, re-armed on
 /// failure — constant pacing is deliberate: the auth daemon restarts in
@@ -402,6 +401,36 @@ pub const Server = struct {
     /// Number of currently detached SM sessions (T124 — avoids full sweep when 0).
     detached_count: u16 = 0,
 
+    /// Per-session bound on retained unacked stanza bytes ([core]
+    /// sm_max_unacked_bytes). Every SM unacked queue charges its entries
+    /// to its own account against this bound; a refusal fails that
+    /// session only.
+    sm_max_unacked_bytes: u64 = sm_state.DEFAULT_MAX_UNACKED_BYTES,
+
+    /// FIFO of unacked queues parked for a chunked section-5 drain
+    /// (T-265C5A0E). drainSmUnackedTick empties it at the batch tail,
+    /// SM_DRAIN_CHUNK credits per iteration.
+    sm_drain_head: ?*session_lifecycle.SmDrain = null,
+    sm_drain_tail: ?*session_lifecycle.SmDrain = null,
+
+    /// Off-loop executor for the drain's offline stores: commits run on
+    /// its writer thread and completions land on sm_drain_completed via
+    /// the self-wake knote for drainSmUnackedTick to settle.
+    sm_drain_exec: sm_drain_exec_mod.Executor = .{},
+    /// Drain store jobs finished by the executor, popped by
+    /// drainSmUnackedTick.
+    sm_drain_completed: std.atomic.Value(?*sm_drain_exec_mod.Job) = std.atomic.Value(?*sm_drain_exec_mod.Job).init(null),
+    /// Retention held by parked drains: freed session slots recycle while
+    /// parked queues stay, so the parked list is bounded separately from
+    /// the per-session queue bound.
+    sm_drain_parked_nodes: u32 = 0,
+    sm_drain_parked_bytes: u64 = 0,
+    /// Per-iteration credit for section-5 drain work, shared by the
+    /// parked tick and the inline overload drains; reset at the top of
+    /// each loop iteration. Exhausted credit switches the overload path
+    /// to bulk counted drops.
+    sm_drain_turn_credit: u32 = session_lifecycle.SM_DRAIN_CHUNK,
+
     /// Stale per-session events skipped because the session was detached or
     /// closed after kevent returned this batch (S28). Counted and logged at
     /// debug so a regression here is visible instead of silent.
@@ -421,6 +450,18 @@ pub const Server = struct {
     /// silently failed inserts when full and broke probe chains on remove
     /// (no tombstones) — spurious item-not-found on resume.
     sm_id_map: std.AutoHashMapUnmanaged([sm_state.SM_ID_HEX_LEN]u8, usize) = .{},
+
+    /// C11: detached-session expiry wheel. Worker-local; every link lives
+    /// and dies on this loop thread. One one-shot EVFILT_TIMER at the
+    /// wheel's earliest deadline replaces the old 30 s sweep of the whole
+    /// session table: armed is true while the knote stands at
+    /// armed_deadline, pending marks an owed re-arm (a mutation mid-batch
+    /// or a stage lost to a full changelist), settled by armSmExpiry at the
+    /// iteration tail.
+    sm_expiry: sm_wheel.Wheel = .{},
+    sm_expiry_armed: bool = false,
+    sm_expiry_armed_deadline: i64 = 0,
+    sm_expiry_pending: bool = false,
 
     /// T177: SM-ID → worker redirects for sessions handed off to another
     /// worker by a cross-worker resume. The SM-ID prefix permanently names
@@ -839,6 +880,26 @@ pub const Server = struct {
         if (self.delivered_targets.len > 0) self.allocator.free(self.delivered_targets);
         if (self.fanout_entries.len > 0) self.allocator.free(self.fanout_entries);
         if (self.byte_scratch.len > 0) self.allocator.free(self.byte_scratch);
+        // The drain executor's writer thread must join before its jobs
+        // or the loop go away: completions wake this loop's knote and
+        // jobs release blobs owned by this allocator.
+        self.sm_drain_exec.stop();
+        var drain_completed = self.sm_drain_completed.swap(null, .acq_rel);
+        while (drain_completed) |job| {
+            const next = job.next;
+            job.destroy();
+            drain_completed = next;
+        }
+        self.sm_drain_exec.deinit();
+        // Parked section-5 drains own the sessions' old unacked queues;
+        // return their blob charges before the allocator goes away.
+        while (self.sm_drain_head) |node| {
+            self.sm_drain_head = node.next;
+            node.queue.deinit();
+            self.allocator.destroy(node.queue);
+            self.allocator.destroy(node);
+        }
+        self.sm_drain_tail = null;
         self.sm_id_map.deinit(self.allocator);
         self.sm_redirects.deinit(self.allocator);
         self.listener.deinit();
@@ -1028,6 +1089,40 @@ pub const Server = struct {
         for (self.scram_param_cache) |*e| e.* = .{};
     }
 
+    /// The blob budget that bounds this worker's SM unacked queues (ADR-3):
+    /// the producer-side budget of the delivery system when one is wired,
+    /// else a server-owned fallback so tests and rigs without a delivery
+    /// system still run with a real bound.
+    pub fn smBlobBudget(self: *Server) *delivery_queue_mod.BlobBudget {
+        if (self.delivery_system) |ds| {
+            if (self.worker_id < ds.worker_count) {
+                return &ds.budgets[self.worker_id];
+            }
+        }
+        if (self.sm_blob_budget_fallback == null) {
+            self.sm_blob_budget_fallback = .{
+                .allocator = self.allocator,
+                .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT,
+            };
+        }
+        return &self.sm_blob_budget_fallback.?;
+    }
+
+    /// The budget carrying blob charges retained by this worker's
+    /// detached SM unacked queues (T-265C5A0E): detached queues move
+    /// their charges here at detach so a resume tail never starves the
+    /// producing ring budgets. Hard-bounded at SM_RETENTION_LIMIT; a full
+    /// budget fails the detaching session so its queue drains counted.
+    pub fn smRetentionBudget(self: *Server) *delivery_queue_mod.BlobBudget {
+        if (self.sm_retention_budget == null) {
+            self.sm_retention_budget = .{
+                .allocator = self.allocator,
+                .limit = delivery_queue_mod.BlobBudget.SM_RETENTION_LIMIT,
+            };
+        }
+        return &self.sm_retention_budget.?;
+    }
+
     /// Run the main event loop. Blocks until SIGTERM or `stop()` is called.
     pub fn run(self: *Server) !void {
         var change_buf: [CHANGE_BUF_SIZE]posix.Kevent = undefined;
@@ -1057,8 +1152,8 @@ pub const Server = struct {
             try changes.addRead(ds.getPipeReadFd(self.worker_id), WAKE_PIPE_UDATA);
         }
 
-        // Register periodic timer for SM resume expiry sweep
-        try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false, SM_EXPIRY_TIMER_UDATA);
+        // C11: no SM expiry registration here. The wheel starts empty; the
+        // first detach stages the single one-shot timer via armSmExpiry.
 
         // Fallback for offline retry timers that could not be staged.
         try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false, OFFLINE_RETRY_TIMER_UDATA);
@@ -1078,6 +1173,14 @@ pub const Server = struct {
         // Start owed reconnect deadlines before the first wait rather than
         // delaying them until after the first unrelated event.
         self.reconcileIpcWriteInterest(&changes);
+
+        // The SM drain's offline commits run on a dedicated writer
+        // thread so LMDB write latency never reaches this loop; the
+        // executor is only submitted to when a store is configured. A
+        // spawn failure fails the worker: submissions that can never be
+        // pumped would strand their stanzas uncounted.
+        if (self.offline != null) try self.sm_drain_exec.start();
+        defer self.sm_drain_exec.stop();
 
         while (self.running) {
             // Mark active before processing events (coalesced signaling)
@@ -1107,6 +1210,11 @@ pub const Server = struct {
                     else => {},
                 }
             }
+
+            // C11/T-265C5A0E: one credit bounds all section-5 drain work
+            // per iteration - parked tick chunks and inline overload
+            // drains share it; exhausted credit bulk-counts drops.
+            self.sm_drain_turn_credit = session_lifecycle.SM_DRAIN_CHUNK;
 
             self.dispatchEvents(events, &changes);
 
@@ -1145,6 +1253,15 @@ pub const Server = struct {
             // Fail sessions whose outbound delivery overflowed in this batch.
             session_lifecycle.reapOutboundOverflow(self, &changes);
 
+            // C11/T-265C5A0E: chunked section-5 drain. Parked unacked
+            // queues lose at most SM_DRAIN_CHUNK stanzas per iteration;
+            // leftovers re-drive the loop on the self-wake knote.
+            session_lifecycle.drainSmUnackedTick(self);
+
+            // C11: settle the expiry wheel's one-shot arm once per batch
+            // (detaches, destroys and drains all mark sm_expiry_pending).
+            self.armSmExpiry(&changes);
+
             // ADR-2 end-of-iteration flush: every conn that accepted
             // outbound bytes this batch sits on outbox_dirty; flush each
             // once so EVFILT_WRITE arms only after a real EAGAIN.
@@ -1174,6 +1291,13 @@ pub const Server = struct {
             .offline_not_stored = delivery_queue_mod.offline_not_stored.load(.monotonic),
             .offline_hold_bounces = delivery_queue_mod.offline_hold_bounces.load(.monotonic),
             .offline_drain_drops = delivery_queue_mod.offline_drain_drops.load(.monotonic),
+            .sm_unacked_stored = delivery_queue_mod.sm_unacked_stored.load(.monotonic),
+            .sm_unacked_bounced = delivery_queue_mod.sm_unacked_bounced.load(.monotonic),
+            .sm_unacked_dropped = delivery_queue_mod.sm_unacked_dropped.load(.monotonic),
+            .sm_unacked_bounce_failed = delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic),
+            .sm_offline_refused = delivery_queue_mod.sm_offline_refused.load(.monotonic),
+            .sm_drain_park_overflow = delivery_queue_mod.sm_drain_park_overflow.load(.monotonic),
+            .sm_drain_overload_drops = delivery_queue_mod.sm_drain_overload_drops.load(.monotonic),
         });
     }
 
@@ -1328,6 +1452,51 @@ pub const Server = struct {
                 else => {},
             }
         }
+    }
+
+    /// C11: settle the expiry wheel's arm state into at most one staged
+    /// timer entry. When the wheel has entries this stages a single
+    /// EV_ONESHOT EVFILT_TIMER at the earliest deadline; when it is empty
+    /// any live arm is deleted. Called once per iteration tail, so repeated
+    /// mutations inside a batch collapse to a single stage. A stage lost
+    /// to a full batch leaves sm_expiry_pending set and the next iteration
+    /// retries: the arm is owed, never dropped silently.
+    fn armSmExpiry(self: *Server, changes: *ChangeList) void {
+        if (self.sm_expiry.nextDeadline()) |deadline| {
+            if (self.sm_expiry_armed and self.sm_expiry_armed_deadline == deadline) {
+                self.sm_expiry_pending = false;
+                return;
+            }
+            const now = sm_state.monotonicSeconds();
+            const delay_ms: u32 = if (deadline <= now)
+                1
+            else
+                @intCast(@min((deadline - now) * 1000, std.math.maxInt(u32)));
+            changes.addTimer(SM_EXPIRY_TIMER_IDENT, delay_ms, true, SM_EXPIRY_TIMER_UDATA) catch |err| {
+                switch (err) {
+                    error.ChangeListFull => {
+                        self.sm_expiry_pending = true;
+                        return;
+                    },
+                }
+            };
+            self.sm_expiry_armed = true;
+            self.sm_expiry_armed_deadline = deadline;
+            self.sm_expiry_pending = false;
+            return;
+        }
+        if (self.sm_expiry_armed) {
+            changes.removeTimer(SM_EXPIRY_TIMER_IDENT) catch |err| {
+                switch (err) {
+                    error.ChangeListFull => {
+                        self.sm_expiry_pending = true;
+                        return;
+                    },
+                }
+            };
+            self.sm_expiry_armed = false;
+        }
+        self.sm_expiry_pending = false;
     }
 
     /// kqueue reported an error on a session fd (EV_ERROR / EV_EOF with an
@@ -2485,7 +2654,7 @@ test "Server: S28 stale writable event does not destroy a detached session" {
     // Detach for SM resume: purge the fd, close it, keep the session.
     session.sm_resume_enabled = true;
     session.sm_detached = true;
-    session.sm_detach_time = std.time.timestamp();
+    session.sm_detach_time = sm_state.monotonicSeconds();
     session.sm_id_len = sm_state.SM_ID_HEX_LEN;
     const sm_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
     @memcpy(&session.sm_id, sm_id);
@@ -2559,7 +2728,7 @@ test "Server: S28 a same-batch kqueue race keeps a detached session resumable" {
     // The race window: detach after kevent returned, before dispatch.
     session.sm_resume_enabled = true;
     session.sm_detached = true;
-    session.sm_detach_time = std.time.timestamp();
+    session.sm_detach_time = sm_state.monotonicSeconds();
     session.sm_id_len = sm_state.SM_ID_HEX_LEN;
     const sm_id = "b2c3d4e5f60718293a4b5c6d7e8f9001";
     @memcpy(&session.sm_id, sm_id);
@@ -3982,7 +4151,7 @@ test "Server: H3 a resume carries the stalled offline tail" {
         .base_seq = 1,
         .last_h = 0,
         .offline_pending = true,
-        .created = std.time.timestamp(),
+        .created = sm_state.monotonicSeconds(),
     };
     @memcpy(&bundle.previd, previd);
     try sm_handoff.put(previd, bundle);
@@ -4132,7 +4301,7 @@ test "Re-review 6.3: a cross-worker resume carries the recorded sequence" {
         .last_h = 0,
         .offline_pending = true,
         .offline_last_sent_sequence = sent_sequence,
-        .created = std.time.timestamp(),
+        .created = sm_state.monotonicSeconds(),
     };
     @memcpy(&bundle.previd, previd);
     try sm_handoff.put(previd, bundle);
@@ -4196,12 +4365,12 @@ test "Re-review 6.3: a local resume carries the recorded sequence" {
     detached.auth_username_len = 5;
     detached.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     detached.sm_detached = true;
-    detached.sm_detach_time = std.time.timestamp();
+    detached.sm_detach_time = sm_state.monotonicSeconds();
     detached.sm_resume_enabled = true;
     detached.offline_pending = true;
     detached.offline_last_sent_sequence = sent_sequence;
     const det_queue = try allocator.create(sm_state.SmUnackedQueue);
-    det_queue.* = sm_state.SmUnackedQueue.init(allocator);
+    det_queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     det_queue.base_seq = 1;
     detached.sm_unacked = det_queue;
     server.sessions[2] = detached;
@@ -4284,11 +4453,11 @@ test "Server: H3 a local resume carries the stalled offline tail" {
     detached.auth_username_len = 5;
     detached.stream.setBoundJid(xmpp.Jid.parse("alice@localhost/res") catch null);
     detached.sm_detached = true;
-    detached.sm_detach_time = std.time.timestamp();
+    detached.sm_detach_time = sm_state.monotonicSeconds();
     detached.sm_resume_enabled = true;
     detached.offline_pending = true;
     const det_queue = try allocator.create(sm_state.SmUnackedQueue);
-    det_queue.* = sm_state.SmUnackedQueue.init(allocator);
+    det_queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     det_queue.base_seq = 1;
     detached.sm_unacked = det_queue;
     server.sessions[2] = detached;
@@ -4914,7 +5083,7 @@ test "Server: S10 a reconnect owed by a full batch still gets its timer" {
     // handling gets this iteration; the third slot below is reserved.
     var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
     var changes = initLoopChangeList(&change_buf);
-    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false, SM_EXPIRY_TIMER_UDATA);
+    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, 1_000, false, SM_EXPIRY_TIMER_UDATA);
     try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false, OFFLINE_RETRY_TIMER_UDATA);
     try std.testing.expectError(error.ChangeListFull, changes.addRead(3, 1));
 
@@ -5043,7 +5212,7 @@ test "Server: S10 reconcile arms IPC write interest from a full batch" {
     // two slots below are all event handling gets this iteration.
     var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
     var changes = initLoopChangeList(&change_buf);
-    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false, SM_EXPIRY_TIMER_UDATA);
+    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, 1_000, false, SM_EXPIRY_TIMER_UDATA);
     try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false, OFFLINE_RETRY_TIMER_UDATA);
     try std.testing.expectEqual(@as(usize, 2), changes.count());
     try std.testing.expectError(error.ChangeListFull, changes.addRead(fds[1], 1));
@@ -5246,7 +5415,7 @@ test "Server: G6 an auth reconnect owed by a full batch still gets its timer" {
     // builds it so the tail budget is production's. The third slot is reserved.
     var change_buf: [IPC_RECONCILE_RESERVED + 2]posix.Kevent = undefined;
     var changes = initLoopChangeList(&change_buf);
-    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, SM_EXPIRY_SWEEP_MS, false, SM_EXPIRY_TIMER_UDATA);
+    try changes.addTimer(SM_EXPIRY_TIMER_IDENT, 1_000, false, SM_EXPIRY_TIMER_UDATA);
     try changes.addTimer(OFFLINE_RETRY_TIMER_IDENT, session_lifecycle.OFFLINE_RETRY_DELAY_MS, false, OFFLINE_RETRY_TIMER_UDATA);
     try std.testing.expectError(error.ChangeListFull, changes.addRead(3, 1));
 
@@ -5765,4 +5934,59 @@ test "Server: scram_stale evicts the cached params and fails soft" {
     var buf: [2048]u8 = undefined;
     const n = posix.read(fds[1], &buf) catch 0;
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "temporary-auth-failure") != null);
+}
+
+// C11: the expiry wheel's arm is a single one-shot timer at the earliest
+// deadline: never a periodic sweep, never per-session timers.
+test "Server: C11 SM expiry stages exactly one one-shot timer at the wheel deadline" {
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, std.testing.allocator);
+    defer server.deinit();
+
+    const session = try std.testing.allocator.create(Session);
+    session.init(-1, 0, "localhost", false, std.testing.allocator);
+    defer {
+        session.deinit();
+        std.testing.allocator.destroy(session);
+    }
+
+    const now = sm_state.monotonicSeconds();
+    server.sm_expiry.insert(session, now + sm_state.DEFAULT_RESUME_TIMEOUT);
+    server.sm_expiry_pending = true;
+
+    var change_buf: [IPC_RECONCILE_RESERVED + 4]posix.Kevent = undefined;
+    var changes = initLoopChangeList(&change_buf);
+    server.armSmExpiry(&changes);
+
+    var timer_count: usize = 0;
+    for (changes.slice()) |ev| {
+        if (ev.filter != std.c.EVFILT.TIMER or ev.ident != SM_EXPIRY_TIMER_IDENT) continue;
+        timer_count += 1;
+        try std.testing.expect(ev.flags & std.c.EV.ONESHOT != 0);
+        try std.testing.expect(ev.data > 299_000 and ev.data <= 300_000);
+    }
+    try std.testing.expectEqual(@as(usize, 1), timer_count);
+    try std.testing.expect(server.sm_expiry_armed);
+    try std.testing.expect(!server.sm_expiry_pending);
+    try std.testing.expectEqual(now + sm_state.DEFAULT_RESUME_TIMEOUT, server.sm_expiry_armed_deadline);
+
+    // Settled state: a second pass stages nothing.
+    changes.reset();
+    server.armSmExpiry(&changes);
+    try std.testing.expectEqual(@as(usize, 0), changes.count());
+
+    // Emptying the wheel disarms the live knote (EV_DELETE), never re-arms.
+    _ = server.sm_expiry.unlink(session);
+    server.sm_expiry_pending = true;
+    changes.reset();
+    server.armSmExpiry(&changes);
+    var delete_found = false;
+    for (changes.slice()) |ev| {
+        if (ev.filter != std.c.EVFILT.TIMER or ev.ident != SM_EXPIRY_TIMER_IDENT) continue;
+        try std.testing.expect(ev.flags & std.c.EV.DELETE != 0);
+        delete_found = true;
+    }
+    try std.testing.expect(delete_found);
+    try std.testing.expect(!server.sm_expiry_armed);
+    try std.testing.expect(!server.sm_expiry_pending);
 }

@@ -26,8 +26,11 @@ const muc_handler = @import("../muc/handler.zig");
 const presence_handler = @import("../presence/handler.zig");
 const lastact_store = @import("last_activity_store");
 const router = @import("../routing/router.zig");
+const routing_deliver = @import("../routing/deliver.zig");
+const stanza_writer = @import("../stanza/writer.zig");
 const connection_mod = @import("../connection.zig");
 const delivery_queue_mod = @import("delivery_queue");
+const sm_drain_exec_mod = @import("sm_drain_exec.zig");
 
 const log = std.log.scoped(.lifecycle);
 
@@ -365,7 +368,11 @@ fn detachSession(server: *Server, id: usize, session: *Session, changes: *Change
     session.sm_detached = true;
     server.detached_count += 1;
     c2s_sm.smIdMapInsert(server, session.sm_id[0..session.sm_id_len], id);
-    session.sm_detach_time = std.time.timestamp();
+    session.sm_detach_time = sm_state.monotonicSeconds();
+    // C11: the resume deadline joins the worker's expiry wheel; the single
+    // one-shot timer is re-armed at the iteration tail (sm_expiry_pending).
+    server.sm_expiry.insert(session, session.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
+    server.sm_expiry_pending = true;
 
     // Remove from kqueue and close the fd. Purge instead of staging deletes:
     // close(2) drops the knotes, and a staged delete/add for this number
@@ -397,11 +404,15 @@ fn destroySession(server: *Server, id: usize, session: *Session, changes: *Chang
         c2s_sm.smIdMapRemove(server, session.sm_id[0..session.sm_id_len]);
     }
 
+    // A linked session still sits in the expiry wheel; drop the node before
+    // the memory goes back (flag-guarded no-op for never-detached sessions).
+    if (server.sm_expiry.unlink(session)) server.sm_expiry_pending = true;
+
     // A detached session that dies without a resume still owns an unacked
     // queue; its messages go to offline storage rather than vanishing
     // (ADR-2). Live-session overflow reaps drain in reapOutboundOverflow.
     if (session.sm_detached) {
-        drainUnackedToOffline(server, session);
+        parkUnackedDrain(server, session);
     }
 
     // Remove from all MUC rooms (broadcasts unavailable to room occupants)
@@ -461,7 +472,7 @@ fn recordLastOffline(roster: anytype, bare_jid: []const u8) void {
 /// Detached sessions are destroyed; a later resume fails with item-not-found
 /// and the client performs a full bind and MAM catch-up.
 /// Called once per event batch from the worker event loop.
-/// noinline: the teardown chains (destroySession, drainUnackedToOffline)
+/// noinline: the teardown chains (destroySession, parkUnackedDrain)
 /// are cold paths and must stay out of the Server.run frame.
 pub noinline fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void {
     for (server.sessions, 0..) |slot, i| {
@@ -480,69 +491,404 @@ pub noinline fn reapOutboundOverflow(server: *Server, changes: *ChangeList) void
             // ADR-2 fail-closed policy: the unacked queue is authoritative
             // for what the client never acknowledged; its messages go to
             // offline storage instead of dying with the session.
-            drainUnackedToOffline(server, session);
+            parkUnackedDrain(server, session);
             forceCloseSession(server, i, changes);
         }
     }
 }
 
-/// ADR-2 fail-closed drain: on teardown of a session with an SM unacked
-/// queue, offer each pending `<message>` stanza to the recipient's offline
-/// store so an over-cap session loses nothing the client never
-/// acknowledged. Only `<message>` qualifies (RFC 6121): type='error' and
-/// type='groupchat' are never stored, presence and iq are skipped. Store
-/// failures count against offline_drain_drops. C11 builds the full
-/// XEP-0198 section 5 policy on this path; C2 only drains.
-fn drainUnackedToOffline(server: *Server, session: *Session) void {
-    const store = server.offline orelse return;
+/// A session's unacked queue parked for a chunked section-5 drain
+/// (T-265C5A0E). The queue object moves here whole: entries, blob
+/// references and all. The session can be freed while the batch
+/// tail finishes the store and bounce work in bounded pieces.
+pub const SmDrain = struct {
+    next: ?*SmDrain = null,
+    /// The session's own unacked queue object; drained entries are
+    /// nulled and released as the cursor advances.
+    queue: *sm_state.SmUnackedQueue,
+    /// Next entry index (0..queue.count, relative to queue.head) to drain.
+    pos: u32 = 0,
+    /// Bare JID the queue's stanzas were bound for; 0 means every entry
+    /// counts as a drop (no bound JID to store under or bounce from).
+    recipient_len: u16 = 0,
+    recipient: [router.BARE_JID_MAX]u8 = undefined,
+};
+
+/// Per-iteration bound on unacked stanzas drained across all paths
+/// (T-265C5A0E): parked-tick chunks and inline overload drains draw
+/// from the same per-turn credit, reset at the top of each event-loop
+/// iteration. Each drained stanza costs at most one bounded executor
+/// submission plus one bounce, and each retired drain node costs one
+/// credit too, so a mass expiry or a teardown burst never stalls a
+/// whole event batch.
+pub const SM_DRAIN_CHUNK: u32 = 32;
+
+/// Parked-drain retention bound: freed session slots recycle while
+/// parked queues still hold blobs, so sessions-per-worker times the
+/// per-session queue bound does not cover them. Two full default queues
+/// park before the byte bound trips; the node bound caps tiny-queue
+/// churn. A park that would overflow instead drains inline through the
+/// same bounded executor path (counted via sm_drain_park_overflow).
+pub const SM_DRAIN_PARK_MAX_NODES: u32 = 64;
+pub const SM_DRAIN_PARK_MAX_BYTES: u64 = 2 * sm_state.DEFAULT_MAX_UNACKED_BYTES;
+
+/// XEP-0198 section-5 drain (C11, chunked by T-265C5A0E): on teardown of
+/// a session with an SM unacked queue, every stanza reaches exactly one
+/// counted outcome so nothing is lost silently (T430; this closes the
+/// #81 counted-but-lost gap where an offline refusal vanished).
+/// `<message>` (not error or groupchat) is offered to the recipient's
+/// offline store; a refusal then bounces like any other non-message. IQ,
+/// presence and refused messages bounce service-unavailable to the
+/// stanza's sender through the session map (local) or the S2S daemon
+/// (remote). type='error', type='result' and groupchat stanzas are
+/// counted drops: RFC 6120 forbids an error for an error, and a
+/// groupchat bounce would target a room JID.
+///
+/// The queue is parked on the worker's drain list and the per-stanza
+/// work runs in drainSmUnackedTick at the batch tail, SM_DRAIN_CHUNK
+/// credits per iteration, so the drain never monopolizes one kevent
+/// batch. Offline stores are submitted to the bounded off-loop executor
+/// and settled on completion; a park that would exceed the retention
+/// bound, or a drain-node allocation failure, drains through the same
+/// bounded submissions under the shared turn credit, with the
+/// remainder bulk-counted so no stanza escapes a counted outcome.
+pub fn parkUnackedDrain(server: *Server, session: *Session) void {
     const queue = session.sm_unacked orelse return;
-    if (session.stream.bound_jid == null) return;
-    const recipient = session.stream.boundBare();
+    session.sm_unacked = null; // the drain node owns it from here
+
+    var recipient_buf: [router.BARE_JID_MAX]u8 = undefined;
+    var recipient_len: u16 = 0;
+    if (session.stream.bound_jid != null) {
+        const bound_bare = session.stream.boundBare();
+        if (bound_bare.len <= recipient_buf.len) {
+            @memcpy(recipient_buf[0..bound_bare.len], bound_bare);
+            recipient_len = @intCast(bound_bare.len);
+        } else {
+            noteDrop("session {d} unacked drain: bare JID exceeds {d} bytes; {d} stanzas count as drops", .{ session.conn.id, router.BARE_JID_MAX, queue.count });
+        }
+    } else if (queue.count > 0) {
+        noteDrop("session {d} unacked drain: {d} stanzas count as drops (no bound JID)", .{ session.conn.id, queue.count });
+    }
+
+    // Bounded parked retention: a session slot freed at teardown can be
+    // reused while its parked queue still holds blobs. On pressure the
+    // queue drains through the bounded overload path instead of
+    // parking: what the turn's remaining credit can reach gets a real
+    // outcome, the rest takes a counted bulk drop, and the detour is
+    // counted per queue.
+    if (server.sm_drain_parked_nodes >= SM_DRAIN_PARK_MAX_NODES or
+        server.sm_drain_parked_bytes + queue.bytes > SM_DRAIN_PARK_MAX_BYTES)
+    {
+        _ = delivery_queue_mod.sm_drain_park_overflow.fetchAdd(1, .monotonic);
+        drainQueueOverload(server, queue, recipient_buf[0..recipient_len]);
+        queue.deinit();
+        server.allocator.destroy(queue);
+        return;
+    }
+
+    const node = server.allocator.create(SmDrain) catch {
+        // No memory for the parking node: the overload path bounds the
+        // inline work to the turn's remaining credit and bulk-counts
+        // the rest, so no stanza escapes a counted outcome.
+        drainQueueOverload(server, queue, recipient_buf[0..recipient_len]);
+        queue.deinit();
+        server.allocator.destroy(queue);
+        return;
+    };
+    node.* = .{
+        .queue = queue,
+        .recipient_len = recipient_len,
+        .recipient = recipient_buf,
+    };
+    if (server.sm_drain_tail) |tail| {
+        tail.next = node;
+    } else {
+        server.sm_drain_head = node;
+    }
+    server.sm_drain_tail = node;
+    server.sm_drain_parked_nodes += 1;
+    server.sm_drain_parked_bytes += queue.bytes;
+}
+
+/// Batch-tail continuation for parked unacked drains (T-265C5A0E): at
+/// most the turn's remaining SM_DRAIN_CHUNK credit leaves the queues
+/// per call (one credit per drained stanza and per retired node) and
+/// leftovers re-drive the loop through the self-wake knote, so the
+/// work lands across ordinary iterations instead of one kevent batch.
+/// Executor completions are settled first, bounded by MAX_JOBS. Called
+/// once per event-loop iteration next to reapOutboundOverflow.
+pub fn drainSmUnackedTick(server: *Server) void {
+    var completed = server.sm_drain_completed.swap(null, .acq_rel);
+    while (completed) |job| {
+        const next = job.next;
+        settleDrainJob(server, job);
+        completed = next;
+    }
+
     const now: u64 = @intCast(@max(std.time.timestamp(), 0));
-    var iter = queue.getUnacked();
-    while (iter.next()) |stanza| {
-        const head_end = std.mem.indexOfScalar(u8, stanza, '>') orelse continue;
-        const head = stanza[0..head_end];
-        if (head.len < 8 or !std.mem.eql(u8, head[0..8], "<message")) continue;
-        if (head.len > 8 and head[8] != ' ' and head[8] != '/') continue;
-        if (c2s_session.headAttr(head, "type")) |stanza_type| {
-            if (std.mem.eql(u8, stanza_type, "error") or std.mem.eql(u8, stanza_type, "groupchat")) continue;
-        }
-        const stored = store.storeHeldPointer(
-            recipient,
-            c2s_session.headAttr(head, "from") orelse "",
-            c2s_session.headAttr(head, "id") orelse "offline",
-            now,
-            stanza,
-        ) catch {
-            _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
+    while (server.sm_drain_turn_credit > 0) {
+        const node = server.sm_drain_head orelse break;
+        if (node.pos == node.queue.count) {
+            server.sm_drain_head = node.next;
+            if (server.sm_drain_tail == node) server.sm_drain_tail = null;
+            server.sm_drain_parked_bytes -= node.queue.bytes;
+            server.sm_drain_parked_nodes -= 1;
+            node.queue.deinit();
+            server.allocator.destroy(node.queue);
+            server.allocator.destroy(node);
+            // Node cleanup is real work: charge it to the turn's credit
+            // so a flood of empty queues still bounds each iteration.
+            server.sm_drain_turn_credit -= 1;
             continue;
-        };
-        if (!stored) {
-            _ = delivery_queue_mod.offline_drain_drops.fetchAdd(1, .monotonic);
         }
+        const idx = (node.queue.head + node.pos) % sm_state.UNACKED_CAPACITY;
+        node.pos += 1;
+        const blob = node.queue.entries[idx] orelse continue;
+        node.queue.entries[idx] = null;
+        server.sm_drain_turn_credit -= 1;
+        if (node.recipient_len == 0) {
+            _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+        } else {
+            drainOneUnacked(server, blob, node.recipient[0..node.recipient_len], now);
+        }
+        node.queue.bytes -= blob.len;
+        server.sm_drain_parked_bytes -= blob.len;
+        blob.releaseRetention();
+    }
+    if (server.sm_drain_head != null) {
+        server.loop.selfWake() catch |err| {
+            log.warn("SM unacked drain self-wake failed: {s}; leftovers wait for the next event", .{@errorName(err)});
+        };
     }
 }
 
-/// Sweep detached sessions that have exceeded the resume timeout.
-/// Called periodically from the event loop (e.g., every 30 seconds via timer).
-pub fn expireDetachedSessions(server: *Server, changes: *ChangeList) void {
-    if (server.detached_count == 0) return;
-    const now = std.time.timestamp();
-    for (server.sessions, 0..) |slot, i| {
-        const session = slot orelse continue;
-        if (!session.sm_detached) continue;
-        const elapsed = now - session.sm_detach_time;
-        if (elapsed >= sm_state.DEFAULT_RESUME_TIMEOUT) {
-            log.info("session {d} SM resume expired (id={s}, elapsed={d}s)", .{
-                i,
-                session.sm_id[0..session.sm_id_len],
-                elapsed,
-            });
-            session.sm_resume_enabled = false; // Prevent re-detach
-            destroySession(server, i, session, changes);
+/// Bounded inline drain used when the queue cannot be parked (node
+/// allocation failure or parked-retention pressure): the stanzas the
+/// turn's remaining credit can reach still get a real outcome through
+/// the same bounded executor submissions, and the rest take a counted
+/// bulk drop. There is no deferred capacity left for these entries -
+/// parking is what failed - so deferring the remainder is not an
+/// option and the whole queue must settle this turn.
+fn drainQueueOverload(server: *Server, queue: *sm_state.SmUnackedQueue, recipient: []const u8) void {
+    const now: u64 = @intCast(@max(std.time.timestamp(), 0));
+    var iter = queue.getUnacked();
+    while (server.sm_drain_turn_credit > 0) {
+        const blob = iter.next() orelse break;
+        server.sm_drain_turn_credit -= 1;
+        if (recipient.len == 0) {
+            _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+        } else {
+            drainOneUnacked(server, blob, recipient, now);
         }
     }
+    const remaining = queue.count - iter.pos;
+    if (remaining > 0) {
+        // Explicit counted outcome for every stanza the budget did not
+        // reach: sm_unacked_dropped keeps the outcome partition and
+        // sm_drain_overload_drops marks the cause.
+        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(remaining, .monotonic);
+        _ = delivery_queue_mod.sm_drain_overload_drops.fetchAdd(remaining, .monotonic);
+        noteDrop("unacked drain: {d} stanzas dropped, overload budget exhausted", .{remaining});
+    }
+}
+
+/// Header fields the drain's outcome decisions need: the tag name and
+/// the raw attribute text up to the tag's end.
+const UnackedHead = struct {
+    head: []const u8,
+    tag_name: []const u8,
+};
+
+fn parseUnackedHead(stanza: []const u8) ?UnackedHead {
+    const head_end = std.mem.indexOfScalar(u8, stanza, '>') orelse return null;
+    const head = stanza[0..head_end];
+    var tag_end: usize = 1;
+    while (tag_end < head.len and head[tag_end] != ' ' and head[tag_end] != '/') : (tag_end += 1) {}
+    return .{ .head = head, .tag_name = head[1..tag_end] };
+}
+
+/// Executor adapter for the offline store: folds the `!bool` commit
+/// result into the job's `stored` flag. Runs on the executor thread.
+fn offlineStoreHeld(ctx: *anyopaque, recipient: []const u8, from_jid: []const u8, stanza_id: []const u8, timestamp: u64, stanza_xml: []const u8) bool {
+    const store: *offline_store_mod.GenericOfflineStore(server_mod.OpBackendType) = @ptrCast(@alignCast(ctx));
+    return store.storeHeldPointer(recipient, from_jid, stanza_id, timestamp, stanza_xml) catch |err| {
+        log.warn("unacked drain: offline store failed for {s}: {s}", .{ recipient, @errorName(err) });
+        return false;
+    };
+}
+
+/// Per-stanza section-5 outcome for the parked unacked drain. Counters
+/// live in delivery_queue (module globals, cold teardown path).
+fn drainOneUnacked(server: *Server, blob: *delivery_queue_mod.Blob, recipient: []const u8, now: u64) void {
+    const stanza = blob.bytes();
+    const parsed = parseUnackedHead(stanza) orelse {
+        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+        return;
+    };
+    const head = parsed.head;
+    const tag_name = parsed.tag_name;
+    const stanza_type = c2s_session.headAttr(head, "type");
+
+    // RFC 6120: never send an error for an error or a result.
+    if (stanza_type) |t| {
+        if (std.mem.eql(u8, t, "error") or std.mem.eql(u8, t, "result")) {
+            _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+            return;
+        }
+    }
+
+    if (std.mem.eql(u8, tag_name, "message")) {
+        if (stanza_type) |t| {
+            // A groupchat bounce would target the room, not a sender.
+            if (std.mem.eql(u8, t, "groupchat")) {
+                _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+        if (server.offline) |store| {
+            // The commit runs on the drain executor thread and the job's
+            // completion settles the outcome; there is no inline commit
+            // fallback - a full ring or a failed job allocation counts as
+            // a store refusal and the stanza bounces like any refusal.
+            server.sm_drain_exec.submit(.{
+                .completed = &server.sm_drain_completed,
+                .wake = &server.loop,
+                .store_ctx = store,
+                .store_fn = offlineStoreHeld,
+                .blob = blob,
+                .recipient = recipient,
+                .from_jid = c2s_session.headAttr(head, "from") orelse "",
+                .stanza_id = c2s_session.headAttr(head, "id") orelse "offline",
+                .timestamp = now,
+            }) catch {
+                _ = delivery_queue_mod.sm_offline_refused.fetchAdd(1, .monotonic);
+                if (bounceUnackedStanza(server, recipient, head, tag_name)) {
+                    _ = delivery_queue_mod.sm_unacked_bounced.fetchAdd(1, .monotonic);
+                } else {
+                    _ = delivery_queue_mod.sm_unacked_bounce_failed.fetchAdd(1, .monotonic);
+                }
+                return;
+            };
+            return;
+        }
+        // No store at all: a refusal still reaches the sender as an
+        // error instead of vanishing.
+        _ = delivery_queue_mod.sm_offline_refused.fetchAdd(1, .monotonic);
+    }
+
+    if (bounceUnackedStanza(server, recipient, head, tag_name)) {
+        _ = delivery_queue_mod.sm_unacked_bounced.fetchAdd(1, .monotonic);
+    } else {
+        _ = delivery_queue_mod.sm_unacked_bounce_failed.fetchAdd(1, .monotonic);
+    }
+}
+
+/// Settle one executor completion on the loop: a stored stanza counts
+/// and frees the job; a refused one bounces like the synchronous
+/// refusal it replaced. The head parse is redone from the job's
+/// retained blob so the executor thread stays store-only.
+fn settleDrainJob(server: *Server, job: *sm_drain_exec_mod.Job) void {
+    defer job.destroy();
+    if (job.stored) {
+        _ = delivery_queue_mod.sm_unacked_stored.fetchAdd(1, .monotonic);
+        return;
+    }
+    // A refusal (quota, store error, executor-side failure) still
+    // reaches the sender as an error instead of vanishing.
+    _ = delivery_queue_mod.sm_offline_refused.fetchAdd(1, .monotonic);
+    const parsed = parseUnackedHead(job.blob.bytes()) orelse {
+        _ = delivery_queue_mod.sm_unacked_dropped.fetchAdd(1, .monotonic);
+        return;
+    };
+    const recipient = job.recipient[0..job.recipient_len];
+    if (bounceUnackedStanza(server, recipient, parsed.head, parsed.tag_name)) {
+        _ = delivery_queue_mod.sm_unacked_bounced.fetchAdd(1, .monotonic);
+    } else {
+        _ = delivery_queue_mod.sm_unacked_bounce_failed.fetchAdd(1, .monotonic);
+    }
+}
+
+/// Bounce one unacked stanza service-unavailable to its sender. The 'from'
+/// attribute arrives entity-encoded; it decodes before the JID parse.
+/// A local full JID routes through the session map (same worker writes to
+/// the session directly, another worker through the delivery MPSC); a
+/// remote domain goes to the S2S daemon. False on every unroutable sender:
+/// missing or bare 'from', undecodable attribute, unparsable JID, session
+/// gone, delivery refusal, no S2S daemon.
+fn bounceUnackedStanza(server: *Server, recipient: []const u8, head: []const u8, tag_name: []const u8) bool {
+    const from_wire = c2s_session.headAttr(head, "from") orelse return false;
+    const stanza_id = c2s_session.headAttr(head, "id") orelse "";
+
+    var sender_buf: [512]u8 = undefined;
+    var sender_fbs = std.io.fixedBufferStream(&sender_buf);
+    xml.decodeWrite(sender_fbs.writer(), from_wire) catch |err| {
+        noteDrop("unacked drain: undecodable 'from' attribute: {s}", .{@errorName(err)});
+        return false;
+    };
+    const sender_full = sender_fbs.getWritten();
+    const sender = xmpp.Jid.parse(sender_full) catch |err| {
+        noteDrop("unacked drain: unparsable 'from' JID: {s}", .{@errorName(err)});
+        return false;
+    };
+    if (sender.resource.len == 0) return false;
+
+    if (!std.mem.eql(u8, sender.domain, server.server_host)) {
+        return routing_deliver.sendS2sError(server, sender_full, recipient, tag_name, stanza_id);
+    }
+
+    const sm = server.session_map orelse return false;
+    const entry = sm.findByFullJid(sender.local, sender.domain, sender.resource) orelse return false;
+
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    stanza_writer.writeCrossWorkerError(fbs.writer(), tag_name, recipient, sender_full, stanza_id) catch |err| {
+        noteDrop("unacked drain: bounce encode failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    const bounce = fbs.getWritten();
+
+    if (entry.worker_id == server.worker_id) {
+        const target = server.sessionForEventToken(entry.token) orelse return false;
+        return target.stanza(bounce) != .failed_closed;
+    }
+    const ds = server.delivery_system orelse return false;
+    ds.deliver(server.worker_id, entry.worker_id, entry.token, bounce) catch |err| {
+        noteDrop("unacked drain: bounce delivery to worker {d} failed: {s}", .{ entry.worker_id, @errorName(err) });
+        return false;
+    };
+    return true;
+}
+
+/// Sweep detached sessions that have exceeded the resume timeout.
+/// C11: driven by the worker's single one-shot expiry timer at the wheel's
+/// earliest deadline, so a call costs O(due) instead of O(sessions). The
+/// fired knote deleted itself; the iteration tail re-arms via
+/// armSmExpiry.
+pub fn expireDetachedSessions(server: *Server, changes: *ChangeList) void {
+    server.sm_expiry_armed = false;
+    if (server.sm_expiry.count > 0) {
+        server.sm_expiry.expireDue(sm_state.monotonicSeconds(), ExpireCtx{
+            .server = server,
+            .changes = changes,
+        }, expireOneDetached);
+    }
+    server.sm_expiry_pending = true;
+}
+
+const ExpireCtx = struct {
+    server: *Server,
+    changes: *ChangeList,
+};
+
+fn expireOneDetached(ctx: ExpireCtx, session: *Session) void {
+    const id = session.conn.id;
+    log.info("session {d} SM resume expired (id={s}, elapsed={d}s)", .{
+        id,
+        session.sm_id[0..session.sm_id_len],
+        sm_state.monotonicSeconds() - session.sm_detach_time,
+    });
+    session.sm_resume_enabled = false; // Prevent re-detach
+    destroySession(ctx.server, id, session, ctx.changes);
 }
 
 /// Deliver queued offline messages to a user who just became available.
@@ -1115,6 +1461,20 @@ const archive_backend = @import("archive_backend");
 const offline_store_mod = @import("generic_offline_store");
 const archive_store_mod = @import("archive_store");
 
+/// Drive a parked drain to completion without a live writer thread:
+/// the tick submits store jobs, pumpStore commits them synchronously,
+/// and the next tick settles their completions.
+fn drainParkedFully(server: *Server) void {
+    while (server.sm_drain_head != null or
+        server.sm_drain_exec.pending() > 0 or
+        server.sm_drain_completed.load(.monotonic) != null)
+    {
+        server.sm_drain_turn_credit = SM_DRAIN_CHUNK; // each call stands in for a loop iteration
+        drainSmUnackedTick(server);
+        _ = server.sm_drain_exec.pumpStore(sm_drain_exec_mod.Executor.MAX_JOBS);
+    }
+}
+
 fn testSocketPair() ![2]posix.fd_t {
     var fds: [2]posix.fd_t = undefined;
     const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.NONBLOCK, 0, &fds);
@@ -1176,7 +1536,7 @@ test "T158: detach timer expires sessions at 300s, not before" {
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
-    const now = std.time.timestamp();
+    const now = sm_state.monotonicSeconds();
 
     // Session 1: detached 301 seconds ago — MUST be expired
     const s1 = try makeAuthenticatedSession(&server, 1, "alice");
@@ -1188,6 +1548,7 @@ test "T158: detach timer expires sessions at 300s, not before" {
     @memcpy(&s1.sm_id, id1);
     server.detached_count = 2;
     c2s_sm.smIdMapInsert(&server, &s1.sm_id, 1);
+    server.sm_expiry.insert(s1, s1.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
 
     // Session 2: detached only 10 seconds ago — MUST NOT be expired
     const s2 = try makeAuthenticatedSession(&server, 2, "bob");
@@ -1198,6 +1559,7 @@ test "T158: detach timer expires sessions at 300s, not before" {
     const id2 = "eeee5555ffff6666aaaa7777bbbb8888";
     @memcpy(&s2.sm_id, id2);
     c2s_sm.smIdMapInsert(&server, &s2.sm_id, 2);
+    server.sm_expiry.insert(s2, s2.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
 
     // Mark slots 1 and 2 as consumed from the free list (tests bypass normal alloc)
     server.free_count -= 2;
@@ -1612,7 +1974,7 @@ test "S15: an overflowed session drains unacked messages to offline storage" {
     server.free_count -= 1;
     // Owned by session.deinit once assigned.
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     session.sm_unacked = queue;
 
     _ = queue.push("<message from='alice@localhost' to='bob@localhost' id='m1'><body>held</body></message>");
@@ -1623,6 +1985,8 @@ test "S15: an overflowed session drains unacked messages to offline storage" {
 
     session.sm_overflow = true;
     reapOutboundOverflow(&server, &changes);
+    // The drain is parked at teardown and runs chunked at the batch tail.
+    drainParkedFully(&server);
 
     // Only the plain <message> reached the offline store; the session
     // was reaped with resource-constraint.
@@ -1692,7 +2056,7 @@ test "T158: detach timer does not expire session at exactly 299s" {
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
-    const now = std.time.timestamp();
+    const now = sm_state.monotonicSeconds();
 
     // Session detached 299 seconds ago — must NOT be expired (boundary check)
     const s1 = try makeAuthenticatedSession(&server, 1, "carol");
@@ -1704,6 +2068,7 @@ test "T158: detach timer does not expire session at exactly 299s" {
     @memcpy(&s1.sm_id, id1);
     server.detached_count = 1;
     c2s_sm.smIdMapInsert(&server, &s1.sm_id, 1);
+    server.sm_expiry.insert(s1, s1.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
     server.free_count -= 1;
 
     expireDetachedSessions(&server, &changes);
@@ -1727,7 +2092,7 @@ test "T158: detach timer expires session at exactly 300s" {
     var change_buf: [16]posix.Kevent = undefined;
     var changes = ChangeListT.init(&change_buf);
 
-    const now = std.time.timestamp();
+    const now = sm_state.monotonicSeconds();
 
     // Session detached exactly 300 seconds ago — MUST be expired (>= comparison)
     const s1 = try makeAuthenticatedSession(&server, 1, "dave");
@@ -1739,6 +2104,7 @@ test "T158: detach timer expires session at exactly 300s" {
     @memcpy(&s1.sm_id, id1);
     server.detached_count = 1;
     c2s_sm.smIdMapInsert(&server, &s1.sm_id, 1);
+    server.sm_expiry.insert(s1, s1.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
     server.free_count -= 1;
 
     expireDetachedSessions(&server, &changes);
@@ -1746,6 +2112,61 @@ test "T158: detach timer expires session at exactly 300s" {
     // Session must be destroyed — 300 >= 300 (exact boundary)
     try std.testing.expect(server.sessions[1] == null);
     try std.testing.expectEqual(@as(u16, 0), server.detached_count);
+}
+
+// C11 regression: a session detached through the production close path
+// carries an expiry-wheel link, and the wheel drain destroys it while a
+// non-due session stays linked.
+test "C11: detach links the expiry wheel and the drain fires once" {
+    const allocator = std.testing.allocator;
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const s1 = try makeAuthenticatedSession(&server, 1, "alice");
+    s1.stream.state = .active;
+    s1.sm_resume_enabled = true;
+    s1.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const id1 = "aaaa1111bbbb2222cccc3333dddd4444";
+    @memcpy(&s1.sm_id, id1);
+    server.free_count -= 1;
+
+    closeSession(&server, 1, &changes);
+    try std.testing.expect(s1.sm_detached);
+    try std.testing.expect(s1.sm_expiry_linked);
+    try std.testing.expectEqual(@as(usize, 1), server.sm_expiry.count);
+    try std.testing.expect(server.sm_expiry_pending);
+
+    // A second detached session with a later deadline must survive the drain.
+    const s2 = try makeAuthenticatedSession(&server, 2, "bob");
+    s2.sm_resume_enabled = true;
+    s2.sm_detached = true;
+    s2.sm_detach_time = sm_state.monotonicSeconds();
+    s2.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const id2 = "eeee5555ffff6666aaaa7777bbbb8888";
+    @memcpy(&s2.sm_id, id2);
+    server.detached_count += 1;
+    c2s_sm.smIdMapInsert(&server, &s2.sm_id, 2);
+    server.sm_expiry.insert(s2, s2.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
+    server.free_count -= 1;
+
+    // Push s1's deadline into the past, then drain.
+    _ = server.sm_expiry.unlink(s1);
+    server.sm_expiry.insert(s1, sm_state.monotonicSeconds() - 1);
+    expireDetachedSessions(&server, &changes);
+
+    try std.testing.expect(server.sessions[1] == null);
+    try std.testing.expect(s2.sm_expiry_linked);
+    try std.testing.expectEqual(@as(u16, 1), server.detached_count);
+    try std.testing.expect(server.sm_expiry_pending);
+
+    // s2's own destroy path unlinks the wheel node (no dangling pointer).
+    destroySession(&server, 2, s2, &changes);
+    try std.testing.expectEqual(@as(usize, 0), server.sm_expiry.count);
+    try std.testing.expectEqual(@as(?i64, null), server.sm_expiry.nextDeadline());
 }
 
 // T152 regression test: a stale (already-bound) resource must be evicted so
@@ -2438,7 +2859,7 @@ test "S35: SM replay resends the stamped stanza unchanged" {
     session.stream.authenticated_jid = xmpp_lib.Jid{ .local = "bob", .domain = "localhost" };
     session.sm_enabled = true;
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     session.sm_unacked = queue;
     server.sessions[1] = session;
     defer {
@@ -2460,7 +2881,8 @@ test "S35: SM replay resends the stamped stanza unchanged" {
     // they carry the stamp written at drain time, still exactly once.
     var iter = session.sm_unacked.?.getUnacked();
     var replayed: usize = 0;
-    while (iter.next()) |replayed_stanza| {
+    while (iter.next()) |replayed_blob| {
+        const replayed_stanza = replayed_blob.bytes();
         replayed += 1;
         try std.testing.expectEqual(@as(usize, 1), countOccurrences(replayed_stanza, "urn:xmpp:delay"));
         try std.testing.expect(std.mem.indexOf(u8, replayed_stanza, "stamp='1970-01-01T00:16:40Z'") != null);
@@ -2799,4 +3221,568 @@ test "T316: a repeated destroySession is a counted no-op" {
     destroySession(&server, server.sessions.len, session, &changes);
     try std.testing.expectEqual(free_count_after, server.free_count);
     try std.testing.expectEqual(@as(u64, 2), server.double_destroy_skips);
+}
+
+// C11 regression tests: every unacked stanza reaches a counted outcome:
+// stored offline, bounced, or a counted drop. Never a silent loss (T430).
+
+test "C11: SM retention never charges the producer's transport budget" {
+    const allocator = std.testing.allocator;
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const session = try makeAuthenticatedSession(&server, 1, "alice");
+    session.stream.state = .active;
+    session.stream.setBoundJid(xmpp_lib.Jid.parse("alice@localhost/res") catch null);
+    session.sm_resume_enabled = true;
+    session.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    @memcpy(&session.sm_id, "aaaa1111bbbb2222cccc3333dddd4444");
+    server.free_count -= 1;
+
+    // A producer-charged blob (the shape a delivered stanza takes in
+    // transport) lands in the queue as a retention reference; the
+    // producer's charge ends with the producer's own handle.
+    var producer = delivery_queue_mod.BlobBudget{ .allocator = allocator, .limit = delivery_queue_mod.BlobBudget.DEFAULT_LIMIT };
+    const blob = try producer.produce("<message from='bob@localhost/res' to='alice@localhost' id='m1'/>");
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
+    _ = queue.pushBlob(blob);
+    _ = queue.push("<presence from='bob@localhost/res' to='alice@localhost'/>");
+    session.sm_unacked = queue;
+    blob.release();
+    try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
+
+    closeSession(&server, 1, &changes);
+
+    // Detached, still resumable; the retained bytes are the session's own
+    // account, never the producer's.
+    try std.testing.expect(session.sm_detached);
+    try std.testing.expect(!session.sm_overflow);
+    try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
+    try std.testing.expect(queue.bytes > 0);
+
+    // Teardown parks the counted drain; draining refunds the session's
+    // account to zero.
+    session.sm_resume_enabled = false;
+    destroySession(&server, 1, session, &changes);
+    try std.testing.expect(server.sm_drain_head != null);
+    drainParkedFully(&server);
+    try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
+}
+
+test "C11: the session byte bound fails only the holder into a counted drain" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var sm = try SessionMap.init(allocator, 1, 0);
+    defer sm.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    try server.configureSessionMap(&sm);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const bob = try makeAuthenticatedSession(&server, 3, "bob");
+    bob.stream.setBoundJid(xmpp_lib.Jid.parse("bob@localhost/res") catch null);
+    try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
+    server.free_count -= 1;
+
+    const session = try makeAuthenticatedSession(&server, 1, "alice");
+    session.stream.state = .active;
+    session.stream.setBoundJid(xmpp_lib.Jid.parse("alice@localhost/res") catch null);
+    session.sm_enabled = true;
+    session.sm_resume_enabled = true;
+    session.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    @memcpy(&session.sm_id, "bbbb2222cccc3333dddd4444eeee5555");
+    server.free_count -= 1;
+    const m1 = "<message from='bob@localhost/res' to='alice@localhost' id='m1' type='chat'><body>hi</body></message>";
+    const iq1 = "<iq from='bob@localhost/res' to='alice@localhost' id='iq1' type='get'><ping/></iq>";
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
+    session.sm_unacked = queue;
+
+    // The per-session byte bound ([core] sm_max_unacked_bytes) fits both
+    // stanzas exactly; a third push is refused and fails this session
+    // alone into the counted drain.
+    server.sm_max_unacked_bytes = m1.len + iq1.len;
+    queue.byte_limit = server.sm_max_unacked_bytes;
+    session.smTrackOutbound(m1, null);
+    session.smTrackOutbound(iq1, null);
+    try std.testing.expect(!session.sm_overflow);
+    session.smTrackOutbound("<presence from='bob@localhost/res' to='alice@localhost'/>", null);
+    try std.testing.expect(session.sm_overflow);
+    try std.testing.expectEqual(@as(u32, 2), queue.count);
+
+    closeSession(&server, 1, &changes);
+    try std.testing.expect(session.sm_detached);
+    try std.testing.expect(session.sm_overflow);
+
+    const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
+    const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
+    const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
+    const failed0 = delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic);
+    reapOutboundOverflow(&server, &changes);
+    try std.testing.expect(server.sessions[1] == null);
+    drainParkedFully(&server);
+
+    // Every queued stanza reached a counted outcome: the message stored,
+    // the IQ bounced to its sender.
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_stored.load(.monotonic) - stored0);
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0);
+    try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+    try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic) - failed0);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("alice@localhost"));
+
+    bob.sm_resume_enabled = false;
+    destroySession(&server, 3, bob, &changes);
+}
+
+test "C11: the unacked drain is chunked per iteration (T-265C5A0E)" {
+    const allocator = std.testing.allocator;
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // A detached queue deeper than one chunk: a mass expiry (or any
+    // teardown burst) must spread the drain across iterations.
+    var stanzas: [SM_DRAIN_CHUNK + 5][]const u8 = undefined;
+    for (&stanzas) |*s| s.* = "<message type='error' from='bob@localhost/res' id='x'/>";
+    const detached = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "cccc3333dddd4444eeee5555ffff6666", &stanzas);
+
+    const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
+    destroySession(&server, 2, detached, &changes);
+    try std.testing.expect(server.sm_drain_head != null);
+
+    // One tick drains at most SM_DRAIN_CHUNK stanzas; the rest wait for
+    // the next iteration.
+    drainSmUnackedTick(&server);
+    try std.testing.expectEqual(@as(u64, SM_DRAIN_CHUNK), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+    try std.testing.expect(server.sm_drain_head != null);
+
+    drainParkedFully(&server);
+    try std.testing.expectEqual(@as(u64, stanzas.len), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+}
+
+fn makeDetachedWithStanzas(
+    server: *Server,
+    id: usize,
+    local: []const u8,
+    bound_full_jid: []const u8,
+    sm_id: []const u8,
+    stanzas: []const []const u8,
+) !*Session {
+    const session = try makeAuthenticatedSession(server, id, local);
+    session.stream.setBoundJid(xmpp_lib.Jid.parse(bound_full_jid) catch null);
+    session.sm_resume_enabled = true;
+    session.sm_detached = true;
+    session.sm_detach_time = sm_state.monotonicSeconds();
+    session.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    @memcpy(&session.sm_id, sm_id[0..sm_state.SM_ID_HEX_LEN]);
+    server.detached_count += 1;
+    c2s_sm.smIdMapInsert(server, &session.sm_id, id);
+    server.sm_expiry.insert(session, session.sm_detach_time + sm_state.DEFAULT_RESUME_TIMEOUT);
+    const queue = try std.testing.allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
+    for (stanzas) |s| _ = queue.push(s);
+    session.sm_unacked = queue;
+    server.free_count -= 1;
+    return session;
+}
+
+test "C11: expiry drain stores messages offline and bounces IQs" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var sm = try SessionMap.init(allocator, 1, 0);
+    defer sm.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    try server.configureSessionMap(&sm);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    // Live sender bound in the session map on this worker.
+    const bob = try makeAuthenticatedSession(&server, 3, "bob");
+    bob.stream.setBoundJid(xmpp_lib.Jid.parse("bob@localhost/res") catch null);
+    try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
+    server.free_count -= 1;
+
+    const detached = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "0011223344556677889900aabbccddeeff", &.{
+        "<message from='bob@localhost/res' to='alice@localhost' id='m1' type='chat'><body>hi</body></message>",
+        "<iq from='bob@localhost/res' to='alice@localhost' id='iq1' type='get'><ping/></iq>",
+    });
+
+    const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
+    const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
+    destroySession(&server, 2, detached, &changes);
+    // The drain is parked at teardown and runs chunked at the batch tail.
+    drainParkedFully(&server);
+
+    // The message reached the offline store; the IQ bounced to its sender.
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("alice@localhost"));
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_stored.load(.monotonic) - stored0);
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0);
+    const pending = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "id='iq1'") != null);
+
+    bob.sm_resume_enabled = false;
+    destroySession(&server, 3, bob, &changes);
+}
+
+test "C11: offline-quota refusal bounces the message to its sender" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var sm = try SessionMap.init(allocator, 1, 0);
+    defer sm.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    try server.configureSessionMap(&sm);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const bob = try makeAuthenticatedSession(&server, 3, "bob");
+    bob.stream.setBoundJid(xmpp_lib.Jid.parse("bob@localhost/res") catch null);
+    try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
+    server.free_count -= 1;
+
+    // Fill alice's offline queue to the store's per-user cap so the unacked
+    // message is refused (the #81 counted-but-lost case).
+    var fill: usize = 0;
+    while (try offline_store.storeHeldPointer("alice@localhost", "carol@localhost/res", "seed", 1000, "<message/>")) : (fill += 1) {}
+    try std.testing.expect(fill > 0);
+
+    const detached = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "11223344556677889900aabbccddee00", &.{
+        "<message from='bob@localhost/res' to='alice@localhost' id='m2' type='chat'><body>hi</body></message>",
+    });
+
+    const refused0 = delivery_queue_mod.sm_offline_refused.load(.monotonic);
+    const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
+    const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
+    destroySession(&server, 2, detached, &changes);
+    drainParkedFully(&server);
+
+    // Refusal counted, then the bounce reached the sender: nothing lost.
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_offline_refused.load(.monotonic) - refused0);
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0);
+    try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+    const pending = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "service-unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "id='m2'") != null);
+
+    bob.sm_resume_enabled = false;
+    destroySession(&server, 3, bob, &changes);
+}
+
+test "C11: error, result and groupchat unacked stanzas drop counted, never bounced" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var sm = try SessionMap.init(allocator, 1, 0);
+    defer sm.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    try server.configureSessionMap(&sm);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const bob = try makeAuthenticatedSession(&server, 3, "bob");
+    bob.stream.setBoundJid(xmpp_lib.Jid.parse("bob@localhost/res") catch null);
+    try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
+    server.free_count -= 1;
+
+    const detached = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "223344556677889900aabbccddee0011", &.{
+        "<message from='bob@localhost/res' to='alice@localhost' id='e1' type='error'><error/></message>",
+        "<iq from='bob@localhost/res' to='alice@localhost' id='r1' type='result'/>",
+        "<message from='bob@localhost/res' to='room@conference.localhost' id='g1' type='groupchat'><body>hi</body></message>",
+    });
+
+    const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
+    const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
+    const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
+    destroySession(&server, 2, detached, &changes);
+    drainParkedFully(&server);
+
+    try std.testing.expectEqual(@as(u64, 3), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+    try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0);
+    try std.testing.expectEqual(@as(u64, 0), delivery_queue_mod.sm_unacked_stored.load(.monotonic) - stored0);
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
+    const pending = bob.conn.pendingOutboxCopy(&outbox_peek_buf);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "service-unavailable") == null);
+
+    bob.sm_resume_enabled = false;
+    destroySession(&server, 3, bob, &changes);
+}
+
+test "C11: the drain's offline store commits off the loop via the executor" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const detached = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "3344556677889900aabbccddee112233", &.{
+        "<message from='bob@localhost/res' to='alice@localhost' id='m1' type='chat'><body>hi</body></message>",
+    });
+
+    destroySession(&server, 2, detached, &changes);
+
+    // The tick submits the store job; nothing commits on this thread.
+    drainSmUnackedTick(&server);
+    try std.testing.expectEqual(@as(usize, 1), server.sm_drain_exec.pending());
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
+
+    // The executor-side pump commits; the outcome settles on the next
+    // tick through the completion stack.
+    try std.testing.expectEqual(@as(usize, 1), server.sm_drain_exec.pumpStore(sm_drain_exec_mod.Executor.MAX_JOBS));
+    const stored0 = delivery_queue_mod.sm_unacked_stored.load(.monotonic);
+    drainSmUnackedTick(&server);
+    try std.testing.expectEqual(@as(usize, 1), try offline_store.countMessages("alice@localhost"));
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_unacked_stored.load(.monotonic) - stored0);
+    try std.testing.expect(server.sm_drain_head == null);
+    try std.testing.expect(server.sm_drain_completed.load(.monotonic) == null);
+}
+
+test "C11: a full drain-store ring refuses and bounces, never commits inline" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var sm = try SessionMap.init(allocator, 1, 0);
+    defer sm.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+    try server.configureSessionMap(&sm);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeListT.init(&change_buf);
+
+    const bob = try makeAuthenticatedSession(&server, 3, "bob");
+    bob.stream.setBoundJid(xmpp_lib.Jid.parse("bob@localhost/res") catch null);
+    try sm.bind(0, server.sessionToken(3), "bob", "localhost", "res");
+    server.free_count -= 1;
+
+    // Two parked queues fill the executor ring: MAX_JOBS submissions
+    // queue, the rest hit the bounded refusal and bounce.
+    var stanzas: [sm_state.UNACKED_CAPACITY][]const u8 = undefined;
+    for (&stanzas, 0..) |*s, i| {
+        s.* = if (i % 2 == 0)
+            "<message from='bob@localhost/res' to='alice@localhost' id='mx' type='chat'><body>hi</body></message>"
+        else
+            "<presence from='bob@localhost/res' to='alice@localhost'/>";
+    }
+    const d1 = try makeDetachedWithStanzas(&server, 2, "alice", "alice@localhost/res", "44556677889900aabbccddee11223344", &stanzas);
+    const d2 = try makeDetachedWithStanzas(&server, 4, "carol", "carol@localhost/res", "556677889900aabbccddee1122334455", &stanzas);
+
+    destroySession(&server, 2, d1, &changes);
+    destroySession(&server, 4, d2, &changes);
+
+    const refused0 = delivery_queue_mod.sm_offline_refused.load(.monotonic);
+    const bounced0 = delivery_queue_mod.sm_unacked_bounced.load(.monotonic);
+    // Ticks keep submitting until the ring is full; nothing commits on
+    // this thread and the count stays zero.
+    while (server.sm_drain_exec.pending() < sm_drain_exec_mod.Executor.MAX_JOBS and server.sm_drain_head != null) {
+        server.sm_drain_turn_credit = SM_DRAIN_CHUNK; // each tick stands in for a loop iteration
+        drainSmUnackedTick(&server);
+    }
+    try std.testing.expectEqual(@as(usize, 0), try offline_store.countMessages("alice@localhost"));
+    try std.testing.expectEqual(@as(usize, sm_drain_exec_mod.Executor.MAX_JOBS), server.sm_drain_exec.pending());
+
+    // The rest of the drain now hits the full ring: refused and bounced.
+    drainParkedFully(&server);
+    try std.testing.expect(delivery_queue_mod.sm_offline_refused.load(.monotonic) - refused0 > 0);
+    try std.testing.expect(delivery_queue_mod.sm_unacked_bounced.load(.monotonic) - bounced0 > 0);
+    try std.testing.expectEqual(@as(usize, 0), server.sm_drain_exec.pending());
+
+    bob.sm_resume_enabled = false;
+    destroySession(&server, 3, bob, &changes);
+}
+
+test "C11: parked drains bound nodes and bytes; overflow drains inline counted" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 6 + SM_DRAIN_PARK_MAX_NODES + SM_DRAIN_CHUNK);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    // A byte-bound overflow: a queue whose retained bytes would pass the
+    // parked cap drains inline through the same submissions, and the
+    // detour is counted once per queue.
+    const overflow0 = delivery_queue_mod.sm_drain_park_overflow.load(.monotonic);
+    const session = try makeAuthenticatedSession(&server, 5, "dave");
+    session.stream.setBoundJid(xmpp_lib.Jid.parse("dave@localhost/res") catch null);
+    server.free_count -= 1;
+    const big_queue = try allocator.create(sm_state.SmUnackedQueue);
+    big_queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
+    _ = big_queue.push("<presence from='dave@localhost/res'/>");
+    big_queue.bytes = SM_DRAIN_PARK_MAX_BYTES + 1;
+    session.sm_unacked = big_queue;
+    parkUnackedDrain(&server, session);
+    try std.testing.expectEqual(@as(u64, 1), delivery_queue_mod.sm_drain_park_overflow.load(.monotonic) - overflow0);
+    try std.testing.expectEqual(@as(u32, 0), server.sm_drain_parked_nodes);
+    try std.testing.expect(server.sm_drain_head == null);
+
+    // A sustained park burst: nodes past the cap drain inline too, and
+    // retirement costs chunk credit so one tick retires at most
+    // SM_DRAIN_CHUNK nodes.
+    var i: usize = 0;
+    while (i < SM_DRAIN_PARK_MAX_NODES + SM_DRAIN_CHUNK) : (i += 1) {
+        const s = try makeAuthenticatedSession(&server, 6 + i, "eve");
+        server.free_count -= 1;
+        const queue = try allocator.create(sm_state.SmUnackedQueue);
+        queue.* = sm_state.SmUnackedQueue.init(server.allocator, server.sm_max_unacked_bytes);
+        s.sm_unacked = queue;
+        parkUnackedDrain(&server, s);
+    }
+    try std.testing.expectEqual(@as(u32, SM_DRAIN_PARK_MAX_NODES), server.sm_drain_parked_nodes);
+    try std.testing.expectEqual(@as(u64, 1 + SM_DRAIN_CHUNK), delivery_queue_mod.sm_drain_park_overflow.load(.monotonic) - overflow0);
+
+    server.sm_drain_turn_credit = SM_DRAIN_CHUNK; // stands in for a fresh loop iteration
+    drainSmUnackedTick(&server);
+    try std.testing.expectEqual(@as(u32, SM_DRAIN_CHUNK), SM_DRAIN_PARK_MAX_NODES - server.sm_drain_parked_nodes);
+
+    drainParkedFully(&server);
+    try std.testing.expectEqual(@as(u32, 0), server.sm_drain_parked_nodes);
+    try std.testing.expectEqual(@as(u64, 0), server.sm_drain_parked_bytes);
+    try std.testing.expect(server.sm_drain_head == null);
+}
+
+test "C11: the overload drain shares the per-turn credit and bulk-counts the rest" {
+    // A queue that cannot park drains inline only while turn credit
+    // lasts; the rest of the queue takes the counted overload drop so
+    // repeated overload parks in one batch cannot walk whole queues.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("op");
+    const op_path = try tmp.dir.realpathAlloc(allocator, "op");
+    defer allocator.free(op_path);
+    var op_db = try op_backend.Backend.open(op_path, .{});
+    defer op_db.close();
+    var offline_store = offline_store_mod.GenericOfflineStore(op_backend.Backend).init(&op_db, allocator);
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 16);
+    defer server.deinit();
+    server.offline = &offline_store;
+
+    // No parked capacity at all: every park overflows into the inline
+    // path. Three credits buy three real outcomes; the unroutable
+    // presence makes each one a bounce failure, distinct from a drop.
+    server.sm_drain_parked_nodes = SM_DRAIN_PARK_MAX_NODES;
+    server.sm_drain_turn_credit = 3;
+
+    var stanzas: [6][]const u8 = undefined;
+    for (&stanzas) |*s| s.* = "<presence from='dave@localhost/res'/>";
+    const first = try makeDetachedWithStanzas(&server, 2, "dave", "dave@localhost/res", "6677889900aabbccddee1122334455ff", &stanzas);
+    const second = try makeDetachedWithStanzas(&server, 4, "dave", "dave@localhost/res", "77889900aabbccddee1122334455ff00", &stanzas);
+
+    const bounce_failed0 = delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic);
+    const dropped0 = delivery_queue_mod.sm_unacked_dropped.load(.monotonic);
+    const overload0 = delivery_queue_mod.sm_drain_overload_drops.load(.monotonic);
+    const overflow0 = delivery_queue_mod.sm_drain_park_overflow.load(.monotonic);
+
+    parkUnackedDrain(&server, first);
+    parkUnackedDrain(&server, second);
+
+    // The shared credit covers three stanzas across BOTH queues; the
+    // other nine drop counted. Every stanza still has one outcome.
+    try std.testing.expectEqual(@as(u32, 0), server.sm_drain_turn_credit);
+    try std.testing.expectEqual(@as(u64, 3), delivery_queue_mod.sm_unacked_bounce_failed.load(.monotonic) - bounce_failed0);
+    try std.testing.expectEqual(@as(u64, 9), delivery_queue_mod.sm_unacked_dropped.load(.monotonic) - dropped0);
+    try std.testing.expectEqual(@as(u64, 9), delivery_queue_mod.sm_drain_overload_drops.load(.monotonic) - overload0);
+    try std.testing.expectEqual(@as(u64, 2), delivery_queue_mod.sm_drain_park_overflow.load(.monotonic) - overflow0);
+    try std.testing.expect(server.sm_drain_head == null);
 }

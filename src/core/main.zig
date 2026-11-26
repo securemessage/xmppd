@@ -119,6 +119,7 @@ pub fn main() !void {
     const max_sessions = v.core.max_sessions;
     const fan_out_batch_size = v.core.fan_out_batch_size;
     const max_resources_per_account = v.core.max_resources_per_account;
+    const sm_max_unacked_bytes = v.core.sm_max_unacked_bytes;
     const oidc_import_avatar = v.oidc.import_avatar;
 
     // cert/key arrive sentinel-terminated for the C TLS API; the file's
@@ -277,6 +278,7 @@ pub fn main() !void {
         .s2s_socket = s2s_socket,
         .per_worker_sessions = per_worker_sessions,
         .fan_out_batch_size = fan_out_batch_size,
+        .sm_max_unacked_bytes = sm_max_unacked_bytes,
         .skip_tls = skip_tls,
         .roster = if (roster_store != null) &roster_store.? else null,
         .offline = if (offline_store != null) &offline_store.? else null,
@@ -408,6 +410,7 @@ const WorkerCtx = struct {
     s2s_socket: ?[]const u8,
     per_worker_sessions: usize,
     fan_out_batch_size: u8,
+    sm_max_unacked_bytes: u64,
     skip_tls: bool,
     roster: ?*GenericRosterStore,
     offline: ?*GenericOfflineStore(OpBackendType),
@@ -447,6 +450,7 @@ fn archiveWriterMain(queue: *ArchiveWriteQueue, store: *archive_store_mod.Archiv
 fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) !void {
     server.worker_id = worker_id;
     try server.configureSessionMap(ctx.session_map);
+    server.sm_max_unacked_bytes = ctx.sm_max_unacked_bytes;
     const caps = @import("worker/worker.zig").caps_mod;
     server.server_caps = caps.computeServerCaps();
     if (ctx.delivery_system) |ds| {

@@ -284,9 +284,10 @@ pub fn drainDeliveryQueue(self: *Server, changes: *ChangeList) void {
                 bounceCrossWorkerUnavailable(c.server, from_jid, target_session.stream.boundBare(), parts.msg_id, "message", c.changes);
                 return;
             }
-            // stanza() covers the T153 detached case itself: it tracks
-            // for resume replay and reports tracked_detached.
-            if (target_session.stanza(payload) == .failed_closed) return;
+            // stanzaBlob() covers the T153 detached case itself: it tracks
+            // for resume replay and reports tracked_detached. A resumable
+            // target stores the ring slot's blob, not a private copy (C11).
+            if (target_session.stanzaBlob(payload, c.queue.current_slot_blob) == .failed_closed) return;
         }
     }.handle);
 }
@@ -1420,13 +1421,13 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
     target.sm_detached = true;
     target.sm_resume_enabled = true;
-    target.sm_detach_time = std.time.timestamp();
+    target.sm_detach_time = sm_state.monotonicSeconds();
     target.sm_id_len = sm_state.SM_ID_HEX_LEN;
     const sm_id = "11112222333344445555666677778888";
     @memcpy(&target.sm_id, sm_id);
     target.offline_pending = true;
     const queue = try allocator.create(sm_state.SmUnackedQueue);
-    queue.* = sm_state.SmUnackedQueue.init(allocator);
+    queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
     queue.base_seq = 1;
     target.sm_unacked = queue;
     server.sessions[5] = target;
@@ -1456,6 +1457,145 @@ test "Server: H3 a cross-worker message to a detached session is held behind its
     }
     // The flag survives: the tail is still outstanding.
     try std.testing.expect(target.offline_pending);
+}
+
+// C11: the unacked queue stores the ring slot's blob, not a private copy.
+test "Server: a cross-worker delivery to a resumable session shares the ring blob" {
+    const allocator = std.testing.allocator;
+
+    var sm = try SessionMap.init(allocator, 2, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 1);
+    defer delivery_sys.deinit();
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 0;
+    try server.configureSessionMap(&sm);
+    server.delivery_system = &delivery_sys;
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const target = try allocator.create(Session);
+    target.init(fds[0], 5, "localhost", false, allocator);
+    target.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
+    target.sm_enabled = true;
+    target.sm_detached = true;
+    target.sm_resume_enabled = true;
+    target.sm_detach_time = sm_state.monotonicSeconds();
+    target.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    const sm_id = "11112222333344445555666677778888";
+    @memcpy(&target.sm_id, sm_id);
+    const queue = try allocator.create(sm_state.SmUnackedQueue);
+    queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
+    queue.base_seq = 1;
+    target.sm_unacked = queue;
+    server.sessions[5] = target;
+    server.detached_count = 1;
+    c2s_sm.smIdMapInsert(&server, &target.sm_id, 5);
+    try sm.bind(0, server.sessionToken(5), "bob", "localhost", "desktop");
+
+    const payload = "<message from='alice@localhost/mobile' to='bob@localhost' id='s1' type='chat'><body>live</body></message>";
+    try delivery_sys.deliver(0, 0, server.sessionToken(5), payload);
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    drainDeliveryQueue(&server, &changes);
+
+    // The queue entry IS the ring blob: its charge owner is the producing
+    // worker's budget, and after the slot's release the queue's retention
+    // reference is the only one left. The producer's transport charge is
+    // already refunded; retention never extends it.
+    try std.testing.expectEqual(@as(u32, 1), queue.count);
+    const entry = queue.entries[queue.head].?;
+    try std.testing.expect(entry.budget == &delivery_sys.budgets[0]);
+    try std.testing.expectEqual(@as(u32, 1), entry.refs.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), entry.charge_refs.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), delivery_sys.budgets[0].bytes_in_flight.load(.monotonic));
+    try std.testing.expectEqualStrings(payload, entry.bytes());
+}
+
+// C11: live SM retention is charged to the holding session, never the
+// producing worker's transport budget. A session that never acks fails
+// alone at its own byte bound; a sibling session on another worker keeps
+// receiving the same producer's deliveries, and no blob is refused.
+test "Server: a session at its SM byte bound fails alone; deliveries still flow" {
+    const allocator = std.testing.allocator;
+
+    var sm = try SessionMap.init(allocator, 2, 0);
+    defer sm.deinit();
+    var delivery_sys = try DeliverySystem.init(allocator, 2);
+    defer delivery_sys.deinit();
+
+    var server: Server = undefined;
+    try server.initWithMaxSessions("localhost", "127.0.0.1", 0, allocator, 64);
+    defer server.deinit();
+    server.worker_id = 1;
+    try server.configureSessionMap(&sm);
+    server.delivery_system = &delivery_sys;
+
+    const payload = "<message from='alice@localhost/mobile' to='bob@localhost' type='chat'><body>0123456789012345678901234567890123456789012345678901234567890123456789</body></message>";
+
+    // The victim: a live resumable session that never acks. Its bound fits
+    // exactly two stanzas.
+    const victim_fds = try makeSocketPair();
+    defer posix.close(victim_fds[1]);
+    const victim = try allocator.create(Session);
+    victim.init(victim_fds[0], 5, "localhost", false, allocator);
+    victim.stream.setBoundJid(xmpp.Jid.parse("bob@localhost/desktop") catch null);
+    victim.sm_enabled = true;
+    victim.sm_resume_enabled = true;
+    victim.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    @memcpy(&victim.sm_id, "11112222333344445555666677778888");
+    const victim_queue = try allocator.create(sm_state.SmUnackedQueue);
+    victim_queue.* = sm_state.SmUnackedQueue.init(allocator, @intCast(payload.len * 2));
+    victim.sm_unacked = victim_queue;
+    server.sessions[5] = victim;
+    try sm.bind(1, server.sessionToken(5), "bob", "localhost", "desktop");
+
+    // The bystander: same shape, its own account, default bound.
+    const bystander_fds = try makeSocketPair();
+    defer posix.close(bystander_fds[1]);
+    const bystander = try allocator.create(Session);
+    bystander.init(bystander_fds[0], 6, "localhost", false, allocator);
+    bystander.stream.setBoundJid(xmpp.Jid.parse("carol@localhost/desktop") catch null);
+    bystander.sm_enabled = true;
+    bystander.sm_resume_enabled = true;
+    bystander.sm_id_len = sm_state.SM_ID_HEX_LEN;
+    @memcpy(&bystander.sm_id, "9999aaaabbbbccccddddeeeeffff0000");
+    const bystander_queue = try allocator.create(sm_state.SmUnackedQueue);
+    bystander_queue.* = sm_state.SmUnackedQueue.init(allocator, sm_state.DEFAULT_MAX_UNACKED_BYTES);
+    bystander.sm_unacked = bystander_queue;
+    server.sessions[6] = bystander;
+    try sm.bind(1, server.sessionToken(6), "carol", "localhost", "desktop");
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    const denials0 = delivery_queue_mod.blob_budget_denials.load(.monotonic);
+
+    // Worker 0 fills the victim past its bound.
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        try delivery_sys.deliver(0, 1, server.sessionToken(5), payload);
+    }
+    drainDeliveryQueue(&server, &changes);
+
+    // Two entries held, the third refused: the victim alone is failed.
+    try std.testing.expectEqual(@as(u32, 2), victim_queue.count);
+    try std.testing.expect(victim.sm_overflow);
+    try std.testing.expect(!bystander.sm_overflow);
+
+    // The same producer still delivers cross-worker to the bystander.
+    try delivery_sys.deliver(0, 1, server.sessionToken(6), payload);
+    drainDeliveryQueue(&server, &changes);
+    try std.testing.expectEqual(@as(u32, 1), bystander_queue.count);
+    try std.testing.expect(!bystander.sm_overflow);
+
+    // Zero producer-budget refusals; every transport charge refunded once
+    // the slots drained even though retention references still hold bytes.
+    try std.testing.expectEqual(denials0, delivery_queue_mod.blob_budget_denials.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), delivery_sys.budgets[0].bytes_in_flight.load(.monotonic));
+    try std.testing.expect(victim_queue.bytes > 0);
 }
 
 test "Server: H2 an unstorable S2S hold behind a draining tail bounces" {

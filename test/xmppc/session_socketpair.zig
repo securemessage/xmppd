@@ -911,8 +911,9 @@ test "socketpair: rejected resume surfaces sm_failed and drops the queue (T-9BC4
     // thread (attachFd/reframe race a still-unwinding old loop otherwise).
     ctx.engine.waitLoopExit();
 
-    // Leg 2: server answers <failed/>; consumer gets sm_failed(1) and the
-    // stream proceeds without SM.
+    // Leg 2: server answers <failed/>; the resume ran pre-bind so the
+    // stream still has no JID: the client binds, does a fresh SM enable,
+    // drops the dead id's queue and surfaces sm_failed(1) (V19).
     var fds: [2]posix.fd_t = undefined;
     if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &fds) != 0)
         return error.Socketpair;
@@ -945,6 +946,10 @@ test "socketpair: rejected resume surfaces sm_failed and drops the queue (T-9BC4
     cur_outcome = .{};
     cur_mutex.unlock();
     try ctx.rig.send("<failed xmlns='urn:xmpp:sm:3'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></failed>");
+    try ctx.rig.expect("<bind", 2000);
+    try ctx.rig.send("<iq type='result' id='bind1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/smoke</jid></bind></iq>");
+    try ctx.rig.expect("<enable", 2000);
+    try ctx.rig.send("<enabled xmlns='urn:xmpp:sm:3' id='sm-test-99' resume='true'/>");
     const out2 = waitTerminal(5000);
     try std.testing.expect(out2.established);
     try std.testing.expectEqual(@as(?u32, 1), last_sm_failed);

@@ -19,26 +19,33 @@
 //! resume requests to the correct worker in multi-threaded deployments.
 
 const std = @import("std");
+const delivery_queue = @import("delivery_queue");
 
 const log = std.log.scoped(.sm);
 
 /// Maximum number of unacknowledged stanzas buffered per session.
-/// Each entry is heap-allocated (variable size). If the queue is full,
-/// the oldest unacked stanza is discarded to bound memory usage — but
-/// `push()` reports the eviction (T178): XEP-0198 has no gap signaling,
-/// so the session must be failed rather than silently losing stanzas.
+/// Each entry is a reference on a shared refcounted blob (ADR-3). If the
+/// queue is full, the oldest unacked stanza is discarded to bound memory
+/// usage, and `push()` reports the eviction (T178): XEP-0198 has no gap
+/// signaling, so the session must be failed rather than silently losing
+/// stanzas.
 pub const UNACKED_CAPACITY: u32 = 256;
 
-/// Result of `SmUnackedQueue.push()`.
+/// Result of `SmUnackedQueue.push()` and `pushBlob()`.
 pub const PushResult = enum {
     /// Stanza buffered without eviction.
     pushed,
-    /// Queue was full — the oldest stanza was evicted to make room.
+    /// Queue was full: the oldest stanza was evicted to make room.
     /// The caller must fail the session (live: resource-constraint stream
     /// error; detached: destroy) because the client can no longer be told
     /// the truth about what was delivered.
     overflow,
-    /// Heap allocation for the stanza copy failed — stanza not buffered.
+    /// Retained bytes would pass `byte_limit` ([core]
+    /// sm_max_unacked_bytes): stanza not buffered. The caller must fail
+    /// this session, and only this session (resource-constraint).
+    bytes_refused,
+    /// Blob allocation for the stanza copy failed (oversize or OOM):
+    /// stanza not buffered.
     alloc_failed,
 };
 
@@ -52,20 +59,32 @@ pub const SM_R_THRESHOLD: u32 = UNACKED_CAPACITY / 2;
 /// Default session resume timeout in seconds.
 pub const DEFAULT_RESUME_TIMEOUT: u32 = 300;
 
+/// Default per-session bound on retained unacked stanza bytes; the
+/// `[core] sm_max_unacked_bytes` schema key carries the same default.
+/// UNACKED_CAPACITY x 16 KiB mirrors the worst case the count bound
+/// alone allowed.
+pub const DEFAULT_MAX_UNACKED_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Monotonic seconds for in-process deadlines: SM detach times, the
+/// expiry wheel's cursor and deadlines, resume-window checks. A wall
+/// clock step must never stall or mass-expire retention; wall time is
+/// only for timestamps that leave the process.
+pub fn monotonicSeconds() i64 {
+    const ts = std.posix.clock_gettime(.MONOTONIC) catch unreachable;
+    return ts.sec;
+}
+
 /// SM-ID length in hex characters (16 bytes = 32 hex chars).
 pub const SM_ID_HEX_LEN: usize = 32;
 
-/// A single queued outbound stanza awaiting client acknowledgment.
-const UnackedEntry = struct {
-    /// Heap-allocated copy of the stanza XML.
-    data: []u8,
-};
-
 /// Bounded ring buffer of outbound stanzas sent to the client but not yet
 /// acknowledged via `<a h='N'/>`. Used to replay stanzas on session resume.
+/// Entries are references on shared refcounted blobs (ADR-3), so a stanza
+/// that arrived through the delivery ring or a resume handoff is stored
+/// once, not copied per recipient.
 pub const SmUnackedQueue = struct {
-    /// Ring buffer storage.
-    entries: [UNACKED_CAPACITY]?UnackedEntry = .{null} ** UNACKED_CAPACITY,
+    /// Ring buffer storage: one blob reference per entry.
+    entries: [UNACKED_CAPACITY]?*delivery_queue.Blob = .{null} ** UNACKED_CAPACITY,
     /// Index of the oldest unacked entry (next to dequeue on ack).
     head: u32 = 0,
     /// Index of the next write position.
@@ -79,48 +98,84 @@ pub const SmUnackedQueue = struct {
     /// 2^32, so a report counts as forward only when it is within 2^31 ahead
     /// of last_h; a duplicate or backwards report discards nothing.
     last_h: u32 = 0,
-    /// Allocator used for heap-allocated stanza copies.
+    /// Allocator for private copies `push` makes. Worker-local: the queue
+    /// is owned by one worker thread at a time (a resume handoff moves
+    /// the whole object).
     allocator: std.mem.Allocator,
+    /// Retained payload bytes (`blob.len` summed over entries). Charged
+    /// on push, refunded on ack, discard or drain.
+    bytes: u64 = 0,
+    /// Per-session bound on `bytes` ([core] sm_max_unacked_bytes). A
+    /// refusal fails this session only; shared multicast payloads count
+    /// once per holder (over-counts, never under-counts).
+    byte_limit: u64,
 
-    pub fn init(allocator: std.mem.Allocator) SmUnackedQueue {
-        return .{ .allocator = allocator };
+    pub fn init(allocator: std.mem.Allocator, byte_limit: u64) SmUnackedQueue {
+        return .{ .allocator = allocator, .byte_limit = byte_limit };
     }
 
     pub fn deinit(self: *SmUnackedQueue) void {
         var i: u32 = 0;
         while (i < self.count) : (i += 1) {
             const idx = (self.head + i) % UNACKED_CAPACITY;
-            if (self.entries[idx]) |entry| {
-                self.allocator.free(entry.data);
+            if (self.entries[idx]) |blob| {
+                self.bytes -= blob.len;
+                blob.releaseRetention();
                 self.entries[idx] = null;
             }
         }
         self.count = 0;
         self.head = 0;
         self.tail = 0;
+        self.bytes = 0;
     }
 
-    /// Push a stanza into the queue. If full, the oldest entry is discarded
-    /// to keep the ring bounded and the result reports `.overflow` (T178) —
-    /// the caller is expected to fail the session rather than continue with
-    /// a silently corrupted replay queue.
-    pub fn push(self: *SmUnackedQueue, stanza: []const u8) PushResult {
-        var result: PushResult = .pushed;
-        if (self.count == UNACKED_CAPACITY) {
-            // Queue full — discard oldest to make room
-            self.discardHead();
-            result = .overflow;
-        }
+    /// Make room for one entry. Reports `.overflow` when the oldest unacked
+    /// stanza had to be evicted (T178): the caller is expected to fail the
+    /// session rather than continue with a silently corrupted replay queue.
+    fn evictForPush(self: *SmUnackedQueue) PushResult {
+        if (self.count != UNACKED_CAPACITY) return .pushed;
+        self.discardHead();
+        return .overflow;
+    }
 
-        const copy = self.allocator.alloc(u8, stanza.len) catch {
-            log.warn("SM unacked queue: allocation failed ({d} bytes)", .{stanza.len});
+    /// Copy `stanza` into a private uncharged blob and buffer the
+    /// reference, charging `len` to this queue's byte bound. A bound
+    /// refusal reports `.bytes_refused`; allocation failures (oversize,
+    /// OOM) report `.alloc_failed`, the same fail-closed class (T178).
+    pub fn push(self: *SmUnackedQueue, stanza: []const u8) PushResult {
+        if (self.bytes + stanza.len > self.byte_limit) {
+            log.warn("SM unacked queue: byte bound reached ({d} + {d} > {d})", .{ self.bytes, stanza.len, self.byte_limit });
+            return .bytes_refused;
+        }
+        const blob = delivery_queue.Blob.createUncharged(self.allocator, stanza) catch {
+            log.warn("SM unacked queue: blob refused ({d} bytes)", .{stanza.len});
             return .alloc_failed;
         };
-        @memcpy(copy, stanza);
-
-        self.entries[self.tail] = .{ .data = copy };
+        const result = self.evictForPush();
+        self.entries[self.tail] = blob;
         self.tail = (self.tail + 1) % UNACKED_CAPACITY;
         self.count += 1;
+        self.bytes += blob.len;
+        return result;
+    }
+
+    /// Buffer a retention reference on an existing blob instead of
+    /// copying (C11): ring-slot payloads and handoff bundles share the
+    /// one allocation. The entry charges `blob.len` to this queue's own
+    /// bound; the producing worker's transport charge ends with the last
+    /// transport reference and is never extended by SM retention.
+    pub fn pushBlob(self: *SmUnackedQueue, blob: *delivery_queue.Blob) PushResult {
+        if (self.bytes + blob.len > self.byte_limit) {
+            log.warn("SM unacked queue: byte bound reached ({d} + {d} > {d})", .{ self.bytes, blob.len, self.byte_limit });
+            return .bytes_refused;
+        }
+        const result = self.evictForPush();
+        blob.retain();
+        self.entries[self.tail] = blob;
+        self.tail = (self.tail + 1) % UNACKED_CAPACITY;
+        self.count += 1;
+        self.bytes += blob.len;
         return result;
     }
 
@@ -175,7 +230,7 @@ pub const SmUnackedQueue = struct {
     }
 
     /// Return all unacked stanza entries for replay.
-    /// Caller must NOT free the returned slices — they remain owned by the queue.
+    /// Caller must NOT release the returned blobs; they remain owned by the queue.
     pub fn getUnacked(self: *const SmUnackedQueue) UnackedIterator {
         return .{
             .queue = self,
@@ -190,8 +245,9 @@ pub const SmUnackedQueue = struct {
 
     fn discardHead(self: *SmUnackedQueue) void {
         if (self.count == 0) return;
-        if (self.entries[self.head]) |entry| {
-            self.allocator.free(entry.data);
+        if (self.entries[self.head]) |blob| {
+            self.bytes -= blob.len;
+            blob.releaseRetention();
             self.entries[self.head] = null;
         }
         self.head = (self.head + 1) % UNACKED_CAPACITY;
@@ -206,19 +262,17 @@ pub const SmUnackedQueue = struct {
     }
 };
 
-/// Iterator over unacked stanza entries.
+/// Iterator over unacked stanza entries. Yields borrowed blob references;
+/// callers read `blob.bytes()` and must not release them.
 pub const UnackedIterator = struct {
     queue: *const SmUnackedQueue,
     pos: u32,
 
-    pub fn next(self: *UnackedIterator) ?[]const u8 {
+    pub fn next(self: *UnackedIterator) ?*delivery_queue.Blob {
         if (self.pos >= self.queue.count) return null;
         const idx = (self.queue.head + self.pos) % UNACKED_CAPACITY;
         self.pos += 1;
-        if (self.queue.entries[idx]) |entry| {
-            return entry.data;
-        }
-        return null;
+        return self.queue.entries[idx];
     }
 };
 
@@ -260,8 +314,7 @@ pub fn classifyAck(h: u32, last_h: u32, sent: u32) SmUnackedQueue.AckResult {
 // ============================================================================
 
 test "SmUnackedQueue: push and ack" {
-    const allocator = std.testing.allocator;
-    var queue = SmUnackedQueue.init(allocator);
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     _ = queue.push("<message>hello</message>");
@@ -279,13 +332,103 @@ test "SmUnackedQueue: push and ack" {
     // Remaining entry should be "<presence/>"
     var iter = queue.getUnacked();
     const entry = iter.next() orelse unreachable;
-    try std.testing.expectEqualStrings("<presence/>", entry);
+    try std.testing.expectEqualStrings("<presence/>", entry.bytes());
     try std.testing.expect(iter.next() == null);
 }
 
+test "SmUnackedQueue: pushBlob shares one allocation, deinit releases it (C11)" {
+    // A queue entry is a reference, not a copy: the ring slot's blob and a
+    // handoff blob land here with only a refcount bump.
+    var producer = delivery_queue.BlobBudget{
+        .allocator = std.testing.allocator,
+        .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT,
+    };
+    const blob = try producer.produce("<message>shared</message>");
+    defer blob.release();
+
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
+    try std.testing.expectEqual(PushResult.pushed, queue.pushBlob(blob));
+    // Producer handle + queue entry share the one allocation.
+    try std.testing.expectEqual(@as(u32, 2), blob.refs.load(.monotonic));
+
+    var iter = queue.getUnacked();
+    const got = iter.next() orelse unreachable;
+    try std.testing.expect(got == blob);
+    try std.testing.expectEqualStrings("<message>shared</message>", got.bytes());
+    try std.testing.expect(iter.next() == null);
+
+    // deinit releases the queue's reference; the producer handle survives.
+    queue.deinit();
+    try std.testing.expectEqual(@as(u32, 1), blob.refs.load(.monotonic));
+}
+
+test "SmUnackedQueue: retention refs do not extend the producer's charge" {
+    // The producer budget pays for bytes in transport only: once the
+    // last transport reference ends the charge returns to the budget
+    // even while the queue's retention reference keeps the bytes alive.
+    var producer = delivery_queue.BlobBudget{
+        .allocator = std.testing.allocator,
+        .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT,
+    };
+
+    const blob = try producer.produce("<message>shared</message>");
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
+    defer queue.deinit();
+    try std.testing.expectEqual(PushResult.pushed, queue.pushBlob(blob));
+    try std.testing.expect(producer.bytes_in_flight.load(.monotonic) > 0);
+
+    // Transport handle gone: the producer is fully refunded while the
+    // queue still holds (and reads) the same allocation.
+    blob.release();
+    try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), blob.charge_refs.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), blob.refs.load(.monotonic));
+    var iter = queue.getUnacked();
+    try std.testing.expectEqualStrings("<message>shared</message>", iter.next().?.bytes());
+
+    // Private copies charge nothing at all: push() allocates outside
+    // every producer budget.
+    try std.testing.expectEqual(PushResult.pushed, queue.push("<presence/>"));
+    try std.testing.expectEqual(@as(u64, 0), producer.bytes_in_flight.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 25 + 11), queue.bytes);
+}
+
+test "SmUnackedQueue: the byte bound refuses only the holder that hits it" {
+    var producer = delivery_queue.BlobBudget{
+        .allocator = std.testing.allocator,
+        .limit = delivery_queue.BlobBudget.DEFAULT_LIMIT,
+    };
+
+    // One shared blob; the victim's 1-byte bound refuses it while a
+    // sibling queue retains it freely. Bound refusals fail the holder,
+    // never a bystander or the producer.
+    var victim = SmUnackedQueue.init(std.testing.allocator, 1);
+    defer victim.deinit();
+    var sibling = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
+    defer sibling.deinit();
+
+    const blob = try producer.produce("<message>held</message>");
+    defer blob.release();
+    try std.testing.expectEqual(PushResult.bytes_refused, victim.pushBlob(blob));
+    try std.testing.expectEqual(@as(u32, 0), victim.count);
+    try std.testing.expectEqual(@as(u64, 0), victim.bytes);
+    try std.testing.expectEqual(PushResult.pushed, sibling.pushBlob(blob));
+
+    // push() is bound by the same per-session account.
+    try std.testing.expectEqual(PushResult.bytes_refused, victim.push("ab"));
+    try std.testing.expectEqual(@as(u32, 0), victim.count);
+
+    // Ack/discard refunds let the same queue accept again later.
+    var small = SmUnackedQueue.init(std.testing.allocator, 16);
+    defer small.deinit();
+    try std.testing.expectEqual(PushResult.pushed, small.push("0123456789"));
+    try std.testing.expectEqual(PushResult.bytes_refused, small.push("overflow"));
+    _ = small.ack(1);
+    try std.testing.expectEqual(PushResult.pushed, small.push("fits"));
+}
+
 test "SmUnackedQueue: overflow discards oldest and reports it (T178)" {
-    const allocator = std.testing.allocator;
-    var queue = SmUnackedQueue.init(allocator);
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     // Fill to capacity — every push reports .pushed
@@ -310,8 +453,7 @@ test "SmUnackedQueue: overflow discards oldest and reports it (T178)" {
 }
 
 test "SmUnackedQueue: ack all" {
-    const allocator = std.testing.allocator;
-    var queue = SmUnackedQueue.init(allocator);
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     _ = queue.push("a");
@@ -324,8 +466,7 @@ test "SmUnackedQueue: ack all" {
 }
 
 test "SmUnackedQueue: ack above the sent count changes nothing (S24)" {
-    const allocator = std.testing.allocator;
-    var queue = SmUnackedQueue.init(allocator);
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     _ = queue.push("a");
@@ -344,8 +485,7 @@ test "SmUnackedQueue: ack above the sent count changes nothing (S24)" {
 }
 
 test "SmUnackedQueue: backwards or duplicate h discards nothing (S24)" {
-    const allocator = std.testing.allocator;
-    var queue = SmUnackedQueue.init(allocator);
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     var i: u32 = 0;
@@ -375,8 +515,7 @@ test "SmUnackedQueue: backwards or duplicate h discards nothing (S24)" {
 }
 
 test "SmUnackedQueue: ack across the u32 wrap (S24)" {
-    const allocator = std.testing.allocator;
-    var queue = SmUnackedQueue.init(allocator);
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     // Sequences wrap at 2^32: a forward h that numerically decreased must
@@ -439,8 +578,7 @@ test "classifyAck: reports too high and backwards without a queue (S24)" {
 }
 
 test "SmUnackedQueue: ack above the sent count across the u32 wrap (S24)" {
-    const allocator = std.testing.allocator;
-    var queue = SmUnackedQueue.init(allocator);
+    var queue = SmUnackedQueue.init(std.testing.allocator, DEFAULT_MAX_UNACKED_BYTES);
     defer queue.deinit();
 
     // One stanza outstanding at the top of the sequence space, client already
