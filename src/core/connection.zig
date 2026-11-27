@@ -224,8 +224,13 @@ pub const Connection = struct {
     /// TLS state: null for plain TCP, set after STARTTLS upgrade.
     tls: ?net.Tls = null,
 
-    /// TLS handshake progress: only meaningful when tls is set.
+    /// TLS handshake progress: only meaningful when tls is set or a pool
+    /// handoff is in flight.
     tls_state: ?TlsState = null,
+
+    /// True while the fd and TLS object are owned by an F7 handshake-pool
+    /// job. Connection then keeps no fd or TLS copy; completion returns both.
+    tls_pool_inflight: bool = false,
 
     /// Unique connection ID (for use as kqueue udata).
     id: usize,
@@ -588,6 +593,48 @@ pub const Connection = struct {
         const conn = ssl.SslConn.init(ctx, self.fd) catch return error.ConnectionReset;
         self.tls = .{ .conn = conn };
         self.tls_state = .handshake_want_read; // Start expecting readable
+    }
+
+    /// Move fd and TLS ownership into a handshake-pool job. The connection
+    /// keeps tls_state as handshaking so no second upgrade can start, but its
+    /// fd is the -1 sentinel and tls is null until completion adopts them.
+    pub fn releaseTlsForPool(self: *Connection) ?struct { fd: posix.fd_t, tls: net.Tls } {
+        if (self.tls_pool_inflight) return null;
+        const t = self.tls orelse return null;
+        const fd = self.fd;
+        self.tls = null;
+        self.fd = -1;
+        self.tls_pool_inflight = true;
+        return .{ .fd = fd, .tls = t };
+    }
+
+    /// Put back a handoff the pool refused before taking ownership. The
+    /// handshake remains unstarted; callers normally fail the session closed.
+    pub fn restoreTlsFromPool(self: *Connection, fd: posix.fd_t, tls: net.Tls) void {
+        std.debug.assert(self.tls_pool_inflight);
+        std.debug.assert(self.tls == null);
+        self.fd = fd;
+        self.tls = tls;
+        self.tls_state = .handshake_want_read;
+        self.tls_pool_inflight = false;
+    }
+
+    /// Adopt the fd and TLS object returned by the pool. kTLS flags were
+    /// captured by the pool at handshake completion.
+    pub fn adoptTlsFromPool(self: *Connection, fd: posix.fd_t, tls: net.Tls) void {
+        std.debug.assert(self.tls_pool_inflight);
+        std.debug.assert(self.tls == null);
+        self.fd = fd;
+        self.tls = tls;
+        self.tls_state = .established;
+        self.tls_pool_inflight = false;
+    }
+
+    /// Abandon a failed pool handoff after the caller destroyed its objects.
+    pub fn failTlsPoolHandoff(self: *Connection) void {
+        std.debug.assert(self.tls_pool_inflight);
+        self.tls_pool_inflight = false;
+        self.tls_state = null;
     }
 
     /// Continue a non-blocking TLS handshake.

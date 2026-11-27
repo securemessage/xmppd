@@ -13,13 +13,16 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const ssl = @import("ssl");
 const loop_mod = @import("loop.zig");
-const Token = @import("net_token").Token;
+pub const Token = @import("net_token").Token;
 const SlotMap = @import("slotmap.zig").SlotMap;
 
 pub const Loop = loop_mod.Loop;
+pub const LoopOptions = loop_mod.Options;
 pub const Handle = loop_mod.Handle;
 pub const Interest = loop_mod.Interest;
 pub const Event = loop_mod.Event;
+pub const Wake = @import("wake.zig").Wake;
+pub const TimerId = loop_mod.TimerId;
 pub const SslError = ssl.SslError;
 
 /// Every error a transport read or write can surface: TLS-layer failures

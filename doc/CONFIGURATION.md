@@ -38,6 +38,10 @@ listed under the daemon that accepts them.
 | `cert` | (none) | core, s2s | TLS certificate path (PEM, full chain) |
 | `key` | (none) | core, s2s | TLS private key path (PEM) |
 | `enabled` | `true` | core, s2s | Enable TLS (C2S STARTTLS and s2s) |
+| `handshake_threads` | `auto` | core | TLS handshake pool lane count (`auto`: ceil(CPU count / 4), clamped to 1..8) |
+| `handshake_concurrency` | `32` | core | Active TLS handshakes one pool lane may drive at once |
+| `handshake_queue` | `128` | core | Queued TLS handoffs one pool lane may hold behind its active bound |
+| `handshake_timeout_ms` | `10000` | core | Lifecycle deadline for one pooled TLS handshake in milliseconds |
 
 ### [auth]
 
@@ -246,6 +250,10 @@ File keys:
   [tls] cert                         default:   TLS certificate chain
   [tls] key                          default:   TLS private key
   [tls] enabled                      default: true  enable STARTTLS
+  [tls] handshake_threads            default: auto  TLS handshake pool lanes
+  [tls] handshake_concurrency        default: 32  active handshakes per lane
+  [tls] handshake_queue              default: 128  queued handoffs per lane
+  [tls] handshake_timeout_ms         default: 10000  handshake deadline
   [auth] socket                       default: /var/run/xmppd/auth.sock  auth IPC socket
   [auth] max_per_account              default: 60  aliases: rate_max_per_account  auth attempts per account per window
   [auth] max_per_ip                   default: 200  aliases: rate_max_per_ip  auth attempts per IP per window

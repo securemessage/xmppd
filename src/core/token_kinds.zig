@@ -17,6 +17,7 @@ pub const ipc_auth: u8 = 3;
 pub const ipc_s2s: u8 = 4;
 pub const wake_pipe: u8 = 5;
 pub const self_wake: u8 = 6;
+pub const handshake_pipe: u8 = 11;
 
 /// Fixed periodic timers; their kqueue ident still carries the dispatch
 /// key, the udata kind is bookkeeping for stale-event accounting.

@@ -285,6 +285,16 @@ pub fn build(b: *std.Build) void {
     net_conn_mod.addImport("net_token", net_token_mod);
     net_conn_mod.addImport("token_kinds", token_kinds_mod);
 
+    // F7 handshake pool. It imports the same conn module instance so its
+    // Tls type is identical to the type core Connection uses.
+    const handshake_pool_mod = b.createModule(.{
+        .root_source_file = b.path("lib/net/handshake_pool.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    handshake_pool_mod.addImport("net", net_conn_mod);
+
     const xmpp_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/xmpp/xmpp.zig"),
         .target = target,
@@ -769,6 +779,7 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("precis_username", precis_username_mod);
     server_test_mod.addImport("ssl", ssl_mod);
     server_test_mod.addImport("net", net_conn_mod);
+    server_test_mod.addImport("handshake_pool", handshake_pool_mod);
     server_test_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     server_test_mod.addImport("ipc_client", ipc_client_test_mod);
     server_test_mod.addImport("roster_store", roster_store_mod_for_server);
@@ -1645,15 +1656,13 @@ pub fn build(b: *std.Build) void {
 
     const run_docs_config = b.addRunArtifact(gen_docs);
     run_docs_config.addArg("doc/CONFIGURATION.md");
-    const docs_config_step = b.step("docs-config",
-        "Regenerate doc/CONFIGURATION.md from src/config/schema.zig");
+    const docs_config_step = b.step("docs-config", "Regenerate doc/CONFIGURATION.md from src/config/schema.zig");
     docs_config_step.dependOn(&run_docs_config.step);
 
     const run_docs_config_check = b.addRunArtifact(gen_docs);
     run_docs_config_check.addArg("--check");
     run_docs_config_check.addArg("doc/CONFIGURATION.md");
-    const docs_config_check_step = b.step("docs-config-check",
-        "Fail when doc/CONFIGURATION.md is stale vs src/config/schema.zig");
+    const docs_config_check_step = b.step("docs-config-check", "Fail when doc/CONFIGURATION.md is stale vs src/config/schema.zig");
     docs_config_check_step.dependOn(&run_docs_config_check.step);
 
     // --- HTTP client module (for OIDC backend) ---
@@ -1761,6 +1770,7 @@ pub fn build(b: *std.Build) void {
     core_mod.addImport("precis_username", precis_username_mod);
     core_mod.addImport("ssl", ssl_mod);
     core_mod.addImport("net", net_conn_mod);
+    core_mod.addImport("handshake_pool", handshake_pool_mod);
     core_mod.addImport("ipc_protocol", ipc_protocol_test_mod);
     core_mod.addImport("ipc_client", ipc_client_test_mod);
     core_mod.addImport("roster_store", roster_store_mod_for_server);

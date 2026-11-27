@@ -106,6 +106,7 @@ const pep_store_mod = @import("pep_store");
 const GenericPepStore = pep_store_mod.PepStore(OpBackendType);
 const token_kinds = @import("token_kinds");
 const Token = @import("net_token").Token;
+const handshake_pool_mod = @import("handshake_pool");
 
 const log = std.log.scoped(.xmppd);
 
@@ -139,6 +140,9 @@ pub const IPC_S2S_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kin
 
 /// udata for the delivery system wake pipe knote.
 const WAKE_PIPE_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.wake_pipe }).toUdata();
+
+/// udata for the F7 handshake-pool completion pipe knote.
+const HANDSHAKE_PIPE_UDATA: usize = (Token{ .index = 0, .gen = 0, .kind = token_kinds.handshake_pipe }).toUdata();
 
 /// udata for the fixed timers. Dispatch stays keyed on ident;
 /// the kind tag exists so a stale session token cannot impersonate one.
@@ -261,7 +265,13 @@ pub const Server = struct {
     slot_gen: []u24 = &.{},
 
     /// TLS context — shared across all connections. Null if TLS is not configured.
+    /// In production every worker copy names the same underlying process-wide
+    /// SSL_CTX; ssl_ctx_owned is false there because main owns the object.
     ssl_ctx: ?ssl.SslContext = null,
+    ssl_ctx_owned: bool = true,
+
+    /// Process-wide F7 handshake pool and this worker's completion endpoint.
+    handshake_pool: ?*handshake_pool_mod.Pool = null,
 
     /// Test seam (T215): when set, the next TLS upgrade fails instead of
     /// starting a handshake, which exercises the teardown that frees the
@@ -862,6 +872,25 @@ pub const Server = struct {
         self.ssl_ctx = ssl.SslContext.initServer(cert_path, key_path) catch {
             return error.TlsConfigFailed;
         };
+        self.ssl_ctx_owned = true;
+    }
+
+    /// Adopt the process-wide SSL_CTX by value. The small SslContext wrapper
+    /// is copied, but every copy names the same underlying OpenSSL object;
+    /// main owns its lifetime.
+    pub fn adoptSharedTls(self: *Server, ctx: ssl.SslContext) void {
+        if (self.ssl_ctx_owned) {
+            if (self.ssl_ctx) |*old| old.deinit();
+        }
+        self.ssl_ctx = ctx;
+        self.ssl_ctx_owned = false;
+    }
+
+    /// Attach the worker loop to its F7 completion endpoint. The pipe itself
+    /// stays owned by the pool and outlives every worker loop.
+    pub fn configureHandshakePool(self: *Server, pool: *handshake_pool_mod.Pool) !void {
+        self.handshake_pool = pool;
+        try self.loop.addFd(pool.completionFd(self.worker_id), .read, HANDSHAKE_PIPE_UDATA);
     }
 
     pub fn deinit(self: *Server) void {
@@ -904,7 +933,9 @@ pub const Server = struct {
         self.sm_redirects.deinit(self.allocator);
         self.listener.deinit();
         self.loop.deinit();
-        if (self.ssl_ctx) |*ctx| ctx.deinit();
+        if (self.ssl_ctx_owned) {
+            if (self.ssl_ctx) |*ctx| ctx.deinit();
+        }
         if (self.ipc.connected) self.ipc.close();
         if (self.s2s_ipc.connected) self.s2s_ipc.close();
         self.ipc.deinit();
@@ -1328,7 +1359,9 @@ pub const Server = struct {
             session.conn.linkDirty();
         }
         if (session.conn.isTlsHandshaking()) {
-            c2s_session.continueTlsHandshake(self, id, session, changes);
+            if (!session.conn.tls_pool_inflight) {
+                c2s_session.continueTlsHandshake(self, id, session, changes);
+            }
             return;
         }
         c2s_session.handleReadable(self, id, changes);
@@ -1366,11 +1399,70 @@ pub const Server = struct {
         }
     }
 
+    fn destroyHandshakeCompletion(comp: *handshake_pool_mod.Completion) void {
+        comp.tls.conn.deinit();
+        if (comp.fd >= 0) posix.close(comp.fd);
+        comp.fd = -1;
+    }
+
+    /// Drain the F7 completion pipe, then the bounded completion ring. The
+    /// pipe byte is only a wake; ordering it before the ring drain means a
+    /// completion arriving after the drain leaves a byte for the next event.
+    fn handleHandshakeCompletions(self: *Server, changes: *ChangeList) void {
+        const pool = self.handshake_pool orelse return;
+        const fd = pool.completionFd(self.worker_id);
+        var buf: [128]u8 = undefined;
+        while (true) {
+            _ = posix.read(fd, &buf) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => break,
+            };
+        }
+
+        while (pool.popCompletion(self.worker_id)) |comp_in| {
+            var comp = comp_in;
+            const token = Token.fromUdata(comp.token_udata);
+            const live = self.validateSessionToken(token) and
+                self.sessions[token.index] != null and
+                self.sessions[token.index].?.conn.tls_pool_inflight;
+            if (!live) {
+                self.stale_token_skips += 1;
+                destroyHandshakeCompletion(&comp);
+                continue;
+            }
+
+            const id: usize = token.index;
+            const session = self.sessions[token.index].?;
+            if (!comp.ok or comp.fd < 0) {
+                if (comp.timed_out) {
+                    log.info("connection {d} TLS handshake timed out", .{id});
+                } else {
+                    log.info("connection {d} TLS handshake failed", .{id});
+                }
+                destroyHandshakeCompletion(&comp);
+                session.conn.failTlsPoolHandoff();
+                session_lifecycle.closeSession(self, id, changes);
+                continue;
+            }
+
+            session.conn.adoptTlsFromPool(comp.fd, comp.tls);
+            c2s_session.completeTlsHandshake(self, id, session, changes);
+            if (self.sessions[id] != null and !session.conn.isClosed()) {
+                changes.addWriteDisabled(session.conn.fd, self.sessionToken(id).toUdata()) catch {
+                    session_lifecycle.closeSession(self, id, changes);
+                    continue;
+                };
+            }
+        }
+    }
+
     fn handleWritableOrHandshake(self: *Server, token: Token, changes: *ChangeList) void {
         const session = self.sessionForEventToken(token) orelse return;
         const id: usize = token.index;
         if (session.conn.isTlsHandshaking()) {
-            c2s_session.continueTlsHandshake(self, id, session, changes);
+            if (!session.conn.tls_pool_inflight) {
+                c2s_session.continueTlsHandshake(self, id, session, changes);
+            }
             return;
         }
         c2s_session.handleWritable(self, id, changes);
@@ -1391,6 +1483,8 @@ pub const Server = struct {
                         self.handleS2sIpcReadable(changes);
                     } else if (e.udata == WAKE_PIPE_UDATA) {
                         // Already handled in the first pass
+                    } else if (e.udata == HANDSHAKE_PIPE_UDATA) {
+                        self.handleHandshakeCompletions(changes);
                     } else {
                         self.handleReadableOrHandshake(Token.fromUdata(e.udata), changes);
                     }
@@ -5989,4 +6083,175 @@ test "Server: C11 SM expiry stages exactly one one-shot timer at the wheel deadl
     try std.testing.expect(delete_found);
     try std.testing.expect(!server.sm_expiry_armed);
     try std.testing.expect(!server.sm_expiry_pending);
+}
+
+fn destroyPoolTestCompletion(comp: *handshake_pool_mod.Completion) void {
+    comp.tls.conn.deinit();
+    if (comp.fd >= 0) posix.close(comp.fd);
+    comp.fd = -1;
+}
+
+test "F7 handshake pool completes a server handshake off the caller thread" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+
+    var server_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+    defer server_ctx.deinit();
+    var client_ctx = try ssl.SslContext.initClient();
+    defer client_ctx.deinit();
+    client_ctx.disableKtls();
+
+    var pool: handshake_pool_mod.Pool = undefined;
+    try pool.init(allocator, .{
+        .workers = 1,
+        .threads = 1,
+        .active_per_thread = 2,
+        .queue_per_thread = 1,
+        .timeout_ms = 2_000,
+    });
+    defer pool.deinit();
+    try pool.start();
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const server_conn = try ssl.SslConn.init(server_ctx, fds[0]);
+    const token = Token.init(1, 1, token_kinds.session);
+    try pool.submit(.{
+        .worker_id = 0,
+        .token_udata = token.toUdata(),
+        .fd = fds[0],
+        .tls = .{ .conn = server_conn },
+    });
+
+    var client = try ssl.SslConn.initClient(client_ctx, fds[1], null);
+    defer client.deinit();
+    var completion: ?handshake_pool_mod.Completion = null;
+    var client_done = false;
+    for (0..20_000) |_| {
+        if (!client_done) {
+            switch (try client.doHandshake()) {
+                .complete => client_done = true,
+                .want_read, .want_write => {},
+            }
+        }
+        if (pool.popCompletion(0)) |comp| {
+            completion = comp;
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(client_done);
+    var comp = completion orelse return error.TestUnexpectedResult;
+    try std.testing.expect(comp.ok);
+    try std.testing.expectEqual(fds[0], comp.fd);
+    try std.testing.expectEqual(token.toUdata(), comp.token_udata);
+    try std.testing.expect(comp.tls.conn.cipherName().len > 0);
+    try std.testing.expect(pool.counters.completed.load(.monotonic) >= 1);
+    destroyPoolTestCompletion(&comp);
+}
+
+test "F7 handshake pool admission is bounded" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+    var server_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+    defer server_ctx.deinit();
+
+    var pool: handshake_pool_mod.Pool = undefined;
+    try pool.init(allocator, .{
+        .workers = 1,
+        .threads = 1,
+        .active_per_thread = 1,
+        .queue_per_thread = 1,
+        .timeout_ms = 2_000,
+    });
+    defer pool.deinit();
+    try pool.start();
+
+    const fds1 = try makeSocketPair();
+    defer posix.close(fds1[1]);
+    const conn1 = try ssl.SslConn.init(server_ctx, fds1[0]);
+    try pool.submit(.{
+        .worker_id = 0,
+        .token_udata = Token.init(1, 1, token_kinds.session).toUdata(),
+        .fd = fds1[0],
+        .tls = .{ .conn = conn1 },
+    });
+    const fds2 = try makeSocketPair();
+    defer posix.close(fds2[1]);
+    const conn2 = try ssl.SslConn.init(server_ctx, fds2[0]);
+    try pool.submit(.{
+        .worker_id = 0,
+        .token_udata = Token.init(2, 1, token_kinds.session).toUdata(),
+        .fd = fds2[0],
+        .tls = .{ .conn = conn2 },
+    });
+
+    const fds3 = try makeSocketPair();
+    defer posix.close(fds3[0]);
+    defer posix.close(fds3[1]);
+    var conn3 = try ssl.SslConn.init(server_ctx, fds3[0]);
+    try std.testing.expectError(error.PoolBusy, pool.submit(.{
+        .worker_id = 0,
+        .token_udata = Token.init(3, 1, token_kinds.session).toUdata(),
+        .fd = fds3[0],
+        .tls = .{ .conn = conn3 },
+    }));
+    conn3.deinit();
+    try std.testing.expect(pool.counters.refused.load(.monotonic) >= 1);
+}
+
+test "Server: pooled STARTTLS handoff removes fd and TLS ownership from the worker" {
+    const allocator = std.testing.allocator;
+    defer connection_mod.dirtyForWorker(0).* = .{};
+    var server: Server = undefined;
+    try server.init("localhost", "127.0.0.1", 0, allocator);
+    defer server.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pem_path = try connection_mod.makeTestPem(allocator, tmp.dir);
+    defer allocator.free(pem_path);
+    server.ssl_ctx = try ssl.SslContext.initServer(pem_path, pem_path);
+
+    var pool: handshake_pool_mod.Pool = undefined;
+    try pool.init(allocator, .{
+        .workers = 1,
+        .threads = 1,
+        .active_per_thread = 2,
+        .queue_per_thread = 1,
+        .timeout_ms = 2_000,
+    });
+    defer pool.deinit();
+    try pool.start();
+    try server.configureHandshakePool(&pool);
+
+    const fds = try makeSocketPair();
+    defer posix.close(fds[1]);
+    const session = try allocator.create(Session);
+    session.init(fds[0], 1, "localhost", false, allocator);
+    server.sessions[1] = session;
+
+    var change_buf: [16]posix.Kevent = undefined;
+    var changes = ChangeList.init(&change_buf);
+    try std.testing.expect(c2s_session.startTlsUpgrade(&server, session, &changes));
+
+    try std.testing.expect(session.conn.tls_pool_inflight);
+    try std.testing.expect(session.conn.tls == null);
+    try std.testing.expectEqual(@as(posix.fd_t, -1), session.conn.fd);
+    try std.testing.expect(session.conn.isTlsHandshaking());
+    var read_delete = false;
+    var write_delete = false;
+    for (changes.slice()) |ev| {
+        if (ev.ident != @as(usize, @intCast(fds[0])) or (ev.flags & std.c.EV.DELETE) == 0) continue;
+        if (ev.filter == std.c.EVFILT.READ) read_delete = true;
+        if (ev.filter == std.c.EVFILT.WRITE) write_delete = true;
+    }
+    try std.testing.expect(read_delete);
+    try std.testing.expect(write_delete);
 }

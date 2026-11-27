@@ -57,6 +57,8 @@ const SessionMap = session_map_mod.SessionMap;
 const delivery_queue_mod = @import("delivery_queue");
 const DeliverySystem = delivery_queue_mod.DeliverySystem;
 const metrics = @import("worker/metrics.zig");
+const ssl = @import("ssl");
+const handshake_pool_mod = @import("handshake_pool");
 
 const log = std.log.scoped(.@"xmppd-core");
 
@@ -269,6 +271,37 @@ pub fn main() !void {
     }
     defer if (delivery_sys) |*ds| ds.deinit();
 
+    // F7: exactly one OpenSSL SSL_CTX exists in this process. Workers adopt
+    // wrapper copies naming this object; main owns its lifetime.
+    var shared_ssl_ctx: ?ssl.SslContext = null;
+    if (cert_path) |cert| {
+        const key = key_path orelse return error.InvalidArgs;
+        shared_ssl_ctx = ssl.SslContext.initServer(cert, key) catch |err| {
+            log.err("TLS configuration failed: {s}", .{@errorName(err)});
+            return error.TlsConfigFailed;
+        };
+    }
+    defer if (shared_ssl_ctx) |*tls_ctx| tls_ctx.deinit();
+
+    var handshake_pool: handshake_pool_mod.Pool = undefined;
+    var handshake_pool_enabled = false;
+    defer if (handshake_pool_enabled) handshake_pool.deinit();
+    if (!skip_tls and shared_ssl_ctx != null) {
+        const lane_count = resolveHandshakeThreads(v);
+        try handshake_pool.init(allocator, .{
+            .workers = worker_count,
+            .threads = lane_count,
+            .active_per_thread = v.tls.handshake_concurrency,
+            .queue_per_thread = v.tls.handshake_queue,
+            .timeout_ms = v.tls.handshake_timeout_ms,
+        });
+        handshake_pool_enabled = true;
+        try handshake_pool.start();
+        log.info("TLS handshake pool: {d} lanes, {d} active + {d} queued per lane, timeout {d} ms", .{
+            lane_count, v.tls.handshake_concurrency, v.tls.handshake_queue, v.tls.handshake_timeout_ms,
+        });
+    }
+
     // Worker context shared across threads
     var ctx = WorkerCtx{
         .host = host,
@@ -294,6 +327,8 @@ pub fn main() !void {
         .delivery_system = if (delivery_sys) |*ds| ds else null,
         .oidc_import_avatar = oidc_import_avatar,
         .scram_exchange_slots = v.core.scram_exchange_slots,
+        .shared_ssl_ctx = shared_ssl_ctx,
+        .handshake_pool = if (handshake_pool_enabled) &handshake_pool else null,
         .allocator = allocator,
     };
 
@@ -377,6 +412,18 @@ const TlsConfig = struct {
     skip_tls: bool,
 };
 
+/// Resolve `[tls] handshake_threads`: auto is CPU-aware but bounded because
+/// handshake lanes share the host with the established-session workers.
+fn resolveHandshakeThreads(v: *const schema.Sections) usize {
+    switch (v.tls.handshake_threads) {
+        .num => |n| return @max(@as(usize, n), 1),
+        .kw => {
+            const cpus = std.Thread.getCpuCount() catch 1;
+            return @min(@max((cpus + 3) / 4, 1), 8);
+        },
+    }
+}
+
 fn resolveTls(arena: std.mem.Allocator, v: *const schema.Sections) error{ OutOfMemory, TlsIncomplete }!TlsConfig {
     if ((v.tls.cert.len == 0) != (v.tls.key.len == 0)) return error.TlsIncomplete;
     const on = v.tls.enabled and v.tls.cert.len != 0;
@@ -426,6 +473,8 @@ const WorkerCtx = struct {
     delivery_system: ?*DeliverySystem,
     oidc_import_avatar: bool,
     scram_exchange_slots: usize,
+    shared_ssl_ctx: ?ssl.SslContext,
+    handshake_pool: ?*handshake_pool_mod.Pool,
     allocator: std.mem.Allocator,
 };
 
@@ -456,15 +505,13 @@ fn configureServer(server: *Server, ctx: *WorkerCtx, worker_id: u16) !void {
     if (ctx.delivery_system) |ds| {
         server.delivery_system = ds;
     }
-    if (ctx.cert_path) |cert| {
-        const key = ctx.key_path orelse {
-            log.err("--cert requires --key", .{});
-            return;
+    if (ctx.shared_ssl_ctx) |shared_ctx| {
+        server.adoptSharedTls(shared_ctx);
+        const pool = ctx.handshake_pool orelse {
+            log.err("TLS is enabled without the F7 handshake pool", .{});
+            return error.TlsConfigFailed;
         };
-        server.configureTls(cert, key) catch {
-            log.err("TLS configuration failed", .{});
-            return;
-        };
+        try server.configureHandshakePool(pool);
     }
 
     if (ctx.auth_socket) |socket_path| {

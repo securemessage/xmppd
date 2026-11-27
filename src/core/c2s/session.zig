@@ -738,6 +738,34 @@ pub const Session = struct {
     }
 };
 
+/// Final TLS-establishment steps shared by the test-only direct driver and
+/// the F7 pool completion path. The connection must already own the fd and
+/// TLS object and be marked established.
+pub fn completeTlsHandshake(self: *Server, id: usize, session: *Session, changes: *ChangeList) void {
+    log.info("connection {d} TLS handshake complete", .{id});
+    // AGENTS.md: kTLS engagement and cipher must be logged after
+    // every handshake; userland fallback is otherwise silent.
+    if (session.conn.tls) |*t| {
+        log.info("connection {d} tls: {s} cipher={s} ktls tx={} rx={}", .{
+            id, t.conn.versionName(), t.conn.cipherName(), t.ktls_tx, t.ktls_rx,
+        });
+    }
+    session.stream.tlsEstablished();
+    session.reader.reset();
+    session.conn.read_start = 0;
+    session.conn.read_end = 0;
+
+    // OpenSSL may have buffered application data internally during the
+    // handshake (client pipelines Finished + new stream open). Drain it now;
+    // kqueue only reports new socket bytes, not OpenSSL-internal plaintext.
+    if (session.conn.tlsPending() > 0) {
+        handleReadable(self, id, changes);
+    }
+    if (self.sessions[id] != null and !session.conn.isClosed()) {
+        changes.addRead(session.conn.fd, self.sessionToken(id).toUdata()) catch {};
+    }
+}
+
 pub fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes: *ChangeList) void {
     const complete = session.conn.continueHandshake() catch {
         log.err("connection {d} TLS handshake failed", .{id});
@@ -746,35 +774,7 @@ pub fn continueTlsHandshake(self: *Server, id: usize, session: *Session, changes
     };
 
     if (complete) {
-        log.info("connection {d} TLS handshake complete", .{id});
-        // AGENTS.md: kTLS engagement and cipher must be logged after
-        // every handshake; userland fallback is otherwise silent.
-        if (session.conn.tls) |*t| {
-            log.info("connection {d} tls: {s} cipher={s} ktls tx={} rx={}", .{
-                id, t.conn.versionName(), t.conn.cipherName(), t.ktls_tx, t.ktls_rx,
-            });
-        }
-        // Notify the stream FSM that TLS is established
-        session.stream.tlsEstablished();
-        // Reset XML reader for stream restart after STARTTLS
-        session.reader.reset();
-        // Clear any stale pre-TLS data from the read buffer
-        session.conn.read_start = 0;
-        session.conn.read_end = 0;
-
-        // OpenSSL may have buffered application data internally during
-        // the handshake (client pipelines Finished + new stream open).
-        // handleReadable's TLS drain loop handles this — just ensure
-        // kqueue is armed so the next readable event triggers it.
-        // If OpenSSL already consumed all socket data, tlsPending() > 0
-        // won't help here since handleReadable needs a kqueue trigger.
-        // Force an immediate drain to handle the pipelined case.
-        if (session.conn.tlsPending() > 0) {
-            handleReadable(self, id, changes);
-        }
-        if (self.sessions[id] != null and !session.conn.isClosed()) {
-            changes.addRead(session.conn.fd, self.sessionToken(id).toUdata()) catch {};
-        }
+        completeTlsHandshake(self, id, session, changes);
     } else {
         // Re-arm the appropriate kqueue filter. The write knote is the
         // accept-time DISPATCH registration: a bare enableWrite re-arms
@@ -2340,7 +2340,39 @@ pub fn startTlsUpgrade(self: *Server, session: *Session, changes: *ChangeList) b
             session_lifecycle.closeSession(self, session.conn.id, changes);
             return false;
         };
-        log.info("connection {d} starting TLS handshake", .{session.conn.id});
+        if (self.handshake_pool) |pool| {
+            const fd = session.conn.fd;
+            changes.removeRead(fd) catch {
+                log.warn("connection {d} TLS upgrade failed: changelist full", .{session.conn.id});
+                session_lifecycle.closeSession(self, session.conn.id, changes);
+                return false;
+            };
+            changes.removeWrite(fd) catch {
+                log.warn("connection {d} TLS upgrade failed: changelist full", .{session.conn.id});
+                session_lifecycle.closeSession(self, session.conn.id, changes);
+                return false;
+            };
+            const released = session.conn.releaseTlsForPool() orelse {
+                session_lifecycle.closeSession(self, session.conn.id, changes);
+                return false;
+            };
+            pool.submit(.{
+                .worker_id = self.worker_id,
+                .token_udata = self.sessionToken(session.conn.id).toUdata(),
+                .fd = released.fd,
+                .tls = released.tls,
+            }) catch |err| {
+                session.conn.restoreTlsFromPool(released.fd, released.tls);
+                log.warn("connection {d} TLS handshake admission refused: {s}", .{ session.conn.id, @errorName(err) });
+                session_lifecycle.closeSession(self, session.conn.id, changes);
+                return false;
+            };
+            log.info("connection {d} starting pooled TLS handshake", .{session.conn.id});
+        } else {
+            // Tests may drive the direct state machine without a pool. The
+            // daemon main always configures one when TLS is enabled (F7).
+            log.info("connection {d} starting TLS handshake", .{session.conn.id});
+        }
     } else {
         log.warn("connection {d} STARTTLS requested but no TLS configured", .{session.conn.id});
     }
