@@ -460,7 +460,19 @@ test "Executor: the writer thread commits and stop drains the queue" {
     var completed: std.atomic.Value(?*Job) = std.atomic.Value(?*Job).init(null);
     var store: MockStore = .{};
 
+    const Publish = struct {
+        event: std.Thread.ResetEvent = .{},
+        fn afterPublish(ctx: ?*anyopaque) void {
+            const publish: *@This() = @ptrCast(@alignCast(ctx.?));
+            publish.event.set();
+        }
+    };
+    var publish: Publish = .{};
+    exec.test_after_publish = Publish.afterPublish;
+    exec.test_after_publish_ctx = &publish;
+
     try exec.start();
+    defer exec.stop();
     const blob = try Blob.createUncharged(allocator, "<message id='m9'/>");
     try exec.submit(.{
         .completed = &completed,
@@ -475,11 +487,9 @@ test "Executor: the writer thread commits and stop drains the queue" {
     });
     blob.releaseRetention();
 
-    // Bounded wait for the writer thread's completion push.
-    var tries: usize = 0;
-    while (completed.load(.acquire) == null and tries < 1_000_000) : (tries += 1) {
-        std.atomic.spinLoopHint();
-    }
+    // The publish hook is the completion barrier: a loaded host may not
+    // schedule the writer inside any fixed spin count.
+    try publish.event.timedWait(5 * std.time.ns_per_s);
     const job = completed.swap(null, .acq_rel).?;
     try std.testing.expect(job.stored);
     try std.testing.expectEqual(@as(u32, 1), store.calls);
@@ -531,10 +541,14 @@ test "Executor: a completion may settle before the writer reaches the wake" {
     var store: MockStore = .{};
 
     const Gate = struct {
-        release_writer: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        published: std.Thread.ResetEvent = .{},
+        release_writer: std.Thread.ResetEvent = .{},
         fn afterPublish(ctx: ?*anyopaque) void {
             const gate: *@This() = @ptrCast(@alignCast(ctx.?));
-            while (!gate.release_writer.load(.acquire)) std.atomic.spinLoopHint();
+            gate.published.set();
+            while (!gate.release_writer.isSet()) {
+                gate.release_writer.timedWait(10 * std.time.ns_per_ms) catch {};
+            }
         }
     };
     var gate: Gate = .{};
@@ -542,6 +556,8 @@ test "Executor: a completion may settle before the writer reaches the wake" {
     exec.test_after_publish_ctx = &gate;
 
     try exec.start();
+    defer exec.stop();
+    defer gate.release_writer.set();
     const blob = try Blob.createUncharged(allocator, "<message id='uaf'/>");
     try exec.submit(.{
         .completed = &completed,
@@ -559,16 +575,11 @@ test "Executor: a completion may settle before the writer reaches the wake" {
     // Wait for the publish CAS, then settle the way the drain tick
     // would: consume the outcome and poison the stale wake handle while
     // the writer still owes the wake.
-    var job: ?*Job = null;
-    var tries: usize = 0;
-    while (job == null and tries < 1_000_000) : (tries += 1) {
-        job = completed.swap(null, .acq_rel);
-        if (job == null) std.atomic.spinLoopHint();
-    }
-    const settled = job.?;
+    try gate.published.timedWait(5 * std.time.ns_per_s);
+    const settled = completed.swap(null, .acq_rel).?;
     try std.testing.expect(settled.stored);
     settled.wake = &dead;
-    gate.release_writer.store(true, .release);
+    gate.release_writer.set();
 
     // stop() joins the writer after it pushes through the gate; the job
     // is only freed afterwards so a stale read would observe the dead
