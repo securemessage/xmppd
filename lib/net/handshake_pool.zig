@@ -394,9 +394,23 @@ fn popQueued(lane: *Lane) ?Job {
     return job;
 }
 
+/// Move one queued job into a reserved active slot. The queue decrement and
+/// active-count increment are one mutex-held transfer so submitters cannot
+/// observe the job in neither class and admit work past active plus queue.
+fn popQueuedForActivation(lane: *Lane) ?Job {
+    lane.mutex.lock();
+    defer lane.mutex.unlock();
+    if (lane.qlen == 0 or lane.active_count.load(.acquire) >= lane.active.len) return null;
+    const job = lane.queue[lane.qhead];
+    lane.qhead = (lane.qhead + 1) % lane.queue.len;
+    lane.qlen -= 1;
+    lane.active_count.store(lane.active_count.load(.acquire) + 1, .release);
+    return job;
+}
+
 fn promoteQueued(lane: *Lane) void {
     while (lane.active_count.load(.acquire) < lane.active.len) {
-        const job = popQueued(lane) orelse break;
+        const job = popQueuedForActivation(lane) orelse break;
         var idx: ?usize = null;
         for (lane.active, 0..) |*a, i| {
             if (!a.used) {
@@ -405,6 +419,7 @@ fn promoteQueued(lane: *Lane) void {
             }
         }
         const i = idx orelse {
+            lane.active_count.store(lane.active_count.load(.acquire) - 1, .release);
             var tls = job.tls;
             destroyOwned(job.fd, &tls);
             continue;
@@ -414,7 +429,6 @@ fn promoteQueued(lane: *Lane) void {
         a.used = true;
         a.timer = null;
         a.timed_out = false;
-        lane.active_count.store(lane.active_count.load(.acquire) + 1, .release);
         const ctx = laneToken(i, a.gen);
         a.handle = lane.loop.attach(job.fd, ctx, .{ .read = true, .write = true }) catch {
             finishActive(lane, i, false);

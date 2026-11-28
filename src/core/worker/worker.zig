@@ -6182,6 +6182,11 @@ test "F7 handshake pool admission is bounded" {
         .fd = fds1[0],
         .tls = .{ .conn = conn1 },
     });
+    var activation_spins: usize = 0;
+    while (pool.lanes[0].active_count.load(.acquire) == 0 and activation_spins < 100_000) : (activation_spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), pool.lanes[0].active_count.load(.acquire));
     const fds2 = try makeSocketPair();
     defer posix.close(fds2[1]);
     const conn2 = try ssl.SslConn.init(server_ctx, fds2[0]);
