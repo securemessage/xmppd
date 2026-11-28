@@ -111,6 +111,11 @@ pub fn main() !void {
         return;
     }
 
+    schema.validateTlsHandshakePool(&cfg.loader, schema.configPathArg(argv.items), &cfg.diag) catch |err| {
+        log.err("{f}", .{&cfg.diag});
+        return err;
+    };
+
     const host = v.server.hostname;
     const address = v.server.bind_address;
     const port = v.server.c2s_port;

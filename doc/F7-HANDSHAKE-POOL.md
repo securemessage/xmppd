@@ -50,9 +50,11 @@ handshake_queue = 128           # queued handoffs per pool thread
 handshake_timeout_ms = 10000    # lifecycle deadline per handshake
 ```
 
-The auto rule makes the pool thread-count aware without pretending that handshake threads have dedicated physical cores. On the six-core measurement host auto selects two lanes, matching the ADR-11 estimate that two lanes already cover roughly ten thousand full ECDSA P-256 handshakes per second. Operators running a dedicated TLS host can raise the count explicitly.
+The auto rule makes the pool thread-count aware without pretending that handshake threads have dedicated physical cores. On the 20 CPU measurement host auto selects five lanes. On a six-core host it selects two lanes, matching the ADR-11 estimate that two lanes already cover roughly ten thousand full ECDSA P-256 handshakes per second. Operators running a dedicated TLS host can raise the count explicitly.
 
 The default active bound is deliberate. TLS handshake cryptography is parallel across lanes, but each lane still serializes its own `SSL_do_handshake` steps. Thirty-two active sockets per lane is enough to keep crypto pipelined behind network readiness without making one lane's completion batch large.
+
+All four values must be positive. The queue minimum is structural rather than cosmetic: submission uses one queue slot as the cross-thread ownership handoff even when an active slot is free, so `handshake_queue = 0` would create a pool that admits nothing. Core startup validates the bounds and reports the offending config field instead of silently clamping them.
 
 ## 3. c2s adoption
 
@@ -104,17 +106,31 @@ The tests must fail when any of these regressions return:
 
 ## 7. Evidence snapshot
 
-Measurement rig: one ECDSA P-256 certificate, four core workers, 200 distinct accounts, `xmppc-load -scenario login -connect-rate 2000 -engines 4`, client userland TLS on loopback per FreeBSD PR 296498. Master and head were both ReleaseSafe. Runs were interleaved but remain a small two-cell snapshot, not the full three-run median required for final merge evidence.
+Measurement rig: one ECDSA P-256 certificate, four core workers, 200 distinct accounts, `xmppc-load -scenario login -connect-rate 2000 -engines 4`, client userland TLS on loopback per FreeBSD PR 296498. Master `e048e8f` and the F7 head were both ReleaseSafe. The harness restarted each server for every run, used fresh copies of the same certificate and 200-account auth database, and interleaved cells as master, head, head, master, master, head. Every driver run exited zero with 200 of 200 sessions established. Raw artifacts are in `/tmp/f7meas-final2` on freebsd-dev1.
 
-| cell | ramp | login/s pipe | login/s wall | driver stall max | STARTTLS p50 | TLS p50 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| master run 1 | 1.76s | 119 | 113 | 16273us | 16472us | 9037us |
-| head run 1 | 1.63s | 128 | 123 | 37133us | 27485us | 18306us |
-| master run 2 | 1.64s | 134 | 122 | 37977us | 27985us | 24568us |
+Server-loop stall is the primary measurement. It comes from the M1 SIGUSR1 per-worker loop histograms, summed over the four workers after each load. The histogram labels are log2 bucket floors in microseconds, so the `8192us` bucket covers [8192, 16384) and `16384us` covers [16384, 32768).
 
-The interleaving shows large run-to-run noise on this shared host. Head is within the master envelope for login rate and STARTTLS/TLS latency once the second master run is included; it does not yet prove a latency improvement. The important structural evidence is that all 200 STARTTLS upgrades were submitted to the pool exactly once, completed exactly once, and logged TLSv1.3 `TLS_AES_256_GCM_SHA384` with server-side `ktls tx=true rx=true`.
+| cell | run | ramp | login/s pipe | login/s wall | STARTTLS p50 | TLS p50 | loop >=4096us | loop >=16384us |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| master | 1 | 1.52s | 146 | 132 | 32757us | 17421us | 58 | 1 |
+| head | 1 | 1.35s | 158 | 149 | 20085us | 18133us | 25 | 0 |
+| head | 2 | 1.48s | 150 | 135 | 17933us | 15158us | 24 | 0 |
+| master | 2 | 1.52s | 136 | 131 | 30896us | 17756us | 42 | 2 |
+| master | 3 | 1.51s | 138 | 132 | 29855us | 16572us | 49 | 1 |
+| head | 3 | 1.46s | 155 | 137 | 33998us | 19354us | 26 | 0 |
 
-The final merge evidence still needs the full interleaved three-run median and server-loop stall instrumentation rather than the client-driver stall proxy above.
+Medians over the three runs per cell:
+
+| cell | ramp | login/s pipe | login/s wall | STARTTLS p50 | TLS p50 | loop >=4096us | loop >=16384us |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| master | 1.52s | 138 | 132 | 30896us | 17421us | 49 | 1 |
+| head | 1.46s | 155 | 137 | 20085us | 18133us | 25 | 0 |
+
+The driver-side stall metric remains noisy on this shared host and is not treated as primary evidence: head run 3 reported 128982us of driver stall while every server worker stayed below the 16384us loop bucket. The server histogram is the direct signal. Master repeatedly put dozens of loop iterations in the 8192us and 16384us buckets while executing handshakes on workers. Head roughly halved the >=4096us count and removed the 16384us bucket entirely in all three runs. Head login rate did not regress; median pipelined login rate rose from 138/s to 155/s, within the noise of this small rig.
+
+The structural evidence is exact in every head run: one pool startup line, 200 `starting pooled TLS handshake` lines, 200 `TLS handshake complete` lines, and 200 cipher/kTLS lines. Successful handshakes logged TLSv1.3 `TLS_AES_256_GCM_SHA384` with server-side `ktls tx=true rx=true`.
+
+These runs do not evaluate ticket count or `SSL_MODE_RELEASE_BUFFERS`; those remain the separate measurement required by section 4. They also do not clear the pre-existing master quality-gate failure. Master quality CI was already red in run 3762 on `c2s.sm_drain_exec`, before this branch, and PR #108 does not clear that gate because `quality.yml` does not run `test-server` and PR #107 reports independent pinned frame failures.
 
 ## 8. Deliberate non-goals
 

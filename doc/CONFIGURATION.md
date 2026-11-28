@@ -39,7 +39,7 @@ listed under the daemon that accepts them.
 | `key` | (none) | core, s2s | TLS private key path (PEM) |
 | `enabled` | `true` | core, s2s | Enable TLS (C2S STARTTLS and s2s) |
 | `handshake_threads` | `auto` | core | TLS handshake pool lane count (`auto`: ceil(CPU count / 4), clamped to 1..8) |
-| `handshake_concurrency` | `32` | core | Active TLS handshakes one pool lane may drive at once |
+| `handshake_concurrency` | `32` | core | Concurrent TLS handshakes one pool lane may drive |
 | `handshake_queue` | `128` | core | Queued TLS handoffs one pool lane may hold behind its active bound |
 | `handshake_timeout_ms` | `10000` | core | Lifecycle deadline for one pooled TLS handshake in milliseconds |
 
